@@ -53,7 +53,10 @@ from autonomous_trust.core.reputation.repprocess import ReputationProcess
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
 from autonomous_trust.core.reputation.reputation import (
     TransactionScore, SlashAttestation, SignedSlash,
-    Checkpoint, SignedCheckpoint, evidence_to_dict)
+    Checkpoint, SignedCheckpoint, evidence_to_dict, place_designation,
+    place_value_digest, placement_entry)
+from autonomous_trust.core.reputation.placement import entry_to_dict
+from autonomous_trust.core.reputation.reputation import TransactionHistory
 from autonomous_trust.core.system import CfgIds, PackageHash
 from autonomous_trust.core._python.identity.peer_standing import (
     PeerStanding, STANDING_CAPPED)
@@ -130,6 +133,44 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: history_len={actual}, expected {expected}'
                     )
+            elif key == 'chain_tasks':
+                # The resident chain's tasks in index order, by slug.
+                want = [uuid5(_NS, f'tx:{slug}') for slug in expected]
+                actual = [tx.task_id for tx in self.process.history]
+                if [str(t) for t in actual] != [str(t) for t in want]:
+                    raise AssertionError(f'{self.id}: chain_tasks differ '
+                                         f'({len(actual)} resident)')
+            elif key == 'pool_count':
+                # How many entries wait in the primary chain's pool.
+                have = self.process.history.pooled_count()
+                if have != expected:
+                    raise AssertionError(f'{self.id}: pool_count={have}, '
+                                         f'expected {expected}')
+            elif key in ('chain_entries', 'pooled_entries', 'pool_tasks'):
+                # The resident chain's entries in index order, or the pool's
+                # entries as a set, by chain-spec slug ("chain:<slug>"); or the
+                # pool's tasks as a set, by task slug ("tx:<slug>").
+                ns = 'tx' if key == 'pool_tasks' else 'chain'
+                want = [str(uuid5(_NS, f'{ns}:{slug}')) for slug in expected]
+                hist = self.process.history
+                actual = ([str(tx.task_id) for tx in hist] if key == 'chain_entries'
+                          else sorted(str(t) for t in hist._pool))
+                if key != 'chain_entries':
+                    want = sorted(want)
+                if actual != want:
+                    raise AssertionError(f'{self.id}: {key} differ '
+                                         f'({len(actual)} held)')
+            elif key == 'place_promised':
+                # {n, by: <pid>}, or null for no promise.
+                have = self.process._place_state('')['promised']
+                if expected is None:
+                    ok = have is None
+                else:
+                    by = participants[expected['by']].identity.uuid
+                    ok = have == (int(expected['n']), str(by).lower())
+                if not ok:
+                    raise AssertionError(f'{self.id}: place_promised={have!r}, '
+                                         f'expected {expected!r}')
             elif key == 'committed_tx_count':
                 # Count of transactions resident in the hash-linked chain
                 # (== len(history) here). The C twin reads tx_history rather
@@ -450,6 +491,87 @@ def _chain_half(entry: dict, half: int, task: str, uuid_of) -> UUID:
     return uuid5(_NS, f"chainp{half}:{task}")
 
 
+def _write_roster(hist, entry, member, sign) -> None:
+    """A roster entry of a chain spec, placed alone at the chain's next index
+    (doc/architecture/reputation.md, "Who is in the group"): {roster: genesis,
+    members: [ids]} or {roster: add, member: id}, its placement certificate
+    signed by `placed_by: [ids]`. `member(id)` returns [uuid, key]. Mirrors the
+    C adapter's _write_roster."""
+    from autonomous_trust.core.reputation.reputation import (roster_digest,
+                                                             roster_task_id)
+    op, who = entry['roster'], None
+    if op == 'genesis':
+        members = [member(m) for m in entry['members']]
+        prev = None
+    else:
+        r = hist.latest_roster()
+        members, prev = list(map(list, r.roster_members)), r.task_id
+        if op == 'add':
+            m = member(entry['member'])
+            members, who = members + [m], m[0]
+    d = roster_digest(members)
+    tx = Transaction(roster_task_id(prev, op, who, d), roster_op=op,
+                     roster_uuid=None if who is None else UUID(who),
+                     roster_digest=d, roster_members=members)
+    k = hist.next_index
+    by = entry.get('placed_by')
+    sigs = (sign(by, place_designation(k, hist.head_hash,
+                                       place_value_digest([tx], k)))
+            if isinstance(by, list) else None)
+    hist.apply_placed(k, [tx], sigs)
+
+
+def _write_chain(hist, spec, uuid_of, sign, member=None) -> None:
+    """Write a `local_chain` / `latest update` chain spec into `hist` through
+    the production writers. An entry without `batch` is written the legacy way
+    (two update() halves). Consecutive entries sharing a `batch` are written as
+    ONE decided placement at the chain's next index (apply_placed); the batch's
+    last entry may name `placed_by: [ids]`, who sign its placement certificate
+    (doc/architecture/reputation.md, "Agreeing on an order"). `certified_by:
+    [ids]` certifies both halves of an entry. `sign(ids, designation)` returns
+    {uuid str: signature hex}. Mirrors the C adapter's _write_chain."""
+    i = 0
+    while i < len(spec):
+        entry = spec[i]
+        if isinstance(entry.get('roster'), str):
+            _write_roster(hist, entry, member, sign)
+            i += 1
+            continue
+        if entry.get('batch') is None:
+            tk = uuid5(_NS, f"chain:{entry['task']}")
+            hist.update(tk, _chain_half(entry, 1, entry['task'], uuid_of),
+                        float(entry['p1']))
+            hist.update(tk, _chain_half(entry, 2, entry['task'], uuid_of),
+                        float(entry['p2']))
+            i += 1
+            continue
+        group = []
+        while i < len(spec) and spec[i].get('batch') == entry['batch']:
+            group.append(spec[i])
+            i += 1
+        entries = [placement_entry(Transaction(
+            uuid5(_NS, f"chain:{e['task']}"),
+            p1_id=_chain_half(e, 1, e['task'], uuid_of), p1_score=float(e['p1']),
+            p2_id=_chain_half(e, 2, e['task'], uuid_of), p2_score=float(e['p2'])))
+            for e in group]
+        k = hist.next_index
+        by = group[-1].get('placed_by')
+        sigs = (sign(by, place_designation(k, hist.head_hash,
+                                           place_value_digest(entries, k)))
+                if isinstance(by, list) else None)
+        hist.apply_placed(k, entries, sigs)
+    for entry in spec:
+        by = entry.get('certified_by')
+        if not isinstance(by, list) or 'task' not in entry:
+            continue
+        tx = hist._task_mapping.get(uuid5(_NS, f"chain:{entry['task']}"))
+        if tx is None:
+            continue
+        for scorer, score in ((tx.p1_id, tx.p1_score), (tx.p2_id, tx.p2_score)):
+            tx.attach_certificate(scorer, sign(
+                by, commit_designation(scorer, tx.task_id, score)))
+
+
 def _to_captured(msg: Any, emitter_id: str) -> CapturedMessage:
     if not isinstance(msg, Message):
         return CapturedMessage(
@@ -618,6 +740,25 @@ class ReputationAdapter:
         # certificates (doc/architecture/reputation.md). Group-carried, so it is
         # set on the one Group every participant shares. Mirrors the C adapter.
         group._commit_certificates = fixtures.get('commit_certificates') is True
+        # ordered_placement: true -- the group places its order
+        # (doc/architecture/reputation.md, "Agreeing on an order"). Placement
+        # state then lives in a directory per participant, fresh per case:
+        # every participant shares this process and its config directory.
+        group._ordered_placement = fixtures.get('ordered_placement') is True
+        place_root = (tempfile.mkdtemp(prefix='at-conf-place-')
+                      if group._ordered_placement else None)
+        preset_place_promised = fixtures.get('place_promised', {}) or {}
+        # A placing group's roster in force before the scenario starts: every
+        # participant, unless `roster` names one per participant ({} for none,
+        # an unfounded chain). Mirrors the C adapter.
+        if 'roster' in fixtures:
+            preset_roster = fixtures.get('roster') or {}
+        elif fixtures.get('ordered_placement') is True:
+            everyone = [p['id'] for p in spec_participants]
+            preset_roster = {p['id']: everyone for p in spec_participants}
+        else:
+            preset_roster = {}
+        self._fixture_roster = preset_roster
 
         handles: dict[str, ParticipantHandle] = {}
         for spec in spec_participants:
@@ -632,6 +773,36 @@ class ReputationAdapter:
                 peers.add(other_id)
 
             participant = self._build_one(pid, role, identity, peers, group)
+            if place_root is not None:
+                where = os.path.join(place_root, pid)
+                os.makedirs(where, exist_ok=True)
+                participant.process._placement_path = (
+                    lambda key, where=where: os.path.join(
+                        where, 'reputation-placement' + ('-' + key if key else '')
+                        + Configuration.file_ext))
+            if pid in preset_roster:
+                # roster: {pid: [member pids]} -- the roster in force on pid's
+                # primary chain before the scenario starts, each member with
+                # its signing key (doc/architecture/reputation.md, "Who is in
+                # the group"). An anchor with no index, so the scenario's
+                # instances keep theirs. Mirrors the C adapter.
+                from nacl.encoding import HexEncoder
+                from autonomous_trust.core.reputation.reputation import (
+                    Transaction, roster_digest, roster_task_id)
+                members = [[str(identities[m].uuid),
+                            identities[m].signature.public.encode(
+                                encoder=HexEncoder).decode('ascii')]
+                           for m in preset_roster[pid]]
+                digest = roster_digest(members)
+                participant.process.history.roster_anchor = Transaction(
+                    roster_task_id(None, 'genesis', None, digest),
+                    roster_op='genesis', roster_digest=digest,
+                    roster_members=members)
+            if pid in preset_place_promised:
+                spec_pp = preset_place_promised[pid]
+                participant.process._place_state('')['promised'] = (
+                    int(spec_pp['n']),
+                    str(identities[spec_pp['by']].uuid).lower())
 
             # Preset history_len: append N zero-Transaction stubs so
             # len(history) returns the expected value without altering
@@ -691,14 +862,28 @@ class ReputationAdapter:
             # participant ids; missing ids on either side are skipped.
             def _ident_uuid(other):
                 return identities[other].uuid if other in identities else None
-            for entry in preset_local_chain.get(pid, []):
-                tk = uuid5(_NS, f"chain:{entry['task']}")
-                participant.process.history.update(
-                    tk, _chain_half(entry, 1, entry['task'], _ident_uuid),
-                    float(entry['p1']))
-                participant.process.history.update(
-                    tk, _chain_half(entry, 2, entry['task'], _ident_uuid),
-                    float(entry['p2']))
+            local = preset_local_chain.get(pid, [])
+            if any('batch' in e or 'certified_by' in e for e in local):
+                # A placed (or certified) local chain: built apart, then
+                # loaded verbatim with its certificates, as catch-up loads one.
+                def _sign_ids(ids, desig):
+                    return {str(identities[i].uuid):
+                            ReputationProcess._detached_sig(identities[i], desig)
+                            for i in ids if i in identities}
+                tmp = TransactionHistory(max_chain_len=len(local) + 1)
+                _write_chain(tmp, local, _ident_uuid, _sign_ids)
+                built = list(tmp)
+                participant.process.history.reconcile(
+                    built, certified={t.index for t in built})
+            else:
+                for entry in local:
+                    tk = uuid5(_NS, f"chain:{entry['task']}")
+                    participant.process.history.update(
+                        tk, _chain_half(entry, 1, entry['task'], _ident_uuid),
+                        float(entry['p1']))
+                    participant.process.history.update(
+                        tk, _chain_half(entry, 2, entry['task'], _ident_uuid),
+                        float(entry['p2']))
 
             for entry in preset_tx_history.get(pid, []):
                 if entry.get('attested'):
@@ -979,6 +1164,120 @@ class ReputationAdapter:
             str(target), float('inf'))
         return doc
 
+    #: A member no participant knows (roster specs). Mirrors the C adapter.
+    STRANGER = ['5e5e5e5e-0000-4000-8000-000000000005', '55' * 32]
+
+    def _roster_member(self, participants, pid):
+        if pid == 'stranger':
+            return list(self.STRANGER)
+        from nacl.encoding import HexEncoder
+        ident = participants[pid].impl.identity
+        return [str(ident.uuid).lower(),
+                ident.signature.public.encode(encoder=HexEncoder).decode('ascii')]
+
+    def _roster_spec(self, participants, spec, base):
+        """A roster entry from its spec (doc/architecture/reputation.md, "Who
+        is in the group"): {roster: genesis, members: [pid...]}, {roster: add,
+        member: pid[, key: hex]} or {roster: restate}; an add or restate
+        builds on the recipient's `roster` fixture (`base`). Mirrors the C
+        adapter's _rp_roster_entry."""
+        from autonomous_trust.core.reputation.reputation import (roster_digest,
+                                                                 roster_task_id)
+        op = spec['roster']
+        who = None
+        if op == 'genesis':
+            members = [self._roster_member(participants, p) for p in spec['members']]
+            d = roster_digest(members)
+            task = roster_task_id(None, 'genesis', None, d)
+        else:
+            members = [self._roster_member(participants, p) for p in base or []]
+            prev = roster_task_id(None, 'genesis', None, roster_digest(members))
+            if op == 'add':
+                m = self._roster_member(participants, spec['member'])
+                if spec.get('key'):
+                    m[1] = spec['key']
+                members = members + [m]
+                who = m[0]
+            d = roster_digest(members)
+            task = roster_task_id(prev, op, who, d)
+        return Transaction(task, roster_op=op,
+                           roster_uuid=None if who is None else UUID(who),
+                           roster_digest=d, roster_members=members)
+
+    def _place_value(self, participants, payload, base=None):
+        """A placement value from its spec: {task_id, p1, p1_score, p2,
+        p2_score} entries, each half certified by `cosigners` (default every
+        participant but the entry's two parties) unless `uncertified`, halves
+        in canonical order unless `swap`, entries by task id unless the step
+        says `unsorted`. Returns (entries, wire list). Mirrors the C adapter's
+        _rp_place_value."""
+        out = []
+        for spec in payload.get('value') or []:
+            if isinstance(spec.get('roster'), str):
+                out.append(self._roster_spec(participants, spec, base))
+                continue
+            a, b = spec['p1'], spec['p2']
+            ia = participants[a].impl.identity
+            ib = participants[b].impl.identity
+            task = uuid5(_NS, f'tx:{spec["task_id"]}')
+            sa, sb = float(spec['p1_score']), float(spec['p2_score'])
+            certs = None
+            if not spec.get('uncertified'):
+                signers = spec.get('cosigners') or [
+                    pid for pid in participants if pid not in (a, b)]
+                certs = {}
+                for who, score in ((ia, sa), (ib, sb)):
+                    certs[str(who.uuid)] = {
+                        str(participants[pid].impl.identity.uuid):
+                            self._detached_sig(participants[pid].impl.identity,
+                                               commit_designation(who.uuid, task, score))
+                        for pid in signers}
+            tx = placement_entry(Transaction(task, p1_id=ia.uuid, p1_score=sa,
+                                             p2_id=ib.uuid, p2_score=sb,
+                                             commit_sigs=certs))
+            if spec.get('swap'):
+                tx.p1_id, tx.p2_id = tx.p2_id, tx.p1_id
+                tx.p1_score, tx.p2_score = tx.p2_score, tx.p1_score
+            out.append(tx)
+        out.sort(key=lambda tx: str(tx.task_id).lower())
+        if payload.get('unsorted'):
+            out.reverse()
+        return out, [entry_to_dict(tx) for tx in out]
+
+    def _place_body(self, participants, from_id, to_id, function, payload):
+        """{group: '', k, ballot: {n, by}, head[, value]} or, for placed,
+        {group: '', k, value, sigs}. `head` is a literal, '' by default, or
+        `recipient` for the recipient's own head. `signers` name a placement
+        certificate's signers (default every participant); `forged_by` makes
+        one sign for all. Mirrors the C adapter."""
+        k = int(payload.get('k', 0))
+        head = payload.get('head', '')
+        if head == 'recipient':
+            head = participants[to_id].impl.process.history.head_hash.decode('ascii')
+        body = {'group': '', 'k': k}
+        if function != ReputationProtocol.placed:
+            ballot = payload.get('ballot') or {}
+            by = participants[ballot.get('by', from_id)].impl.identity.uuid
+            body['ballot'] = {'n': int(ballot.get('n', 1)), 'by': str(by).lower()}
+            body['head'] = head
+        if function == ReputationProtocol.place_request:
+            return body
+        entries, wire = self._place_value(
+            participants, payload,
+            (getattr(self, '_fixture_roster', None) or {}).get(to_id))
+        body['value'] = wire
+        if function == ReputationProtocol.placed:
+            desig = place_designation(k, head, place_value_digest(entries, k))
+            signers = payload.get('signers') or list(participants)
+            forger = payload.get('forged_by')
+            by_key = participants[forger].impl.identity if forger else None
+            body['sigs'] = {
+                str(participants[pid].impl.identity.uuid):
+                    self._detached_sig(by_key or participants[pid].impl.identity,
+                                       desig)
+                for pid in signers}
+        return body
+
     def _build_inbound(self, participants: dict[str, ParticipantHandle], *,
                        from_id: str, to_id: str, function: str,
                        payload: dict[str, Any]) -> Message:
@@ -1041,6 +1340,12 @@ class ReputationAdapter:
             if payload.get('certify') is True:
                 # A proposer in a declaring group asks for certification.
                 tup = tup + (True,)
+            if payload.get('placing') is True:
+                # A proposer in a group that places its order names the group
+                # ('' is the primary), and sends without a grant.
+                if len(tup) < 3:
+                    tup = tup + (False,)
+                tup = tup + ('',)
             obj = to_json_string(tup)
         elif function == ReputationProtocol.accepted:
             tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
@@ -1108,27 +1413,32 @@ class ReputationAdapter:
                 def _part_uuid(other):
                     return (participants[other].impl.identity.uuid
                             if other in participants else None)
-                for entry in spec:
-                    tk = uuid5(_NS, f"chain:{entry['task']}")
-                    p1 = _chain_half(entry, 1, entry['task'], _part_uuid)
-                    p2 = _chain_half(entry, 2, entry['task'], _part_uuid)
-                    tmp.update(tk, p1, float(entry['p1']))
-                    tmp.update(tk, p2, float(entry['p2']))
-                built = list(tmp)
                 # certified_by: [ids] certifies both halves of an entry with
-                # those participants' signatures (doc/architecture/reputation.md, "Commit certificates").
-                for tx, entry in zip(built, spec):
-                    by = entry.get('certified_by')
-                    if not isinstance(by, list):
-                        continue
-                    for scorer, score in ((tx.p1_id, tx.p1_score),
-                                          (tx.p2_id, tx.p2_score)):
-                        tx.attach_certificate(scorer, self._cosignatures(
-                            participants, {'cosigners': by},
-                            commit_designation(scorer, tx.task_id, score)))
+                # those participants' signatures (doc/architecture/reputation.md,
+                # "Commit certificates"); batch / placed_by write placements.
+                _write_chain(tmp, spec, _part_uuid,
+                             lambda ids, desig: self._cosignatures(
+                                 participants, {'cosigners': ids}, desig),
+                             lambda pid: self._roster_member(participants, pid))
+                built = list(tmp)
                 if payload.get('tamper') and len(built) >= 2:
                     built[1].p2_score = -1.0
-                obj = to_json_string(built)
+                # from: N sends the chain from its Nth entry on, as a peer whose
+                # window has moved past the start would.
+                built = built[int(payload.get('from') or 0):]
+                # to: N stops before the Nth entry (with from, one page's
+                # slice of a window).
+                if payload.get('to') is not None:
+                    built = built[:int(payload['to']) - int(payload.get('from') or 0)]
+                # page / of / head: send it as one page of a paged window
+                # (ISSUES §2.67), as a responder over the page size would.
+                if payload.get('page') is not None:
+                    obj = to_json_string({'page': payload['page'],
+                                          'of': payload.get('of'),
+                                          'head': payload.get('head', 'h'),
+                                          'chain': built})
+                else:
+                    obj = to_json_string(built)
         elif function in (ReputationProtocol.rep_req,
                           ReputationProtocol.consensus_rep_req):
             # Canonical wire form (BUGS.md §P9B): JSON object with named
@@ -1287,6 +1597,10 @@ class ReputationAdapter:
                                                       sigs=sigs))
             else:
                 obj = to_json_string(ck)
+        elif function in (ReputationProtocol.place_request,
+                          ReputationProtocol.place, ReputationProtocol.placed):
+            obj = to_json_string(self._place_body(participants, from_id, to_id,
+                                                  function, payload))
         else:
             raise AssertionError(f'unsupported reputation function {function!r}')
 

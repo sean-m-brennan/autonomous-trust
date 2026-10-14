@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <errno.h>
+#include <ctype.h>
 #include <sodium.h>
 
 #include "reputation/reputation.h"
@@ -112,6 +113,17 @@ int transaction_canonical_bytes(const transaction_t *tx, char *out, size_t outsz
         if (tx->attest_scope[0] != '\0')
             n += snprintf(buf + n, sizeof(buf) - n, "|%s", tx->attest_scope);
     }
+    if (tx->roster)
+    {
+        /* A roster entry: no scorer, no channel, so its block follows the six
+         * common fields. No other entry has "roster" there ("roster" is not a
+         * channel), and no existing entry's bytes change. */
+        char who[UUID_STRING_LEN + 1] = "null";
+        if (!uuid_is_null(tx->roster_uuid))
+            uuid_unparse_lower(tx->roster_uuid, who);
+        n += snprintf(buf + n, sizeof(buf) - n, "|roster|%s|%s|%s", tx->roster_op,
+                      who, tx->roster_digest[0] != '\0' ? tx->roster_digest : "null");
+    }
     if (n < 0 || (size_t)n >= sizeof(buf) || (size_t)n >= outsz)
         return -1;
     memcpy(out, buf, (size_t)n + 1);
@@ -143,7 +155,7 @@ void transaction_entry_hash(const transaction_t *tx, char out[TX_HASH_HEX_LEN + 
 bool transaction_score_about(const transaction_t *tx, const uuid_t peer_uuid,
                              double *score, uuid_t author)
 {
-    if (tx == NULL || !tx_is_committed(tx))
+    if (tx == NULL || !tx_is_committed(tx) || tx->roster)
         return false;
     const uuid_t *from = NULL;
     double s = 0.0;
@@ -193,6 +205,180 @@ void tx_attest_task_uuid(const uuid_t verifier, const uuid_t subject,
     if (n < 0 || (size_t)n >= sizeof(name))
         n = (int)strnlen(name, sizeof(name) - 1);
     uuid_generate_sha1(out, AT_ATTEST_NS, name, (size_t)n);
+}
+
+/* uuid5(NAMESPACE_URL, "urn:autonomous-trust:roster"), mirrored by Python
+ * ROSTER_NS. */
+static const uuid_t AT_ROSTER_NS = {
+    0x26, 0xdd, 0x83, 0x63, 0x9e, 0x20, 0x5e, 0x9e,
+    0x96, 0x27, 0x13, 0x31, 0x44, 0xc1, 0x0c, 0xcc };
+
+bool tx_roster_op_valid(const char *op)
+{
+    return op != NULL && (strcmp(op, "genesis") == 0 || strcmp(op, "add") == 0
+                          || strcmp(op, "restate") == 0);
+}
+
+void tx_roster_task_uuid(const uuid_t prev, const char *op, const uuid_t member,
+                         const char *digest, uuid_t out)
+{
+    char p[UUID_STRING_LEN + 1] = "null", m[UUID_STRING_LEN + 1] = "null";
+    if (prev != NULL)
+        uuid_unparse_lower(prev, p);
+    if (member != NULL)
+        uuid_unparse_lower(member, m);
+    char name[2 * UUID_STRING_LEN + TX_ROSTER_OP_LEN + TX_HASH_HEX_LEN + 8];
+    int n = snprintf(name, sizeof(name), "%s|%s|%s|%s", p, op != NULL ? op : "",
+                     m, digest != NULL ? digest : "");
+    if (n < 0 || (size_t)n >= sizeof(name))
+        n = (int)strnlen(name, sizeof(name) - 1);
+    uuid_generate_sha1(out, AT_ROSTER_NS, name, (size_t)n);
+}
+
+static int _roster_pair_cmp(const void *a, const void *b)
+{
+    const char *ua = json_string_value(json_array_get(*(json_t *const *)a, 0));
+    const char *ub = json_string_value(json_array_get(*(json_t *const *)b, 0));
+    return strcmp(ua, ub);
+}
+
+int roster_digest(const json_t *members, char out[TX_HASH_HEX_LEN + 1],
+                  json_t **norm_out)
+{
+    if (norm_out != NULL)
+        *norm_out = NULL;
+    size_t n = json_array_size(members);
+    if (!json_is_array(members) || n == 0 || n > 4096)
+        return -1;
+    json_t **pairs = calloc(n, sizeof(json_t *));
+    if (pairs == NULL)
+        return -1;
+    int rc = 0;
+    for (size_t i = 0; i < n && rc == 0; i++)
+    {
+        json_t *m = json_array_get(members, i);
+        const char *u = json_string_value(json_array_get(m, 0));
+        const char *k = json_string_value(json_array_get(m, 1));
+        uuid_t parsed;
+        if (!json_is_array(m) || u == NULL || k == NULL || uuid_parse(u, parsed) != 0
+            || strlen(k) != 64)
+        {
+            rc = -1;
+            break;
+        }
+        char ul[UUID_STRING_LEN + 1], kl[65];
+        uuid_unparse_lower(parsed, ul);
+        for (int j = 0; j < 64; j++)
+        {
+            char c = (char)tolower((unsigned char)k[j]);
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+                rc = -1;
+            kl[j] = c;
+        }
+        kl[64] = '\0';
+        pairs[i] = json_pack("[s, s]", ul, kl);
+        if (pairs[i] == NULL)
+            rc = -1;
+    }
+    if (rc == 0)
+    {
+        qsort(pairs, n, sizeof(json_t *), _roster_pair_cmp);
+        for (size_t i = 1; i < n && rc == 0; i++)
+            if (_roster_pair_cmp(&pairs[i - 1], &pairs[i]) == 0)
+                rc = -1;                      /* a member repeated */
+    }
+    size_t cap = 16 + n * (UUID_STRING_LEN + 66);
+    char *lines = rc == 0 ? malloc(cap) : NULL;
+    if (rc == 0 && lines == NULL)
+        rc = -1;
+    if (rc == 0)
+    {
+        size_t len = 0;
+        memcpy(lines, "AT-ROSTER\0", 10);
+        len = 10;
+        for (size_t i = 0; i < n; i++)
+            len += (size_t)snprintf(lines + len, cap - len, "%s%s:%s",
+                                    i > 0 ? "\n" : "",
+                                    json_string_value(json_array_get(pairs[i], 0)),
+                                    json_string_value(json_array_get(pairs[i], 1)));
+        unsigned char digest[32];
+        crypto_generichash(digest, sizeof(digest), (const unsigned char *)lines,
+                           len, NULL, 0);
+        sodium_bin2hex(out, TX_HASH_HEX_LEN + 1, digest, sizeof(digest));
+    }
+    free(lines);
+    json_t *norm = rc == 0 && norm_out != NULL ? json_array() : NULL;
+    for (size_t i = 0; i < n; i++)
+    {
+        if (norm != NULL && pairs[i] != NULL)
+            json_array_append(norm, pairs[i]);
+        json_decref(pairs[i]);
+    }
+    free(pairs);
+    if (norm_out != NULL)
+        *norm_out = norm;
+    return rc;
+}
+
+int tx_history_roster_put(tx_history_t *hist, const json_t *members,
+                          char digest_out[TX_HASH_HEX_LEN + 1])
+{
+    char digest[TX_HASH_HEX_LEN + 1];
+    json_t *norm = NULL;
+    if (hist == NULL || roster_digest(members, digest, &norm) != 0 || norm == NULL)
+        return -1;
+    char *text = json_dumps(norm, JSON_COMPACT);
+    json_decref(norm);
+    if (text == NULL)
+        return -1;
+    map_set(&hist->rosters, (map_key_t)digest, string_data(text, strlen(text)));
+    free(text);
+    if (digest_out != NULL)
+        memcpy(digest_out, digest, sizeof(digest));
+    return 0;
+}
+
+int tx_history_roster_at(const tx_history_t *hist, int k, transaction_t *out)
+{
+    const transaction_t *best = NULL;
+    for (int i = 0; hist != NULL && i < hist->chain_len; i++)
+    {
+        const transaction_t *t = &hist->chain[i];
+        if (t->roster && t->index >= 0 && t->index < k
+            && (best == NULL || t->index > best->index))
+            best = t;
+    }
+    if (best == NULL)
+    {
+        if (hist == NULL || hist->roster_anchor[0] == '\0')
+            return -1;
+        if (out != NULL)
+        {
+            memset(out, 0, sizeof(*out));
+            out->index = -1;
+            out->roster = true;
+            at_strlcpy(out->roster_op, "genesis", sizeof(out->roster_op));
+            at_strlcpy(out->roster_digest, hist->roster_anchor,
+                       sizeof(out->roster_digest));
+            tx_roster_task_uuid(NULL, "genesis", NULL, hist->roster_anchor,
+                                out->task_uuid);
+        }
+        return 0;
+    }
+    if (out != NULL)
+        *out = *best;
+    return 0;
+}
+
+const char *tx_history_roster_members(const tx_history_t *hist, const char *digest)
+{
+    data_t *d = NULL;
+    char *text = NULL;
+    if (hist == NULL || digest == NULL
+        || map_get((map_t *)&hist->rosters, (map_key_t)digest, &d) != 0
+        || d == NULL || data_string_ptr(d, &text) != 0)
+        return NULL;
+    return text;
 }
 
 /* uuid5(NAMESPACE_URL, "urn:autonomous-trust:task-pair"), mirrored by Python
@@ -492,6 +678,21 @@ int tx_history_init(tx_history_t *hist)
     if (err != 0) return err;
     err = map_init(&hist->commit_certs);
     if (err != 0) return err;
+    hist->pool_len = 0;
+    hist->pool_rev = 0;
+    hist->roster_anchor[0] = '\0';
+    err = map_init(&hist->pool_certs);
+    if (err != 0) return err;
+    err = map_init(&hist->decided);
+    if (err != 0) return err;
+    err = map_init(&hist->decided_sigs);
+    if (err != 0) return err;
+    err = map_init(&hist->place_certs);
+    if (err != 0) return err;
+    err = map_init(&hist->place_from);
+    if (err != 0) return err;
+    err = map_init(&hist->rosters);
+    if (err != 0) return err;
     return map_init(&hist->evicted_set);
 }
 
@@ -656,6 +857,8 @@ static void tx_history_evict_oldest(tx_history_t *hist)
 
     /* 1. Drop evicted's task_map entry, and an attested entry's certificate. */
     map_remove(&hist->task_map, task_str);
+    map_remove(&hist->place_certs, task_str);
+    map_remove(&hist->place_from, task_str);
     if (evicted.attested)
         map_remove(&hist->attest_certs, task_str);
     else
@@ -1005,26 +1208,33 @@ int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
     return 0;
 }
 
+/* The chain's half of the attested-entry rule (tx_history_append_attested).
+ * Mirrors Python TransactionHistory._attested_well_formed. */
+static bool _attested_well_formed(const transaction_t *in)
+{
+    if (!in->attested || !in->p1_set || in->p2_set)
+        return false;
+    if (uuid_is_null(in->subject_uuid) || uuid_compare(in->subject_uuid, in->p1_uuid) == 0)
+        return false;
+    if (!(in->p1_score >= 0.0 && in->p1_score <= 1.0))
+        return false;
+    if (!tx_channel_attestable(in->p1_channel))
+        return false;
+    if (!tx_attest_digest_valid(in->evidence_digest))
+        return false;
+    if (in->attest_scope[0] != '\0' && !tx_attest_digest_valid(in->attest_scope))
+        return false;
+    uuid_t want;
+    tx_attest_task_uuid(in->p1_uuid, in->subject_uuid, in->evidence_digest, want);
+    return uuid_compare(want, in->task_uuid) == 0;
+}
+
 int tx_history_append_attested(tx_history_t *hist, const transaction_t *in,
                                 const char *cert_json)
 {
     if (hist == NULL || in == NULL)
         return EXCEPTION(EINVAL);
-    if (!in->attested || !in->p1_set || in->p2_set)
-        return EXCEPTION(EINVAL);
-    if (uuid_is_null(in->subject_uuid) || uuid_compare(in->subject_uuid, in->p1_uuid) == 0)
-        return EXCEPTION(EINVAL);
-    if (!(in->p1_score >= 0.0 && in->p1_score <= 1.0))
-        return EXCEPTION(EINVAL);
-    if (!tx_channel_attestable(in->p1_channel))
-        return EXCEPTION(EINVAL);
-    if (!tx_attest_digest_valid(in->evidence_digest))
-        return EXCEPTION(EINVAL);
-    if (in->attest_scope[0] != '\0' && !tx_attest_digest_valid(in->attest_scope))
-        return EXCEPTION(EINVAL);
-    uuid_t want;
-    tx_attest_task_uuid(in->p1_uuid, in->subject_uuid, in->evidence_digest, want);
-    if (uuid_compare(want, in->task_uuid) != 0)
+    if (!_attested_well_formed(in))
         return EXCEPTION(EINVAL);
     char task_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(in->task_uuid, task_str);
@@ -1068,6 +1278,548 @@ const char *tx_history_attest_cert(const tx_history_t *hist, const uuid_t task_u
         return NULL;
     char *text = NULL;
     if (data_string_ptr(d, &text) != 0)
+        return NULL;
+    return text;
+}
+
+/****************************
+ * Ordered placement (doc/architecture/reputation.md, "Agreeing on an order")
+ ****************************/
+
+static void _commit_cert_key(const uuid_t task, const uuid_t scorer,
+                             char out[2 * UUID_STRING_LEN + 2]);
+
+/* A buffered placement's entries, owned by hist->decided. */
+typedef struct {
+    int           n;
+    transaction_t entries[PLACE_BATCH_MAX];
+} tx_decided_t;
+
+static bool _task_placed(const tx_history_t *hist, const char *task_str)
+{
+    data_t *d = NULL;
+    if (map_get((map_t *)&hist->task_map, (map_key_t)task_str, &d) != 0 || d == NULL)
+        return false;
+    int slot = -1;
+    if (data_integer(d, &slot) != 0 || slot < 0 || slot >= hist->chain_len)
+        return false;
+    return tx_is_committed(&hist->chain[slot]);
+}
+
+static bool _task_tombstoned(const tx_history_t *hist, const char *task_str)
+{
+    data_t *d = NULL;
+    return map_get((map_t *)&hist->evicted_set, (map_key_t)task_str, &d) == 0;
+}
+
+static int _pool_slot(const tx_history_t *hist, const uuid_t task_uuid)
+{
+    for (int i = 0; i < hist->pool_len; i++)
+        if (uuid_compare(hist->pool[i].task_uuid, task_uuid) == 0)
+            return i;
+    return -1;
+}
+
+/* Forget the certificates kept for pooled @p tx. */
+static void _drop_pool_certs(tx_history_t *hist, const transaction_t *tx)
+{
+    char key[2 * UUID_STRING_LEN + 2];
+    if (tx->attested)
+    {
+        uuid_unparse_lower(tx->task_uuid, key);
+        map_remove(&hist->pool_certs, key);
+        return;
+    }
+    if (tx->p1_set)
+    {
+        _commit_cert_key(tx->task_uuid, tx->p1_uuid, key);
+        map_remove(&hist->pool_certs, key);
+    }
+    if (tx->p2_set)
+    {
+        _commit_cert_key(tx->task_uuid, tx->p2_uuid, key);
+        map_remove(&hist->pool_certs, key);
+    }
+}
+
+/* Remove pool[slot], keeping the rest in arrival order. Its certificates are
+ * the caller's to move or drop first. */
+static void _pool_remove_at(tx_history_t *hist, int slot)
+{
+    if (slot < 0 || slot >= hist->pool_len)
+        return;
+    memmove(&hist->pool[slot], &hist->pool[slot + 1],
+            (size_t)(hist->pool_len - slot - 1) * sizeof(transaction_t));
+    hist->pool_len--;
+    hist->pool_rev++;
+}
+
+const char *tx_history_pool_cert(const tx_history_t *hist,
+                                 const uuid_t task_uuid, const uuid_t scorer)
+{
+    if (hist == NULL)
+        return NULL;
+    int slot = _pool_slot(hist, task_uuid);
+    if (slot < 0)
+        return NULL;
+    char key[2 * UUID_STRING_LEN + 2];
+    if (hist->pool[slot].attested)
+        uuid_unparse_lower(task_uuid, key);
+    else
+        _commit_cert_key(task_uuid, scorer, key);
+    data_t *d = NULL;
+    char *text = NULL;
+    if (map_get((map_t *)&hist->pool_certs, (map_key_t)key, &d) != 0 || d == NULL
+        || data_string_ptr(d, &text) != 0)
+        return NULL;
+    return text;
+}
+
+int tx_history_pool_drop(tx_history_t *hist, const uuid_t task_uuid)
+{
+    if (hist == NULL)
+        return -1;
+    int slot = _pool_slot(hist, task_uuid);
+    if (slot < 0)
+        return -1;
+    _drop_pool_certs(hist, &hist->pool[slot]);
+    _pool_remove_at(hist, slot);
+    return 0;
+}
+
+/* A free pool slot at the end, dropping the oldest entry when full. */
+static transaction_t *_pool_append(tx_history_t *hist)
+{
+    if (hist->pool_len >= MAX_CHAIN_LEN)
+    {
+        _drop_pool_certs(hist, &hist->pool[0]);
+        _pool_remove_at(hist, 0);
+    }
+    transaction_t *tx = &hist->pool[hist->pool_len++];
+    memset(tx, 0, sizeof(*tx));
+    tx->index = -1;
+    hist->pool_rev++;
+    return tx;
+}
+
+int tx_history_record_half(tx_history_t *hist, const uuid_t task_uuid,
+                           const uuid_t peer_uuid, double score,
+                           const char *channel, const char *cert_json)
+{
+    if (hist == NULL)
+        return -1;
+    if (channel != NULL && channel[0] != '\0' && !tx_channel_valid(channel))
+        return -1;
+    char task_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(task_uuid, task_str);
+    if (_task_placed(hist, task_str))
+        return TX_HALF_PLACED;
+    if (_task_tombstoned(hist, task_str))
+        return TX_HALF_TOMBSTONED;
+    int slot = _pool_slot(hist, task_uuid);
+    transaction_t *tx = NULL;
+    if (slot < 0)
+    {
+        tx = _pool_append(hist);
+        uuid_copy(tx->task_uuid, task_uuid);
+    }
+    else
+        tx = &hist->pool[slot];
+    if (tx->attested)
+        return TX_HALF_DUP;
+    char key[2 * UUID_STRING_LEN + 2];
+    _commit_cert_key(task_uuid, peer_uuid, key);
+    bool have_cert = cert_json != NULL && cert_json[0] != '\0';
+    if ((tx->p1_set && uuid_compare(tx->p1_uuid, peer_uuid) == 0)
+        || (tx->p2_set && uuid_compare(tx->p2_uuid, peer_uuid) == 0))
+    {
+        if (have_cert)
+        {
+            data_t *held = NULL;
+            char *text = NULL;
+            if (map_get(&hist->pool_certs, (map_key_t)key, &held) != 0
+                || held == NULL || data_string_ptr(held, &text) != 0
+                || text == NULL || strcmp(text, cert_json) != 0)
+            {
+                map_set(&hist->pool_certs, (map_key_t)key,
+                        string_data((string_t)cert_json, strlen(cert_json)));
+                hist->pool_rev++;
+            }
+        }
+        return TX_HALF_DUP;
+    }
+    if (tx->p1_set && tx->p2_set)
+        return TX_HALF_DUP;
+    const char *chan = channel != NULL ? channel : "";
+    if (!tx->p1_set)
+    {
+        uuid_copy(tx->p1_uuid, peer_uuid);
+        tx->p1_score = score;
+        tx->p1_set = true;
+        at_strlcpy(tx->p1_channel, chan, sizeof(tx->p1_channel));
+    }
+    else
+    {
+        uuid_copy(tx->p2_uuid, peer_uuid);
+        tx->p2_score = score;
+        tx->p2_set = true;
+        at_strlcpy(tx->p2_channel, chan, sizeof(tx->p2_channel));
+    }
+    if (have_cert)
+        map_set(&hist->pool_certs, (map_key_t)key,
+                string_data((string_t)cert_json, strlen(cert_json)));
+    hist->pool_rev++;
+    return (tx->p1_set && tx->p2_set) ? TX_HALF_READY : TX_HALF_PENDING;
+}
+
+int tx_history_pool_attested(tx_history_t *hist, const transaction_t *in,
+                             const char *cert_json)
+{
+    if (hist == NULL || in == NULL || !_attested_well_formed(in))
+        return EXCEPTION(EINVAL);
+    char task_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(in->task_uuid, task_str);
+    data_t *d = NULL;
+    if (map_get(&hist->task_map, task_str, &d) == 0
+        || _task_tombstoned(hist, task_str)
+        || _pool_slot(hist, in->task_uuid) >= 0)
+        return EXCEPTION(EINVAL);   /* ever held: a duplicate or a replay */
+    transaction_t *tx = _pool_append(hist);
+    *tx = *in;
+    tx->index = -1;
+    tx->prev_hash[0] = '\0';
+    tx->p2_channel[0] = '\0';
+    memset(tx->p2_uuid, 0, sizeof(tx->p2_uuid));
+    tx->p2_score = 0.0;
+    if (cert_json != NULL && cert_json[0] != '\0')
+        map_set(&hist->pool_certs, (map_key_t)task_str,
+                string_data((string_t)cert_json, strlen(cert_json)));
+    return 0;
+}
+
+const transaction_t *tx_history_pooled(const tx_history_t *hist,
+                                       const uuid_t task_uuid)
+{
+    if (hist == NULL)
+        return NULL;
+    int slot = _pool_slot(hist, task_uuid);
+    return slot < 0 ? NULL : &hist->pool[slot];
+}
+
+void placement_entry(const transaction_t *in, transaction_t *out)
+{
+    *out = *in;
+    out->index = -1;
+    out->prev_hash[0] = '\0';
+    if (out->attested || !out->p1_set || !out->p2_set)
+        return;
+    char a[UUID_STRING_LEN + 1], b[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(out->p1_uuid, a);
+    uuid_unparse_lower(out->p2_uuid, b);
+    if (strcmp(b, a) >= 0)
+        return;
+    uuid_t u;
+    uuid_copy(u, out->p1_uuid);
+    uuid_copy(out->p1_uuid, out->p2_uuid);
+    uuid_copy(out->p2_uuid, u);
+    double sc = out->p1_score;
+    out->p1_score = out->p2_score;
+    out->p2_score = sc;
+    char ch[TX_CHANNEL_NAMELEN + 1];
+    memcpy(ch, out->p1_channel, sizeof(ch));
+    memcpy(out->p1_channel, out->p2_channel, sizeof(ch));
+    memcpy(out->p2_channel, ch, sizeof(ch));
+}
+
+static int _cmp_task(const void *x, const void *y)
+{
+    char a[UUID_STRING_LEN + 1], b[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(((const transaction_t *)x)->task_uuid, a);
+    uuid_unparse_lower(((const transaction_t *)y)->task_uuid, b);
+    return strcmp(a, b);
+}
+
+int tx_history_ready_items(const tx_history_t *hist, transaction_t *out,
+                           int max_out)
+{
+    if (hist == NULL || out == NULL || max_out <= 0)
+        return 0;
+    transaction_t *ready = calloc((size_t)(hist->pool_len > 0 ? hist->pool_len : 1),
+                                  sizeof(transaction_t));
+    if (ready == NULL)
+        return 0;
+    int n = 0;
+    for (int i = 0; i < hist->pool_len; i++)
+    {
+        const transaction_t *tx = &hist->pool[i];
+        if (tx->attested || (tx->p1_set && tx->p2_set))
+            ready[n++] = *tx;
+    }
+    qsort(ready, (size_t)n, sizeof(transaction_t), _cmp_task);
+    if (n > max_out)
+        n = max_out;
+    for (int i = 0; i < n; i++)
+        placement_entry(&ready[i], &out[i]);
+    free(ready);
+    return n;
+}
+
+size_t place_value_bytes(const transaction_t *entries, int n, int k,
+                         uint8_t *out, size_t cap)
+{
+    static const char tag[] = "AT-PLACE-VALUE";
+    size_t len = sizeof(tag);   /* includes the NUL separator */
+    if (entries == NULL || out == NULL || n < 0 || cap < len)
+        return 0;
+    memcpy(out, tag, len);
+    for (int i = 0; i < n; i++)
+    {
+        transaction_t at = entries[i];
+        at.index = k + i;
+        char canon[TX_CANON_MAX];
+        int clen = transaction_canonical_bytes(&at, canon, sizeof(canon));
+        if (clen < 0)
+            return 0;
+        size_t need = (size_t)clen + (i > 0 ? 1 : 0);
+        if (len + need > cap)
+            return 0;
+        if (i > 0)
+            out[len++] = '\n';
+        memcpy(out + len, canon, (size_t)clen);
+        len += (size_t)clen;
+    }
+    return len;
+}
+
+void place_value_digest(const transaction_t *entries, int n, int k,
+                        char out[TX_HASH_HEX_LEN + 1])
+{
+    uint8_t *buf = malloc(PLACE_VALUE_MAX);
+    out[0] = '\0';
+    if (buf == NULL)
+        return;
+    size_t len = place_value_bytes(entries, n, k, buf, PLACE_VALUE_MAX);
+    if (len > 0)
+    {
+        unsigned char digest[32];
+        crypto_generichash(digest, sizeof(digest), buf, len, NULL, 0);
+        sodium_bin2hex(out, TX_HASH_HEX_LEN + 1, digest, sizeof(digest));
+    }
+    free(buf);
+}
+
+size_t place_designation(int k, const char *prev_hash, const char *digest,
+                         uint8_t *out, size_t cap)
+{
+    static const char tag[] = "AT-PLACE";
+    size_t tag_len = sizeof(tag);   /* includes the NUL separator */
+    if (out == NULL || digest == NULL || cap <= tag_len)
+        return 0;
+    int n = snprintf((char *)out + tag_len, cap - tag_len, "%d|%s|%s", k,
+                     prev_hash != NULL ? prev_hash : "", digest);
+    if (n < 0 || (size_t)n >= cap - tag_len)
+        return 0;
+    memcpy(out, tag, tag_len);
+    return tag_len + (size_t)n;
+}
+
+/* Move a pooled certificate under @p from_key to @p to_map under @p to_key. */
+static void _move_pool_cert(tx_history_t *hist, const char *from_key,
+                            map_t *to_map, const char *to_key)
+{
+    data_t *d = NULL;
+    char *text = NULL;
+    if (map_get(&hist->pool_certs, (map_key_t)from_key, &d) == 0 && d != NULL
+        && data_string_ptr(d, &text) == 0 && text != NULL)
+        map_set(to_map, (map_key_t)to_key, string_data((string_t)text, strlen(text)));
+    map_remove(&hist->pool_certs, (map_key_t)from_key);
+}
+
+static void _append_placed(tx_history_t *hist, const transaction_t *entries,
+                           int n, const char *sigs_json)
+{
+    char task_str[UUID_STRING_LEN + 1] = {0};
+    int first = hist->next_index;
+    for (int i = 0; i < n; i++)
+    {
+        transaction_t tx;
+        placement_entry(&entries[i], &tx);
+        tx.index = hist->next_index;
+        memcpy(tx.prev_hash, hist->head_hash, TX_HASH_HEX_LEN + 1);
+        _history_load_committed(hist, &tx);
+        uuid_unparse_lower(tx.task_uuid, task_str);
+        if (tx.attested)
+            _move_pool_cert(hist, task_str, &hist->attest_certs, task_str);
+        else
+        {
+            char key[2 * UUID_STRING_LEN + 2];
+            _commit_cert_key(tx.task_uuid, tx.p1_uuid, key);
+            _move_pool_cert(hist, key, &hist->commit_certs, key);
+            _commit_cert_key(tx.task_uuid, tx.p2_uuid, key);
+            _move_pool_cert(hist, key, &hist->commit_certs, key);
+        }
+        int slot = _pool_slot(hist, tx.task_uuid);
+        if (slot >= 0)
+        {
+            _drop_pool_certs(hist, &hist->pool[slot]);
+            _pool_remove_at(hist, slot);
+        }
+    }
+    if (n > 0 && sigs_json != NULL && sigs_json[0] != '\0')
+    {
+        map_set(&hist->place_certs, (map_key_t)task_str,
+                string_data((string_t)sigs_json, strlen(sigs_json)));
+        map_set(&hist->place_from, (map_key_t)task_str, integer_data(first));
+    }
+}
+
+/* A placement's certificate, on its last entry @p obj: "place_from" and
+ * "place_sigs", omitted unless both are held. Outside the entry hash. */
+static void _place_cert_to_json(const tx_history_t *hist, const char *task_str,
+                                json_t *obj)
+{
+    data_t *d = NULL, *fd = NULL;
+    char *text = NULL;
+    int from = -1;
+    if (map_get((map_t *)&hist->place_certs, (map_key_t)task_str, &d) != 0
+        || d == NULL || data_string_ptr(d, &text) != 0 || text == NULL
+        || map_get((map_t *)&hist->place_from, (map_key_t)task_str, &fd) != 0
+        || fd == NULL || data_integer(fd, &from) != 0 || from < 0)
+        return;
+    json_t *sj = json_loads(text, 0, NULL);
+    if (!json_is_object(sj) || json_object_size(sj) == 0)
+    {
+        json_decref(sj);
+        return;
+    }
+    json_object_set_new(obj, "place_from", json_integer(from));
+    json_object_set_new(obj, "place_sigs", sj);
+}
+
+/* Keep the placement certificate entry @p obj carries, for its task. The
+ * caller verified it (catch-up) or wrote it (evidence). */
+static void _place_cert_from_json(tx_history_t *hist, const json_t *obj,
+                                  const char *task_key)
+{
+    const char *task_str = json_string_value(json_object_get((json_t *)obj, task_key));
+    json_t *sigs = json_object_get((json_t *)obj, "place_sigs");
+    json_t *from = json_object_get((json_t *)obj, "place_from");
+    uuid_t tk;
+    if (task_str == NULL || !json_is_object(sigs) || json_object_size(sigs) == 0
+        || !json_is_integer(from) || json_integer_value(from) < 0
+        || uuid_parse(task_str, tk) != 0)
+        return;
+    char *text = json_dumps(sigs, JSON_COMPACT | JSON_SORT_KEYS);
+    if (text == NULL)
+        return;
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(tk, key);
+    map_set(&hist->place_certs, (map_key_t)key, string_data(text, strlen(text)));
+    map_set(&hist->place_from, (map_key_t)key,
+            integer_data((int)json_integer_value(from)));
+    free(text);
+}
+
+int tx_history_apply_placed(tx_history_t *hist, int k,
+                            const transaction_t *entries, int n,
+                            const char *sigs_json)
+{
+    if (hist == NULL || n < 0 || n > PLACE_BATCH_MAX || (n > 0 && entries == NULL))
+        return -1;
+    if (n == 0)
+        return TX_PLACE_EMPTY;
+    if (k < hist->next_index)
+        return TX_PLACE_OLD;
+    char key[24];
+    if (k > hist->next_index)
+    {
+        tx_decided_t *dec = calloc(1, sizeof(*dec));
+        if (dec == NULL)
+            return -1;
+        dec->n = n;
+        memcpy(dec->entries, entries, (size_t)n * sizeof(transaction_t));
+        snprintf(key, sizeof(key), "%d", k);
+        map_set(&hist->decided, (map_key_t)key,
+                owned_object_data((ptr_t)dec, sizeof(*dec)));
+        if (sigs_json != NULL && sigs_json[0] != '\0')
+            map_set(&hist->decided_sigs, (map_key_t)key,
+                    string_data((string_t)sigs_json, strlen(sigs_json)));
+        else
+            map_remove(&hist->decided_sigs, (map_key_t)key);
+        return TX_PLACE_BUFFERED;
+    }
+    _append_placed(hist, entries, n, sigs_json);
+    for (;;)
+    {
+        snprintf(key, sizeof(key), "%d", hist->next_index);
+        data_t *d = NULL;
+        void *ptr = NULL;
+        if (map_get(&hist->decided, (map_key_t)key, &d) != 0 || d == NULL
+            || data_object_ptr(d, &ptr) != 0 || ptr == NULL)
+            break;
+        tx_decided_t dec = *(tx_decided_t *)ptr;
+        char *sigs = NULL;
+        data_t *sd = NULL;
+        if (map_get(&hist->decided_sigs, (map_key_t)key, &sd) == 0 && sd != NULL)
+        {
+            char *text = NULL;
+            if (data_string_ptr(sd, &text) == 0 && text != NULL)
+                sigs = strdup(text);
+        }
+        map_remove(&hist->decided, (map_key_t)key);
+        map_remove(&hist->decided_sigs, (map_key_t)key);
+        _append_placed(hist, dec.entries, dec.n, sigs);
+        free(sigs);
+    }
+    /* Anything still buffered below the chain was overtaken. */
+    array_t *keys = map_keys(&hist->decided);
+    for (size_t i = 0; keys != NULL && i < array_size(keys); i++)
+    {
+        data_t *kd = NULL;
+        char *kstr = NULL;
+        if (array_get(keys, (int)i, &kd) != 0 || data_string_ptr(kd, &kstr) != 0
+            || kstr == NULL)
+            continue;
+        if (atoi(kstr) < hist->next_index)
+        {
+            map_remove(&hist->decided, (map_key_t)kstr);
+            map_remove(&hist->decided_sigs, (map_key_t)kstr);
+        }
+    }
+    return TX_PLACE_APPLIED;
+}
+
+int tx_history_placed_end(const tx_history_t *hist)
+{
+    if (hist == NULL)
+        return -1;
+    int end = -1;
+    for (int i = 0; i < hist->chain_len; i++)
+    {
+        const transaction_t *tx = &hist->chain[i];
+        if (!tx_is_committed(tx))
+            continue;
+        char task_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(tx->task_uuid, task_str);
+        data_t *d = NULL;
+        if (map_get((map_t *)&hist->place_certs, (map_key_t)task_str, &d) == 0
+            && tx->index + 1 > end)
+            end = tx->index + 1;
+    }
+    return end;
+}
+
+const char *tx_history_place_cert(const tx_history_t *hist,
+                                  const uuid_t task_uuid)
+{
+    if (hist == NULL)
+        return NULL;
+    char task_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(task_uuid, task_str);
+    data_t *d = NULL;
+    char *text = NULL;
+    if (map_get((map_t *)&hist->place_certs, (map_key_t)task_str, &d) != 0
+        || d == NULL || data_string_ptr(d, &text) != 0)
         return NULL;
     return text;
 }
@@ -1327,6 +2079,13 @@ void tx_history_free(tx_history_t *hist)
     map_free(&hist->evicted_set);
     map_free(&hist->attest_certs);
     map_free(&hist->commit_certs);
+    map_free(&hist->pool_certs);
+    map_free(&hist->decided);
+    map_free(&hist->decided_sigs);
+    map_free(&hist->place_certs);
+    map_free(&hist->place_from);
+    map_free(&hist->rosters);
+    hist->pool_len = 0;
     hist->chain_len = 0;
     hist->committed_count = 0;
     hist->next_index = 0;
@@ -1389,6 +2148,62 @@ static void _tx_attested_from_json_key(const json_t *obj, transaction_t *tx,
     if (scope != NULL)
         at_strlcpy(tx->attest_scope, scope, sizeof(tx->attest_scope));
     tx->p2_set = false;
+}
+
+/* A roster entry's fields on the catch-up wire and in evidence:
+ * "roster_op", "roster_uuid" (null for none), "roster_digest" and
+ * "roster_members", the list checked against the digest. Omitted otherwise.
+ * Mirrors Python Transaction.to_dict / evidence_to_dict. */
+static void _tx_roster_to_json(const tx_history_t *hist, const transaction_t *tx,
+                               json_t *obj)
+{
+    if (!tx->roster)
+        return;
+    json_object_set_new(obj, "roster_op", json_string(tx->roster_op));
+    if (uuid_is_null(tx->roster_uuid))
+        json_object_set_new(obj, "roster_uuid", json_null());
+    else
+    {
+        char who[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(tx->roster_uuid, who);
+        json_object_set_new(obj, "roster_uuid", json_string(who));
+    }
+    json_object_set_new(obj, "roster_digest", json_string(tx->roster_digest));
+    const char *members = tx_history_roster_members(hist, tx->roster_digest);
+    json_t *mj = members != NULL ? json_loads(members, 0, NULL) : NULL;
+    json_object_set_new(obj, "roster_members", mj != NULL ? mj : json_array());
+}
+
+/* Read a roster entry's fields onto @p tx, keeping its member list in
+ * @p hist when given. A malformed one leaves the entry an ordinary one, which
+ * then hashes differently from what its sender hashed: the segment is
+ * rejected as a broken link, as tampering is. */
+static void _tx_roster_from_json(const json_t *obj, transaction_t *tx,
+                                 tx_history_t *hist)
+{
+    tx->roster = false;
+    tx->roster_op[0] = '\0';
+    memset(tx->roster_uuid, 0, sizeof(tx->roster_uuid));
+    tx->roster_digest[0] = '\0';
+    const char *op = json_string_value(json_object_get((json_t *)obj, "roster_op"));
+    if (!tx_roster_op_valid(op))
+        return;
+    const char *who = json_string_value(json_object_get((json_t *)obj, "roster_uuid"));
+    const char *dig = json_string_value(json_object_get((json_t *)obj, "roster_digest"));
+    json_t *members = json_object_get((json_t *)obj, "roster_members");
+    char want[TX_HASH_HEX_LEN + 1];
+    uuid_t wu;
+    if (dig == NULL || roster_digest(members, want, NULL) != 0
+        || strcmp(want, dig) != 0 || (who != NULL && uuid_parse(who, wu) != 0))
+        return;
+    tx->roster = true;
+    at_strlcpy(tx->roster_op, op, sizeof(tx->roster_op));
+    if (who != NULL)
+        uuid_copy(tx->roster_uuid, wu);
+    at_strlcpy(tx->roster_digest, dig, sizeof(tx->roster_digest));
+    tx->p1_set = tx->p2_set = false;
+    if (hist != NULL)
+        (void)tx_history_roster_put(hist, members, NULL);
 }
 
 static void _tx_attested_from_json(const json_t *obj, transaction_t *tx)
@@ -1473,6 +2288,9 @@ int tx_history_era_to_json(const tx_history_t *hist, int start_idx, int end_idx,
         json_t *commit_sigs = _commit_sigs_json(hist, tx);
         if (commit_sigs != NULL)
             json_object_set_new(obj, "commit_sigs", commit_sigs);
+        /* A placement's certificate, on its last entry. */
+        _place_cert_to_json(hist, task_str, obj);
+        _tx_roster_to_json(hist, tx, obj);
         json_array_append_new(arr, obj);
         committed_seen++;
     }
@@ -1506,6 +2324,7 @@ static bool _tx_from_json(const json_t *obj, transaction_t *tx)
      * mismatches and the segment is rejected as a broken link. */
     _tx_channels_from_json(obj, tx);
     _tx_attested_from_json(obj, tx);
+    _tx_roster_from_json(obj, tx, NULL);
     const char *ph = json_string_value(json_object_get((json_t *)obj, "prev_hash"));
     tx->prev_hash[0] = '\0';
     if (ph != NULL)
@@ -1599,12 +2418,125 @@ static bool _segment_reproduces(const transaction_t *seg, int n,
     return strcmp(root, att->root) == 0;
 }
 
+static bool _in_set(const int *set, int n, int v)
+{
+    for (int i = 0; set != NULL && i < n; i++)
+        if (set[i] == v)
+            return true;
+    return false;
+}
+
+static int _reconcile(tx_history_t *hist, const json_t *arr, int final_end,
+                      const tx_attested_t *attested,
+                      const int *certified, int n_cert, bool placing,
+                      tx_reconcile_result_t *out);
+
 int tx_history_reconcile_attested(tx_history_t *hist, const json_t *arr,
                                   int final_end,
                                   const tx_attested_t *attested,
                                   tx_reconcile_result_t *out)
 {
-    tx_reconcile_result_t res = { TX_RECONCILE_NONE, -1, 0, 0, NULL };
+    return _reconcile(hist, arr, final_end, attested, NULL, 0, false, out);
+}
+
+int tx_history_reconcile_placed(tx_history_t *hist, const json_t *arr,
+                                int final_end,
+                                const tx_attested_t *attested,
+                                const int *certified, int n_certified,
+                                tx_reconcile_result_t *out)
+{
+    if (certified == NULL)
+        return _reconcile(hist, arr, final_end, attested, NULL, 0, false, out);
+    return _reconcile(hist, arr, final_end, attested, certified, n_certified,
+                      true, out);
+}
+
+int tx_history_place_batches(const tx_history_t *hist, const json_t *arr,
+                             tx_place_batch_t **out, int *n_out)
+{
+    if (out == NULL || n_out == NULL)
+        return -1;
+    *out = NULL;
+    *n_out = 0;
+    if (!json_is_array(arr))
+        return -1;
+    size_t n_all = json_array_size(arr);
+    transaction_t *seg = calloc(n_all > 0 ? n_all : 1, sizeof(transaction_t));
+    if (seg == NULL)
+        return EXCEPTION(ENOMEM);
+    int n = 0, closers = 0;
+    for (size_t i = 0; i < n_all; i++)
+    {
+        const json_t *o = json_array_get(arr, i);
+        if (_tx_from_json(o, &seg[n]) && seg[n].index >= 0 && tx_is_committed(&seg[n]))
+        {
+            if (json_is_object(json_object_get((json_t *)o, "place_sigs")))
+                closers++;
+            n++;
+        }
+    }
+    if (closers == 0)
+    {
+        free(seg);
+        return 0;
+    }
+    tx_place_batch_t *batches = calloc((size_t)closers, sizeof(tx_place_batch_t));
+    if (batches == NULL)
+    {
+        free(seg);
+        return EXCEPTION(ENOMEM);
+    }
+    int nb = 0;
+    for (size_t i = 0; i < n_all && nb < closers; i++)
+    {
+        const json_t *o = json_array_get(arr, i);
+        json_t *sigs = json_object_get((json_t *)o, "place_sigs");
+        json_t *from = json_object_get((json_t *)o, "place_from");
+        transaction_t last;
+        if (!json_is_object(sigs) || !_tx_from_json(o, &last) || last.index < 0
+            || !tx_is_committed(&last))
+            continue;
+        tx_place_batch_t *b = &batches[nb++];
+        b->sigs = sigs;
+        b->k = json_is_integer(from) ? (int)json_integer_value(from) : -1;
+        if (b->k < 0 || b->k > last.index || last.index - b->k >= PLACE_BATCH_MAX)
+            continue;
+        b->whole = true;
+        int m = 0;
+        for (int at = b->k; at <= last.index; at++)
+        {
+            const transaction_t *e = NULL;
+            for (int j = 0; j < n; j++)
+                if (seg[j].index == at) { e = &seg[j]; break; }
+            if (e == NULL)
+            {
+                b->whole = false;
+                e = _committed_at(hist, at);
+            }
+            if (e == NULL)
+            {
+                m = 0;
+                break;
+            }
+            b->entries[m++] = *e;
+        }
+        b->n = m;
+        if (m == 0)
+            b->whole = false;
+    }
+    free(seg);
+    *out = batches;
+    *n_out = nb;
+    return 0;
+}
+
+static int _reconcile(tx_history_t *hist, const json_t *arr, int final_end,
+                      const tx_attested_t *attested,
+                      const int *certified, int n_cert, bool placing,
+                      tx_reconcile_result_t *out)
+{
+    tx_reconcile_result_t res = { TX_RECONCILE_NONE, -1, 0, 0, NULL, 0 };
+    bool jumped = false;
     if (out != NULL)
         out->dropped_entries = NULL;   /* never a stale pointer, whatever happens */
     if (!json_is_array(arr))
@@ -1639,6 +2571,30 @@ int tx_history_reconcile_attested(tx_history_t *hist, const json_t *arr,
         goto done;
     }
 
+    int placed_end = placing ? tx_history_placed_end(hist) : -1;
+    if (placing)
+    {
+        /* From the first certified index (or our own placed end, if that
+         * comes first) on, only certified entries: cut at the first that is
+         * not. */
+        int cut = -1;
+        for (int i = 0; i < n_cert; i++)
+            if (cut < 0 || certified[i] < cut)
+                cut = certified[i];
+        if (placed_end >= 0 && (cut < 0 || placed_end < cut))
+            cut = placed_end;
+        if (cut >= 0)
+        {
+            int keep = 0;
+            while (keep < n && (seg[keep].index < cut
+                                || _in_set(certified, n_cert, seg[keep].index)))
+                keep++;
+            n = keep;
+        }
+        if (n == 0)
+            goto done;
+    }
+
     int f = -1;
     if (hist->committed_count == 0)
     {
@@ -1648,8 +2604,42 @@ int tx_history_reconcile_attested(tx_history_t *hist, const json_t *arr,
     {
         if (seg[0].index > hist->next_index)
         {
-            res.status = TX_RECONCILE_REJECTED;   /* a gap: nothing to link to */
-            goto done;
+            /* A certified placement may carry us across the gap: our window
+             * goes (tombstoned, so a late commit cannot revive it) and the
+             * segment from that placement's start is taken whole. */
+            int start = -1;
+            if (placing)
+            {
+                size_t ji;
+                json_t *jo;
+                json_array_foreach((json_t *)arr, ji, jo)
+                {
+                    json_t *pf = json_object_get(jo, "place_from");
+                    json_t *ix = json_object_get(jo, "index");
+                    if (!json_is_object(json_object_get(jo, "place_sigs"))
+                        || !json_is_integer(pf) || !json_is_integer(ix)
+                        || !_in_set(certified, n_cert, (int)json_integer_value(ix)))
+                        continue;
+                    int from = (int)json_integer_value(pf);
+                    if (from >= seg[0].index && (start < 0 || from < start))
+                        start = from;
+                }
+            }
+            if (start < 0)
+            {
+                res.status = TX_RECONCILE_REJECTED;   /* a gap: nothing to link to */
+                goto done;
+            }
+            int skip = 0;
+            while (skip < n && seg[skip].index < start)
+                skip++;
+            memmove(seg, seg + skip, (size_t)(n - skip) * sizeof(transaction_t));
+            n -= skip;
+            while (hist->committed_count > 0)
+                tx_history_evict_oldest(hist);
+            jumped = true;
+            f = seg[0].index;
+            goto fork_found;
         }
         char ho[TX_HASH_HEX_LEN + 1], hs[TX_HASH_HEX_LEN + 1];
         for (int i = 0; i < n; i++)
@@ -1693,9 +2683,28 @@ int tx_history_reconcile_attested(tx_history_t *hist, const json_t *arr,
             goto done;
         }
     }
+fork_found:
     res.fork = f;
 
-    if (hist->committed_count > 0 && f < hist->next_index)
+    if (placing && hist->committed_count > 0 && placed_end >= 0 && f < placed_end)
+    {
+        /* Nothing below our placed end is rewritten. */
+        res.status = _in_set(certified, n_cert, f) ? TX_RECONCILE_EQUIVOCATION
+                                                   : TX_RECONCILE_KEPT;
+        goto done;
+    }
+    if (placing && hist->committed_count > 0 && f < hist->next_index
+        && _in_set(certified, n_cert, f))
+    {
+        /* A certified entry at the fork wins whatever the lengths, but never
+         * inside our finalized checkpoint. */
+        if (final_end >= 0 && f < final_end)
+        {
+            res.status = TX_RECONCILE_REFUSED_FINAL;
+            goto done;
+        }
+    }
+    else if (hist->committed_count > 0 && f < hist->next_index)
     {
         int s_tip = seg[n - 1].index + 1;
         int o_tip = hist->next_index;
@@ -1756,6 +2765,10 @@ int tx_history_reconcile_attested(tx_history_t *hist, const json_t *arr,
             if (res.dropped_entries != NULL)
                 res.dropped_entries[res.dropped] = *t;
             res.dropped++;
+            char dkey[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(t->task_uuid, dkey);
+            map_remove(&hist->place_certs, (map_key_t)dkey);
+            map_remove(&hist->place_from, (map_key_t)dkey);
             continue;
         }
         if (w != i)
@@ -1775,6 +2788,13 @@ int tx_history_reconcile_attested(tx_history_t *hist, const json_t *arr,
         char key[UUID_STRING_LEN + 1];
         uuid_unparse_lower(seg[i].task_uuid, key);
         map_remove(&hist->evicted_set, key);
+        /* Placed now: it leaves the pool. */
+        int pslot = _pool_slot(hist, seg[i].task_uuid);
+        if (pslot >= 0)
+        {
+            _drop_pool_certs(hist, &hist->pool[pslot]);
+            _pool_remove_at(hist, pslot);
+        }
         int slot = _slot_of_task(hist, seg[i].task_uuid);
         if (slot >= 0)
         {
@@ -1818,11 +2838,46 @@ int tx_history_reconcile_attested(tx_history_t *hist, const json_t *arr,
     }
     if (!have_first)
         hist->first_index = hist->next_index;
-    res.status = res.dropped > 0 ? TX_RECONCILE_ADOPTED
+    res.status = (res.dropped > 0 || jumped) ? TX_RECONCILE_ADOPTED
                : res.added > 0   ? TX_RECONCILE_EXTENDED
                                  : TX_RECONCILE_NONE;
 done:
     free(seg);
+    /* Under ordered placement, what an adoption drops goes back to the pool
+     * to be placed again, each half with its certificate (before those leave
+     * the chain's maps below). A half without one is not returned: no
+     * acceptor would take it. Mirrors Python _pool_dropped. */
+    for (int di = 0; placing && res.status == TX_RECONCILE_ADOPTED
+                     && di < res.dropped && res.dropped_entries != NULL; di++)
+    {
+        const transaction_t *t = &res.dropped_entries[di];
+        if (t->attested)
+        {
+            const char *cert = tx_history_attest_cert(hist, t->task_uuid);
+            char *copy = cert != NULL ? strdup(cert) : NULL;
+            if (tx_history_pool_attested(hist, t, copy) == 0)
+                res.pooled++;
+            free(copy);
+            continue;
+        }
+        const unsigned char *who[2] = { t->p1_uuid, t->p2_uuid };
+        const double sc[2] = { t->p1_score, t->p2_score };
+        const char *ch[2] = { t->p1_channel, t->p2_channel };
+        const bool set[2] = { t->p1_set, t->p2_set };
+        for (int side = 0; side < 2; side++)
+        {
+            const char *cert = set[side]
+                ? tx_history_commit_cert(hist, t->task_uuid, who[side]) : NULL;
+            char *copy = cert != NULL ? strdup(cert) : NULL;
+            if (copy != NULL)
+                (void)tx_history_record_half(hist, t->task_uuid, who[side],
+                                             sc[side], ch[side][0] != '\0'
+                                             ? ch[side] : NULL, copy);
+            free(copy);
+        }
+        if (tx_history_pooled(hist, t->task_uuid) != NULL)
+            res.pooled++;
+    }
     /* A dropped entry's commit certificates go with it, even when the peer's
      * copy of the same task comes back below: the peer's halves may carry
      * different scores, and only the peer's own certificates fit them. */
@@ -1837,8 +2892,24 @@ done:
         size_t ci;
         json_t *co;
         json_array_foreach((json_t *)arr, ci, co)
+        {
             if (!json_is_true(json_object_get(co, "attested")))
                 _commit_sigs_from_json(hist, co, "task");
+            /* A placement certificate on an entry now held (the caller
+             * verified it). */
+            const char *pt = json_string_value(json_object_get(co, "task"));
+            uuid_t ptk;
+            if (placing && pt != NULL && uuid_parse(pt, ptk) == 0
+                && _slot_of_task(hist, ptk) >= 0)
+                _place_cert_from_json(hist, co, "task");
+            /* A roster entry's member list (checked against its digest). */
+            if (json_object_get(co, "roster_op") != NULL)
+            {
+                transaction_t scratch;
+                memset(&scratch, 0, sizeof(scratch));
+                _tx_roster_from_json(co, &scratch, hist);
+            }
+        }
         size_t ai;
         json_t *ao;
         json_array_foreach((json_t *)arr, ai, ao)
@@ -1945,11 +3016,13 @@ int reputation_evidence_to_json(const tx_history_t *hist,
         uuid_unparse_lower(tx->p1_uuid, p1_str);
         uuid_unparse_lower(tx->p2_uuid, p2_str);
         /* An attested entry has no second party: null, as Python writes it. */
-        json_t *obj = json_pack("{s:s, s:s, s:f, s:o, s:o, s:i, s:s}",
+        /* A roster entry has no parties: null, as Python writes it. */
+        json_t *obj = json_pack("{s:s, s:o, s:o, s:o, s:o, s:i, s:s}",
             "task_id", task_str,
-            "p1_id", p1_str, "p1_score", tx->p1_score,
-            "p2_id", tx->attested ? json_null() : json_string(p2_str),
-            "p2_score", tx->attested ? json_null() : json_real(tx->p2_score),
+            "p1_id", tx->roster ? json_null() : json_string(p1_str),
+            "p1_score", tx->roster ? json_null() : json_real(tx->p1_score),
+            "p2_id", tx->attested || tx->roster ? json_null() : json_string(p2_str),
+            "p2_score", tx->attested || tx->roster ? json_null() : json_real(tx->p2_score),
             "index", tx->index,
             "prev_hash", tx->prev_hash);
         if (obj == NULL)
@@ -1989,6 +3062,14 @@ int reputation_evidence_to_json(const tx_history_t *hist,
         json_t *commit_sigs = _commit_sigs_json(hist, tx);
         if (commit_sigs != NULL)
             json_object_set_new(obj, "commit_sigs", commit_sigs);
+        /* A placement certificate, on the last entry of each placement:
+         * additive, omitted otherwise. Mirrors Python evidence_to_dict. */
+        {
+            char ptask[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(tx->task_uuid, ptask);
+            _place_cert_to_json(hist, ptask, obj);
+        }
+        _tx_roster_to_json(hist, tx, obj);
         json_array_append_new(chain, obj);
     }
 
@@ -2090,13 +3171,34 @@ int reputation_evidence_from_json(const json_t *doc, tx_history_t *hist_out,
         const char *p1_str = json_string_value(json_object_get(obj, "p1_id"));
         const char *p2_str = json_string_value(json_object_get(obj, "p2_id"));
         bool attested = json_is_true(json_object_get(obj, "attested"));
+        transaction_t *tx = &staged[staged_n];
+        memset(tx, 0, sizeof(*tx));
+        if (task_str != NULL && json_object_get(obj, "roster_op") != NULL)
+        {
+            /* A roster entry: no parties, its member list kept beside it. */
+            const char *ph = json_string_value(json_object_get(obj, "prev_hash"));
+            if (uuid_parse(task_str, tx->task_uuid) != 0)
+            {
+                free(staged);
+                return -1;
+            }
+            _tx_roster_from_json(obj, tx, hist_out);
+            if (!tx->roster)
+            {
+                free(staged);
+                return -1;
+            }
+            tx->index = (int)json_integer_value(index_j);
+            if (ph != NULL)
+                at_strlcpy(tx->prev_hash, ph, sizeof(tx->prev_hash));
+            staged_n++;
+            continue;
+        }
         if (task_str == NULL || p1_str == NULL || (p2_str == NULL && !attested))
         {
             free(staged);
             return -1;   /* an entry no counterparty agreed to is not evidence */
         }
-        transaction_t *tx = &staged[staged_n];
-        memset(tx, 0, sizeof(*tx));
         if (uuid_parse(task_str, tx->task_uuid) != 0
             || uuid_parse(p1_str, tx->p1_uuid) != 0
             || (!attested && uuid_parse(p2_str, tx->p2_uuid) != 0))
@@ -2166,6 +3268,7 @@ int reputation_evidence_from_json(const json_t *doc, tx_history_t *hist_out,
      * ordinary halves their commit certificates. */
     json_array_foreach(chain, idx, obj)
     {
+        _place_cert_from_json(hist_out, obj, "task_id");
         if (!json_is_true(json_object_get(obj, "attested")))
         {
             _commit_sigs_from_json(hist_out, obj, "task_id");

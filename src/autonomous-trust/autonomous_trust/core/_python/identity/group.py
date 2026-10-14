@@ -35,7 +35,7 @@ class Group(InitializableConfig):
 
     def __init__(self, _uuid, _address_map, _nickname, _encryptor, _public_only=True,
                  _created=0.0, _key_epoch=0, _previous_keys=None, _wire_format=None,
-                 _commit_certificates=False):
+                 _commit_certificates=False, _ordered_placement=False):
         super().__init__(identity_pb2.Group)
         self._uuid = str(_uuid)
         self._address_map = _address_map
@@ -109,6 +109,12 @@ class Group(InitializableConfig):
         # a group this node mints. Absent -> False, which is every group minted
         # before this existed.
         self._commit_certificates = bool(_commit_certificates)
+        # Whether Paxos decides this group's chain order (doc/architecture/
+        # reputation.md, "Agreeing on an order"). Group-carried for the same
+        # reason: a cohort that half placed and half appended on arrival would
+        # fork. A joiner adopts it; AT_ORDERED_PLACEMENT only stamps a group
+        # this node mints. Absent -> False.
+        self._ordered_placement = bool(_ordered_placement)
 
     def to_dict(self):
         # `_previous_keys` is process-local grace-window state, not part of the
@@ -122,6 +128,10 @@ class Group(InitializableConfig):
         # runtimes' persisted groups the same shape.
         d = super().to_dict()
         d.pop('_previous_keys', None)
+        # Absent when off, so every group that does not declare it keeps the
+        # shape it had before the field existed.
+        if not d.get('_ordered_placement'):
+            d.pop('_ordered_placement', None)
         return d
 
     def __eq__(self, other):
@@ -162,6 +172,12 @@ class Group(InitializableConfig):
         before the field existed has no attribute, and every such group does
         not."""
         return bool(getattr(self, '_commit_certificates', False))
+
+    @property
+    def ordered_placement(self) -> bool:
+        """Does Paxos decide this group's chain order? ``getattr`` with a
+        default, as for :attr:`commit_certificates`."""
+        return bool(getattr(self, '_ordered_placement', False))
 
     #: How long a superseded key still decrypts, and how many are kept. A
     #: rotation propagates as fast as one message to each member, so this is
@@ -382,6 +398,7 @@ class Group(InitializableConfig):
         # cohort, and an absorbed node that kept its own would refuse (or
         # accept) commits the rest of its new group does not.
         self._commit_certificates = other.commit_certificates
+        self._ordered_placement = other.ordered_placement
 
     def encrypt(self, msg, whom, nonce=None):
         """
@@ -434,7 +451,8 @@ class Group(InitializableConfig):
         # public-only view still has to know which envelope the cohort speaks.
         return Group(self.uuid, self.addresses, self.nickname, Encryptor(self.encryptor.publish(), True), True,
                      _wire_format=self.wire_format,
-                     _commit_certificates=self.commit_certificates)
+                     _commit_certificates=self.commit_certificates,
+                     _ordered_placement=self.ordered_placement)
 
     def sync_to_message(self):
         self.message.uuid = str(self._uuid).encode('utf-8')
@@ -457,6 +475,8 @@ class Group(InitializableConfig):
         # generated code that predates the field.
         if 'commit_certificates' in self.message.DESCRIPTOR.fields_by_name:
             self.message.commit_certificates = self.commit_certificates
+        if 'ordered_placement' in self.message.DESCRIPTOR.fields_by_name:
+            self.message.ordered_placement = self.ordered_placement
         self._encryptor.sync_to_message()
         self.message.encryptor.CopyFrom(self._encryptor.message)
 
@@ -476,6 +496,8 @@ class Group(InitializableConfig):
                              else NetWireFormat.json)
         self._commit_certificates = bool(
             getattr(self.message, 'commit_certificates', False))
+        self._ordered_placement = bool(
+            getattr(self.message, 'ordered_placement', False))
         self._nickname = ''
         self._public_only = True
         # Reconstruct nested Encryptor
@@ -525,6 +547,9 @@ class Group(InitializableConfig):
         # (every byte-pinned group form in the corpus). Absent reads as False.
         if self.commit_certificates:
             out['commit_certificates'] = True
+        # Likewise the ordered-placement declaration.
+        if self.ordered_placement:
+            out['ordered_placement'] = True
         return out
 
     @staticmethod
@@ -545,7 +570,8 @@ class Group(InitializableConfig):
                      # Absent -> json (the constructor's default), which is both
                      # what an older peer means and the safe reading (doc/architecture/network-wire-format.md).
                      _wire_format=d.get('wire_format'),
-                     _commit_certificates=d.get('commit_certificates') is True)
+                     _commit_certificates=d.get('commit_certificates') is True,
+                     _ordered_placement=d.get('ordered_placement') is True)
 
     @staticmethod
     def initialize(address_map, our_nickname):
@@ -553,7 +579,9 @@ class Group(InitializableConfig):
         # Stamp a real creation epoch (doc/architecture/identity-protocol.md) so a group minted here carries a
         # comparable age for the merge tiebreaker. now() is the NTP-adjusted
         # clock (autonomous_trust.core.system.now).
-        from ..system import now, resolve_net_wire_mode, resolve_commit_certificates
+        from ..system import (now, resolve_net_wire_mode,
+                              resolve_commit_certificates,
+                              resolve_ordered_placement)
         created = now().timestamp()
         # AT_NET_WIRE_MODE applies HERE and only here: this is the one moment a
         # node decides a format rather than adopting one. Every other group this
@@ -561,12 +589,13 @@ class Group(InitializableConfig):
         # (doc/architecture/network-wire-format.md), so an operator stands up a proto cohort by setting the knob on
         # whichever node forms the group.
         wire_format, _src = resolve_net_wire_mode()
-        # The commit-certificate declaration likewise: decided here, adopted
-        # everywhere else.
+        # The commit-certificate and ordered-placement declarations likewise:
+        # decided here, adopted everywhere else.
         return Group(uuid_mod.uuid4(), address_map, our_nickname,
                      Encryptor.generate(), False, _created=created,
                      _wire_format=wire_format,
-                     _commit_certificates=resolve_commit_certificates())
+                     _commit_certificates=resolve_commit_certificates(),
+                     _ordered_placement=resolve_ordered_placement())
 
 
 class ChildGroupSet(object):

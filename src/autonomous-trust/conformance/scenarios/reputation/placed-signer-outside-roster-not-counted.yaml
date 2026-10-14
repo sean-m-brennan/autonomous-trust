@@ -1,0 +1,43 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: placed-signer-outside-roster-not-counted
+byte_pinning: false
+description: |
+    Membership recorded in the chain (doc/architecture/reputation.md, "Who is
+    in the group"). Only members of the roster in force for an instance sign
+    for it. dave is one of bob's peers but not on the roster logged before
+    instance 0, {alice, bob, carol}, so his signature does not count: alice's
+    alone is no majority, and bob writes nothing.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+  - id: erin
+    role: member
+
+fixtures:
+  ordered_placement: true
+  roster:
+    bob: [alice, bob, carol]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: placed
+    payload:
+      k: 0
+      value:
+        - {task_id: t-1, p1: carol, p1_score: 0.9, p2: dave, p2_score: 0.7}
+      signers: [alice, dave]
+
+expected_state:
+  bob:
+    chain_tasks: []

@@ -7,10 +7,10 @@ description: |
     Paxos round-2 happy path. alice has already won round-1 (the harness
     pre-stages bob's `requests` list with the granted (id1, id2) tuple
     and alice's `my_requests` / `proposals` so her handle_accepted can
-    look up the score by idx). bob verifies the proposal and emits
-    `tx accepted` back to alice; alice's handle_accepted records the
-    acceptance and (with one peer in the group) commits the transaction
-    to history.
+    look up the score by idx).
+    bob verifies the proposal and emits `tx accepted` back to alice;
+    alice's handle_accepted records the acceptance and, with her own vote
+    making the pair, commits the transaction to history.
 
 participants:
   - id: alice

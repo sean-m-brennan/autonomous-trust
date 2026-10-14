@@ -87,7 +87,7 @@ def _sign(ident, scorer, task, score, channel=None):
 @pytest.fixture
 def four():
     """A proposer and three others: a roster of 3 per node, so a quorum is
-    more than 3 // 2 == 1, i.e. two signatures."""
+    (3 + 1) // 2 == 2 signatures besides the scorer's."""
     return (_ident('prop', 1), _ident('acc1', 2), _ident('acc2', 3),
             _ident('obs', 4))
 
@@ -126,6 +126,17 @@ class TestGroupDeclaration:
         assert Group.initialize({}, 'g').commit_certificates is True
         monkeypatch.setenv('AT_COMMIT_CERTIFICATES', 'garbage')
         assert Group.initialize({}, 'g').commit_certificates is False
+
+    def test_ordered_placement_is_minted_on_unless_turned_off(self, monkeypatch):
+        """On by default since 2026-10-13: a typo leaves it on, and only an
+        explicit off spelling mints a group that converges the old way."""
+        monkeypatch.delenv('AT_ORDERED_PLACEMENT', raising=False)
+        assert Group.initialize({}, 'g').ordered_placement is True
+        for off in ('0', 'off', ' No '):
+            monkeypatch.setenv('AT_ORDERED_PLACEMENT', off)
+            assert Group.initialize({}, 'g').ordered_placement is False
+        monkeypatch.setenv('AT_ORDERED_PLACEMENT', 'garbage')
+        assert Group.initialize({}, 'g').ordered_placement is True
 
     def test_proto_round_trip(self):
         g = Group.initialize({}, 'g')
@@ -219,7 +230,9 @@ class TestRound:
             rp, q = _node(p, _roster(p, four), required)
             score = TransactionScore(uuid4(), 0.9)
             idx = (1, 1)
-            rp.my_requests[idx] = SimpleNamespace(score=score, count=0)
+            # Four members: the proposer and two grants. One is in already.
+            rp.my_requests[idx] = SimpleNamespace(score=score, count=1)
+            rp.grants[idx] = {str(four[2].uuid)}
             rp.handle_grant(q, _msg(ReputationProtocol.grant,
                                     ((1, 1, p.uuid), (None, 0), None),
                                     four[1]))

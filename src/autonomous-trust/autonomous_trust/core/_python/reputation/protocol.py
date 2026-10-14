@@ -101,6 +101,20 @@ class ReputationProtocol(Protocol):
     # _consensus_reputation/_compute_reputation, bypassing the slow EMA. Mirrors the
     # transaction/accepted/committed three-phase shape. See reputation.py
     # SlashAttestation and doc/architecture/reputation.md.
+    # Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+    # order"), only in a group that declares it: classic Paxos per chain
+    # index. A proposer asks `place request` for instance k; acceptors answer
+    # `place grant` (reporting any value they accepted at k) or `place nack`;
+    # on a majority the proposer sends `place` with a batch of ready entries;
+    # acceptors answer `place accepted` with a signature; on a majority the
+    # proposer broadcasts `placed` with the certificate and every member writes
+    # the batch at k. One JSON-object payload shape in both runtimes.
+    place_request = 'place request'
+    place_grant = 'place grant'
+    place_nack = 'place nack'
+    place = 'place'
+    place_accepted = 'place accepted'
+    placed = 'placed'
     slash_propose = 'slash propose'
     slash_sign = 'slash sign'
     slash_final = 'slash final'

@@ -1338,6 +1338,9 @@ class TestProposerHistoryBilateral:
         stub._fold_committed_tx = lambda *a, **k: None
         # A group that does not declare commit certificates (the default).
         stub._commit_certs_required = lambda g=None: False
+        stub._ordered_placement = lambda g=None: False
+        stub._record_committed_half = lambda *a: \
+            ReputationProcess._record_committed_half(stub, *a)
         stub.identity = SimpleNamespace(uuid=self_id)
         stub.logger = SimpleNamespace(
             warning=lambda *a, **k: None, debug=lambda *a, **k: None,
@@ -1400,11 +1403,14 @@ class TestProposerHistoryBilateral:
             _note_interaction=lambda *a, **k: None,
             _fold_committed_tx=lambda *a, **k: None,
             _commit_certs_required=lambda g=None: False,
+            _ordered_placement=lambda g=None: False,
             identity=SimpleNamespace(uuid=self_id),
             logger=SimpleNamespace(
                 warning=lambda *a, **k: None, debug=lambda *a, **k: None,
                 info=lambda *a, **k: None),
         )
+        stub._record_committed_half = lambda *a: \
+            ReputationProcess._record_committed_half(stub, *a)
         msg = SimpleNamespace(
             function=ReputationProtocol.committed,
             obj=to_json_string((task, peer_id, 0.3)),

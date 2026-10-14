@@ -168,6 +168,15 @@ void identity_periodic_vote_collection(process_t *proc, directory_t *queues);
  *  cadence tick; exposed for unit tests. */
 void identity_retry_sibling_handoffs(process_t *proc);
 
+/** How many group_key_update frames identity holds while it is not yet in
+ *  phase 3 (ISSUES §2.18); past it the oldest is dropped. */
+#define ID_HELD_GROUP_UPDATES 16
+
+/** Replay, in arrival order, the group updates held because they arrived
+ *  before phase 3, and forget them. identity_run calls it the moment it enters
+ *  phase 3; returns how many were replayed. */
+size_t identity_replay_held_group_updates(process_t *proc, directory_t *queues);
+
 /** Test seam: how many sibling hand-offs are waiting to be retried. */
 size_t identity_pending_sibling_handoffs(void);
 

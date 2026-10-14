@@ -316,6 +316,11 @@ mechanism is a leaderless Byzantine Multi-Paxos protocol that runs a round per
 transaction score. It assumes the identity protocol has already succeeded, so
 consensus here is permissioned rather than open.
 
+This section describes the full half round, as a group that does not place its
+order runs it. In a group that does (the default since 2026-10-13, under
+"Agreeing on an order" below), a half has no Phase 1: its proposer sends the
+`transaction` at once, and the round is Phases 2 and 3 alone.
+
 | Message | Constant | Direction | Purpose |
 |---------|----------|-----------|---------|
 | `ask permission` | `request` | proposer to group | Phase 1: request the floor with a unique proposal ID |
@@ -335,10 +340,10 @@ timestamp, the chain index of the proposer, and the UUID of the proposer. These
 combine into a float index for tracking.
 
 The diagram below is generated from a conformance scenario by the documentation
-build. It pins the Phase 1 happy path; the branches are documented as separate
-scenarios.
+build. It pins the Phase 1 happy path in a group that does not place its
+order; the branches are documented as separate scenarios.
 
-<!-- at_diagram:start protocol=reputation scenario=reputation-canonical -->
+<!-- at_diagram:start protocol=reputation scenario=reputation-legacy-canonical -->
 ```mermaid
 sequenceDiagram
     participant alice as proposer
@@ -368,14 +373,49 @@ transaction carrying the score, keyed by the same round tuple. Each acceptor
 verifies that the round was previously granted before emitting acceptance, and
 the proposer commits to history on majority acceptance.
 
-Both thresholds are sized per round from the round's own group as it stands
-then, `n = len(peers)`, this node excluded: a round carries at `n // 2` grants or
-more, and commits at more than `n // 2` acceptances. Both runtimes ask exactly
-that. C used to compare against `n / 2 + 1` of a count read once at start-up,
-before discovery had found anybody, so in production one grant and one
-acceptance carried every round however large the group grew. The acceptance
-test was already Python's (`>= n/2 + 1` is `> n // 2` in integers); only the
-count was frozen. The grant test was one stricter than Python's.
+*Both thresholds are a majority of the group, the proposer counted.* With
+`n = len(peers)`, this node excluded, a round needs `(n + 1) // 2` of the
+others in each phase, sized per round from the round's own group as it stands
+then. The proposer is the remaining vote. It ranks its ballot above any it
+has promised (so its own grant always counts), and sending the transaction is
+its own acceptance. So a group of three commits on two members, four on
+three, and five on three:
+
+| Members | Grants needed | Acceptances needed |
+|---------|---------------|--------------------|
+| 2 | 1 | 1 |
+| 3 | 1 | 1 |
+| 4 | 2 | 2 |
+| 5 | 2 | 2 |
+
+Until 2026-10-13 a round carried at `n // 2` grants and committed at more
+than `n // 2` acceptances, with the proposer left out. That asked one member
+more than a majority to commit, so in a group of three one stopped member
+blocked every commit, and in a group of five two did. It also asked one
+member less than a majority for a grant in an even group, two of four. The
+commit certificate's bar moved with it: at least `(n + 1) // 2` signatures
+besides the scorer's.
+
+*One vote per member, on the exact ballot.* A grant counts once per verified
+sender, and an acceptance only under the exact ballot it answers, from a
+member whose promise that ballot still meets (Python's `last_id` check, C's
+`paxos_take_grant` / `paxos_mark_granted`). The proposer's own vote is the
+echo of its own round. From 2026-10-13 until the same day's ordered placement
+replaced it, every node also held each chain slot (`id2`) for the first half
+it accepted there. On the partition cohort that hold stalled the chain: seven
+acceptors held one slot for seven different halves, and none of them could
+reach a majority (ISSUES §2.52). The hold is gone. A round now certifies a
+half and nothing more; where its entry lands in the chain is decided
+separately, under "Agreeing on an order" below.
+
+The thresholds meet the minority-island test (below, under "What only a live
+cohort could show"): a node parks a
+half it could not commit when it has not heard from a majority of the group,
+itself counted, which is exactly the set that can commit.
+
+Before 2026-10-05 C compared against `n / 2 + 1` of a count read once at
+start-up, before discovery had found anybody, so in production one grant and
+one acceptance carried every round however large the group grew.
 
 *Phase 3, commit broadcast.* After committing to its own history, the proposer
 broadcasts the commit carrying the task identifier, the proposer identifier, and
@@ -388,10 +428,22 @@ B, and the bilateral check that contrite tit-for-tat performs could never match.
 Phase 3 is what makes a single bilateral transaction appear in the view of every
 peer.
 
-*Sync sub-protocol.* A proposer that has fallen behind sends `update needed` to
-its three most trusted peers, encrypted peer-to-peer, carrying its current chain
-length. Each recipient responds with any history segment beyond that length, and
-the proposer majority-votes across the three responses before catching up.
+*Sync sub-protocol.* A node that has fallen behind sends `update needed`,
+encrypted peer-to-peer, carrying its current chain length. The recipient answers
+with a `latest update` carrying its whole resident window, whatever length was
+reported, so that a requester on an equal-length fork still reconciles (ISSUES
+§2.51). The catch-up quorum is one: the requester verifies the window's links and
+certificates and appends only past its own next index.
+
+A window whose JSON exceeds 24,000 bytes goes as pages, because it would not fit
+in one UDP datagram. With commit and placement certificates on every entry, a
+57-entry window came to 104 KB (ISSUES §2.67). Each page is
+`{page, of, head, chain}`, plus `group` for a child chain; `head` is the
+responder's head hash, the same on every page of one window. The receiver keeps
+the pages it has, one set per sender and chain and at most eight sets at a time.
+A page naming another head or page count starts that set over. Once every page
+is in, the receiver handles the joined window exactly as an unpaged reply. A
+window that fits goes unpaged, as before.
 
 *Replay invariants.* Both Phase 1 and the chain-update path are pinned against
 re-delivery. The Paxos last-identifier advances on grant, so a duplicate or
@@ -399,6 +451,291 @@ out-of-order ballot is rejected idempotently.
 
 Pending requests and proposals expire after three hundred seconds, which bounds
 memory growth for rounds that never completed.
+
+## Agreeing on an order
+
+The rounds above certify each half: a majority of the group accepted it, and
+the commit certificate proves so. They do not decide where its entry goes.
+Before ordered placement, a node gave an entry its index when the entry's
+second half reached it. That made the index, the order of the two halves and
+so the entry hash a matter of local arrival order. Histories agreed only
+because the fork repair under "Why the chains would not converge" pulled them
+back together. A group that declares **ordered placement** has a separate
+classic Paxos decide the chain order. This is the default for every group
+minted since 2026-10-13. `AT_ORDERED_PLACEMENT=0` on the node that forms a group
+mints one that converges the old way. The flag lives on the group, like commit
+certificates, so every member reads the same answer.
+
+**The pool.** In a placing group, a committed half goes to a per-chain pending
+pool, not to the chain. Each half keeps its commit certificate there, and
+nothing in the pool is scored. A certified attestation goes there too. An
+entry is *ready* once both of its halves are pooled, or, for an attestation,
+once it arrives with its quorum certificate. The pool is written to
+`reputation-pool[-<chain>].cfg.json` whenever it changes and read back at
+boot. A pooled half's round is over and nobody proposes it again, so without
+the file a restart of every holder would lose it. Restoring goes through the
+same calls a commit uses, so a task that was placed or tombstoned in the
+meantime stays out.
+
+**Instances.** Instance `k` decides what is written at chain index `k`. Its
+value is a batch of up to 32 ready entries sorted by task id. Within an
+ordinary entry the halves are ordered by scorer uuid; an attestation keeps
+its verifier in `p1`. The batch is written verbatim at `k`, `k+1`, and so on,
+so every node builds the same bytes whichever half reached it first. A ballot
+is `(n, proposer uuid)`, compared in that order, with `n` above the highest
+ballot the proposer has seen.
+
+| Message | Payload | Direction | Purpose |
+|---------|---------|-----------|---------|
+| `place request` | `{group, k, ballot, head}` | proposer to group | Phase 1: ask for a promise at `k` |
+| `place grant` | `{group, k, ballot, accepted?}` | acceptor to proposer | Phase 1: the promise, with the value last accepted at `k` |
+| `place nack` | `{group, k, ballot, next, promised?}` | acceptor to proposer | Phase 1 or 2: refused, with the acceptor's next index |
+| `place` | `{group, k, ballot, head, value}` | proposer to group | Phase 2: the value to accept |
+| `place accepted` | `{group, k, ballot, digest, sig}` | acceptor to proposer | Phase 2: accepted, signed |
+| `placed` | `{group, k, value, sigs}` | proposer to group | Learn: the decided value and its certificate |
+
+**The acceptor.** It answers at `k` only when it has applied everything below
+`k` and its head hash is the one the proposer extends. If it is behind, it
+refuses and asks for the missing history. If the head differs, it refuses.
+It promises a ballot only above the one it last promised, and its grant
+reports the value it last accepted at `k`. A proposer that hears of one in a
+majority of grants carries the highest-ballot value instead of its own. That
+is what makes a value decided once stay decided. An acceptor accepts a value
+only under a ballot it has not outranked, and only when the value is valid on
+its own prefix:
+- each task appears once, in task order;
+- no task is already placed or tombstoned;
+- every half's commit certificate verifies against the roster in force for
+  `k` (under "Who is in the group" below);
+- every attestation carries that roster's quorum and is within its rate cap;
+- a roster entry stands alone and follows the rules of its own kind.
+
+So a decided value is valid by construction, and writing it checks nothing.
+Promises and accepted values are written to
+`reputation-placement[-<chain>].cfg.json` before the answer goes out, so a
+restart cannot forget a promise. An unreadable file is left in place, and the
+node promises nothing until it is repaired.
+
+**The certificate.** An acceptance signs `AT-PLACE\0` `k` `|` the previous
+entry's hash `|` the value digest. Covering the previous hash pins the whole
+prefix, so the signature needs no group uuid. The proposer collects
+signatures from a majority of the roster in force for `k`, its own included,
+and broadcasts `placed` with them. A learner writes the batch only on a
+certificate that a majority of that roster signed, verified with the keys the
+roster records, and that extends its own head. A placement that arrives early
+waits, up to 16 of them, until the ones before it land. The certificate
+stays on the batch's last entry (`place_from` and `place_sigs`). It travels
+on the catch-up wire and in the evidence document, outside the entry hash.
+
+**Who proposes.** Only members of the roster in force for `k` propose, grant
+or accept there; a refusal from anyone else is ignored. Whoever placed
+instance `k-1` leads `k`, and proposes as soon as it holds a ready entry or a
+roster entry is due. Every other member waits until ready entries
+have sat for 3 s with no placement round heard. It then takes over in an
+order every node computes the same way, `blake2b(uuid|k)`, 0.3 s per rank. A
+nack or a round that runs past 5 s backs off for a random 0.5 to 2 s. A
+proposer leaves out any pooled entry its own acceptor check would refuse, and
+drops it from the pool, so one bad entry cannot sink every round.
+
+**The leader skips Phase 1.** A promise covers the whole chain, not one
+instance, and an acceptor accepts only at its own next index. So the
+majority that promised the leader's ballot at `k-1` had accepted nothing at
+`k`, and has refused every lower ballot since. That ballot still carries `k`,
+and the leader sends `place` at once, with its own ready entries. It does so
+only while it still holds that promise itself and has accepted nothing at
+`k`. A member that has promised a higher ballot since refuses the `place`.
+A refused or stalled round, or a placement by anyone else, drops the lead,
+and the next round asks again. In a quiet group one message pair per
+placement is saved: `place` and `place accepted` carry it, then `placed`.
+
+**Catch-up in a placing group.** Reconcile changes in four ways:
+1. Nothing below this node's own placed end is rewritten. A certified entry
+   there that differs from ours is equivocation: two certificates for one
+   index. It is logged as an error and refused.
+2. Past the placed end, a certified segment wins whatever the lengths. The
+   finalized-checkpoint guard still applies.
+3. An uncertified entry is cut off once the segment reaches placed territory.
+   A segment carrying a placement certificate that does not verify is refused
+   whole.
+4. A certified placement may carry a node that is far behind across a gap.
+
+Every placement certificate in a segment is judged against the roster in
+force for its instance: the latest roster entry below it, the node's own or
+the segment's. A node that knows no roster of the chain anchors on the
+segment's latest roster entry instead (under "Who is in the group"). An entry
+a verified placement covers is not asked again for its halves' commit
+certificates or its attestation's quorum: the acceptors checked those against
+the roster in force when they accepted it. Entries no placement covers still
+are.
+
+What an adoption drops goes back to the pool with its certificates and is
+placed again; it is not re-proposed through the half rounds. `outdated` and
+`update` carry the group, so a child chain catches up as the primary does.
+
+**A half has no round of its own.** Once placement decides where an entry
+goes, a half's Phase 1 orders nothing, and its `id2` gate only made a lagging
+acceptor backdate halves during catch-up, exactly when they were needed. So in
+a placing group the proposer skips `ask permission` and sends its
+`transaction` at once. The proposal asks to be certified and names its group
+(the fourth element in Python, `group` in C). An acceptor in a group that
+places takes it without having granted it, and signs the half's commit
+designation. The rest is unchanged: the proposer counts signed acceptances, a
+majority certifies the half, and `tx committed` puts it in every member's
+pool. An acceptor still refuses an ungranted proposal that does not ask to be
+certified, or that names a group which does not place its order: there the
+grant is what orders the chain. A retry is a fresh proposal, as before.
+
+<!-- at_diagram:start protocol=reputation scenario=reputation-canonical -->
+```mermaid
+sequenceDiagram
+    participant alice as proposer
+    participant bob as acceptor
+    alice->>+bob: transaction
+    Note right of alice: alice proposes her half to the group at once, naming the group and asking each member to sign what it accepts. No ask permission: placement decides where the entry goes.
+    bob-->>-alice: tx accepted (re: 1)
+    Note right of bob: bob signs alice's commit designation. With his signature and her own acceptance a majority certifies the half, and alice puts it in her pool (then broadcasts `tx committed`, so every member pools it).
+```
+<!-- at_diagram:end -->
+
+| Behavior | Scenario |
+|---|---|
+| A promise at the next index | [`place-request-granted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-request-granted.yaml) |
+| An outranked or misplaced request is refused | [`place-request-outranked-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-request-outranked-refused.yaml), [`place-request-not-next-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-request-not-next-refused.yaml), [`place-request-other-head-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-request-other-head-refused.yaml) |
+| A value is accepted at the promised ballot, signed | [`place-accepted-at-promise.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-accepted-at-promise.yaml) |
+| An uncertified half is not accepted | [`place-uncertified-half-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-uncertified-half-refused.yaml) |
+| A certified placement is written in order, byte for byte | [`placed-written-in-order.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/placed-written-in-order.yaml) |
+| A sub-quorum or forged placement is refused | [`placed-sub-quorum-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/placed-sub-quorum-refused.yaml), [`placed-forged-certificate-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/placed-forged-certificate-refused.yaml) |
+| A half is accepted without a grant, signed, and pooled | [`transaction-placing-accepted-without-a-grant.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/transaction-placing-accepted-without-a-grant.yaml) |
+| ...only when it asks to be certified, and only where order is placed | [`transaction-placing-uncertified-not-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/transaction-placing-uncertified-not-accepted.yaml), [`transaction-grant-still-needed-where-order-is-not-placed.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/transaction-grant-still-needed-where-order-is-not-placed.yaml) |
+| A certified commit goes to the pool, not the chain | [`commit-placing-certified-half-pooled.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-placing-certified-half-pooled.yaml) |
+| A certified attestation goes to the pool | [`attest-final-placing-pooled.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/attest-final-placing-pooled.yaml) |
+| A certified segment beats a longer uncertified one | [`catchup-placed-beats-longer-uncertified.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-placed-beats-longer-uncertified.yaml) |
+| The placed end is never rewritten; equivocation is refused | [`catchup-placed-end-not-rewritten.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-placed-end-not-rewritten.yaml), [`catchup-placed-equivocation-kept.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-placed-equivocation-kept.yaml) |
+| A certified placement crosses a gap | [`catchup-placed-crosses-gap.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-placed-crosses-gap.yaml) |
+
+What conformance cannot reach is covered by unit tests. Its C harness starts
+every step from empty state, so it cannot test buffering across steps, a
+restart, or a whole group:
+- `tests/a_unit/test_placement_sim.py` runs N nodes in one process with
+  shuffled and dropped messages, a 3+2 partition and a heal, and checks that
+  every chain ends the same, that no task is placed twice and that every
+  certified completion is placed;
+- `test_placement_reconcile.py` heals a minority after a partition;
+- `test_placement_acceptor.py` and `rep_place_acceptor_test.c` keep a promise
+  across a restart;
+- `test_placement_pool_persist.py` and `rep_place_pool_persist_test.c` keep
+  the pool across a restart, and pin its file byte for byte;
+- `test_placement_halves.py` and `rep_place_halves_test.c` pin the half's
+  proposer side, which conformance has no step for: a placing node sends its
+  `transaction` without asking, and one that does not place still asks;
+- the leader's skip is pinned by `test_placement_sim.py`
+  (`test_the_leader_places_the_next_instance_without_asking`,
+  `test_a_leader_outranked_since_asks_again`) and its C twins in
+  `rep_place_proposer_test.c`, which also holds a gateway's child-chain round
+  to that group alone, and an acceptance across a second one and a restart.
+
+## Who is in the group
+
+Every quorum in ordered placement is a majority of *some* membership. Until
+2026-10-14 it was each node's live view, read at the moment a message
+arrived. On the partition cohort (part-3546034) dee decided index 15 with its
+own and ada's signatures, a majority of {dee, ada, amy}. Thirty milliseconds
+later bob joined, and ada and amy added him before dee's `placed` reached
+them. Under four members two signatures were short, so they refused index 15
+for good. dee went on at 18 while they stayed at 15, each refusing the
+other's placements. A founder who joined last held an empty chain, and a later
+newcomer refused every certificate made while the group was small.
+
+So the membership goes in the chain, as Paxos reconfiguration has it. A
+**roster entry** records who the group is. Instance `k` is decided by the
+**roster in force for `k`**: the latest roster entry below index `k`. Its
+members are the only acceptors there, and their signatures are verified with
+the keys the roster itself records, not the live peer list. A member who has
+since left is therefore still checkable, and a peer the roster does not list
+never counts. Every node judges every certificate the same way, whenever it
+learns of it.
+
+**The entry.** A roster entry has no scorer and no score. Its hash covers its
+kind (`genesis`, `add` or `restate`), the member an add adds, and a digest of
+its member list: blake2b over `AT-ROSTER\0` and one `uuid:key` line per
+member, sorted. The list itself, `[[uuid, signing key]]`, travels beside the
+entry like a certificate and must reproduce the digest. Its task id is
+derived, uuid5 over the previous roster's task, the kind, the member and the
+digest, so two members proposing the same change propose the same value. A
+roster entry is always placed alone, so the next instance's deciders are
+never in doubt.
+
+**Genesis.** A placing chain's first entry is a genesis roster, and nothing
+else is accepted, learned or certified before it. Its proposer lists its live
+view once that holds at least two members. An acceptor takes a genesis that
+lists it and only members it sees, with their keys: a subset of its view,
+since views keep growing. There is no roster before it, so a genesis is
+decided by every member it lists, in each phase. The leader's skip does not
+apply at instance 0.
+
+**Adds.** After the genesis, each member compares its live view with the
+roster in force. One member missing from it, the lowest uuid first, is
+proposed in an `add`, ahead of any ready entry. An acceptor takes an add only
+if it extends the roster in force by exactly that member, whom it sees itself
+with the same key. A majority of the roster before the add decides it, and the
+group is larger from the next index on. Views that differ for a moment only
+cost a retry. Rosters only grow for now (the user's call, 2026-10-14): a member
+who leaves still counts in the quorum, exactly as before.
+
+**Restatement.** The chain is a window of 200 entries, and a roster entry
+older than that would leave it. So once the roster in force is half a window
+old, a member places a `restate` of the same members, and acceptors refuse an
+earlier one. The roster in force is always resident, and catch-up and
+evidence need no other carrier.
+
+**A newcomer's anchor.** A node that knows no roster of the chain, being new
+or far behind, cannot check a segment from its genesis: the genesis has long
+left the window, and a history one insider invents can carry invented keys
+all the way down. Instead it anchors on the segment's latest roster entry,
+which must:
+1. differ from the group as identity shows it to the node by at most one
+   member (perhaps the node itself);
+2. list the keys identity holds for the members both know;
+3. carry a placement certificate signed by a majority of the roster before
+   it, counting only members the node knows, verified with identity's keys.
+
+What follows the anchor is verified as usual. What precedes it is taken by
+its hash links, which the anchor's certificate covers. On the partition
+cohort the sixth member, admitted into a 3-of-5 island, anchors on the add
+that admitted it: three of the five old members signed it, and it then signs
+as the fourth of six.
+
+**Before the roster.** Halves committed before the genesis are pooled on the
+live view's quorum and placed after it. A placing chain that holds entries but
+no roster was written before rosters existed, and nothing in it can be judged
+by one. It exists only in development and cohort directories, so at boot it is
+cleared with its placement state and pool, and the group founds it anew (the
+user's call, 2026-10-14).
+
+**Still on the live view.** Checkpoints and slashes keep sizing their quorum
+from the live roster. Merges are out of scope: absorbed members arrive as adds,
+one per instance. A gateway's child chain has its own roster, of that child
+group's members.
+
+| Behavior | Scenario |
+|---|---|
+| A placement is judged by the roster logged before it | [`placed-judged-by-logged-roster.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/placed-judged-by-logged-roster.yaml) |
+| A signer outside the roster does not count | [`placed-signer-outside-roster-not-counted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/placed-signer-outside-roster-not-counted.yaml) |
+| A half's certificate is judged by the roster in force | [`place-value-cert-judged-by-roster.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-value-cert-judged-by-roster.yaml) |
+| An add of a member the acceptor sees is accepted | [`place-roster-add-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-roster-add-accepted.yaml) |
+| An add of a stranger, under another key, beside other entries, or an early restatement, is refused | [`place-roster-add-unknown-member-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-roster-add-unknown-member-refused.yaml), [`place-roster-key-mismatch-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-roster-key-mismatch-refused.yaml), [`place-roster-not-alone-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-roster-not-alone-refused.yaml), [`place-roster-restate-too-early-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-roster-restate-too-early-refused.yaml) |
+| A genesis within the acceptor's view is accepted; one naming a stranger is not | [`place-genesis-subset-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-genesis-subset-accepted.yaml), [`place-genesis-stranger-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-genesis-stranger-refused.yaml) |
+| A genesis needs every member it lists | [`placed-genesis-unanimous-written.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/placed-genesis-unanimous-written.yaml), [`placed-genesis-not-unanimous-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/placed-genesis-not-unanimous-refused.yaml) |
+| Nothing but a genesis before the roster | [`place-before-genesis-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-before-genesis-refused.yaml), [`placed-before-genesis-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/placed-before-genesis-refused.yaml) |
+| A newcomer anchors on the roster its group signed, and on no other | [`catchup-roster-anchor-newcomer-adopts.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-roster-anchor-newcomer-adopts.yaml), [`catchup-roster-anchor-insider-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-roster-anchor-insider-refused.yaml), [`catchup-roster-anchor-view-mismatch-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-roster-anchor-view-mismatch-refused.yaml) |
+
+The cohort's race, founders joining one at a time, a member joining mid
+placement, a 3-of-5 island admitting a sixth while a 2-of-5 island cannot,
+the leader's skip across a roster change and a late joiner on a restated
+roster are all run by `tests/a_unit/test_placement_sim.py`. The entry's bytes
+are pinned identically by `tests/a_unit/test_placement_roster.py` and
+`src/c/test/rep_place_roster_test.c`; the C proposer side, the anchor and the
+boot reset by `src/c/test/rep_place_proposer_test.c`.
 
 ## Warm start, and why it is safe
 
@@ -866,11 +1203,12 @@ Byzantine threshold on the chain is one member, not the majority the Paxos path
 is sized for.
 
 A group can close that by declaring **commit certificates**. Then every
-ordinary half carries the signatures of more than a quorum of acceptors over
-exactly what it writes, and no node writes one without them.
+ordinary half carries the signatures of a quorum of acceptors over exactly
+what it writes, and no node writes one without them.
 
 **What a certificate proves, and what it does not.** It proves the round: that
-more than `n // 2` members of the receiver's own view accepted this score, from
+at least `(n + 1) // 2` members of the receiver's own view besides the scorer
+(with the scorer, a majority) accepted this score, from
 this scorer, on this channel, for this task. It does not prove the score is
 true. An acceptor never sees the task; it signs what the proposer tells it. So
 the lie a certificate leaves open is a scorer's about its own half, which is
@@ -888,7 +1226,9 @@ true, so an undeclared group's bytes are unchanged), in `identity.proto`
 adopts the surviving group's value. `AT_COMMIT_CERTIFICATES` stamps only a
 group the node mints; a joiner adopts its group's value. Turning it on for an
 existing cohort means minting a new group, the same constraint `wire_format`
-has.
+has. A group that places its order ("Agreeing on an order") requires
+certificates whatever it declares here, and since 2026-10-13 that is every
+newly minted group, so in practice commit certificates are on by default too.
 
 **What is signed.** One certificate per half, so two per entry, because the two
 halves are committed by two rounds:
@@ -916,9 +1256,11 @@ resolves, so what it leaves is a scorer re-filing its own certified half.
    their authenticated sender, and commits once they clear the bar a receiver
    will hold them to. The certificate rides on `committed` (Python: element
    six; C: `"certificate"`).
-4. A receiver in a declaring group writes the half only if more than
-   `_quorum_for_group` distinct members of **its own** view signed it. The
-   scorer's own signature never counts.
+4. A receiver in a declaring group writes the half only if at least
+   `_round_quorum` distinct members of **its own** view signed it. The
+   scorer's own signature never counts. (Until 2026-10-13 this was more than
+   `n // 2`; a node still on that rule refuses a certificate the new one
+   issues in a group of four or five, so a declaring group must move together.)
 
 A receiver whose group does not declare them still keeps a valid certificate it
 is handed, so a chain cut before the group declared them can be served to one
@@ -944,6 +1286,11 @@ meeting this node's quorum. Two kinds of entry are exempt:
   roster.
 - **Entries already held identically**, at the same index with the same hash.
   Repeating them tells the receiver nothing new.
+
+In a group that places its order, certificates are judged against the
+roster in force for their instance rather than the receiver's live view, and
+catch-up does not re-judge an entry a verified placement covers (under "Who is
+in the group").
 
 Pinned by the `commit-cert-*` scenarios below, `tests/a_unit/test_commit_certificates.py`
 and `src/c/test/rep_commit_cert_test.c`.
@@ -1106,6 +1453,12 @@ Both blind spots are cheap to close once named: drive the real originator, and
 put two processes on a real wire.
 
 ### Why the chains would not converge
+
+This is the history of the convergence path. Since 2026-10-13 a group that
+places its order (above, "Agreeing on an order") no longer needs it to agree:
+its order is decided, and its reconcile runs the placement rules. What follows
+still governs a group minted with `AT_ORDERED_PLACEMENT=0`, and entries no
+certificate covers, such as a chain written before the group placed.
 
 Once rounds committed, a second cohort found the chains drifting apart and never
 settling, and that drift, not any single refused round, was what kept a report
@@ -1296,9 +1649,9 @@ own windows, and at the heal each refused to rewrite inside its finality (step
 `(num_peers + 1) / 2`, with more than that many required
 (`_ckpt_quorum_for_group` in C, `_checkpoint_quorum` in Python), at the
 proposer, the receiver of a final, the store and the warm-start rebuild. Odd
-sizes are unchanged, and Paxos grants and slashing are not touched: they keep
-`len(peers) // 2`, which C now sizes per round from the live roster as Python
-does (see [Commit certificates](#commit-certificates)). Pinned by `checkpoint-final-even-group-half-refused`
+sizes are unchanged. Slashing keeps `len(peers) // 2`; Paxos grants and
+acceptances moved to the same whole-group majority on 2026-10-13 (see "Agreeing
+on a history"). Pinned by `checkpoint-final-even-group-half-refused`
 and `checkpoint-final-even-group-majority-stored`.
 
 The first host runs with the rule in place (mod-2481048 and mod-2483539,
@@ -1381,10 +1734,14 @@ stands over is documented rather than papered over.
 
 | Behavior | Scenario |
 |---|---|
-| Phase 1 happy path | [`reputation-canonical.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/reputation-canonical.yaml) |
+| A half in a placing group: no Phase 1, signed, pooled | [`reputation-canonical.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/reputation-canonical.yaml) |
+| Phase 1 happy path, where order is not placed | [`reputation-legacy-canonical.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/reputation-legacy-canonical.yaml) |
 | Nack on a stale ballot | [`request-nacked-stale.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/request-nacked-stale.yaml) |
 | Backdate on a chain mismatch | [`request-backdated-chain-mismatch.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/request-backdated-chain-mismatch.yaml) |
 | Phase 2 acceptance | [`transaction-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/transaction-accepted.yaml) |
+| Two of three commit: the proposer's own vote counts | [`paxos-commit-majority-counts-the-proposer.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/paxos-commit-majority-counts-the-proposer.yaml) |
+| A grant from one member counts once | [`paxos-grant-from-one-member-counts-once.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/paxos-grant-from-one-member-counts-once.yaml) |
+| An acceptor refuses a ballot below its promise | [`paxos-acceptor-refuses-a-ballot-below-its-promise.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/paxos-acceptor-refuses-a-ballot-below-its-promise.yaml) |
 | Phase 3 bilateral commit | [`transaction-committed-bilateral.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/transaction-committed-bilateral.yaml) |
 | Evidence channel carried; a channel from a peer changes nothing | [`transaction-channel-carried.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/transaction-channel-carried.yaml) |
 | A refutation from a peer accuses nobody | [`remote-refutation-cannot-accuse.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/remote-refutation-cannot-accuse.yaml) |

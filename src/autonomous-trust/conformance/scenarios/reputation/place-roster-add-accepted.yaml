@@ -1,0 +1,48 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: place-roster-add-accepted
+byte_pinning: false
+description: |
+    Membership recorded in the chain (doc/architecture/reputation.md, "Who is
+    in the group"). bob's roster in force is {alice, bob, carol}; dave is one of
+    his peers, with the key the entry records. An add of dave alone, built on
+    that roster with the task id it derives, is accepted.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  ordered_placement: true
+  roster:
+    bob: [alice, bob, carol]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: place
+    payload:
+      k: 0
+      ballot: {n: 5, by: alice}
+      head: ""
+      value:
+        - {roster: add, member: dave}
+  - id: 2
+    from: bob
+    to: alice
+    function: place accepted
+    in_response_to: 1
+    no_propagate: true
+    payload: {}
+
+expected_state:
+  bob:
+    place_promised: {n: 5, by: alice}

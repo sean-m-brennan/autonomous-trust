@@ -41,6 +41,7 @@ int paxos_init_with_node(paxos_instance_t *inst, int num_peers,
     map_init(&inst->acceptances);
     map_init(&inst->backoff);
     array_init(&inst->granted_ids);
+    map_init(&inst->granted);
     pthread_mutex_init(&inst->lock, NULL);
     inst->initialized = true;
     return 0;
@@ -63,6 +64,8 @@ void paxos_destroy(paxos_instance_t *inst)
         map_free(&inst->backoff);
     if (inst->granted_ids.array != NULL)
         array_free(&inst->granted_ids);
+    if (inst->granted.items != NULL)
+        map_free(&inst->granted);
     pthread_mutex_destroy(&inst->lock);
     inst->initialized = false;
 }
@@ -75,6 +78,24 @@ void paxos_id_index(char *buf, size_t len, int64_t id1, int64_t id2)
 static void make_key(char *buf, size_t buflen, int64_t id1, int64_t id2)
 {
     paxos_id_index(buf, buflen, id1, id2);
+}
+
+/* Grants a transaction never took are not otherwise forgotten, so past this
+ * many the map starts over: a round in flight then has its transaction
+ * refused and is re-proposed by the commit sweep. */
+#define PAXOS_GRANTED_CAP 4096
+
+/* Record the exact ballot (id1, id2) as granted. Caller holds inst->lock. */
+static void _mark_granted_locked(paxos_instance_t *inst, int64_t id1, int64_t id2)
+{
+    char key[PAXOS_KEY_LEN];
+    make_key(key, sizeof(key), id1, id2);
+    if (map_size(&inst->granted) >= PAXOS_GRANTED_CAP)
+    {
+        map_free(&inst->granted);
+        map_init(&inst->granted);
+    }
+    map_set(&inst->granted, key, integer_data(1));
 }
 
 /* WHY the ballot-ordering logic matters:
@@ -120,6 +141,7 @@ paxos_response_t paxos_handle_request(paxos_instance_t *inst,
         {
             data_t *id2_dat = integer_data((int)id2);
             array_append(&inst->granted_ids, id2_dat);
+            _mark_granted_locked(inst, id1, id2);
             inst->last_id = id1;
             pthread_mutex_unlock(&inst->lock);
             return PAXOS_GRANT;
@@ -229,6 +251,27 @@ bool paxos_has_granted_id(paxos_instance_t *inst, int id2)
     return false;
 }
 
+bool paxos_take_grant(paxos_instance_t *inst, int64_t id1, int64_t id2)
+{
+    char key[PAXOS_KEY_LEN];
+    make_key(key, sizeof(key), id1, id2);
+    pthread_mutex_lock(&inst->lock);
+    data_t *dat = NULL;
+    bool granted = map_get(&inst->granted, key, &dat) == 0;
+    if (granted)
+        map_remove(&inst->granted, key);
+    bool ok = granted && id1 >= inst->last_id;
+    pthread_mutex_unlock(&inst->lock);
+    return ok;
+}
+
+void paxos_mark_granted(paxos_instance_t *inst, int64_t id1, int64_t id2)
+{
+    pthread_mutex_lock(&inst->lock);
+    _mark_granted_locked(inst, id1, id2);
+    pthread_mutex_unlock(&inst->lock);
+}
+
 void paxos_advance_chain(paxos_instance_t *inst)
 {
     pthread_mutex_lock(&inst->lock);
@@ -256,6 +299,15 @@ void paxos_next_ids(paxos_instance_t *inst, int64_t *out_id1, int64_t *out_id2)
     /* Low 16 bits = node_id (unique per node); high 48 bits = counter.
      * Two nodes minting at the same counter value produce different id1s. */
     int64_t id1 = (next << 16) | (int64_t)inst->node_id;
+    /* Outrank every ballot this node has promised, so its own grant counts
+     * toward the round (a rival's clock can run ahead of ours). last_id only
+     * ever rises. */
+    if (id1 <= inst->last_id)
+    {
+        next = (inst->last_id >> 16) + 1;
+        inst->next_counter = next;
+        id1 = (next << 16) | (int64_t)inst->node_id;
+    }
 
     inst->last_id = id1;
     *out_id1 = id1;

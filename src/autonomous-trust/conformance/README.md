@@ -158,6 +158,9 @@ results/               per-run JSON output (gitignored)
 - The scenario engine schema gained `no_propagate: true` for assertion
   steps that verify a captured outbound exists in the parent step's
   outbox without delivering it. Used by replay and emission-pin cases.
+- `expect_none: true` on an assertion step is the opposite check: no message
+  matching it is in the parent step's outbox. Used for refusals that must
+  stay silent, such as an acceptor declining an outranked ballot.
 - The Python adapters depend on `synchronous_dispatch` test hooks on
   `IdentityProcess`, `NegotiationProcess`, `ReputationProcess`. When
   enabled the protocols run handler cascades inline so scenarios stay

@@ -514,8 +514,9 @@ when true, so the IPC bytes did not change. The local-app-verb guard
 
 **The refusal.** The core keeps the names-only table beside the oracle table.
 `identity_run` refuses, with an ERROR naming the library, when
-`$AT_OWN_GEOHASH` or `$AT_OWN_PROFILE` is set and non-empty and no identity
-extension named "social" is registered (`identity_ext_check_env`). A node told
+`$AT_OWN_GEOHASH`, `$AT_OWN_EXACT` or `$AT_OWN_PROFILE` is set and non-empty
+and no identity extension named "social" is registered
+(`identity_ext_check_env`), the same three Python refuses on. A node told
 to publish its position that silently published nothing would look healthy
 while failing its operator.
 

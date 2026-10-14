@@ -1,0 +1,47 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: catchup-placed-extends
+byte_pinning: false
+description: |
+    Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+    order"): a placed chain carries each placement's certificate on its last
+    entry, with the index the placement began at, so a node catching up checks
+    every placement it is handed, against its own view of the group (a strict
+    majority, here three of four). Then a placement decides, not a length.
+
+    bob holds the placement at index 0. alice's chain repeats it and adds a
+    second placement of two entries at index 1. bob verifies both certificates
+    and takes the extension verbatim.
+
+participants:
+  - id: alice
+    role: provider
+  - id: bob
+    role: consumer
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  ordered_placement: true
+  local_chain:
+    bob:
+      - {task: a, p1: 0.7, p2: 0.5, batch: 1, placed_by: [alice, bob, carol]}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: latest update
+    payload:
+      chain:
+        - {task: a, p1: 0.7, p2: 0.5, batch: 1, placed_by: [alice, bob, carol]}
+        - {task: b, p1: 0.9, p2: 0.3, batch: 2, certified_by: [alice, carol, dave]}
+        - {task: c, p1: 0.6, p2: 0.4, batch: 2, placed_by: [alice, bob, carol], certified_by: [alice, carol, dave]}
+
+expected_state:
+  bob:
+    chain_entries: [a, b, c]
+    committed_tx_count: 3

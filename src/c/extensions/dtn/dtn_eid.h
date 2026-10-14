@@ -29,7 +29,7 @@
  * AT channel → EID service mapping:
  *   NET_CHAN_PEER      -> .../peer
  *   NET_CHAN_BROADCAST -> .../bcast (on group-bcast node)
- *   NET_CHAN_GROUP     -> .../group (on group-bcast node, BPSec-protected)
+ *   NET_CHAN_GROUP     -> .../group (on group-bcast node; SecretBox in the payload, no BPSec)
  */
 
 #include <stddef.h>

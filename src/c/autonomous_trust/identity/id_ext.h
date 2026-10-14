@@ -136,8 +136,9 @@ int identity_ext_register(const identity_ext_t *ext);
 bool identity_ext_present(const char *name);
 
 /** Refuse a node whose environment declares a feature this binary lacks:
- *  $AT_OWN_GEOHASH or $AT_OWN_PROFILE set and non-empty with no "social"
- *  extension. The node was told to publish its position or profile; starting
+ *  $AT_OWN_GEOHASH, $AT_OWN_EXACT or $AT_OWN_PROFILE set and non-empty with no
+ *  "social" extension. The node was told to share its position or profile, or
+ *  to answer proximity probes from an exact one; starting
  *  without the feature that would do it is a silent misconfiguration. Logs an
  *  ERROR naming the library. @return 0 or -1. */
 int identity_ext_check_env(logger_t *logger);

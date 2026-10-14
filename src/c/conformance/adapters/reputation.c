@@ -36,8 +36,10 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <jansson.h>
+#include <sodium.h>
 #include <uuid/uuid.h>
 
 #include "identity/identity.h"
@@ -125,6 +127,16 @@ typedef struct {
      * (doc/architecture/reputation.md, "Commit certificates"). */
     int halves_held;
     int certified_halves;
+    /* Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+     * order"): the primary chain's tasks in index order, and the ballot this
+     * node has promised. */
+    int     chain_task_n;
+    uuid_t  chain_tasks[64];
+    int     pool_task_n;
+    uuid_t  pool_tasks[64];
+    bool    place_have;
+    int64_t place_n;
+    uuid_t  place_by;
 } rp_snap_t;
 static rp_snap_t g_snaps[SCE_MAX_PARTICIPANTS];
 
@@ -360,6 +372,217 @@ static void _chain_half_uuid(sce_run_ctx_t *ctx, json_t *entry, int half,
         _uuid5(half == 1 ? "chainp1:" : "chainp2:", task, out);
 }
 
+static json_t *_rp_cosignatures(sce_run_ctx_t *ctx, json_t *payload,
+                                const uint8_t *desig, size_t dlen,
+                                const char *exclude);
+
+/* Write a `local_chain` / `latest update` chain spec into @p hist through the
+ * production writers. An entry without "batch" is written the legacy way
+ * (two update() halves). Consecutive entries sharing a "batch" are written as
+ * ONE decided placement at the chain's next index (apply_placed); the batch's
+ * last entry may name "placed_by": [ids], who sign its placement certificate
+ * (doc/architecture/reputation.md, "Agreeing on an order"). Mirrors the
+ * Python adapter's _write_chain. */
+static json_t *_rp_roster_member(sce_run_ctx_t *ctx, const char *pid);
+
+/* A roster entry of a chain spec, placed alone at the chain's next index
+ * (doc/architecture/reputation.md, "Who is in the group"): {roster: genesis,
+ * members: [ids]} or {roster: add, member: id}, its placement certificate
+ * signed by `placed_by: [ids]`. Mirrors the Python adapter's _write_roster. */
+static void _write_roster(sce_run_ctx_t *ctx, tx_history_t *hist, json_t *ce)
+{
+    const char *op = json_string_value(json_object_get(ce, "roster"));
+    if (!tx_roster_op_valid(op))
+        return;
+    json_t *members = NULL;
+    transaction_t r;
+    bool have_prev = false;
+    const char *who = NULL;
+    if (strcmp(op, "genesis") == 0)
+    {
+        members = json_array();
+        size_t mi;
+        json_t *mp;
+        json_array_foreach(json_object_get(ce, "members"), mi, mp)
+        {
+            json_t *m = _rp_roster_member(ctx, json_string_value(mp));
+            if (m != NULL)
+                json_array_append_new(members, m);
+        }
+    }
+    else
+    {
+        if (tx_history_roster_at(hist, hist->next_index, &r) != 0)
+            return;
+        have_prev = true;
+        const char *text = tx_history_roster_members(hist, r.roster_digest);
+        members = text != NULL ? json_loads(text, 0, NULL) : json_array();
+    }
+    json_t *added = NULL;
+    if (strcmp(op, "add") == 0)
+    {
+        added = _rp_roster_member(ctx, json_string_value(json_object_get(ce, "member")));
+        if (added == NULL)
+        {
+            json_decref(members);
+            return;
+        }
+        json_array_append(members, added);
+        who = json_string_value(json_array_get(added, 0));
+    }
+    char d[TX_HASH_HEX_LEN + 1];
+    if (tx_history_roster_put(hist, members, d) != 0)
+    {
+        json_decref(added);
+        json_decref(members);
+        return;
+    }
+    transaction_t tx;
+    memset(&tx, 0, sizeof(tx));
+    tx.index = -1;
+    tx.roster = true;
+    at_strlcpy(tx.roster_op, op, sizeof(tx.roster_op));
+    at_strlcpy(tx.roster_digest, d, sizeof(tx.roster_digest));
+    uuid_t wu;
+    if (who != NULL && uuid_parse(who, wu) == 0)
+        uuid_copy(tx.roster_uuid, wu);
+    tx_roster_task_uuid(have_prev ? r.task_uuid : NULL, op,
+                        who != NULL ? tx.roster_uuid : NULL, d, tx.task_uuid);
+    int k = hist->next_index;
+    char *sigs_text = NULL;
+    json_t *by = json_object_get(ce, "placed_by");
+    if (json_is_array(by))
+    {
+        char digest[TX_HASH_HEX_LEN + 1] = {0};
+        place_value_digest(&tx, 1, k, digest);
+        uint8_t desig[PLACE_DESIG_MAX];
+        size_t dlen = place_designation(k, hist->head_hash, digest, desig, sizeof(desig));
+        json_t *named = json_pack("{s:O}", "cosigners", by);
+        json_t *sigs = _rp_cosignatures(ctx, named, desig, dlen, NULL);
+        sigs_text = sigs != NULL ? json_dumps(sigs, JSON_COMPACT | JSON_SORT_KEYS) : NULL;
+        json_decref(sigs);
+        json_decref(named);
+    }
+    tx_history_apply_placed(hist, k, &tx, 1, sigs_text);
+    free(sigs_text);
+    json_decref(added);
+    json_decref(members);
+}
+
+static void _write_chain(sce_run_ctx_t *ctx, tx_history_t *hist, json_t *spec)
+{
+    size_t n = json_array_size(spec);
+    size_t i = 0;
+    while (i < n)
+    {
+        json_t *ce = json_array_get(spec, i);
+        if (json_is_string(json_object_get(ce, "roster")))
+        {
+            _write_roster(ctx, hist, ce);
+            i++;
+            continue;
+        }
+        const char *task = json_string_value(json_object_get(ce, "task"));
+        json_t *batch = json_object_get(ce, "batch");
+        if (task == NULL)
+        {
+            i++;
+            continue;
+        }
+        if (batch == NULL)
+        {
+            uuid_t tk, p1u, p2u;
+            _uuid5("chain:", task, tk);
+            _chain_half_uuid(ctx, ce, 1, task, p1u);
+            _chain_half_uuid(ctx, ce, 2, task, p2u);
+            tx_history_update(hist, tk, p1u,
+                              json_number_value(json_object_get(ce, "p1")), NULL);
+            tx_history_update(hist, tk, p2u,
+                              json_number_value(json_object_get(ce, "p2")), NULL);
+            i++;
+            continue;
+        }
+        transaction_t entries[PLACE_BATCH_MAX];
+        int m = 0;
+        json_t *last = ce;
+        while (i < n && m < PLACE_BATCH_MAX
+               && json_equal(json_object_get(json_array_get(spec, i), "batch"), batch))
+        {
+            json_t *e = json_array_get(spec, i);
+            const char *t = json_string_value(json_object_get(e, "task"));
+            transaction_t raw;
+            memset(&raw, 0, sizeof(raw));
+            _uuid5("chain:", t != NULL ? t : "", raw.task_uuid);
+            _chain_half_uuid(ctx, e, 1, t != NULL ? t : "", raw.p1_uuid);
+            _chain_half_uuid(ctx, e, 2, t != NULL ? t : "", raw.p2_uuid);
+            raw.p1_score = json_number_value(json_object_get(e, "p1"));
+            raw.p2_score = json_number_value(json_object_get(e, "p2"));
+            raw.p1_set = raw.p2_set = true;
+            raw.index = -1;
+            placement_entry(&raw, &entries[m++]);
+            last = e;
+            i++;
+        }
+        int k = hist->next_index;
+        char *sigs_text = NULL;
+        json_t *by = json_object_get(last, "placed_by");
+        if (json_is_array(by))
+        {
+            char digest[TX_HASH_HEX_LEN + 1] = {0};
+            place_value_digest(entries, m, k, digest);
+            uint8_t desig[PLACE_DESIG_MAX];
+            size_t dlen = place_designation(k, hist->head_hash, digest, desig,
+                                            sizeof(desig));
+            json_t *named = json_pack("{s:O}", "cosigners", by);
+            json_t *sigs = _rp_cosignatures(ctx, named, desig, dlen, NULL);
+            sigs_text = sigs != NULL ? json_dumps(sigs, JSON_COMPACT | JSON_SORT_KEYS)
+                                     : NULL;
+            json_decref(sigs);
+            json_decref(named);
+        }
+        tx_history_apply_placed(hist, k, entries, m, sigs_text);
+        free(sigs_text);
+    }
+}
+
+/* certified_by: [ids] on a chain spec entry certifies both its halves with
+ * those participants' signatures (doc/architecture/reputation.md, "Commit
+ * certificates"). @p arr is era_to_json of the written chain, in the spec's
+ * order. */
+static void _attach_spec_certs(sce_run_ctx_t *ctx, json_t *arr, json_t *spec)
+{
+    for (size_t ai = 0; arr != NULL && ai < json_array_size(arr)
+                        && ai < json_array_size(spec); ai++)
+    {
+        json_t *spec_e = json_array_get(spec, ai);
+        json_t *by = json_object_get(spec_e, "certified_by");
+        if (!json_is_array(by))
+            continue;
+        json_t *ae = json_array_get(arr, ai);
+        const char *task = json_string_value(json_object_get(spec_e, "task"));
+        uuid_t tk, pu[2];
+        _uuid5("chain:", task, tk);
+        _chain_half_uuid(ctx, spec_e, 1, task, pu[0]);
+        _chain_half_uuid(ctx, spec_e, 2, task, pu[1]);
+        double ps[2] = { json_number_value(json_object_get(spec_e, "p1")),
+                         json_number_value(json_object_get(spec_e, "p2")) };
+        json_t *named = json_pack("{s:O}", "cosigners", by);
+        json_t *all = json_object();
+        for (int k = 0; k < 2; k++)
+        {
+            uint8_t desig[512];
+            size_t dlen = commit_designation(pu[k], tk, ps[k], NULL,
+                                             desig, sizeof(desig));
+            char su[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(pu[k], su);
+            json_object_set_new(all, su, _rp_cosignatures(ctx, named, desig,
+                                                          dlen, NULL));
+        }
+        json_object_set_new(ae, "commit_sigs", all);
+        json_decref(named);
+    }
+}
+
 /* Reset rep_state and re-install the per-participant fixtures relevant
  * to the dispatcher (target). Run BEFORE every handler dispatch so each
  * step sees the right slice of state. */
@@ -457,7 +680,82 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
         if (ti != NULL && ti->proc != NULL)
             ti->proc->protocol.group.commit_certificates =
                 json_is_true(json_object_get(g_fixtures, "commit_certificates"));
+        /* ordered_placement: true -- the group places its order. Placement
+         * state then lives in a directory of its own, emptied before every
+         * step: rep_state is reset per step, and a promise persisted by one
+         * step must not come back in the next except through a fixture. */
+        bool placing = json_is_true(json_object_get(g_fixtures, "ordered_placement"));
+        if (ti != NULL && ti->proc != NULL)
+            ti->proc->protocol.group.ordered_placement = placing;
+        static char place_dir[256];
+        if (placing)
+        {
+            if (place_dir[0] == '\0')
+            {
+                snprintf(place_dir, sizeof(place_dir), "/tmp/at-conf-place-XXXXXX");
+                if (mkdtemp(place_dir) == NULL)
+                    place_dir[0] = '\0';
+            }
+            char path[320];
+            snprintf(path, sizeof(path), "%s/reputation-placement.cfg.json", place_dir);
+            unlink(path);
+            reputation_set_placement_dir(place_dir);
+        }
+        else
+            reputation_set_placement_dir(NULL);
     }
+
+    /* place_promised: { "<pid>": {n, by: "<pid>"} } -- the ballot a node has
+     * promised on its primary chain. */
+    json_t *pp = json_object_get(json_object_get(g_fixtures, "place_promised"),
+                                 target_id);
+    if (json_is_object(pp))
+    {
+        const char *by = json_string_value(json_object_get(pp, "by"));
+        const uuid_t *u = by != NULL ? _uuid_of(ctx, by) : NULL;
+        if (u != NULL)
+            reputation_install_place_promise(
+                json_integer_value(json_object_get(pp, "n")), *u);
+    }
+
+    /* roster: { "<pid>": ["<member pid>", ...] } -- the roster in force on
+     * the primary chain before the scenario starts, each member with its
+     * signing key (doc/architecture/reputation.md, "Who is in the group"). An
+     * anchor with no index, so the scenario's instances keep theirs. Mirrors
+     * the Python adapter. */
+    json_t *rl = json_object_get(json_object_get(g_fixtures, "roster"), target_id);
+    json_t *everyone = NULL;
+    if (json_object_get(g_fixtures, "roster") == NULL
+        && json_is_true(json_object_get(g_fixtures, "ordered_placement")))
+    {
+        /* Every participant, unless `roster` names one per participant ({}
+         * for none, an unfounded chain). Mirrors the Python adapter. */
+        everyone = json_array();
+        for (size_t pi = 0; pi < ctx->participant_count; pi++)
+            json_array_append_new(everyone, json_string(ctx->participants[pi].id));
+        rl = everyone;
+    }
+    if (json_is_array(rl))
+    {
+        json_t *members = json_array();
+        size_t ri;
+        json_t *rp;
+        json_array_foreach(rl, ri, rp)
+        {
+            sce_participant_t *mp = sce_find_participant(ctx, json_string_value(rp));
+            const rp_impl_t *mi = mp != NULL ? (const rp_impl_t *)mp->impl : NULL;
+            if (mi == NULL || mi->pub == NULL)
+                continue;
+            char u[UUID_STRING_LEN + 1], k[2 * crypto_sign_PUBLICKEYBYTES + 1];
+            uuid_unparse_lower(mi->pub->uuid, u);
+            sodium_bin2hex(k, sizeof(k), mi->pub->signature.public,
+                           crypto_sign_PUBLICKEYBYTES);
+            json_array_append_new(members, json_pack("[s, s]", u, k));
+        }
+        (void)reputation_set_roster_anchor(members);
+        json_decref(members);
+    }
+    json_decref(everyone);
 
     /* requests: { "<pid>": [[id1, id2], ...] } — pre-stage granted Paxos
      * rounds (so handle_transaction's paxos_has_granted_id check passes). */
@@ -593,7 +891,27 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
         json_t *entries = json_object_get(lc, target_id);
         size_t lc_i;
         json_t *lc_e;
+        bool placed = false;
         if (json_is_array(entries))
+            json_array_foreach(entries, lc_i, lc_e)
+                placed = placed || json_object_get(lc_e, "batch") != NULL
+                                || json_object_get(lc_e, "certified_by") != NULL;
+        if (placed)
+        {
+            /* A placed (or certified) local chain: built apart, then loaded
+             * verbatim with its certificates, as catch-up loads one. */
+            tx_history_t tmp;
+            tx_history_init(&tmp);
+            _write_chain(ctx, &tmp, entries);
+            json_t *arr = NULL;
+            tx_history_era_to_json(&tmp, 0, tx_history_len(&tmp), &arr);
+            _attach_spec_certs(ctx, arr, entries);
+            if (arr != NULL)
+                reputation_install_chain_json(arr);
+            json_decref(arr);
+            tx_history_free(&tmp);
+        }
+        else if (json_is_array(entries))
             json_array_foreach(entries, lc_i, lc_e)
             {
                 const char *task = json_string_value(json_object_get(lc_e, "task"));
@@ -892,6 +1210,263 @@ static json_t *_rp_cosignatures(sce_run_ctx_t *ctx, json_t *payload,
     return sigs;
 }
 
+
+/* Ordered placement (doc/architecture/reputation.md, "Agreeing on an order").
+ *
+ * A value spec is a list of {task_id, p1, p1_score, p2, p2_score} entries.
+ * Each half is certified by `cosigners` (default: every participant but the
+ * entry's two parties) unless `uncertified`; halves go in canonical order
+ * (by scorer uuid) unless `swap`; entries go by task id unless the step says
+ * `unsorted`. Mirrors the Python adapter's _place_value. */
+/* A member of a roster spec: a participant with its signing key, or
+ * "stranger", a fixed member no participant knows. Mirrors the Python
+ * adapter's _roster_member. */
+static json_t *_rp_roster_member(sce_run_ctx_t *ctx, const char *pid)
+{
+    if (pid != NULL && strcmp(pid, "stranger") == 0)
+    {
+        char k[65];
+        memset(k, '5', 64);
+        k[64] = '\0';
+        return json_pack("[s, s]", "5e5e5e5e-0000-4000-8000-000000000005", k);
+    }
+    sce_participant_t *mp = pid != NULL ? sce_find_participant(ctx, pid) : NULL;
+    const rp_impl_t *mi = mp != NULL ? (const rp_impl_t *)mp->impl : NULL;
+    if (mi == NULL || mi->pub == NULL)
+        return NULL;
+    char u[UUID_STRING_LEN + 1], k[2 * crypto_sign_PUBLICKEYBYTES + 1];
+    uuid_unparse_lower(mi->pub->uuid, u);
+    sodium_bin2hex(k, sizeof(k), mi->pub->signature.public, crypto_sign_PUBLICKEYBYTES);
+    return json_pack("[s, s]", u, k);
+}
+
+/* A roster entry from its spec (doc/architecture/reputation.md, "Who is in
+ * the group"): {roster: genesis, members: [pid...]}, {roster: add, member:
+ * pid[, key: hex]} or {roster: restate}; an add or restate builds on the
+ * recipient's `roster` fixture. Mirrors the Python adapter's _roster_spec. */
+static int _rp_roster_entry(sce_run_ctx_t *ctx, json_t *e, const char *to_id,
+                            transaction_t *tx, json_t **wire)
+{
+    const char *op = json_string_value(json_object_get(e, "roster"));
+    if (!tx_roster_op_valid(op))
+        return -1;
+    json_t *members = json_array();
+    json_t *list = strcmp(op, "genesis") == 0 ? json_object_get(e, "members")
+        : json_object_get(json_object_get(g_fixtures, "roster"), to_id);
+    size_t i;
+    json_t *pj;
+    json_array_foreach(list, i, pj)
+    {
+        json_t *m = _rp_roster_member(ctx, json_string_value(pj));
+        if (m != NULL)
+            json_array_append_new(members, m);
+    }
+    char base[TX_HASH_HEX_LEN + 1], d[TX_HASH_HEX_LEN + 1];
+    uuid_t prev, task, wu;
+    const char *who = NULL;
+    if (strcmp(op, "genesis") != 0)
+    {
+        if (roster_digest(members, base, NULL) != 0)
+        {
+            json_decref(members);
+            return -1;
+        }
+        tx_roster_task_uuid(NULL, "genesis", NULL, base, prev);
+    }
+    json_t *added = NULL;
+    if (strcmp(op, "add") == 0)
+    {
+        added = _rp_roster_member(ctx, json_string_value(json_object_get(e, "member")));
+        const char *key = json_string_value(json_object_get(e, "key"));
+        if (added == NULL)
+        {
+            json_decref(members);
+            return -1;
+        }
+        if (key != NULL)
+            json_array_set_new(added, 1, json_string(key));
+        json_array_append(members, added);
+        who = json_string_value(json_array_get(added, 0));
+    }
+    json_t *norm = NULL;
+    if (roster_digest(members, d, &norm) != 0)
+    {
+        json_decref(added);
+        json_decref(members);
+        return -1;
+    }
+    memset(tx, 0, sizeof(*tx));
+    tx->index = -1;
+    tx->roster = true;
+    at_strlcpy(tx->roster_op, op, sizeof(tx->roster_op));
+    at_strlcpy(tx->roster_digest, d, sizeof(tx->roster_digest));
+    if (strcmp(op, "genesis") == 0)
+        tx_roster_task_uuid(NULL, "genesis", NULL, d, task);
+    else if (who != NULL && uuid_parse(who, wu) == 0)
+    {
+        uuid_copy(tx->roster_uuid, wu);
+        tx_roster_task_uuid(prev, "add", wu, d, task);
+    }
+    else
+        tx_roster_task_uuid(prev, "restate", NULL, d, task);
+    uuid_copy(tx->task_uuid, task);
+    char t[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(task, t);
+    json_t *r = json_pack("{s:s, s:o, s:s, s:o}", "op", op,
+                          "uuid", who != NULL ? json_string(who) : json_null(),
+                          "digest", d, "members", norm);
+    *wire = json_pack("{s:s, s:o}", "task", t, "roster", r);
+    json_decref(added);
+    json_decref(members);
+    return 0;
+}
+
+static int _rp_place_value(sce_run_ctx_t *ctx, json_t *payload, json_t **out_value,
+                           transaction_t *entries, const char *to_id)
+{
+    json_t *spec = json_object_get(payload, "value");
+    *out_value = json_array();
+    if (!json_is_array(spec) || json_array_size(spec) > PLACE_BATCH_MAX)
+        return -1;
+    int n = 0;
+    for (size_t i = 0; i < json_array_size(spec); i++)
+    {
+        json_t *e = json_array_get(spec, i);
+        if (json_is_string(json_object_get(e, "roster")))
+        {
+            json_t *wire = NULL;
+            if (_rp_roster_entry(ctx, e, to_id, &entries[n], &wire) != 0)
+                return -1;
+            json_array_append_new(*out_value, wire);
+            n++;
+            continue;
+        }
+        const char *slug = json_string_value(json_object_get(e, "task_id"));
+        const char *a = json_string_value(json_object_get(e, "p1"));
+        const char *b = json_string_value(json_object_get(e, "p2"));
+        const uuid_t *ua = a ? _uuid_of(ctx, a) : NULL;
+        const uuid_t *ub = b ? _uuid_of(ctx, b) : NULL;
+        if (slug == NULL || ua == NULL || ub == NULL)
+            return -1;
+        transaction_t *tx = &entries[n];
+        memset(tx, 0, sizeof(*tx));
+        tx->index = -1;
+        _uuid5("tx:", slug, tx->task_uuid);
+        uuid_copy(tx->p1_uuid, *ua);
+        uuid_copy(tx->p2_uuid, *ub);
+        tx->p1_set = tx->p2_set = true;
+        tx->p1_score = json_number_value(json_object_get(e, "p1_score"));
+        tx->p2_score = json_number_value(json_object_get(e, "p2_score"));
+        const char *pa = a, *pb = b;
+        char sa[UUID_STRING_LEN + 1], sb[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(tx->p1_uuid, sa);
+        uuid_unparse_lower(tx->p2_uuid, sb);
+        bool swap = strcmp(sb, sa) < 0;
+        if (json_is_true(json_object_get(e, "swap")))
+            swap = !swap;
+        if (swap)
+        {
+            transaction_t t = *tx;
+            uuid_copy(tx->p1_uuid, t.p2_uuid);
+            uuid_copy(tx->p2_uuid, t.p1_uuid);
+            tx->p1_score = t.p2_score;
+            tx->p2_score = t.p1_score;
+            pa = b;
+            pb = a;
+        }
+        json_t *d = json_object();
+        char task_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(tx->task_uuid, task_str);
+        uuid_unparse_lower(tx->p1_uuid, sa);
+        uuid_unparse_lower(tx->p2_uuid, sb);
+        json_object_set_new(d, "task", json_string(task_str));
+        json_object_set_new(d, "p1", json_string(sa));
+        json_object_set_new(d, "p1_score", json_real(tx->p1_score));
+        json_object_set_new(d, "p2", json_string(sb));
+        json_object_set_new(d, "p2_score", json_real(tx->p2_score));
+        if (!json_is_true(json_object_get(e, "uncertified")))
+        {
+            json_t *named = json_object_get(e, "cosigners");
+            json_t *who = json_object();
+            if (json_is_array(named))
+                json_object_set(who, "cosigners", named);
+            else
+            {
+                json_t *list = json_array();
+                for (size_t j = 0; j < ctx->participant_count; j++)
+                    if (strcmp(ctx->participants[j].id, pa) != 0
+                        && strcmp(ctx->participants[j].id, pb) != 0)
+                        json_array_append_new(list, json_string(ctx->participants[j].id));
+                json_object_set_new(who, "cosigners", list);
+            }
+            for (int side = 0; side < 2; side++)
+            {
+                uint8_t desig[512];
+                size_t dlen = commit_designation(side == 0 ? tx->p1_uuid : tx->p2_uuid,
+                                                 tx->task_uuid,
+                                                 side == 0 ? tx->p1_score : tx->p2_score,
+                                                 NULL, desig, sizeof(desig));
+                json_object_set_new(d, side == 0 ? "p1_cert" : "p2_cert",
+                                    _rp_cosignatures(ctx, who, desig, dlen, NULL));
+            }
+            json_decref(who);
+        }
+        json_array_append_new(*out_value, d);
+        n++;
+    }
+    {
+        /* Sort by task id: a small insertion sort over both arrays. */
+        for (int i = 1; i < n; i++)
+            for (int j = i; j > 0; j--)
+            {
+                char x[UUID_STRING_LEN + 1], y[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(entries[j - 1].task_uuid, x);
+                uuid_unparse_lower(entries[j].task_uuid, y);
+                if (strcmp(x, y) <= 0)
+                    break;
+                transaction_t t = entries[j];
+                entries[j] = entries[j - 1];
+                entries[j - 1] = t;
+                json_t *dj = json_incref(json_array_get(*out_value, (size_t)j));
+                json_t *dp = json_incref(json_array_get(*out_value, (size_t)j - 1));
+                json_array_set_new(*out_value, (size_t)j, dp);
+                json_array_set_new(*out_value, (size_t)j - 1, dj);
+            }
+    }
+    if (json_is_true(json_object_get(payload, "unsorted")))
+    {
+        /* Out of task order on purpose: reverse the sorted batch. */
+        size_t m = json_array_size(*out_value);
+        for (size_t i = 0; i < m / 2; i++)
+        {
+            json_t *x = json_incref(json_array_get(*out_value, i));
+            json_t *y = json_incref(json_array_get(*out_value, m - 1 - i));
+            json_array_set_new(*out_value, i, y);
+            json_array_set_new(*out_value, m - 1 - i, x);
+            transaction_t t = entries[i];
+            entries[i] = entries[m - 1 - i];
+            entries[m - 1 - i] = t;
+        }
+    }
+    return n;
+}
+
+/* The head a placement step extends: the payload's literal, "" by default,
+ * or the recipient's own head for "recipient". */
+static void _rp_place_head(sce_run_ctx_t *ctx, json_t *payload, const char *to_id,
+                           char out[TX_HASH_HEX_LEN + 1])
+{
+    const char *head = json_string_value(json_object_get(payload, "head"));
+    out[0] = '\0';
+    if (head != NULL && strcmp(head, "recipient") == 0 && to_id != NULL)
+    {
+        _install_target_state(ctx, to_id);
+        reputation_get_head_hash(out);
+    }
+    else if (head != NULL)
+        snprintf(out, TX_HASH_HEX_LEN + 1, "%s", head);
+}
+
 static int _build_inbound(sce_run_ctx_t *ctx,
                           const char *from_id,
                           const char *to_id,
@@ -1026,6 +1601,10 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         /* A proposer in a declaring group asks for certification. */
         if (payload && json_is_true(json_object_get(payload, "certify")))
             json_object_set_new(body, "certify", json_true());
+        /* A proposer in a group that places its order names the group ("" is
+         * the primary), and sends without a grant. */
+        if (payload && json_is_true(json_object_get(payload, "placing")))
+            json_object_set_new(body, "group", json_string(""));
         if (task_slug)
         {
             uuid_t task_uuid;
@@ -1090,6 +1669,69 @@ static int _build_inbound(sce_run_ctx_t *ctx,
             }
         }
     }
+    else if (strcmp(function, REP_PROTO_PLACE_REQUEST) == 0
+             || strcmp(function, REP_PROTO_PLACE) == 0
+             || strcmp(function, REP_PROTO_PLACED) == 0)
+    {
+        /* {group: "", k, ballot: {n, by}, head[, value]} or, for placed,
+         * {group: "", k, value, sigs}. `ballot.by` is a participant id
+         * (default the sender); `signers` name a placement certificate's
+         * signers (default every participant), `forged_by` makes one sign for
+         * all. Mirrors the Python adapter. */
+        json_t *jk = json_object_get(payload, "k");
+        int k = json_is_integer(jk) ? (int)json_integer_value(jk) : 0;
+        char head[TX_HASH_HEX_LEN + 1];
+        _rp_place_head(ctx, payload, to_id, head);
+        body = json_object();
+        json_object_set_new(body, "group", json_string(""));
+        json_object_set_new(body, "k", json_integer(k));
+        if (strcmp(function, REP_PROTO_PLACED) != 0)
+        {
+            json_t *jb = json_object_get(payload, "ballot");
+            const char *by_id = json_string_value(json_object_get(jb, "by"));
+            const uuid_t *by = _uuid_of(ctx, by_id != NULL ? by_id : from_id);
+            char by_str[UUID_STRING_LEN + 1] = {0};
+            if (by != NULL)
+                uuid_unparse_lower(*by, by_str);
+            json_object_set_new(body, "ballot", json_pack(
+                "{s:I, s:s}", "n", (json_int_t)json_integer_value(json_object_get(jb, "n")),
+                "by", by_str));
+            json_object_set_new(body, "head", json_string(head));
+        }
+        if (strcmp(function, REP_PROTO_PLACE_REQUEST) != 0)
+        {
+            transaction_t *entries = calloc(PLACE_BATCH_MAX, sizeof(transaction_t));
+            json_t *value = NULL;
+            int n = entries != NULL ? _rp_place_value(ctx, payload, &value, entries, to_id) : -1;
+            if (n < 0)
+            {
+                free(entries);
+                json_decref(value);
+                json_decref(body);
+                snprintf(ctx->err, sizeof(ctx->err), "build_inbound: bad placement value");
+                return -1;
+            }
+            json_object_set_new(body, "value", value);
+            if (strcmp(function, REP_PROTO_PLACED) == 0)
+            {
+                char digest[TX_HASH_HEX_LEN + 1];
+                place_value_digest(entries, n, k, digest);
+                uint8_t desig[PLACE_DESIG_MAX];
+                size_t dlen = place_designation(k, head, digest, desig, sizeof(desig));
+                json_t *who = json_object();
+                json_t *named = json_object_get(payload, "signers");
+                if (json_is_array(named))
+                    json_object_set(who, "cosigners", named);
+                json_t *forger = json_object_get(payload, "forged_by");
+                if (forger != NULL)
+                    json_object_set(who, "forged_by", forger);
+                json_object_set_new(body, "sigs",
+                                    _rp_cosignatures(ctx, who, desig, dlen, NULL));
+                json_decref(who);
+            }
+            free(entries);
+        }
+    }
     else if (strcmp(function, REP_PROTO_OUTDATED) == 0)
     {
         body = json_object();  /* empty payload */
@@ -1117,57 +1759,10 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         {
             tx_history_t tmp;
             tx_history_init(&tmp);
-            size_t ci;
-            json_t *ce;
-            json_array_foreach(spec, ci, ce)
-            {
-                const char *task = json_string_value(json_object_get(ce, "task"));
-                if (task == NULL)
-                    continue;
-                double p1s = json_number_value(json_object_get(ce, "p1"));
-                double p2s = json_number_value(json_object_get(ce, "p2"));
-                uuid_t tk, p1u, p2u;
-                _uuid5("chain:", task, tk);
-                _chain_half_uuid(ctx, ce, 1, task, p1u);
-                _chain_half_uuid(ctx, ce, 2, task, p2u);
-                tx_history_update(&tmp, tk, p1u, p1s, NULL);
-                tx_history_update(&tmp, tk, p2u, p2s, NULL);
-            }
+            _write_chain(ctx, &tmp, spec);
             json_t *arr = NULL;
             tx_history_era_to_json(&tmp, 0, tx_history_len(&tmp), &arr);
-            /* certified_by: [ids] on a chain entry certifies both its halves
-             * with those participants' signatures (doc/architecture/reputation.md, "Commit certificates").
-             * era_to_json emits committed entries in the spec's order. */
-            for (size_t ai = 0; arr != NULL && ai < json_array_size(arr)
-                                && ai < json_array_size(spec); ai++)
-            {
-                json_t *spec_e = json_array_get(spec, ai);
-                json_t *by = json_object_get(spec_e, "certified_by");
-                if (!json_is_array(by))
-                    continue;
-                json_t *ae = json_array_get(arr, ai);
-                const char *task = json_string_value(json_object_get(spec_e, "task"));
-                uuid_t tk, pu[2];
-                _uuid5("chain:", task, tk);
-                _chain_half_uuid(ctx, spec_e, 1, task, pu[0]);
-                _chain_half_uuid(ctx, spec_e, 2, task, pu[1]);
-                double ps[2] = { json_number_value(json_object_get(spec_e, "p1")),
-                                 json_number_value(json_object_get(spec_e, "p2")) };
-                json_t *named = json_pack("{s:O}", "cosigners", by);
-                json_t *all = json_object();
-                for (int k = 0; k < 2; k++)
-                {
-                    uint8_t desig[512];
-                    size_t dlen = commit_designation(pu[k], tk, ps[k], NULL,
-                                                     desig, sizeof(desig));
-                    char su[UUID_STRING_LEN + 1];
-                    uuid_unparse_lower(pu[k], su);
-                    json_object_set_new(all, su, _rp_cosignatures(ctx, named, desig,
-                                                                  dlen, NULL));
-                }
-                json_object_set_new(ae, "commit_sigs", all);
-                json_decref(named);
-            }
+            _attach_spec_certs(ctx, arr, spec);
             json_t *tamper = payload ? json_object_get(payload, "tamper") : NULL;
             if (arr != NULL && tamper != NULL && json_is_true(tamper)
                 && json_array_size(arr) >= 2)
@@ -1175,7 +1770,43 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                 json_t *e1 = json_array_get(arr, 1);
                 json_object_set_new(e1, "p2_score", json_real(-1.0));
             }
+            /* from: N sends the chain from its Nth entry on, as a peer whose
+             * window has moved past the start would. */
+            json_t *from = payload ? json_object_get(payload, "from") : NULL;
+            if (arr != NULL && json_is_integer(from) && json_integer_value(from) > 0)
+            {
+                json_t *cut = json_array();
+                for (size_t ai = (size_t)json_integer_value(from);
+                     ai < json_array_size(arr); ai++)
+                    json_array_append(cut, json_array_get(arr, ai));
+                json_decref(arr);
+                arr = cut;
+            }
+            /* to: N stops before the Nth entry (with from, one page's slice
+             * of a window). */
+            json_t *to = payload ? json_object_get(payload, "to") : NULL;
+            if (arr != NULL && json_is_integer(to))
+            {
+                json_int_t first = json_is_integer(from) ? json_integer_value(from) : 0;
+                json_int_t keep = json_integer_value(to) - first;
+                while (keep >= 0 && (json_int_t)json_array_size(arr) > keep)
+                    json_array_remove(arr, json_array_size(arr) - 1);
+            }
             body = (arr != NULL) ? arr : json_array();
+            /* page / of / head: send it as one page of a paged window (ISSUES
+             * §2.67), as a responder over the page size would. Mirrors the
+             * Python adapter. */
+            json_t *page = payload ? json_object_get(payload, "page") : NULL;
+            if (page != NULL)
+            {
+                json_t *head = json_object_get(payload, "head");
+                json_t *wrapped = json_pack(
+                    "{s:O, s:O, s:s, s:o}", "page", page,
+                    "of", json_object_get(payload, "of") ? json_object_get(payload, "of") : json_null(),
+                    "head", json_is_string(head) ? json_string_value(head) : "h",
+                    "chain", body);
+                body = wrapped != NULL ? wrapped : json_array();
+            }
             tx_history_free(&tmp);
         }
     }
@@ -1673,6 +2304,9 @@ static int _dispatch(sce_run_ctx_t *ctx,
         reputation_get_commit_cert_counts(&s->halves_held, &s->certified_halves);
         reputation_get_window_root(s->window_root);
         reputation_get_checkpoint_root(s->checkpoint_root);
+        s->chain_task_n = reputation_get_chain_tasks(s->chain_tasks, 64);
+        s->pool_task_n = reputation_get_pool_tasks(s->pool_tasks, 64);
+        s->place_have = reputation_get_place_promise(&s->place_n, s->place_by);
         s->cosigns_parked = (int)reputation_parked_cosign_count();
         s->request_count = reputation_get_request_count();
         s->n_proposed = reputation_get_my_request_tasks(
@@ -1772,6 +2406,93 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: history_len=%d, expected %d",
                              pid, snap->chain_len, want);
+                    return -1;
+                }
+            }
+            else if (strcmp(key, "chain_tasks") == 0)
+            {
+                /* The resident chain's tasks in index order, by slug. */
+                bool ok = json_is_array(val)
+                    && (int)json_array_size(val) == snap->chain_task_n;
+                for (int i = 0; ok && i < snap->chain_task_n; i++)
+                {
+                    const char *slug = json_string_value(json_array_get(val, (size_t)i));
+                    uuid_t want;
+                    _uuid5("tx:", slug != NULL ? slug : "", want);
+                    ok = uuid_compare(want, snap->chain_tasks[i]) == 0;
+                }
+                if (!ok)
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: chain_tasks differ (%d resident)", pid,
+                             snap->chain_task_n);
+                    return -1;
+                }
+            }
+            else if (strcmp(key, "pool_count") == 0)
+            {
+                /* How many entries wait in the primary chain's pool. */
+                int want = (int)json_integer_value(val);
+                if (!json_is_integer(val) || snap->pool_task_n != want)
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: pool_count=%d, expected %d", pid,
+                             snap->pool_task_n, want);
+                    return -1;
+                }
+            }
+            else if (strcmp(key, "chain_entries") == 0
+                     || strcmp(key, "pooled_entries") == 0
+                     || strcmp(key, "pool_tasks") == 0)
+            {
+                /* The resident chain's entries in index order, or the pool's
+                 * entries as a set, by chain-spec slug ("chain:<slug>"); or
+                 * the pool's tasks as a set, by task slug ("tx:<slug>"). */
+                bool chain = strcmp(key, "chain_entries") == 0;
+                const char *ns = strcmp(key, "pool_tasks") == 0 ? "tx:" : "chain:";
+                int have = chain ? snap->chain_task_n : snap->pool_task_n;
+                const uuid_t *held = chain ? snap->chain_tasks : snap->pool_tasks;
+                bool ok = json_is_array(val) && (int)json_array_size(val) == have;
+                for (int i = 0; ok && i < have; i++)
+                {
+                    const char *slug = json_string_value(json_array_get(val, (size_t)i));
+                    uuid_t want;
+                    _uuid5(ns, slug != NULL ? slug : "", want);
+                    if (chain)
+                        ok = uuid_compare(want, held[i]) == 0;
+                    else
+                    {
+                        bool found = false;
+                        for (int j = 0; j < have && !found; j++)
+                            found = uuid_compare(want, held[j]) == 0;
+                        ok = found;
+                    }
+                }
+                if (!ok)
+                {
+                    snprintf(ctx->err, sizeof(ctx->err), "%s: %s differ (%d held)",
+                             pid, key, have);
+                    return -1;
+                }
+            }
+            else if (strcmp(key, "place_promised") == 0)
+            {
+                /* {n, by: <pid>}, or null for no promise. */
+                bool ok;
+                if (json_is_null(val))
+                    ok = !snap->place_have;
+                else
+                {
+                    const char *by = json_string_value(json_object_get(val, "by"));
+                    const uuid_t *u = by != NULL ? _uuid_of(ctx, by) : NULL;
+                    ok = snap->place_have && u != NULL
+                        && snap->place_n == json_integer_value(json_object_get(val, "n"))
+                        && uuid_compare(*u, snap->place_by) == 0;
+                }
+                if (!ok)
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: place_promised differs", pid);
                     return -1;
                 }
             }

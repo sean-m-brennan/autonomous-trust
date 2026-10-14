@@ -363,3 +363,40 @@ class TestAdoptedKeyReachesSiblings:
         a.handle_group_update(_queues(), _update_from(b_grp))
 
         a._record_group.assert_not_called()
+
+
+class TestHeldUntilPhase3:
+    """Partition cohort part-3615656 (2026-10-14), ISSUES §2.61: three members
+    rotated at once to the same epoch. cal was still in phase 2 when the
+    update carrying the winning (lower) key arrived, then took the losing key
+    from the merge history; nobody resends to a member, so in C, which dropped
+    the early update, cal kept the losing key for good. An early update is left
+    unhandled, which process() turns into a retry every pass, and once phase 3
+    is reached the same-epoch tiebreak hands it the winner. Mirrors
+    group_rotation_sibling_test.c."""
+
+    def test_an_update_before_phase_3_settles_the_tiebreak_after_it(self):
+        cal_id = _new_identity('cal', '10.0.0.3')
+        amy_id = _new_identity('amy', '10.0.0.2')
+        base, _ = _shared_group(cal_id, amy_id)
+        a = Group.from_canonical(base.to_canonical())
+        b = Group.from_canonical(base.to_canonical())
+        a.rotate_key()
+        b.rotate_key()
+        assert a.key_epoch == b.key_epoch and _key_of(a) != _key_of(b)
+        winner, loser = (a, b) if _key_of(a) < _key_of(b) else (b, a)
+
+        cal = _build_process(cal_id, None)
+        cal.phase = 2
+        early = _update_from(winner)
+        assert cal.handle_group_update(_queues(), early) is False, (
+            'an early update was consumed: process() would not offer it again')
+
+        # Joining takes the losing key, as cal's merge did.
+        cal.group = Group.from_canonical(loser.to_canonical())
+        cal.protocol.group = cal.group
+        cal.phase = 3
+        cal.handle_group_update(_queues(), early)      # process()'s next pass
+
+        assert _key_of(cal.group) == _key_of(winner)
+

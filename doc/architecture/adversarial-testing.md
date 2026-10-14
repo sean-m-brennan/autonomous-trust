@@ -85,16 +85,19 @@ parent teardown.
 | Scenario | Mechanism | Target Vulnerability | Expected AT Response |
 |----------|-----------|---------------------|---------------------|
 | **Network Partition** | AttackRouter injects iptables DROP rules between peer groups on a timed schedule | No explicit partition recovery in the protocol | Store-and-forward recovery; state re-converges after partition heals |
-| **Byzantine Node** | Modified `ReputationProcess` sends inconsistent `TransactionScore` values to different peers | Paxos prepare quorum at `>= n/2` and accept quorum at `> n/2` instead of Byzantine threshold `> 2n/3`; unverified NaCl signatures on proposals | Consensus detects inconsistency; byzantine node reputation drops below trust threshold |
+| **Byzantine Node** | Modified `ReputationProcess` sends inconsistent `TransactionScore` values to different peers | Paxos prepare and accept quorums at a simple majority (the proposer counted) instead of Byzantine threshold `> 2n/3`; unverified NaCl signatures on proposals | Consensus detects inconsistency; byzantine node reputation drops below trust threshold |
 | **Sybil** | Extra Docker containers with fabricated NaCl keypairs attempt identity voting admission | Identity voting must reject unknown keys | Voting rejects fake identities; identity count stays bounded |
 | **Reputation Gaming** | Normal AT process cooperates to build trust, then defects at a configured time | Accumulated trust from cooperation phase | Tit-for-tat recovery; reputation penalty exceeds the trust gained before defection |
 | **MITM** | tcpdump sidecar captures traffic between two nodes; pcap is analyzed for plaintext protocol strings and replayed packets | NaCl encryption must prevent content extraction and nonce reuse | Encryption holds; no plaintext leaked; replayed packets rejected |
 
-The Byzantine attack exploits two distinct quorum thresholds in the current
-Paxos implementation. The prepare phase requires `>= len(peers) // 2` grants,
-and the accept phase requires `> len(peers) // 2` acceptances. Neither meets the
-`> 2*peers/3` threshold required for Byzantine fault tolerance. A single
-Byzantine node in a group of three can break consensus at the prepare phase.
+The Byzantine attack exploits the Paxos quorum threshold. Since 2026-10-13
+both phases need a simple majority of the group, the proposer counted
+(`(len(peers) + 1) // 2` of the others), and each node accepts at most one half
+per chain slot (doc/architecture/reputation.md, "Agreeing on a history"). A
+majority does not meet the `> 2*peers/3` threshold required for Byzantine
+fault tolerance: a single Byzantine node in a group of three is one of the two
+votes any round needs, and can accept two rivals for one slot where an honest
+node accepts one.
 
 The MITM analysis searches captured bytes for known AT message signatures:
 process names and function identifiers registered via

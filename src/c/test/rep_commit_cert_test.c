@@ -213,6 +213,29 @@ DEFINE_TEST(test_the_knob_reads_the_same_spellings_as_python)
 }
 END_TEST_DEFINITION()
 
+/* On by default since 2026-10-13: a typo leaves it on, and only an explicit
+ * off spelling mints a group that converges the old way. Mirrors Python
+ * test_ordered_placement_is_minted_on_unless_turned_off. */
+DEFINE_TEST(test_ordered_placement_is_on_unless_turned_off)
+{
+    unsetenv("AT_ORDERED_PLACEMENT");
+    ck_assert(group_ordered_placement_resolve());
+    const char *off[] = { "0", "off", " No ", "FALSE" };
+    for (size_t i = 0; i < sizeof(off) / sizeof(off[0]); i++)
+    {
+        setenv("AT_ORDERED_PLACEMENT", off[i], 1);
+        ck_assert(!group_ordered_placement_resolve());
+    }
+    const char *on[] = { "1", "garbage", "" };
+    for (size_t i = 0; i < sizeof(on) / sizeof(on[0]); i++)
+    {
+        setenv("AT_ORDERED_PLACEMENT", on[i], 1);
+        ck_assert(group_ordered_placement_resolve());
+    }
+    unsetenv("AT_ORDERED_PLACEMENT");
+}
+END_TEST_DEFINITION()
+
 /* ------------------------------------------------------------------ */
 /* The certificate store                                               */
 /* ------------------------------------------------------------------ */
@@ -426,6 +449,7 @@ RUN_TESTS(RepCommitCert,
           test_the_designation_matches_python_byte_for_byte,
           test_the_group_declaration_is_omitted_unless_set,
           test_the_knob_reads_the_same_spellings_as_python,
+          test_ordered_placement_is_on_unless_turned_off,
           test_a_certificate_needs_its_half_and_travels_with_the_entry,
           test_a_quorum_checkpoint_covers_what_it_commits_to,
           test_a_checkpoint_the_segment_does_not_reproduce_covers_nothing,

@@ -1,0 +1,55 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: paxos-grant-from-one-member-counts-once
+byte_pinning: false
+description: |
+    A member's grant counts once per round (doc/architecture/reputation.md,
+    "Agreeing on a history"). alice proposes in a group of five, so her round
+    needs grants from two of the other four. bob's grant arrives twice. That
+    is still one member, so alice sends no transaction.
+
+    Before this rule each grant message added one to the round's count, so a
+    repeated grant from one member could carry a round on its own.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: acceptor
+  - id: dave
+    role: acceptor
+  - id: erin
+    role: acceptor
+
+fixtures:
+  my_requests:
+    alice:
+      - id1: 1000
+        id2: 1
+        task_id: t-1
+        score: 0.8
+
+steps:
+  - id: 1
+    from: bob
+    to: alice
+    function: permission granted
+    repeat: 2
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+
+  - id: 2
+    from: alice
+    to: broadcast
+    function: transaction
+    in_response_to: 1
+    expect_none: true
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice

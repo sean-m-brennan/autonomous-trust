@@ -1,0 +1,43 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: catchup-placed-uncertified-tail-cut
+byte_pinning: false
+description: |
+    Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+    order"): a placed chain carries each placement's certificate on its last
+    entry, with the index the placement began at, so a node catching up checks
+    every placement it is handed, against its own view of the group (a strict
+    majority, here three of four). Then a placement decides, not a length.
+
+    alice's chain holds a certified placement at index 0 and, after it, an
+    entry written outside any placement. In a group that places its order
+    nothing reaches the chain except by a placement, so bob takes the
+    placement and cuts the segment at the first entry no certificate covers.
+
+participants:
+  - id: alice
+    role: provider
+  - id: bob
+    role: consumer
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  ordered_placement: true
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: latest update
+    payload:
+      chain:
+        - {task: a, p1: 0.7, p2: 0.5, batch: 1, placed_by: [alice, bob, carol], certified_by: [alice, carol, dave]}
+        - {task: z, p1: 0.4, p2: 0.4, certified_by: [alice, carol, dave]}
+
+expected_state:
+  bob:
+    chain_entries: [a]

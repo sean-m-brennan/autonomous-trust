@@ -1,0 +1,43 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: placed-written-once
+byte_pinning: false
+description: |
+    Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+    order"): a decided placement is broadcast with a quorum certificate over its
+    designation (index, predecessor head, value digest), and every member writes
+    it at that index exactly as given.
+
+    The same placement arrives twice. The second is behind bob's chain by then,
+    so the chain holds each entry once.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  ordered_placement: true
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: placed
+    repeat: 2
+    payload:
+      k: 0
+      value:
+        - {task_id: t-1, p1: carol, p1_score: 0.9, p2: dave, p2_score: 0.7}
+        - {task_id: t-2, p1: alice, p1_score: 0.8, p2: carol, p2_score: 0.6}
+      signers: [alice, bob, carol]
+
+expected_state:
+  bob:
+    chain_tasks: [t-2, t-1]

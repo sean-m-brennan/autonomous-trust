@@ -141,6 +141,13 @@ def _drive_assertion(ctx: ScenarioContext, step: dict, in_resp: int) -> None:
         and cm.function == expected_fn
         and (expected_to == 'broadcast' or cm.to_id in (expected_to, 'broadcast'))
     ]
+    if step.get('expect_none'):
+        # A refusal that must stay silent: nothing of the kind went out.
+        if matches:
+            raise AssertionError(
+                f'step {sid}: expected no {expected_from}->{expected_to}:'
+                f'{expected_fn} in response to step {in_resp}, but one was sent')
+        return
     if not matches:
         captured_summary = ', '.join(
             f'{cm.from_id}->{cm.to_id}:{cm.function}' for cm in parent.captured
