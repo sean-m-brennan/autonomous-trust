@@ -1,0 +1,39 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: catchup-roster-anchor-view-mismatch-refused
+byte_pinning: false
+description: |
+    Membership recorded in the chain (doc/architecture/reputation.md, "Who is
+    in the group"). The segment's latest roster lists a member bob does not know
+    and leaves out dave, whom he does: two members from the group identity shows
+    him. bob does not anchor on it, and adopts nothing.
+
+participants:
+  - id: alice
+    role: provider
+  - id: bob
+    role: consumer
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  ordered_placement: true
+  roster: {}          # an unfounded chain: no roster in force
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: latest update
+    payload:
+      chain:
+        - {roster: genesis, members: [alice, carol, stranger], placed_by: [alice, carol]}
+        - {task: a, p1: 0.7, p2: 0.5, batch: 1, placed_by: [alice, carol], certified_by: [alice, carol, dave]}
+        - {roster: add, member: bob, placed_by: [alice, carol]}
+
+expected_state:
+  bob:
+    committed_tx_count: 0

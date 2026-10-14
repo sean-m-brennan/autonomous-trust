@@ -77,6 +77,7 @@ static const struct {
     bool is_switch;
 } declarations[] = {
     { "AT_OWN_GEOHASH", "social", "libat_social", false },
+    { "AT_OWN_EXACT", "social", "libat_social", false },
     { "AT_OWN_PROFILE", "social", "libat_social", false },
     { "AT_FIRST_CONTACT", "first_contact", "libat_first_contact", true },
     /* Rendezvous (FEATURE_SPLIT_PLAN Phase 7b): a node told to use a relay,

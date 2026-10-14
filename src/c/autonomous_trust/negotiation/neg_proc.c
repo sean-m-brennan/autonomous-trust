@@ -649,10 +649,12 @@ static void _task_info_into_json(const process_t *proc, const task_t *task,
     if (req != NULL)
         json_object_set_new(j, "requestor", req);
     /* How many participants the requestor expects. Carried through rather
-     * than assumed to be 1: a Python requestor's `handle_results` forwards
-     * only once `len(results) >= task.size`, and it reads that off the reply
-     * we send back. A task that arrived without one counts as single-
-     * participant, which is what every C-originated task is. */
+     * than assumed to be 1, so the requestor's value survives the round
+     * trip. Neither runtime's completion rule reads it today: a Python
+     * requestor forwards every result and marks all but the first
+     * `score_only`, and a C requestor counts the peers it invited. A task
+     * that arrived without one counts as single-participant, which is what
+     * every C-originated task is. */
     json_object_set_new(j, "size", json_integer(task->size > 0 ? task->size : 1));
     /* Freshness sequence. Emitted unconditionally, including as 0, so that an
      * unstamped invitation is visibly unstamped on the wire rather than

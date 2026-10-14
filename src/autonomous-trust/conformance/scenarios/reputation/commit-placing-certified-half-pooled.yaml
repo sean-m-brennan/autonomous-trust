@@ -1,0 +1,43 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: commit-placing-certified-half-pooled
+byte_pinning: false
+description: |
+    Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+    order"). bob's roster is alice, carol and dave; carol and dave both signed
+    alice's commit_designation, so the half is certified.
+
+    In a group that places its order, a certified half goes to the pool, not
+    to the chain: its entry is written only where a placement puts it, so
+    every member writes it at the same index.
+    Placement-mode twin of commit-cert-certified-commit-written.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: proposer
+  - id: dave
+    role: member
+
+fixtures:
+  ordered_placement: true
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: tx committed
+    payload:
+      task_id: t-1
+      score: 0.8
+      cosigners: [carol, dave]
+
+expected_state:
+  bob:
+    committed_tx_count: 0
+    chain_tasks: []
+    pool_tasks: [t-1]

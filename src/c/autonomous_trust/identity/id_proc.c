@@ -149,12 +149,14 @@ int identity_send_to_network_then(const process_t *proc, generic_msg_t *out,
  * kind of object: both are NET_MESSAGEs dispatched on `net_msg.function` by
  * run_message_handlers, and route_to_process (net_proc.c) forwards to the
  * named process by name with NO function allowlist. The plaintext receive
- * policy (ID_UNENCRYPTED_VERBS, enforced at net_proc.c:1799) refuses an
- * app_* verb in the clear, so this is not open to a stranger — but an
- * ADMITTED peer's frame decrypts and routes like any other, and would land in
- * an app handler. Admitted peers are exactly who the tier and reputation
+ * policy (ID_UNENCRYPTED_VERBS, try_unencrypted_from_known_peer in
+ * net_proc.c) refuses an app_* verb in the clear only from a KNOWN peer. A
+ * plaintext frame from an address we cannot place, and a relayed frame from
+ * an unknown uuid, route with no verb check at all, so a stranger can reach
+ * an app handler too. And an ADMITTED peer's frame decrypts and routes like
+ * any other. Admitted peers are exactly who the tier and reputation
  * machinery exists to constrain, so "already admitted" is not a trust
- * argument.
+ * argument. This guard is what stops all three.
  *
  * THE TEST. The app builds its request as `generic_msg_t req = {0}` and never
  * populates from_whom (see at_app_events_block in app_events.c), so a local
@@ -552,6 +554,17 @@ static struct {
      * uuid, which never changes, so it cannot tell an answer to this round
      * from one captured in an earlier one. */
     int64_t probe_seq;
+    /* group_key_update frames that arrived before phase 3, oldest first, each
+     * a private copy, replayed by identity_replay_held_group_updates once the
+     * group is chosen. The senders see us as a member already and never
+     * resend, so a dropped one was a key we could not learn any other way:
+     * partition cohort part-3615656 (2026-10-14), cal dropped amy's and dee's
+     * winning epoch-5 key in phase 2, adopted the losing one from the merge
+     * history, and decrypted nothing from its island again (ISSUES §2.18,
+     * §2.61). Python holds them the same way: an unhandled message goes back
+     * to IdentityProcess.messages and is retried every pass. */
+    generic_msg_t held_group_updates[ID_HELD_GROUP_UPDATES];
+    size_t num_held_group_updates;
 } id_state;
 
 static void _ensure_id_init(void)
@@ -1982,7 +1995,13 @@ static bool _join_authorized(const process_t *proc,
 static bool handle_welcoming_committee(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     if (proc->protocol.phase != 3)
+    {
+        /* Nobody resends a request_access, so say that this one is lost. */
+        log_info(proc->logger,
+                 "Identity: dropping access request from %s: identity phase %d, not 3\n",
+                 msg->info.net_msg.from_whom.nickname, proc->protocol.phase);
         return false;
+    }
 
     net_msg_t *nmsg = &msg->info.net_msg;
     log_info(proc->logger, "Identity: received access request from %s\n",
@@ -3371,6 +3390,9 @@ void identity_reset_state(void)
      * would refuse the next scenario's first stamped message as a replay. */
     freshness_reset(&id_state.freshness);
     id_state.probe_seq = 0;
+    for (size_t i = 0; i < id_state.num_held_group_updates; i++)
+        messaging_recv_release(&id_state.held_group_updates[i]);
+    id_state.num_held_group_updates = 0;
     pthread_mutex_unlock(&id_state.lock);
     _handoffs_reset();
     at_send_retry_reset();
@@ -3871,6 +3893,66 @@ static bool handle_history_diff(const process_t *proc, directory_t *queues, gene
  * definition" cast warning that blocks discharge of valid_dest/valid_src/separation).
  * Helpers also touch filesystem/network/identity stubs.
  */
+/* Keep a private copy of @p msg (a group_key_update that arrived before
+ * phase 3) for identity_replay_held_group_updates. When full, the oldest goes:
+ * a later update from the same cohort carries at least as much. */
+static void _hold_group_update(const process_t *proc, const generic_msg_t *msg)
+{
+    const net_msg_t *nmsg = &msg->info.net_msg;
+    generic_msg_t copy = *msg;
+    copy.info.net_msg.function = nmsg->function ? strdup(nmsg->function) : NULL;
+    copy.info.net_msg.obj = NULL;
+    if (nmsg->obj != NULL && nmsg->len > 0)
+    {
+        copy.info.net_msg.obj = malloc(nmsg->len);
+        if (copy.info.net_msg.obj != NULL)
+            memcpy(copy.info.net_msg.obj, nmsg->obj, nmsg->len);
+    }
+    if ((nmsg->function != NULL && copy.info.net_msg.function == NULL)
+        || (nmsg->obj != NULL && nmsg->len > 0 && copy.info.net_msg.obj == NULL))
+    {
+        messaging_recv_release(&copy);
+        log_warn(proc->logger, "Identity: could not hold group update from %s "
+                 "(out of memory); it is lost\n", nmsg->from_whom.nickname);
+        return;
+    }
+    _ensure_id_init();
+    pthread_mutex_lock(&id_state.lock);
+    if (id_state.num_held_group_updates == ID_HELD_GROUP_UPDATES)
+    {
+        messaging_recv_release(&id_state.held_group_updates[0]);
+        memmove(&id_state.held_group_updates[0], &id_state.held_group_updates[1],
+                (ID_HELD_GROUP_UPDATES - 1) * sizeof(generic_msg_t));
+        id_state.num_held_group_updates--;
+    }
+    id_state.held_group_updates[id_state.num_held_group_updates++] = copy;
+    pthread_mutex_unlock(&id_state.lock);
+    log_info(proc->logger,
+             "Identity: holding group update from %s until phase 3 (identity "
+             "phase %d)\n", nmsg->from_whom.nickname, proc->protocol.phase);
+}
+
+size_t identity_replay_held_group_updates(process_t *proc, directory_t *queues)
+{
+    _ensure_id_init();
+    generic_msg_t held[ID_HELD_GROUP_UPDATES];
+    pthread_mutex_lock(&id_state.lock);
+    size_t n = id_state.num_held_group_updates;
+    memcpy(held, id_state.held_group_updates, n * sizeof(generic_msg_t));
+    id_state.num_held_group_updates = 0;
+    pthread_mutex_unlock(&id_state.lock);
+    if (n > 0)
+        log_info(proc->logger, "Identity: replaying %zu group update(s) held "
+                 "until phase 3\n", n);
+    for (size_t i = 0; i < n; i++)
+    {
+        /* In arrival order, through the dispatcher, as if they arrived now. */
+        run_message_handlers(proc, queues, held[i].type, &held[i]);
+        messaging_recv_release(&held[i]);
+    }
+    return n;
+}
+
 /*@
   requires \valid(proc);
   requires \valid(queues);
@@ -3880,7 +3962,12 @@ static bool handle_history_diff(const process_t *proc, directory_t *queues, gene
 static bool handle_group_update(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     if (proc->protocol.phase != 3)
-        return false;
+    {
+        /* The senders see us as already a member and will not resend, so the
+         * update is held and replayed once the group is chosen. */
+        _hold_group_update(proc, msg);
+        return true;
+    }
 
     net_msg_t *nmsg = &msg->info.net_msg;
     log_info(proc->logger, "Identity: received group update from %s\n",
@@ -4193,6 +4280,8 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
          * its new group does not. Mirrors Python Group.adopt_membership. */
         ((process_t *)proc)->protocol.group.commit_certificates =
             json_is_true(json_object_get(payload, "commit_certificates"));
+        ((process_t *)proc)->protocol.group.ordered_placement =
+            json_is_true(json_object_get(payload, "ordered_placement"));
         /* Replace address_map: free any existing entries, then ingest theirs
          * by walking the JSON object so we never need map_priv.h here. */
         if (((process_t *)proc)->protocol.group.address_map.items != NULL)
@@ -8317,6 +8406,8 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
                  * adopted everywhere else. */
                 proc->protocol.group.commit_certificates =
                     group_commit_certificates_resolve();
+                proc->protocol.group.ordered_placement =
+                    group_ordered_placement_resolve();
             }
             if (pub != NULL)
                 smrt_deref(pub);
@@ -8334,6 +8425,7 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
         pthread_mutex_unlock(&id_state.lock);
     }
     proc->protocol.phase = 3;
+    (void)identity_replay_held_group_updates(proc, queues);
 
     /* Identity-specific loop: re-announce periodically until peers found */
     generic_msg_t announce_buf = {0};

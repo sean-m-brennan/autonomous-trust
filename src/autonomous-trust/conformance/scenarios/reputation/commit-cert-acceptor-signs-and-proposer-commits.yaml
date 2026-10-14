@@ -7,8 +7,8 @@ description: |
     Commit certificates (doc/architecture/reputation.md), end to end through one
     acceptor. alice's proposal asks for certification; bob signs what he accepts,
     and that real signature travels on his `tx accepted`. alice's roster is bob
-    alone, so one verified signature clears her quorum (more than 1 // 2), and her
-    half is written beside its certificate.
+    alone, so his one verified signature and her own acceptance make the whole
+    group, and her half is written beside its certificate.
 
 participants:
   - id: alice

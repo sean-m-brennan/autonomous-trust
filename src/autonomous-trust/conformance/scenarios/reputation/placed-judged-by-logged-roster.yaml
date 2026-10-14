@@ -1,0 +1,45 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: placed-judged-by-logged-roster
+byte_pinning: false
+description: |
+    Membership recorded in the chain (doc/architecture/reputation.md, "Who is
+    in the group"). bob sees five members now, so a majority of his live view
+    is three. But instance 0 belongs to the roster logged before it,
+    {alice, bob, carol}, and two of those three signed the placement: bob
+    writes it. This is the race of partition cohort part-3546034 in one step:
+    a placement decided by a majority of the group as it then was, learned by
+    a member that has since added someone.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+  - id: erin
+    role: member
+
+fixtures:
+  ordered_placement: true
+  roster:
+    bob: [alice, bob, carol]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: placed
+    payload:
+      k: 0
+      value:
+        - {task_id: t-1, p1: carol, p1_score: 0.9, p2: dave, p2_score: 0.7}
+      signers: [alice, carol]
+
+expected_state:
+  bob:
+    chain_tasks: [t-1]

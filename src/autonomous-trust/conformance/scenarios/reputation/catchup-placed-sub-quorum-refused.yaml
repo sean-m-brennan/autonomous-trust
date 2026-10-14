@@ -1,0 +1,42 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: catchup-placed-sub-quorum-refused
+byte_pinning: false
+description: |
+    Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+    order"): a placed chain carries each placement's certificate on its last
+    entry, with the index the placement began at, so a node catching up checks
+    every placement it is handed, against its own view of the group (a strict
+    majority, here three of four). Then a placement decides, not a length.
+
+    alice's placement certificate carries two signatures, alice's and
+    carol's. bob's quorum for a placement is three of four, so the certificate
+    does not verify, and since the segment holds the whole placement it is no
+    mere gap in what bob can check: the segment is refused whole.
+
+participants:
+  - id: alice
+    role: provider
+  - id: bob
+    role: consumer
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  ordered_placement: true
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: latest update
+    payload:
+      chain:
+        - {task: a, p1: 0.7, p2: 0.5, batch: 1, placed_by: [alice, carol], certified_by: [alice, carol, dave]}
+
+expected_state:
+  bob:
+    committed_tx_count: 0

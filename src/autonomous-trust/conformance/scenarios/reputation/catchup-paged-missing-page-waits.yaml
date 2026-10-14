@@ -1,0 +1,41 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: catchup-paged-missing-page-waits
+byte_pinning: false
+description: |
+    A page of a paged catch-up reply (ISSUES §2.67) is not a chain by itself.
+    alice sends the first two entries of her window as page 1 of 2; dave keeps
+    them and applies nothing until the other page of the same head arrives.
+    Applying a partial window would be safe for the prefix, but the reply is
+    the whole window on purpose (§2.51), and its tail is where a fork would
+    show.
+
+participants:
+  - id: alice
+    role: provider
+  - id: dave
+    role: consumer
+
+fixtures:
+  num_updates:
+    dave: 1
+
+steps:
+  - id: 1
+    from: alice
+    to: dave
+    function: latest update
+    payload:
+      page: 0
+      of: 2
+      head: "aa"
+      to: 2
+      chain:
+        - {task: a, p1: 0.7, p2: 0.5}
+        - {task: b, p1: 0.9, p2: 0.3}
+        - {task: c, p1: 0.6, p2: 0.4}
+
+expected_state:
+  dave:
+    committed_tx_count: 0
