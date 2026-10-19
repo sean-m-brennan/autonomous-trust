@@ -18,9 +18,8 @@ handled then, and says so.
 
 Nobody resends either one: a requester gives up and founds its own group, and
 the members that sent a group update see the receiver as already a member.
-An access request is dropped; a group update is held (left unhandled, so
-process() offers it again until phase 3; see test_group_key_convergence's
-TestHeldUntilPhase3). Each is logged at INFO, and only for the handler's own
+Both are held (left unhandled, so process() offers them again until phase 3;
+see test_group_key_convergence's TestHeldUntilPhase3). Each is logged at INFO, and only for the handler's own
 verb, since every handler sees every identity message.
 """
 from unittest.mock import MagicMock
@@ -48,7 +47,7 @@ def _drop_lines(node):
             if c.args and str(c.args[0]).startswith(('Dropping', 'Holding'))]
 
 
-def test_early_access_request_is_logged_and_left_unhandled():
+def test_early_access_request_is_logged_and_held():
     node = _node(phase=1)
     assert node.welcoming_committee({}, _message(IdentityProtocol.announce)) is False
     lines = _drop_lines(node)

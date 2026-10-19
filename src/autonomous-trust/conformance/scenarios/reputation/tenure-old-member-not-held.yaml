@@ -1,0 +1,52 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: tenure-old-member-not-held
+byte_pinning: false
+description: |
+    A member past its tenure is scored as it always was: the control for
+    tenure-young-member-held-below-tier-three. The same four 0.9 tasks, the
+    same 600 s minimum, but bob first held alice 1000 s ago, so the bound does
+    not apply and her score stays 0.90 (doc/architecture/reputation.md,
+    "Tenure").
+
+participants:
+  - id: carol
+    role: requestor
+  - id: bob
+    role: oracle
+  - id: alice
+    role: subject
+
+fixtures:
+  tx_history:
+    bob:
+      - {task_id: t-1, p1: alice, p1_score: 0.9, p2: bob, p2_score: 0.9}
+      - {task_id: t-2, p1: bob, p1_score: 0.9, p2: alice, p2_score: 0.9}
+      - {task_id: t-3, p1: alice, p1_score: 0.9, p2: bob, p2_score: 0.9}
+      - {task_id: t-4, p1: bob, p1_score: 0.9, p2: alice, p2_score: 0.9}
+  reputations:
+    bob:
+      alice: 0.2
+  coop_mode:
+    bob:
+      alice: false
+  tenure:
+    bob:
+      min_sec: 600
+      alice: 1000
+
+steps:
+  - id: 1
+    from: carol
+    to: bob
+    function: request reputation
+    payload:
+      target: alice
+      proc: negotiation
+    description: carol asks bob for alice's reputation.
+
+expected_state:
+  bob:
+    reputation_of:
+      alice: 0.90

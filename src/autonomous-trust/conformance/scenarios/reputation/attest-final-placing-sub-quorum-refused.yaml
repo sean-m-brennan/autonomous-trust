@@ -17,8 +17,7 @@ participants:
   - id: carol
     role: subject
 
-fixtures:
-  ordered_placement: true
+fixtures: {}
 
 steps:
   - id: 1

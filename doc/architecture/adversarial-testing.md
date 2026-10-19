@@ -101,7 +101,7 @@ node accepts one.
 
 The MITM analysis searches captured bytes for known AT message signatures:
 process names and function identifiers registered via
-`Protocol.register_handler()` (such as `'ask permission'` and `'transaction'`).
+`Protocol.register_handler()` (such as `'transaction'` and `'place request'`).
 It also attempts replay of captured packets to verify nonce-based rejection.
 
 ## Harness orchestration

@@ -27,6 +27,9 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #include <jansson.h>
 
 #include "fleet/update_proc.h"
@@ -157,9 +160,15 @@ int update_backup_path(const char *data_dir, char *buf, size_t buflen)
 
 int update_current_binary_path(char *buf, size_t buflen)
 {
+#ifdef __APPLE__
+    /* Darwin has no /proc; dyld knows the path the program was started from. */
+    uint32_t cap = (uint32_t)buflen;
+    return _NSGetExecutablePath(buf, &cap) == 0 ? 0 : -1;
+#else
     ssize_t len = readlink("/proc/self/exe", buf, buflen - 1);
     if (len < 0)
         return -1;
     buf[len] = '\0';
     return 0;
+#endif
 }

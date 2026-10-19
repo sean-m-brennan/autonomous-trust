@@ -201,6 +201,68 @@ DEFINE_TEST(test_group_rotate_key_mints_new_key_and_bumps_epoch)
 /* A public-only view of somebody else's group has no standing to rotate it:
  * minting a key we cannot already decrypt with would fork the cohort into two
  * halves that cannot hear each other. */
+#ifndef AT_NO_LINK_WRAP
+/* Linked with -Wl,--wrap=encryptor_generate (CMakeLists.txt): every call the
+ * library makes lands here and passes through unless a test asks for a failed
+ * mint. */
+unsigned char *__real_encryptor_generate(void);
+static bool _fail_next_mint = false;
+unsigned char *__wrap_encryptor_generate(void)
+{
+    if (_fail_next_mint)
+    {
+        _fail_next_mint = false;
+        return NULL;
+    }
+    return __real_encryptor_generate();
+}
+
+/* A mint that fails changes nothing. It used to retire the live key first, so
+ * the group kept a current key that was also in its own retired list, and every
+ * update carrying that key (the cohort's tiebreak winner included) was refused
+ * as "a key we already retired". */
+DEFINE_TEST(test_group_rotate_key_failed_mint_retires_nothing)
+{
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t uuid;
+    uuid_generate(uuid);
+    char addr[] = "10.0.0.7";
+    group_t *grp = NULL;
+    ck_assert_ret_ok(group_create(&uuid, addr, &grp));
+    encryptor_t live = grp->encryptor;
+
+    _fail_next_mint = true;
+    ck_assert(group_rotate_key(grp) == -1);
+    ck_assert(!_fail_next_mint);   /* the mint was attempted */
+    ck_assert(grp->key_epoch == 0);
+    ck_assert(grp->num_previous_keys == 0);
+    ck_assert_mem_eq(grp->encryptor.private, live.private,
+                     sizeof(live.private));
+
+    /* The same key offered back at our epoch is ours, not a retired one. */
+    group_t offer = {0};
+    memcpy(offer.uuid, grp->uuid, sizeof(uuid_t));
+    offer.key_epoch = 0;
+    offer.encryptor = live;
+    ck_assert_str_eq(group_rotation_refusal(grp, &offer), "already our key");
+
+    /* And the next mint works as usual. */
+    ck_assert(group_rotate_key(grp) == 1);
+    ck_assert(grp->num_previous_keys == 1);
+    ck_assert_mem_eq(grp->previous_keys[0].private, live.private,
+                     sizeof(live.private));
+
+    group_free(grp);
+}
+#else
+/* No --wrap on this linker (Apple's, lld-link), so no way to fail one mint here. */
+DEFINE_TEST(test_group_rotate_key_failed_mint_retires_nothing)
+{
+    printf("  skipped: needs -Wl,--wrap (not available on this linker)\n");
+}
+#endif
+
 DEFINE_TEST(test_group_rotate_key_refused_without_private)
 {
     ck_assert(sodium_init() >= 0);
@@ -324,6 +386,37 @@ DEFINE_TEST(test_group_decrypt_falls_back_to_retired_key)
 
     group_free(receiver);
     group_free(sender);
+}
+
+/* The network process's call: the group itself as `whom` (net_proc.c
+ * `group_decrypt(grp, &cmsg, grp, ...)`). The fallback used to pair the
+ * retired private with whom's public, which is then the CURRENT public, so this
+ * exact call never opened a frame sealed under a retired key. */
+DEFINE_TEST(test_group_decrypt_retired_key_with_itself_as_sender)
+{
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t uuid;
+    uuid_generate(uuid);
+    char addr[] = "10.0.0.8";
+    group_t *grp = NULL;
+    ck_assert_ret_ok(group_create(&uuid, addr, &grp));
+
+    unsigned char plain[] = "sealed just before the rotation";
+    msg_str_t in = { plain, sizeof(plain) };
+    unsigned char nonce[crypto_box_NONCEBYTES];
+    randombytes_buf(nonce, sizeof(nonce));
+    unsigned char cipher[sizeof(plain) + crypto_box_MACBYTES];
+    ck_assert_ret_ok(group_encrypt(grp, &in, grp, nonce, cipher));
+
+    ck_assert(group_rotate_key(grp) == 1);
+
+    msg_str_t ct = { cipher, sizeof(cipher) };
+    unsigned char out[sizeof(plain)] = {0};
+    ck_assert_ret_ok(group_decrypt(grp, &ct, grp, nonce, out));
+    ck_assert_mem_eq(out, plain, sizeof(plain));
+
+    group_free(grp);
 }
 
 /* Two members that rotate at the SAME INSTANT both mint the same epoch with
@@ -537,9 +630,11 @@ RUN_TESTS(Group2, test_group_json_roundtrip,
           test_group_init_nul_terminates_long_address,
           test_group_rotate_key_mints_new_key_and_bumps_epoch,
           test_group_rotate_key_refused_without_private,
+          test_group_rotate_key_failed_mint_retires_nothing,
           test_group_accept_rotation_requires_higher_epoch_and_key,
           test_group_accept_rotation_equal_epoch_converges,
           test_group_accept_rotation_never_reinstates_a_retired_key,
           test_group_accept_rotation_public_only_takes_a_real_key,
           test_group_rotation_refusal_names_each_reason,
-          test_group_decrypt_falls_back_to_retired_key)
+          test_group_decrypt_falls_back_to_retired_key,
+          test_group_decrypt_retired_key_with_itself_as_sender)

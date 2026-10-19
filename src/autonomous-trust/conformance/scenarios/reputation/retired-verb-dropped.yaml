@@ -1,0 +1,56 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: retired-verb-dropped
+byte_pinning: false
+description: |
+    The half round's Phase 1 is retired (2026-10-16): every group places its
+    order (doc/architecture/reputation.md, "Agreeing on an order"), and a half
+    goes straight to co-signing. A node on a build from before then still
+    opens a round with `ask permission`. bob drops it: nothing is granted,
+    nacked or backdated, and the sender is named once in bob's log.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: ask permission
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+
+  - id: 2
+    from: bob
+    to: alice
+    function: permission granted
+    in_response_to: 1
+    expect_none: true
+    payload: {}
+
+  - id: 3
+    from: bob
+    to: alice
+    function: try again
+    in_response_to: 1
+    expect_none: true
+    payload: {}
+
+  - id: 4
+    from: bob
+    to: alice
+    function: out of date
+    in_response_to: 1
+    expect_none: true
+    payload: {}
+
+expected_state:
+  bob:
+    committed_tx_count: 0
+    pool_count: 0

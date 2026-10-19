@@ -36,17 +36,11 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
  *  reputation_run still calls this internally on entry. */
 int reputation_register_handlers(process_t *proc);
 
-/** Start a Paxos round for one locally-observed score: file the pending
- *  round in my_requests and broadcast Phase 1a ("ask permission") to every
- *  peer. THE production proposer path — reputation_run's loop calls it for
- *  every TRANSACTION_SCORE that arrives over IPC.
- *
- *  Declared here so a test can drive the real proposer rather than staging
- *  my_requests by hand. That distinction is not academic: every existing
- *  test staged the pending round through reputation_install_my_request, so
- *  the key this function files under and the key handle_grant looks up by
- *  were free to disagree — and did, from the time the round key was
- *  introduced until 2026-09-21, which meant no live round ever committed.
+/** Propose our half for one locally-observed score: file it, follow it until
+ *  it is in the chain, and send it to the group to co-sign (_propose_half).
+ *  THE production proposer path — reputation_run's loop calls it for every
+ *  TRANSACTION_SCORE that arrives over IPC. Declared here so a test can drive
+ *  the real proposer rather than staging a round by hand.
  *
  *  @p peer_uuid is the PROPOSER (us), echoed on the wire as "peer_uuid";
  *  @p subject_uuid is who the score is about, and may be zeroed for a
@@ -55,15 +49,6 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
                           const uuid_t peer_uuid, double score,
                           const char *capability_name, const char *channel,
                           const uuid_t subject_uuid, double competence);
-
-/** Re-propose every round of ours whose nack backoff expired at or before
- *  @p present. Called once per pass from reputation_run's loop; @p present is
- *  a parameter rather than a time(NULL) inside so a test can advance the
- *  clock instead of sleeping out a real backoff.
- *
- *  Exposed for that reason alone. Production has exactly one caller. */
-void _retry_nacked_rounds(const process_t *proc, double present,
-                          const uuid_t self_uuid, bool have_self);
 
 /** Re-propose every half of OURS still not in the chain REP_COMMIT_TIMEOUT
  *  (AT_REP_COMMIT_TIMEOUT_SEC, default 15 s) after it was last proposed, up to
@@ -113,10 +98,9 @@ size_t _recheck_parked_cosigns(const process_t *proc, double present);
 /** Test seam: how many checkpoint proposals are parked for a later co-sign. */
 size_t reputation_parked_cosign_count(void);
 
-/** Toggle synchronous-dispatch mode for the conformance harness.
- *  When enabled, handle_nack emits a retry "ask permission" inline to
- *  broadcast (Python parity — Python's _try_again thread is inlined
- *  under sync dispatch). Production must leave this off. */
+/** Toggle synchronous-dispatch mode for the conformance harness, as the
+ *  Python adapter sets synchronous_dispatch. Production must leave this
+ *  off. */
 void reputation_set_synchronous_dispatch(bool enabled);
 
 /** Reset the file-scope rep_state to a clean baseline (paxos
@@ -127,14 +111,9 @@ void reputation_set_synchronous_dispatch(bool enabled);
  *  Idempotent. */
 void reputation_reset_state(int num_peers);
 
-/** Pre-install the dispatching participant's chain length so
- *  handle_request's id2 == chain_len + 1 check is gated as if the
- *  participant had committed @p len entries. */
+/** Pre-install the dispatching participant's chain length, as if it had
+ *  committed @p len entries. */
 void reputation_set_chain_len(int len);
-
-/** Pre-install the dispatching participant's paxos last_id so
- *  handle_request's id1 > last_id check rejects stale ballots. */
-void reputation_set_last_id(int64_t id);
 
 /** Pre-set the catch-up quorum (rep_state.num_updates). Conformance
  *  scenarios lower it to 1 so a single `latest update` step triggers the
@@ -147,22 +126,11 @@ void reputation_set_num_updates(int n);
  *  reputation_reset_state. */
 void reputation_set_update_page_bytes(size_t bytes);
 
-/** Pre-install an outstanding paxos round on the dispatching
- *  participant. handle_grant looks the entry up by @p proposer_uuid.
- *  @p task_uuid carries through into the broadcast tx payload on
- *  majority. */
-void reputation_install_my_request(int64_t id1, int64_t id2,
-                                   const uuid_t proposer_uuid,
-                                   double score,
-                                   const uuid_t task_uuid);
-
-/** Pre-install an accepted (granted) round on the dispatching
- *  participant — i.e., add @p id1 to paxos.granted_ids so
- *  paxos_has_granted_id(id2)... actually paxos_has_granted_id checks
- *  the LAST id1 against id2; see paxos_record_grant. The harness uses
- *  this to satisfy handle_transaction's "did we grant this round?"
- *  check. */
-void reputation_install_accepted(int64_t id1, int64_t id2);
+/** Pre-install OUR round (@p id1, @p id2) as _forward_transaction leaves it
+ *  for handle_accepted: its score, and @p task_uuid's evidence @p channel
+ *  (NULL or "" for the default). The conformance `proposals` fixture. */
+void reputation_install_proposal(int64_t id1, int64_t id2, double score,
+                                 const uuid_t task_uuid, const char *channel);
 
 /** Keep placement state under @p dir rather than the config directory, or
  *  NULL for the config directory. Test and conformance seam: every
@@ -208,6 +176,16 @@ int reputation_set_roster_anchor(const json_t *members);
  *  does. True when it was reset. */
 bool reputation_reset_pre_roster(const process_t *proc);
 
+/** Tenure (doc/architecture/reputation.md, "Tenure"): take @p since (seconds
+ *  since the epoch) as when this node first held @p peer_uuid as a member,
+ *  with signing key @p key_hex (NULL: whatever key the next sweep sees).
+ *  Marks roster.cfg.json as already read. */
+void reputation_set_member_since(const uuid_t peer_uuid, const char *key_hex,
+                                 double since);
+/** Tenure: use @p seconds as the minimum instead of AT_REP_MIN_TENURE_SEC
+ *  (negative: back to the environment). Reset by reputation_reset_state. */
+void reputation_set_min_tenure(double seconds);
+
 /** Write each placing chain's pool if it changed, as the process loop does. */
 void reputation_persist_pools(const process_t *proc);
 /** Put the primary chain's persisted pool back, as boot does (once per state
@@ -245,8 +223,8 @@ int reputation_get_chain_len(void);
  *  Returns -1 if state is uninitialized. */
 int reputation_get_committed_tx_count(void);
 
-/** Count the ordinary halves rep_state.history holds (pending or committed)
- *  and how many of them carry a commit certificate, for the `halves_held` /
+/** Count the ordinary halves rep_state.history holds (pending, committed, or
+ *  waiting in its pool) and how many of them carry a commit certificate, for the `halves_held` /
  *  `certified_halves` expected_state assertions (doc/architecture/reputation.md, "Commit certificates").
  *  Mirrors the Python adapter's reading of Transaction.commit_sigs. */
 void reputation_get_commit_cert_counts(int *halves_held, int *certified_halves);
@@ -303,30 +281,11 @@ void reputation_force_checkpoint(const process_t *proc,
                                 const char *self_uuid_str,
                                 const char *chain_key);
 
-/** Read the count of granted Paxos rounds for the
- *  `requests_count` expected_state assertion. */
-int reputation_get_request_count(void);
-
-/** This node's own rounds under way (rep_state.my_requests): each one's task
- *  and score, at most @p cap of them, for the `proposed_tasks` expected_state
- *  assertion (the re-proposal an adoption makes, Agora Phase 4 DDIL). Returns
- *  how many were written, or -1 if state is uninitialized. Mirrors the Python
- *  adapter reading process.my_requests. */
-int reputation_get_my_request_tasks(uuid_t *tasks, double *scores, int cap);
-
-/** Read the current Paxos `last_id` for the `last_id_set`
- *  expected_state assertion. Returns 0 if state is uninitialized OR
- *  if last_id has never been advanced — Python's `self.last_id is
- *  not None` maps to `> 0` here (paxos_handle_request only ever
- *  sets last_id to id1, which scenarios pin > 0). */
-int64_t reputation_get_last_id(void);
-
 /** Pre-install a transaction_weight in rep_state.task_weights for
  *  @p task_uuid. The conformance harness calls this so scenarios can
  *  pin per-task weights without driving the full
- *  Capability-registration → handle_grant → handle_transaction wire
- *  flow. Production code MUST NOT call this. Mirrors the existing
- *  install_my_request / install_accepted test hooks. */
+ *  Capability-registration → _forward_transaction → handle_transaction
+ *  wire flow. Production code MUST NOT call this. */
 void reputation_install_task_weight(const uuid_t task_uuid, int weight);
 
 /** Pre-install a bilateral Transaction (@p task_uuid) in
@@ -337,6 +296,14 @@ void reputation_install_task_weight(const uuid_t task_uuid, int weight);
 void reputation_install_tx_pair(const uuid_t task_uuid,
                                 const uuid_t p1_uuid, double p1_score,
                                 const uuid_t p2_uuid, double p2_score);
+
+/** reputation_install_tx_pair with each half's evidence channel (NULL for the
+ *  default). The conformance `tx_history` fixture's p1_channel / p2_channel. */
+void reputation_install_tx_pair_tagged(const uuid_t task_uuid,
+                                       const uuid_t p1_uuid, double p1_score,
+                                       const char *p1_channel,
+                                       const uuid_t p2_uuid, double p2_score,
+                                       const char *p2_channel);
 
 /** Pre-install ONE SIDE of a Transaction (@p task_uuid): @p peer_uuid scored
  *  at @p score, the counterparty slot left open.
@@ -392,6 +359,14 @@ int reputation_install_tx_attested_scoped(const uuid_t verifier_uuid,
                                           const char *evidence_digest,
                                           const char *scope,
                                           const char *cert_json);
+
+/** Pool a verifier-attested entry (test hook): where a certified
+ *  attestation waits to be placed, without the quorum round. Returns
+ *  tx_history_pool_attested's result. */
+int reputation_install_pooled_attested(const uuid_t verifier_uuid,
+                                       double score, const char *channel,
+                                       const uuid_t subject_uuid,
+                                       const char *evidence_digest);
 
 /** Store a checkpoint as a finalized one arriving would (test hook): the
  *  evidence file, the finality record, and the durable attested records

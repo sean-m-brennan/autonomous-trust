@@ -94,7 +94,13 @@ class IdentityHooks:
     ``credential_anchored(proc, signer)`` is asked by REPUTATION about an
     evidence co-signer it never admitted (``signer`` is the carried identity
     dict). ``on_tick(proc, queues, tick)`` runs once per identity loop
-    iteration (C's zta_verify process has its own loop)."""
+    iteration (C's zta_verify process has its own loop).
+
+    ``is_contact(proc, uuid_str)`` says whether ``uuid_str`` is someone the user
+    recorded as a contact (first contact). Duplicate detection lets such a peer,
+    presenting the keys it is known by, be voted on like any newcomer, which is
+    the one route by which a contact joins the cohort. None is a node with no
+    contacts."""
     on_start: Optional[Callable[[Any, Any], None]] = None
     on_peer_confirmed: Optional[Callable[[Any, Any, Any], None]] = None
     periodic_resync: Optional[Callable[[Any, Any], None]] = None
@@ -105,6 +111,7 @@ class IdentityHooks:
     operator_credential: Optional[Callable[[Any, Any, bytes], bool]] = None
     credential_anchored: Optional[Callable[[Any, dict], bool]] = None
     on_tick: Optional[Callable[[Any, Any, Any], None]] = None
+    is_contact: Optional[Callable[[Any, str], bool]] = None
 
 
 @dataclass(frozen=True)
@@ -194,7 +201,12 @@ class Extension:
     ``transports`` is ``((kind, class path), ...)``: network transports this
     feature supplies, under the name C registers them by (``dtn_bp``), so the
     hybrid transport can open one as a leg (:func:`transport_class`). A node
-    can also name the class path as its transport directly."""
+    can also name the class path as its transport directly.
+
+    ``process_aliases`` is ``((wire_name, local_process), ...)``: a process a
+    C peer addresses that Python runs inside another one. ZTA's findings go to
+    C's ``zta_verify`` process; Python's ZTA rides identity, so the network
+    process delivers them there (:func:`process_alias`)."""
     name: str
     enabled: Callable[[], bool]
     register_handlers: Callable[[Any, str], None]
@@ -208,6 +220,7 @@ class Extension:
     network: Optional[NetworkHooks] = None
     plaintext_verbs: tuple = ()
     transports: tuple = ()
+    process_aliases: tuple = ()
 
 
 def _builtin() -> list[Extension]:
@@ -294,6 +307,16 @@ def transport_class(kind: str):
         for name, path in ext.transports:
             if name == kind:
                 return path
+    return None
+
+
+def process_alias(name: str):
+    """The local process an enabled extension delivers wire process ``name``
+    to, or None (:attr:`Extension.process_aliases`)."""
+    for ext in enabled_extensions():
+        for wire_name, local in ext.process_aliases:
+            if wire_name == name:
+                return local
     return None
 
 

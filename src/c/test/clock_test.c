@@ -33,6 +33,12 @@ DEFINE_TEST(test_clock_state_queries_the_real_kernel)
     /* Unmocked on purpose: the syscall must actually answer here, which is
      * the whole reason it was chosen over a chrony socket. */
     at_clock_state_t state = at_clock_state();
+#ifdef _WIN32
+    /* Windows has no kernel NTP state to read; the state says so, rather than
+     * claiming a clean clock (compat/win32/sys/timex.h). */
+    ck_assert(!state.available);
+    return;
+#endif
     ck_assert(state.available);
     /* An undisciplined kernel reports 16 s; a disciplined one reports far
      * less. Either is legitimate — what must hold is the invariant between
@@ -132,8 +138,9 @@ DEFINE_TEST(test_enforcing_accepts_a_good_clock)
         ck_assert_int_eq(at_clock_require_synced(NULL, 60000000L), 0);
     else
         /* Unsynced hosts cannot exercise the accept path; the refusal above
-         * already covers this host, and the bound is checked there. */
-        ck_assert(state.max_error_us > 0);
+         * already covers this host, and the bound is checked there. Where
+         * the state is unavailable (Windows) there is no bound to check. */
+        ck_assert(!state.available || state.max_error_us > 0);
     unsetenv(AT_CLOCK_REQUIRE_ENV);
 }
 

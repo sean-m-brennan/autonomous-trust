@@ -22,7 +22,8 @@
  *  and the owner's half committed later. Owner and verifier paired it at index
  *  9; the late pair held the owner's half alone, their chains forked two and
  *  two, and no checkpoint ever reached a quorum. _hand_off_pending_halves
- *  re-sends our unpaired halves to each newcomer at 5, 15 and 30 s. The
+ *  re-sends our unpaired halves, waiting in the pool, to each newcomer at 5,
+ *  15 and 30 s. The
  *  fixture is rep_commit_retry_test.c's. Mirrors
  *  tests/a_unit/test_repprocess_half_handoff.py.
  */
@@ -51,6 +52,7 @@
 #include "utilities/msg_types.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/allocation.h"
+#include "utilities/util.h"
 
 static char COMMITTED_FN[] = "tx committed";
 
@@ -150,26 +152,59 @@ static void _dispatch(process_t *proc, identity_t *sender, json_t *payload)
     smrt_deref(pub);
 }
 
-/* @p scorer's half of @p task, committed as handle_accepted broadcasts it. A
- * frame from ourselves plants our own half, which handle_committed accepts
- * because it writes only its sender's half. */
-static void _commit_half(process_t *proc, identity_t *scorer,
-                         const char *task_str, double score, const char *channel)
+/* @p scorer's half of @p task, committed as handle_accepted broadcasts it,
+ * with a certificate signed by @p signer (any member but the scorer). A frame
+ * from ourselves plants our own half, which handle_committed accepts because
+ * it writes only its sender's half; it waits in the pool for its placement. */
+static void _commit_half_by(process_t *proc, identity_t *scorer,
+                            identity_t *signer, const char *task_str,
+                            double score, const char *channel)
 {
-    char who[UUID_STRING_LEN + 1];
+    char who[UUID_STRING_LEN + 1], by[UUID_STRING_LEN + 1];
     uuid_unparse_lower(scorer->uuid, who);
+    uuid_unparse_lower(signer->uuid, by);
+    uuid_t task;
+    ck_assert_int_eq(uuid_parse(task_str, task), 0);
+    uint8_t desig[512];
+    size_t dlen = commit_designation(scorer->uuid, task, score, channel, desig,
+                                     sizeof(desig));
+    ck_assert(dlen > 0);
+    unsigned char sig[crypto_sign_BYTES];
+    ck_assert(crypto_sign_detached(sig, NULL, desig, dlen,
+                                   signer->signature.private) == 0);
+    char hex[crypto_sign_BYTES * 2 + 1];
+    hexlify(sig, crypto_sign_BYTES, (unsigned char *)hex);
     json_t *p = json_object();
     json_object_set_new(p, "task_uuid", json_string(task_str));
     json_object_set_new(p, "peer_uuid", json_string(who));
     json_object_set_new(p, "score", json_real(score));
     if (channel != NULL)
         json_object_set_new(p, "channel", json_string(channel));
+    json_object_set_new(p, "certificate", json_pack("{s:s}", by, hex));
     _dispatch(proc, scorer, p);
     json_decref(p);
 }
 
 typedef struct { identity_t *me, *alice, *carol; process_t *proc;
                  char t[UUID_STRING_LEN + 1]; } cohort_t;
+
+static cohort_t *g_c;
+
+/* The same, signed by me for anyone else's half and by alice for mine. */
+static void _commit_half(process_t *proc, identity_t *scorer,
+                         const char *task_str, double score, const char *channel)
+{
+    identity_t *signer = scorer == g_c->me ? g_c->alice : g_c->me;
+    _commit_half_by(proc, scorer, signer, task_str, score, channel);
+}
+
+/* Ordinary halves held, in the chain and the pool. */
+static int _halves(void)
+{
+    int held = 0, certified = 0;
+    reputation_get_commit_cert_counts(&held, &certified);
+    return held;
+}
 
 static void _task(char *out)
 {
@@ -190,6 +225,7 @@ static void _begin(cohort_t *c)
     c->proc = _mk_process(c->me);
     _add_peer(c->proc, c->alice);
     _task(c->t);
+    g_c = c;
 }
 
 static void _end(void)
@@ -299,17 +335,19 @@ DEFINE_TEST(test_the_joiner_pairs_the_late_half)
     _add_peer(carol, c.me);
     _add_peer(carol, c.alice);
     _commit_half(carol, c.alice, c.t, 0.9, NULL);
-    ck_assert_int_eq(reputation_get_committed_tx_count(), 0);
+    ck_assert_int_eq(_halves(), 1);
 
-    /* With it, the same late half pairs. */
+    /* With it, the same late half pairs, ready to be placed. */
     reputation_reset_state(2);
     carol = _mk_process(c.carol);
     _add_peer(carol, c.me);
     _add_peer(carol, c.alice);
     _dispatch(carol, c.me, handed);
-    ck_assert_int_eq(reputation_get_committed_tx_count(), 0);
+    ck_assert_int_eq(_halves(), 1);
     _commit_half(carol, c.alice, c.t, 0.9, NULL);
-    ck_assert_int_eq(reputation_get_committed_tx_count(), 1);
+    ck_assert_int_eq(_halves(), 2);
+    uuid_t pooled[4];
+    ck_assert_int_eq(reputation_get_pool_tasks(pooled, 4), 1);
     json_decref(handed);
     _end();
 }

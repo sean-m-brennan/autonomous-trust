@@ -36,6 +36,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>  /* mkdtemp: Darwin declares it here, not in stdlib.h */
 #include <string.h>
 #include <time.h>
 
@@ -54,6 +55,7 @@
 #include <openssl/evp.h>              /* scenario-time operator-binding signing */
 #include <openssl/pem.h>
 #include "zta/zta_policy.h"           /* zta_policy_t / defaults / from_json */
+#include "zta/zta_delegation.h"       /* members' vouches and alerts (ISSUES §2.20) */
 #include "zta/zta_binding.h"          /* credential->identity binding
 # (doc/architecture/zta-integration.md) */
 #endif
@@ -965,8 +967,6 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
                     if (json_is_string(gwf))
                         impl->proc->protocol.group.wire_format =
                             net_wire_format_from_name(json_string_value(gwf));
-                    impl->proc->protocol.group.commit_certificates =
-                        json_is_true(json_object_get(gspec, "commit_certificates"));
                     memcpy(impl->fixture_group_pub,
                            impl->proc->protocol.group.encryptor.public,
                            sizeof(impl->fixture_group_pub));
@@ -1207,6 +1207,13 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
 
     json_t *amnesia_j = json_object_get(fixtures, "amnesia_known");
     bool amnesia_known = json_is_true(amnesia_j);
+    /* amnesia_member goes one step further: the newcomer is also in the
+     * existing participants' group address map, i.e. a MEMBER that lost its
+     * state, which is the only node the amnesia branch readmits without a
+     * vote. Mirrors the Python adapter. */
+    bool amnesia_member = json_is_true(json_object_get(fixtures, "amnesia_member"));
+    if (amnesia_member)
+        amnesia_known = true;
 
     /* Find the new_node by role. */
     int newcomer_idx = -1;
@@ -1228,6 +1235,13 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
         memcpy(&p->protocol.peers[p->protocol.num_peers],
                new_impl->pub, sizeof(public_identity_t));
         p->protocol.num_peers++;
+        if (amnesia_member) {
+            if (p->protocol.group.address_map.items == NULL)
+                map_init(&p->protocol.group.address_map);
+            char nu[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(new_impl->pub->uuid, nu);
+            group_add_address(&p->protocol.group, nu, new_impl->pub->address);
+        }
     }
 }
 
@@ -1885,6 +1899,27 @@ static int _build_inbound(sce_run_ctx_t *ctx,
      * no pre-existing scenario changes shape. Slots 0-2 mirror
      * _build_announcement: package_hash (empty; C has no package hash),
      * capabilities, attestation. */
+    /* `rekeyed: true` presents the sender's uuid under fresh signing and
+     * encryption keys; `address` presents it from another address (a node
+     * that moved networks). Both model a returning node. Mirrors the Python
+     * adapter. */
+    if (strcmp(function, "request_access") == 0 && json_is_object(payload)) {
+        public_identity_t *fw = &out->info.net_msg.from_whom;
+        if (json_is_true(json_object_get(payload, "rekeyed"))) {
+            crypto_sign_keypair(fw->signature.public, fw->signature.private);
+            hexlify(fw->signature.public, crypto_sign_PUBLICKEYBYTES,
+                    fw->signature.public_hex);
+            crypto_box_keypair(fw->encryptor.public, fw->encryptor.private);
+            hexlify(fw->encryptor.public, crypto_box_PUBLICKEYBYTES,
+                    fw->encryptor.public_hex);
+            sodium_memzero(fw->signature.private, sizeof(fw->signature.private));
+            sodium_memzero(fw->encryptor.private, sizeof(fw->encryptor.private));
+        }
+        const char *moved = json_string_value(json_object_get(payload, "address"));
+        if (moved != NULL && moved[0] != '\0')
+            at_strlcpy(fw->address, moved, sizeof(fw->address));
+    }
+
     if (strcmp(function, "request_access") == 0 && json_is_object(payload)) {
         const char *jt = json_string_value(json_object_get(payload,
                                                            "group_uuid"));
@@ -2672,6 +2707,37 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                              pid, uuid_str, (int)proc->protocol.num_peers);
                     return -1;
                 }
+            } else if (strcmp(key, "member_address") == 0) {
+                /* {participant_id: address}: the address this participant's
+                 * group address map holds for that member. Mirrors the
+                 * Python adapter's member_address. */
+                const char *ma_pid;
+                json_t *ma_want;
+                json_object_foreach(val, ma_pid, ma_want) {
+                    sce_participant_t *other = sce_find_participant(ctx, ma_pid);
+                    if (other == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: member_address names unknown participant %s",
+                                 pid, ma_pid);
+                        return -1;
+                    }
+                    char mu[UUID_STR_LEN + 1];
+                    uuid_unparse_lower(((ic_impl_t *)other->impl)->pub->uuid, mu);
+                    data_t *addr_dat = NULL;
+                    string_t actual = NULL;
+                    if (proc->protocol.group.address_map.items != NULL
+                        && map_get(&proc->protocol.group.address_map, mu,
+                                   &addr_dat) == 0 && addr_dat != NULL)
+                        (void)data_string_ptr(addr_dat, &actual);
+                    const char *want = json_string_value(ma_want);
+                    if (actual == NULL || want == NULL || strcmp(actual, want) != 0) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: member_address[%s]=%s, expected %s", pid,
+                                 ma_pid, actual ? actual : "(none)",
+                                 want ? want : "(none)");
+                        return -1;
+                    }
+                }
             } else if (strcmp(key, "direct_peers") == 0) {
                 /* The OPTIONAL 1:1 first-contact handshake's admission, as
                  * {participant_id: bool}. True asserts BOTH halves of what a
@@ -3341,15 +3407,6 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                              got ? got : "?", want ? want : "?");
                     return -1;
                 }
-            } else if (strcmp(key, "group_commit_certificates") == 0) {
-                bool want = json_is_true(val);
-                bool got = proc->protocol.group.commit_certificates;
-                if (got != want) {
-                    snprintf(ctx->err, sizeof(ctx->err),
-                             "%s: group_commit_certificates=%d, expected %d",
-                             pid, (int)got, (int)want);
-                    return -1;
-                }
             } else if (strcmp(key, "group_size") == 0) {
                 /* Address-map size — proves the larger membership WAS adopted.
                  * Mirrors Python len(group.addresses). */
@@ -3716,6 +3773,196 @@ static void _install_contacts(sce_run_ctx_t *ctx)
 }
 #endif /* AT_FIRST_CONTACT_ENABLED */
 
+#ifdef AT_ZTA_ENABLED
+/* Members' ZTA findings (scenarios `zta-delegation-*`, ISSUES §2.20): the
+ * fixture's event table offered to zta_deleg_event / zta_deleg_own_result,
+ * each verdict and each standing published compared with the table. Every
+ * answer the decisions ask for comes from the fixture. Mirrors Python
+ * _run_zta_delegation. */
+typedef struct {
+    json_t *fx;               /* fixtures.zta_delegation */
+    json_t *reputations;      /* uuid -> score; changed by `reputation` events */
+    json_t *published;        /* [{peer, standing, ceiling}] for this event */
+} zd_ctx_t;
+
+static const char *_zd_standing_str(peer_standing_t s)
+{
+    return s == PEER_STANDING_PROVED ? "proved"
+         : s == PEER_STANDING_CAPPED ? "capped" : "failed";
+}
+
+static zta_status_t _zd_status(const char *s)
+{
+    static const zta_status_t all[] = { ZTA_VERIFIED, ZTA_REJECTED, ZTA_DEFERRED,
+                                        ZTA_EXPIRED, ZTA_REVOKED, ZTA_UNAVAILABLE };
+    for (size_t i = 0; s != NULL && i < sizeof(all) / sizeof(all[0]); i++)
+        if (strcmp(s, zta_status_str(all[i])) == 0)
+            return all[i];
+    return ZTA_REJECTED;
+}
+
+static bool _zd_is_member(void *user, const char *uuid)
+{
+    json_t *m = json_object_get(((zd_ctx_t *)user)->fx, "members");
+    size_t i;
+    json_t *one;
+    json_array_foreach(m, i, one)
+        if (json_is_string(one) && strcmp(json_string_value(one), uuid) == 0)
+            return true;
+    return false;
+}
+
+static bool _zd_recorded_hash(void *user, const char *peer, uint8_t out[ZTA_HASH_LEN])
+{
+    const char *hex = json_string_value(
+        json_object_get(json_object_get(((zd_ctx_t *)user)->fx, "records"), peer));
+    size_t n = 0;
+    return hex != NULL
+        && sodium_hex2bin(out, ZTA_HASH_LEN, hex, strlen(hex), NULL, &n, NULL) == 0
+        && n == ZTA_HASH_LEN;
+}
+
+static int _zd_reputation(void *user, const char *uuid, double *score)
+{
+    json_t *v = json_object_get(((zd_ctx_t *)user)->reputations, uuid);
+    if (!json_is_number(v))
+        return 0;
+    *score = json_number_value(v);
+    return 1;
+}
+
+static zta_status_t _zd_own_check(void *user, const char *peer)
+{
+    const char *s = json_string_value(
+        json_object_get(json_object_get(((zd_ctx_t *)user)->fx, "own_checks"), peer));
+    return s != NULL ? _zd_status(s) : ZTA_UNAVAILABLE;
+}
+
+static void _zd_standing(void *user, const char *peer, peer_standing_t standing,
+                         double ceiling, const char *reason)
+{
+    (void)reason;
+    json_array_append_new(((zd_ctx_t *)user)->published,
+        json_pack("{s:s, s:s, s:o}", "peer", peer, "standing", _zd_standing_str(standing),
+                  "ceiling", ceiling < 0.0 ? json_null() : json_real(ceiling)));
+}
+
+/* Whether @p got (published) equals @p want (the event's `standings`, absent:
+ * none). Ceilings to 1e-9. */
+static bool _zd_standings_match(json_t *want, json_t *got)
+{
+    size_t nw = json_is_array(want) ? json_array_size(want) : 0;
+    if (nw != json_array_size(got))
+        return false;
+    for (size_t i = 0; i < nw; i++) {
+        json_t *w = json_array_get(want, i), *g = json_array_get(got, i);
+        const char *wp = json_string_value(json_object_get(w, "peer"));
+        const char *ws = json_string_value(json_object_get(w, "standing"));
+        json_t *wc = json_object_get(w, "ceiling"), *gc = json_object_get(g, "ceiling");
+        if (wp == NULL || ws == NULL
+            || strcmp(wp, json_string_value(json_object_get(g, "peer"))) != 0
+            || strcmp(ws, json_string_value(json_object_get(g, "standing"))) != 0)
+            return false;
+        bool wnull = (wc == NULL || json_is_null(wc));
+        if (wnull != json_is_null(gc))
+            return false;
+        if (!wnull && fabs(json_number_value(wc) - json_number_value(gc)) > 1e-9)
+            return false;
+    }
+    return true;
+}
+
+static int run_zta_delegation(const at_case_t *c, char *err, size_t err_len)
+{
+    json_t *fx = json_object_get(json_object_get(c->data, "fixtures"), "zta_delegation");
+    json_t *events = json_object_get(fx, "events");
+    json_t *pol = json_object_get(fx, "policy");
+    if (!json_is_array(events) || !json_is_object(pol)) {
+        snprintf(err, err_len, "scenario: fixtures.zta_delegation needs policy and events");
+        return -1;
+    }
+    zd_ctx_t z = { .fx = fx, .published = json_array() };
+    json_t *reps = json_object_get(fx, "reputations");
+    z.reputations = json_is_object(reps) ? json_deep_copy(reps) : json_object();
+    zta_deleg_ctx_t ctx = {
+        .user = &z, .is_member = _zd_is_member, .recorded_hash = _zd_recorded_hash,
+        .reputation = _zd_reputation, .own_check = _zd_own_check,
+        .standing = _zd_standing,
+        .min_reputation = json_number_value(json_object_get(pol, "min_reputation")),
+        .quorum = (int)json_integer_value(json_object_get(pol, "quorum")),
+        .ddil_cap = json_number_value(json_object_get(pol, "ddil_cap")),
+        .revocation_penalty = json_number_value(json_object_get(pol, "revocation_penalty")),
+    };
+    zta_deleg_t *d = calloc(1, sizeof(*d));
+    if (d == NULL) {
+        json_decref(z.published);
+        json_decref(z.reputations);
+        snprintf(err, err_len, "OOM");
+        return -1;
+    }
+    zta_deleg_init(d);
+    bool all = true;
+    size_t i;
+    json_t *ev;
+    json_array_foreach(events, i, ev) {
+        json_array_clear(z.published);
+        const char *peer = json_string_value(json_object_get(ev, "peer"));
+        json_t *rep = json_object_get(ev, "reputation");
+        if (json_is_object(rep)) {
+            json_object_update(z.reputations, rep);
+            continue;
+        }
+        const char *own = json_string_value(json_object_get(ev, "own_result"));
+        if (own != NULL) {
+            zta_deleg_own_result(d, peer, _zd_status(own));
+            continue;
+        }
+        const char *kind = json_string_value(json_object_get(ev, "kind"));
+        const char *from = json_string_value(json_object_get(ev, "from"));
+        const char *hex = json_string_value(json_object_get(ev, "hash"));
+        const char *want = json_string_value(json_object_get(ev, "verdict"));
+        uint8_t hash[ZTA_HASH_LEN] = {0};
+        size_t n = 0;
+        if (kind == NULL || from == NULL || peer == NULL || hex == NULL || want == NULL
+            || sodium_hex2bin(hash, sizeof(hash), hex, strlen(hex), NULL, &n, NULL) != 0
+            || n != ZTA_HASH_LEN) {
+            snprintf(err, err_len, "scenario: event %zu malformed", i);
+            all = false;
+            break;
+        }
+        zta_deleg_verdict_t v = zta_deleg_event(
+            d, &ctx, strcmp(kind, "vouch") == 0 ? ZTA_DELEG_VOUCH : ZTA_DELEG_ALERT,
+            from, peer, hash, _zd_status(json_string_value(json_object_get(ev, "status"))));
+        if (strcmp(zta_deleg_verdict_str(v), want) != 0
+            || !_zd_standings_match(json_object_get(ev, "standings"), z.published)) {
+            char *got = json_dumps(z.published, JSON_COMPACT);
+            fprintf(stderr, "zta-delegation event %zu: verdict %s (want %s), standings %s\n",
+                    i, zta_deleg_verdict_str(v), want, got ? got : "?");
+            free(got);
+            all = false;
+        }
+    }
+    free(d);
+    json_decref(z.published);
+    json_decref(z.reputations);
+    if (err[0] != '\0')
+        return -1;
+    /* Asserted, never assumed: a table the scenario forgot to pin fails. */
+    json_t *want = json_object_get(json_object_get(json_object_get(c->data, "expected_state"),
+                                                   "node"), "all_cases_match");
+    if (!json_is_boolean(want)) {
+        snprintf(err, err_len, "scenario: expected_state.node.all_cases_match missing");
+        return -1;
+    }
+    if (json_is_true(want) != all) {
+        snprintf(err, err_len, "node: all_cases_match mismatch: expected %s, got %s",
+                 json_is_true(want) ? "true" : "false", all ? "true" : "false");
+        return -1;
+    }
+    return 0;
+}
+#endif /* AT_ZTA_ENABLED */
+
 void at_identity_run(const at_case_t *c, at_case_result_t *out) {
     at_identity_run_ext(c, out, NULL);
 }
@@ -3732,6 +3979,24 @@ void at_identity_run_ext(const at_case_t *c, at_case_result_t *out,
                  "C identity adapter only handles kind:scenario|negative (got %s)", c->kind);
         at_case_result_set_skip(out, detail);
         return;
+    }
+
+    /* Members' ZTA findings: a table of decisions, no participants. */
+    {
+        json_t *fx = json_object_get(c->data, "fixtures");
+        if (json_is_object(fx) && json_object_get(fx, "zta_delegation") != NULL) {
+#ifdef AT_ZTA_ENABLED
+            char derr[256] = {0};
+            if (run_zta_delegation(c, derr, sizeof(derr)) == 0)
+                at_case_result_set_pass(out, 0);
+            else
+                at_case_result_set_fail(out, 0, "AssertionError", derr);
+#else
+            at_case_result_set_skip(out, "ZTA scenario skipped: C built without AT_ZTA "
+                                         "(build -DAT_ZTA=ON to run it symmetrically)");
+#endif
+            return;
+        }
     }
 
     /* ZTA admission scenarios (fixtures.zta_policy present) require the ZTA

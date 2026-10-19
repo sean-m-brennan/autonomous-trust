@@ -18,7 +18,6 @@ participants:
     role: member
 
 fixtures:
-  ordered_placement: true
   roster: {}          # an unfounded chain: no roster in force
 
 steps:

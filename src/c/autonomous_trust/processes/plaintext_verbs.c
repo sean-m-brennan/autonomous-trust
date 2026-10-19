@@ -44,7 +44,7 @@ static bool _in(char list[][PLAINTEXT_VERB_LEN + 1], size_t n, const char *v)
 }
 
 /* Parse @p path into @p out. 1: no file; 0: read; -1: malformed (logged). */
-static int _read(const char *path, char out[][PLAINTEXT_VERB_LEN + 1], size_t *n,
+static int _read_verbs(const char *path, char out[][PLAINTEXT_VERB_LEN + 1], size_t *n,
                  logger_t *logger)
 {
     *n = 0;
@@ -121,7 +121,7 @@ int plaintext_verbs_configure(const char *cfg_dir, logger_t *logger)
     char named[PLAINTEXT_VERBS_MAX][PLAINTEXT_VERB_LEN + 1];
     size_t n = 0;
     /* No configuration directory at all reads as no file. */
-    int rc = cfg_dir[0] != '\0' ? _read(path, named, &n, logger) : 1;
+    int rc = cfg_dir[0] != '\0' ? _read_verbs(path, named, &n, logger) : 1;
     if (rc < 0)
         return -1;
     bool absent = rc == 1;

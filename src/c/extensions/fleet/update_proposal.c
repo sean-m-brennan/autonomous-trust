@@ -105,6 +105,14 @@ static size_t build_signable(const update_proposal_t *prop, uint8_t *buf, size_t
     memcpy(buf + offset, prop->target_arch, alen);
     offset += alen;
 
+    /* Who signed and which proposal: unsigned, either could be swapped, and a
+     * proposal replayed under a fresh uuid would be a new vote. */
+    if (offset + 2 * sizeof(uuid_t) > buflen) return 0;
+    memcpy(buf + offset, prop->signer_uuid, sizeof(uuid_t));
+    offset += sizeof(uuid_t);
+    memcpy(buf + offset, prop->proposal_uuid, sizeof(uuid_t));
+    offset += sizeof(uuid_t);
+
     return offset;
 }
 

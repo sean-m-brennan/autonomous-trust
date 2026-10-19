@@ -25,7 +25,9 @@ the identity hooks below; the core names none of it.
 from autonomous_trust.core.extensions import Extension, IdentityHooks
 
 from autonomous_trust.zta.admission import (admission_gate, credential_anchored, gateway_refused,
-                        init_state, join_refused, on_tick, operator_credential)
+                        init_state, join_refused, on_tick, operator_credential,
+                        register_delegation_handlers)
+from autonomous_trust.zta.delegation import ZTA_PROCESS
 from autonomous_trust.zta.zta_policy import ZtaPolicy
 
 
@@ -35,10 +37,13 @@ def _enabled() -> bool:
 
 
 def _register_handlers(proc, proc_name: str) -> None:
-    # No verbs (re-verification and revocation ride the identity loop in Python;
-    # C has its own zta_verify process). Identity and reputation keep state.
+    # Re-verification and members' findings ride the identity loop in Python (C
+    # has its own zta_verify process, which the alias below stands in for).
+    # Identity and reputation keep state.
     if proc_name in ('identity', 'reputation'):
         init_state(proc)
+    if proc_name == 'identity':
+        register_delegation_handlers(proc)
 
 
 def _check_config(cfg_dir, logger) -> None:
@@ -58,4 +63,6 @@ EXTENSION = Extension(
     identity=IdentityHooks(admission_gate=admission_gate, join_refused=join_refused,
                            gateway_refused=gateway_refused,
                            operator_credential=operator_credential,
-                           credential_anchored=credential_anchored, on_tick=on_tick))
+                           credential_anchored=credential_anchored, on_tick=on_tick),
+    # Members' zta_verified / zta_revoked are addressed to C's process name.
+    process_aliases=((ZTA_PROCESS, 'identity'),))

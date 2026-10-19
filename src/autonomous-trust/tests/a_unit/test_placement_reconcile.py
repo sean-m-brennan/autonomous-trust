@@ -222,8 +222,7 @@ class TestReconcileUnderPlacement:
 
 def _process(n=4):
     idents = [_ident('r%d' % i, i + 1) for i in range(n)]
-    rp, q = _node(idents[0], _roster(idents[0], idents), required=False)
-    rp.protocol.group.ordered_placement = True
+    rp, q = _node(idents[0], _roster(idents[0], idents))
     peers = rp.protocol.peers.all
     rp.protocol.peers.find_top_n = lambda k, peers=peers: list(peers)[:k]
     from tests.a_unit.test_placement_acceptor import _roster_of

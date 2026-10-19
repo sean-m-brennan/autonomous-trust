@@ -18,8 +18,8 @@
  *
  *  The cross-language half is pinned by conformance/scenarios/reputation/
  *  commit-cert-*. These cover what a single-step scenario cannot: the
- *  designation's bytes against Python's, the group declaration's JSON and its
- *  knob, the certificate store (catch-up wire, reconcile, evidence), and the
+ *  designation's bytes against Python's, the retired group declaration, the
+ *  certificate store (catch-up wire, reconcile, evidence), and the
  *  two catch-up exemptions -- a quorum checkpoint covering the past, and an
  *  entry this node already holds identically. */
 
@@ -162,7 +162,11 @@ DEFINE_TEST(test_the_designation_matches_python_byte_for_byte)
 }
 END_TEST_DEFINITION()
 
-DEFINE_TEST(test_the_group_declaration_is_omitted_unless_set)
+/* The declarations were retired 2026-10-16: every group places its order and
+ * certifies its commits. A group config written before then still loads, its
+ * old keys ignored whatever they said, and none is written back. Mirrors
+ * Python test_commit_certificates.py. */
+DEFINE_TEST(test_a_retired_group_declaration_is_ignored)
 {
     group_t g;
     char bcast[] = "10.0.0.255";
@@ -170,69 +174,23 @@ DEFINE_TEST(test_the_group_declaration_is_omitted_unless_set)
     json_t *obj = NULL;
     ck_assert_ret_ok(group_to_json(&g, &obj));
     ck_assert_ptr_null(json_object_get(obj, "commit_certificates"));
-    json_decref(obj);
-
-    g.commit_certificates = true;
-    ck_assert_ret_ok(group_to_json(&g, &obj));
-    ck_assert(json_is_true(json_object_get(obj, "commit_certificates")));
-    group_t back;
-    memset(&back, 0, sizeof(back));
-    ck_assert_ret_ok(group_from_json(obj, &back));
-    ck_assert(back.commit_certificates);
-    group_free(&back);
-
-    /* Only a literal true turns it on. */
-    json_object_set_new(obj, "commit_certificates", json_string("yes"));
-    group_t typo;
-    memset(&typo, 0, sizeof(typo));
-    ck_assert_ret_ok(group_from_json(obj, &typo));
-    ck_assert(!typo.commit_certificates);
-    group_free(&typo);
+    ck_assert_ptr_null(json_object_get(obj, "ordered_placement"));
+    for (int v = 0; v < 2; v++)
+    {
+        json_object_set_new(obj, "commit_certificates", json_boolean(v));
+        json_object_set_new(obj, "ordered_placement", json_boolean(v));
+        group_t back;
+        memset(&back, 0, sizeof(back));
+        ck_assert_ret_ok(group_from_json(obj, &back));
+        json_t *again = NULL;
+        ck_assert_ret_ok(group_to_json(&back, &again));
+        ck_assert_ptr_null(json_object_get(again, "commit_certificates"));
+        ck_assert_ptr_null(json_object_get(again, "ordered_placement"));
+        json_decref(again);
+        group_free(&back);
+    }
     json_decref(obj);
     group_free(&g);
-}
-END_TEST_DEFINITION()
-
-DEFINE_TEST(test_the_knob_reads_the_same_spellings_as_python)
-{
-    unsetenv("AT_COMMIT_CERTIFICATES");
-    ck_assert(!group_commit_certificates_resolve());
-    const char *on[] = { "1", "true", " Yes ", "ON" };
-    for (size_t i = 0; i < sizeof(on) / sizeof(on[0]); i++)
-    {
-        setenv("AT_COMMIT_CERTIFICATES", on[i], 1);
-        ck_assert(group_commit_certificates_resolve());
-    }
-    const char *off[] = { "0", "no", "garbage", "", "truetruetrue" };
-    for (size_t i = 0; i < sizeof(off) / sizeof(off[0]); i++)
-    {
-        setenv("AT_COMMIT_CERTIFICATES", off[i], 1);
-        ck_assert(!group_commit_certificates_resolve());
-    }
-    unsetenv("AT_COMMIT_CERTIFICATES");
-}
-END_TEST_DEFINITION()
-
-/* On by default since 2026-10-13: a typo leaves it on, and only an explicit
- * off spelling mints a group that converges the old way. Mirrors Python
- * test_ordered_placement_is_minted_on_unless_turned_off. */
-DEFINE_TEST(test_ordered_placement_is_on_unless_turned_off)
-{
-    unsetenv("AT_ORDERED_PLACEMENT");
-    ck_assert(group_ordered_placement_resolve());
-    const char *off[] = { "0", "off", " No ", "FALSE" };
-    for (size_t i = 0; i < sizeof(off) / sizeof(off[0]); i++)
-    {
-        setenv("AT_ORDERED_PLACEMENT", off[i], 1);
-        ck_assert(!group_ordered_placement_resolve());
-    }
-    const char *on[] = { "1", "garbage", "" };
-    for (size_t i = 0; i < sizeof(on) / sizeof(on[0]); i++)
-    {
-        setenv("AT_ORDERED_PLACEMENT", on[i], 1);
-        ck_assert(group_ordered_placement_resolve());
-    }
-    unsetenv("AT_ORDERED_PLACEMENT");
 }
 END_TEST_DEFINITION()
 
@@ -284,7 +242,7 @@ DEFINE_TEST(test_a_certificate_needs_its_half_and_travels_with_the_entry)
     ck_assert_str_eq(tx_history_commit_cert(&e, t, a), "{\"v\":\"aa\"}");
     json_decref(doc);
 
-    /* An undeclared group's entries keep their old shape. */
+    /* Entries without certificates keep their old shape. */
     tx_history_t plain;
     ck_assert_ret_ok(tx_history_init(&plain));
     tx_history_update(&plain, t, a, 0.9, NULL);
@@ -311,8 +269,8 @@ typedef struct {
     uuid_t tasks[3];
 } cohort_t;
 
-/* bob, rostered with alice, carol and dave (a quorum of more than 3 // 2), in
- * a group that declares certificates; alice holds three bilateral entries
+/* bob, rostered with alice, carol and dave (a quorum of more than 3 // 2);
+ * alice holds three bilateral entries
  * between herself and carol, none certified. */
 static void _cohort(cohort_t *c)
 {
@@ -325,7 +283,6 @@ static void _cohort(cohort_t *c)
     _add_peer(c->proc, c->alice);
     _add_peer(c->proc, c->carol);
     _add_peer(c->proc, c->dave);
-    c->proc->protocol.group.commit_certificates = true;
     ck_assert_ret_ok(tx_history_init(&c->src));
     for (int i = 0; i < 3; i++)
     {
@@ -432,26 +389,10 @@ DEFINE_TEST(test_an_entry_we_already_hold_is_not_asked_again)
 }
 END_TEST_DEFINITION()
 
-DEFINE_TEST(test_an_undeclared_group_accepts_an_uncertified_segment)
-{
-    cohort_t c;
-    _cohort(&c);
-    c.proc->protocol.group.commit_certificates = false;
-    json_t *seg = _segment(&c, 3);
-    _dispatch(c.proc, c.alice, UPDATE_FN, seg);
-    json_decref(seg);
-    ck_assert_int_eq(reputation_get_committed_tx_count(), 3);
-    tx_history_free(&c.src);
-}
-END_TEST_DEFINITION()
-
 RUN_TESTS(RepCommitCert,
           test_the_designation_matches_python_byte_for_byte,
-          test_the_group_declaration_is_omitted_unless_set,
-          test_the_knob_reads_the_same_spellings_as_python,
-          test_ordered_placement_is_on_unless_turned_off,
+          test_a_retired_group_declaration_is_ignored,
           test_a_certificate_needs_its_half_and_travels_with_the_entry,
           test_a_quorum_checkpoint_covers_what_it_commits_to,
           test_a_checkpoint_the_segment_does_not_reproduce_covers_nothing,
-          test_an_entry_we_already_hold_is_not_asked_again,
-          test_an_undeclared_group_accepts_an_uncertified_segment)
+          test_an_entry_we_already_hold_is_not_asked_again)

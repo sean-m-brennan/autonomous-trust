@@ -136,83 +136,11 @@ DEFINE_TEST(test_reputation_threshold_exact)
 }
 END_TEST_DEFINITION()
 
-/* ---------------------------------------------------------------
- * test_should_accept_valid
- * Valid signature + good reputation — should return true.
- * --------------------------------------------------------------- */
-DEFINE_TEST(test_should_accept_valid)
-{
-    ck_assert_int_eq(sodium_init() < 0 ? -1 : 0, 0);
-
-    uint8_t pk[crypto_sign_PUBLICKEYBYTES];
-    uint8_t sk[crypto_sign_SECRETKEYBYTES];
-    crypto_sign_keypair(pk, sk);
-
-    update_proposal_t prop;
-    fill_test_proposal(&prop);
-    prop.min_proposer_reputation = 0.7;
-
-    ck_assert_ret_ok(update_proposal_sign(&prop, sk));
-    ck_assert(fleet_should_accept_proposal(&prop, pk, 0.9));
-}
-END_TEST_DEFINITION()
-
-/* ---------------------------------------------------------------
- * test_should_accept_bad_sig
- * Invalid signature — should return false regardless of reputation.
- * --------------------------------------------------------------- */
-DEFINE_TEST(test_should_accept_bad_sig)
-{
-    ck_assert_int_eq(sodium_init() < 0 ? -1 : 0, 0);
-
-    uint8_t pk[crypto_sign_PUBLICKEYBYTES];
-    uint8_t sk[crypto_sign_SECRETKEYBYTES];
-    crypto_sign_keypair(pk, sk);
-
-    /* Generate a second keypair to sign with */
-    uint8_t pk2[crypto_sign_PUBLICKEYBYTES];
-    uint8_t sk2[crypto_sign_SECRETKEYBYTES];
-    crypto_sign_keypair(pk2, sk2);
-
-    update_proposal_t prop;
-    fill_test_proposal(&prop);
-    prop.min_proposer_reputation = 0.7;
-
-    /* Sign with sk2 but verify against pk (mismatch) */
-    ck_assert_ret_ok(update_proposal_sign(&prop, sk2));
-    ck_assert(!fleet_should_accept_proposal(&prop, pk, 0.9));
-}
-END_TEST_DEFINITION()
-
-/* ---------------------------------------------------------------
- * test_should_accept_low_rep
- * Valid signature but reputation below threshold — should return false.
- * --------------------------------------------------------------- */
-DEFINE_TEST(test_should_accept_low_rep)
-{
-    ck_assert_int_eq(sodium_init() < 0 ? -1 : 0, 0);
-
-    uint8_t pk[crypto_sign_PUBLICKEYBYTES];
-    uint8_t sk[crypto_sign_SECRETKEYBYTES];
-    crypto_sign_keypair(pk, sk);
-
-    update_proposal_t prop;
-    fill_test_proposal(&prop);
-    prop.min_proposer_reputation = 0.7;
-
-    ck_assert_ret_ok(update_proposal_sign(&prop, sk));
-    ck_assert(!fleet_should_accept_proposal(&prop, pk, 0.5));
-}
-END_TEST_DEFINITION()
-
 RUN_TESTS(FleetProc,
     test_validate_proposal_valid,
     test_validate_proposal_tampered,
     test_validate_proposal_wrong_key,
     test_reputation_threshold_pass,
     test_reputation_threshold_fail,
-    test_reputation_threshold_exact,
-    test_should_accept_valid,
-    test_should_accept_bad_sig,
-    test_should_accept_low_rep
+    test_reputation_threshold_exact
 )

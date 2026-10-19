@@ -274,6 +274,27 @@ class TestRotationRefusalIsNamed:
         self._assert_refusal(mine, rival, None if lower else
                              'ours stands (the lower key wins the tiebreak)')
 
+    def test_a_failed_mint_retires_nothing(self):
+        # It used to retire the live key before minting, so a mint that raised
+        # left that key in its own retired list and every update carrying it
+        # was refused as "a key we already retired". Same as C
+        # test_group_rotate_key_failed_mint_retires_nothing.
+        a_id = _new_identity('a', '10.0.0.1')
+        b_id = _new_identity('b', '10.0.0.2')
+        mine, _ = _shared_group(a_id, b_id)
+        live = Group.from_canonical(mine.to_canonical())
+        target = type(mine.encryptor)
+        with patch.object(target, 'generate', side_effect=RuntimeError('no entropy')):
+            try:
+                mine.rotate_key()
+                raise AssertionError('the mint should have raised')
+            except RuntimeError:
+                pass
+        assert mine.key_epoch == 0
+        assert not getattr(mine, '_previous_keys', None)
+        assert mine.rotation_refusal(live) == 'already our key'
+        assert mine.rotate_key() == 1
+
     def test_the_refusal_is_logged_with_both_keys(self, caplog):
         a_id = _new_identity('a', '10.0.0.1')
         b_id = _new_identity('b', '10.0.0.2')
@@ -326,6 +347,31 @@ class TestRotationRefusalIsNamed:
         assert [r.levelno for r in sent] == [logging.INFO, logging.DEBUG]
         assert ('with key %s… epoch 0 (carries_key=1) to 1 member(s)'
                 % _key_of(grp)[:16].decode()) in sent[0].getMessage()
+
+
+class TestAdoptedGroupKeepsItsEpoch:
+    """Reputation cohort rep-4070096-11 (2026-10-16): C adopted a DIFFERENT,
+    larger group from a stale update and installed its epoch-1 key under its
+    own epoch 2, which forked the cohort. Python takes the group wholesale, so
+    the key keeps its own epoch; pinned here so the two runtimes stay alike.
+    Same as C test_an_adopted_groups_key_keeps_its_own_epoch."""
+
+    def test_a_different_groups_key_comes_with_its_epoch(self):
+        a_id = _new_identity('alice', '10.0.0.1')
+        c_id = _new_identity('carol', '10.0.0.3')
+        mine = Group.initialize({str(c_id.uuid): c_id.address}, 'mine')
+        mine.rotate_key()
+        mine.rotate_key()
+        carol = _build_process(c_id, mine)
+        theirs = Group.initialize({str(a_id.uuid): a_id.address,
+                                   'uuid-bob': '10.0.0.2',
+                                   'uuid-dee': '10.0.0.4'}, 'theirs')
+        theirs.rotate_key()
+        carol.handle_group_update(_queues(), _update_from(theirs))
+        assert str(carol.group.uuid) == str(theirs.uuid)
+        assert _key_of(carol.group) == _key_of(theirs)
+        assert carol.group.key_epoch == 1
+        assert not getattr(carol.group, '_previous_keys', None)
 
 
 class TestAdoptedKeyReachesSiblings:

@@ -464,6 +464,9 @@ class NetworkAdapter:
         if case.name == 'gateway-boundary-verbs':
             self._run_gateway_boundary_verbs(case)
             return
+        if case.name == 'wire-verb-policy':
+            self._run_wire_verb_policy(case)
+            return
         if case.name == 'unencrypted-verbs':
             self._run_unencrypted_verbs(case)
             return
@@ -731,6 +734,21 @@ class NetworkAdapter:
                 (None not in BOOTSTRAP_VERBS) and ('' not in BOOTSTRAP_VERBS),
         }
         _assert_expected_flags(case, 'node', state)
+
+    def _run_wire_verb_policy(self, case: Case) -> None:
+        """What an inbound frame may carry, by its path (ISSUES §2.17): each
+        fixture case asked of netprocess.wire_verb_admitted. Mirrors C
+        run_wire_verb_policy."""
+        from autonomous_trust.core._python.network.netprocess import \
+            wire_verb_admitted
+        cases = (case.data.get('fixtures') or {}).get('cases') or []
+        mismatched = [c for c in cases
+                      if wire_verb_admitted(c['process'], c['function'],
+                                            c['path'])[0] != bool(c['admitted'])]
+        if mismatched:
+            print('wire-verb-policy mismatches:', mismatched)
+        _assert_expected_flags(case, 'node', {
+            'all_cases_match': bool(cases) and not mismatched})
 
     def _run_unencrypted_verbs(self, case: Case) -> None:
         """The plaintext allowlist: which verbs a receiver accepts unencrypted

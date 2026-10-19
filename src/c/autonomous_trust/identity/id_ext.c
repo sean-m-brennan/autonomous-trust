@@ -268,3 +268,11 @@ bool identity_ext_credential_anchored(const process_t *proc, const public_identi
             return true;
     return false;
 }
+
+bool identity_ext_is_contact(const process_t *proc, const char *uuid_str)
+{
+    for (size_t i = 0; i < _exts_len; i++)
+        if (_exts[i]->is_contact != NULL && _exts[i]->is_contact(proc, uuid_str))
+            return true;
+    return false;
+}

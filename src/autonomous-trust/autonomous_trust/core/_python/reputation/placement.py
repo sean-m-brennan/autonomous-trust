@@ -22,8 +22,8 @@ accepts per chain; a grant reports the value it last accepted at k, and a
 proposer holding a majority of grants must carry the highest-ballot one of
 those rather than its own. A decided placement is broadcast with a quorum
 certificate over :func:`place_designation`, and every member writes it at k
-exactly as given. Only a group that declares ``ordered_placement`` runs any of
-this.
+exactly as given. Every group places its order (the half round that let a
+group append entries as they completed was retired 2026-10-16).
 
 This module is the acceptor's and learner's half. Mirrors the "Ordered
 placement" section of C rep_proc.c.
@@ -37,7 +37,7 @@ from uuid import UUID
 
 from ..config import Configuration, atomic_write, from_json_string, to_json_string
 from ..network import Message
-from ..system import CfgIds
+from ..system import CfgIds, now
 from .protocol import ReputationProtocol
 from .reputation import (PLACE_BATCH_MAX, ROSTER_OPS, AttestedScore,
                          Transaction, TransactionHistory, place_designation,
@@ -183,12 +183,6 @@ class PlacementMixin:
 
     # --- group and state ------------------------------------------------
 
-    def _ordered_placement(self, group_uuid=None) -> bool:
-        """Does the group a chain belongs to declare ordered placement? Read
-        off the group, so every member of a cohort gives the same answer."""
-        grp = self._group_by_uuid(group_uuid) or self.group
-        return getattr(grp, 'ordered_placement', False) is True
-
     def _placement_path(self, chain_key: str) -> str:
         name = PLACEMENT_FILE + ('-' + chain_key if chain_key else '')
         return os.path.join(Configuration.get_cfg_dir(),
@@ -247,14 +241,13 @@ class PlacementMixin:
                             name + Configuration.file_ext)
 
     def _reset_pre_roster_chain(self, key):
-        """A placing chain that holds entries but no roster was written before
+        """A chain that holds entries but no roster was written before
         membership went in the chain (doc/architecture/reputation.md, "Who is
-        in the group"): nothing in it can be judged by a roster in force. It
-        exists only in development and cohort directories, so it is cleared
-        -- chain, placement state and pool -- and the group founds it anew
-        (the user's call, 2026-10-14)."""
-        if not self._ordered_placement(key or None):
-            return False
+        in the group"), or by a group that did not place its order before that
+        mode was retired (2026-10-16): nothing in it can be judged by a roster
+        in force. It exists only in development and cohort directories, so it
+        is cleared -- chain, placement state and pool -- and the group founds
+        it anew (the user's calls, 2026-10-14 and 2026-10-16)."""
         chain = self._chain_for_key(key)
         if not len(chain) or chain.latest_roster() is not None:
             return False
@@ -303,8 +296,6 @@ class PlacementMixin:
         last written. Runs on the process loop."""
         saved = self.__dict__.setdefault('_pool_saved', {})
         for key in self._chain_keys():
-            if not self._ordered_placement(key or None):
-                continue
             self._restore_pool(key)
             chain = self._chain_for_key(key)
             mark = (id(chain), chain.pool_rev)
@@ -347,8 +338,6 @@ class PlacementMixin:
             return None
         group = payload.get('group') or None
         key = self._chain_key(group)
-        if not self._ordered_placement(group if key else None):
-            return None
         return payload, key, self._chain_for_key(key), group
 
     def _place_deciders_ok(self, key, k, ballot) -> bool:
@@ -549,6 +538,19 @@ class PlacementMixin:
                 # under ordered placement an entry is completed here (cohorts
                 # and operators watch for it). Mirrors C.
                 self.logger.info('task %s is bilateral (index %d)', tx.task_id, k + i)
+            if tx.attested:
+                # What _commit_attestation does for a chain that does not
+                # place: a checkpoint soon, so the entry is archived before a
+                # busy chain can evict it, and the line cohorts watch for.
+                soon = now().timestamp() + self.ATTEST_CHECKPOINT_SEC
+                if self._next_checkpoint_at > soon:
+                    self._next_checkpoint_at = soon
+                self.logger.info(
+                    'Attested score committed: verifier=%s subject=%s '
+                    'score=%.2f channel=%s signers=%d (index %d)',
+                    str(tx.p1_id)[:8], str(tx.subject_id)[:8],
+                    float(tx.p1_score), tx.p1_channel,
+                    len(chain.attest_certs.get(tx.task_id) or {}), k + i)
             self._fold_committed_tx(tx.task_id, chain)
             for uid in (tx.p1_id, tx.p2_id, tx.subject_id if tx.attested else None):
                 if uid is None:
@@ -818,8 +820,6 @@ class PlacementMixin:
         clock = time.monotonic()
         for key in self._chain_keys():
             group = key or None
-            if not self._ordered_placement(group):
-                continue
             chain = self._chain_for_key(key)
             k = chain.next_index
             rnd = v['_place_rounds'].get(key)
@@ -976,7 +976,7 @@ class PlacementMixin:
         item = self._roster_item(key, chain)
         if item is not None:
             return [item]
-        if self._ordered_placement(group) and not self._founded(chain):
+        if not self._founded(chain):
             return []                   # nothing is placed before the genesis
         entries = []
         for e in chain.ready_items():

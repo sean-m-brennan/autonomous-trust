@@ -32,9 +32,23 @@ from autonomous_trust.core.network import Message
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
 from autonomous_trust.core.system import CfgIds
 
+from autonomous_trust.core.reputation.reputation import (
+    Transaction, TransactionHistory, placement_entry)
+
 from tests.a_unit.test_commit_certificates import _ident, _node, _sent
+from tests.a_unit.test_placement_acceptor import _roster_of
+from tests.a_unit.test_placement_reconcile import _signed
 
 ENTRIES = 20
+_IDS = {}
+
+
+def _id(name, n):
+    """One identity per name for the module, so a receiver's roster and the
+    signers of the window it is sent are the same keys."""
+    if name not in _IDS:
+        _IDS[name] = _ident(name, n)
+    return _IDS[name]
 
 
 def _raw(function, obj, sender):
@@ -45,11 +59,15 @@ def _raw(function, obj, sender):
 
 
 def _staged(me, other):
-    rp, q = _node(me, [other], required=False)
+    """`me` holding ENTRIES placed entries, each placement certified by
+    ada, bob and cal."""
+    rp, q = _node(me, [other])
+    hist = TransactionHistory()
     for i in range(ENTRIES):
-        t = uuid4()
-        rp.history.update(t, me.uuid, 0.3 + 0.01 * i)
-        rp.history.update(t, other.uuid, 0.9 - 0.01 * i)
+        hist.apply_placed(hist.next_index, [placement_entry(Transaction(
+            uuid4(), me.uuid, 0.3 + 0.01 * i, other.uuid, 0.9 - 0.01 * i))],
+            {'voter': 'sig'})
+    rp.history = _signed(hist, [_id('ada', 1), _id('bob', 2), _id('cal', 3)])
     return rp, q
 
 
@@ -66,8 +84,11 @@ def _pages(me, bob):
 
 
 def _receiver():
-    cal = _ident('cal', 3)
-    return _node(cal, [], required=False)
+    """cal, in a group of ada, bob and cal whose roster is in force."""
+    ada, bob, cal = _id('ada', 1), _id('bob', 2), _id('cal', 3)
+    rp, q = _node(cal, [ada, bob])
+    rp.history.roster_anchor = _roster_of([ada, bob, cal])
+    return rp, q
 
 
 def _deliver(rp, q, obj, sender):
@@ -75,7 +96,7 @@ def _deliver(rp, q, obj, sender):
 
 
 def test_a_window_over_the_page_size_goes_in_pages():
-    me, bob = _ident('ada', 1), _ident('bob', 2)
+    me, bob = _id('ada', 1), _id('bob', 2)
     rp, q = _staged(me, bob)
     whole = _ask(rp, q, bob, 10 ** 9)
     assert len(whole) == 1
@@ -99,7 +120,7 @@ def test_a_window_over_the_page_size_goes_in_pages():
 
 
 def test_pages_are_put_together_in_any_order():
-    me, bob = _ident('ada', 1), _ident('bob', 2)
+    me, bob = _id('ada', 1), _id('bob', 2)
     pages = _pages(me, bob)
     assert len(pages) > 2
     rp, q = _receiver()
@@ -111,7 +132,7 @@ def test_pages_are_put_together_in_any_order():
 
 
 def test_a_page_of_another_head_starts_over():
-    me, bob = _ident('ada', 1), _ident('bob', 2)
+    me, bob = _id('ada', 1), _id('bob', 2)
     pages = _pages(me, bob)
     assert len(pages) > 2
     rp, q = _receiver()
@@ -130,7 +151,7 @@ def test_a_page_of_another_head_starts_over():
 
 
 def test_pages_from_two_senders_do_not_mix():
-    me, bob = _ident('ada', 1), _ident('bob', 2)
+    me, bob = _id('ada', 1), _id('bob', 2)
     pages = _pages(me, bob)
     assert len(pages) > 1
     rp, q = _receiver()

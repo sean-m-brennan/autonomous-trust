@@ -63,8 +63,7 @@ class Sim:
         self.idents = [_ident('n%d' % i, i + 1) for i in range(n)]
         self.nodes = []
         for i, me in enumerate(self.idents):
-            rp, q = _node(me, _roster(me, self.idents), required=False)
-            rp.protocol.group.ordered_placement = True
+            rp, q = _node(me, _roster(me, self.idents))
             peers = rp.protocol.peers.all
             rp.protocol.peers.find_top_n = lambda k, peers=peers: list(peers)[:k]
             where = tmp_path / ('n%d' % i)

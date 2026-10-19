@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -172,6 +173,15 @@ DEFINE_TEST(test_a_checkpoint_archives_its_attested_entries)
     _sign(obs, ck_desig, cklen, ck_o);
     _sign(ver, ck_desig, cklen, ck_v);
     json_t *sigs = json_pack("{s:s, s:s}", o_str, ck_o, v_str, ck_v);
+    /* The verifier's tenure clock, started 300 s ago with its own key: the
+     * roster records that start as first_seen, not the moment of the write
+     * (doc/architecture/reputation.md, "Tenure"). Mirrors
+     * test_tenure.py test_the_roster_records_the_clock_it_keeps. */
+    char ver_key[crypto_sign_PUBLICKEYBYTES * 2 + 1];
+    sodium_bin2hex(ver_key, sizeof(ver_key), ver->signature.public,
+                   crypto_sign_PUBLICKEYBYTES);
+    json_int_t ver_since = (json_int_t)time(NULL) - 300;
+    reputation_set_member_since(ver->uuid, ver_key, (double)ver_since);
     reputation_test_store_checkpoint(proc, o_str, root, 1, 0, 1, "", sigs);
 
     char path[400];
@@ -208,6 +218,8 @@ DEFINE_TEST(test_a_checkpoint_archives_its_attested_entries)
     ck_assert_int_eq((int)json_object_size(members), 3);
     ck_assert_str_eq(json_string_value(json_object_get(
         json_object_get(members, v_str), "pubkey")), pk_hex);
+    ck_assert_int_eq((int)(json_integer_value(json_object_get(
+        json_object_get(members, v_str), "first_seen")) - ver_since), 0);
     ck_assert(json_is_true(json_object_get(json_object_get(members, s_str),
                                            "member")));
     ck_assert_ptr_nonnull(json_object_get(members, o_str));
@@ -377,8 +389,104 @@ DEFINE_TEST(test_the_conflict_file_is_read_and_reread)
 }
 END_TEST_DEFINITION()
 
+/* Stele red team rt-3765724, phase 7b: a member that joined late archived
+ * history certified by a group of four with the size it saw itself, five, and
+ * its own records then failed their quorum. The record carries the roster in
+ * force at the entry's index (AT §2.48). Mirrors test_attested_scores.py
+ * test_the_group_size_is_the_one_the_certificate_was_made_in. */
+DEFINE_TEST(test_the_group_size_is_the_one_the_certificate_was_made_in)
+{
+    ck_assert(sodium_init() >= 0);
+    snprintf(g_root_dir, sizeof(g_root_dir), "/tmp/at-archive-XXXXXX");
+    ck_assert_ptr_nonnull(mkdtemp(g_root_dir));
+    char etc[300];
+    snprintf(etc, sizeof(etc), "%s/etc", g_root_dir);
+    mkdir(etc, 0755);
+    snprintf(etc, sizeof(etc), "%s/etc/at", g_root_dir);
+    mkdir(etc, 0755);
+    setenv("AUTONOMOUS_TRUST_ROOT", g_root_dir, 1);
+
+    reputation_reset_state(4);
+    identity_t *ver = _mk_identity("ver", "10.0.9.1");
+    identity_t *subj = _mk_identity("subj", "10.0.9.2");
+    identity_t *obs = _mk_identity("obs", "10.0.9.3");
+    identity_t *x = _mk_identity("x", "10.0.9.4");
+    identity_t *late = _mk_identity("late", "10.0.9.5");
+    process_t *proc = _mk_process(obs);
+    _add_peer(proc, ver);                    /* today: five members */
+    _add_peer(proc, subj);
+    _add_peer(proc, x);
+    _add_peer(proc, late);
+    json_t *members = json_array();          /* then: four */
+    identity_t *then[4] = { ver, subj, obs, x };
+    for (int i = 0; i < 4; i++)
+    {
+        char u[UUID_STRING_LEN + 1], k[2 * crypto_sign_PUBLICKEYBYTES + 1];
+        uuid_unparse_lower(then[i]->uuid, u);
+        sodium_bin2hex(k, sizeof(k), then[i]->signature.public, crypto_sign_PUBLICKEYBYTES);
+        json_array_append_new(members, json_pack("[s, s]", u, k));
+    }
+    ck_assert_int_eq(reputation_set_roster_anchor(members), 0);
+    json_decref(members);
+
+    char v_str[UUID_STRING_LEN + 1], s_str[UUID_STRING_LEN + 1];
+    char o_str[UUID_STRING_LEN + 1], x_str[UUID_STRING_LEN + 1];
+    char t_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(ver->uuid, v_str);
+    uuid_unparse_lower(subj->uuid, s_str);
+    uuid_unparse_lower(obs->uuid, o_str);
+    uuid_unparse_lower(x->uuid, x_str);
+    uuid_t task;
+    tx_attest_task_uuid(ver->uuid, subj->uuid, DIGEST, task);
+    uuid_unparse_lower(task, t_str);
+    char desig[512];
+    int n = snprintf(desig + 10, sizeof(desig) - 10, "%s|%s|%s|%.17g|probe|%s",
+                     v_str, s_str, t_str, 0.3, DIGEST);
+    memcpy(desig, "AT-ATTEST", 10);
+    size_t dlen = 10 + (size_t)n;
+    char sig_v[crypto_sign_BYTES * 2 + 1], sig_o[crypto_sign_BYTES * 2 + 1];
+    _sign(ver, desig, dlen, sig_v);
+    _sign(obs, desig, dlen, sig_o);
+    json_t *cert = json_pack("{s:s, s:s}", v_str, sig_v, o_str, sig_o);
+    char *cert_txt = json_dumps(cert, JSON_COMPACT | JSON_SORT_KEYS);
+    json_decref(cert);
+    ck_assert_ret_ok(reputation_install_tx_attested_scoped(
+        ver->uuid, 0.3, "probe", subj->uuid, DIGEST, NULL, cert_txt));
+    free(cert_txt);
+
+    char root[TX_HASH_HEX_LEN + 1] = {0};
+    reputation_get_window_root(root);
+    char ck_desig[512];
+    n = snprintf(ck_desig + 8, sizeof(ck_desig) - 8, "%s|%s|%d|%d|%d",
+                 o_str, root, 1, 0, 1);
+    memcpy(ck_desig, "AT-CKPT", 8);
+    size_t cklen = 8 + (size_t)n;
+    char ck_o[crypto_sign_BYTES * 2 + 1], ck_v[crypto_sign_BYTES * 2 + 1];
+    char ck_x[crypto_sign_BYTES * 2 + 1];
+    _sign(obs, ck_desig, cklen, ck_o);
+    _sign(ver, ck_desig, cklen, ck_v);
+    _sign(x, ck_desig, cklen, ck_x);
+    json_t *sigs = json_pack("{s:s, s:s, s:s}", o_str, ck_o, v_str, ck_v, x_str, ck_x);
+    reputation_test_store_checkpoint(proc, o_str, root, 1, 0, 1, "", sigs);
+
+    char path[400];
+    snprintf(path, sizeof(path), "%s/etc/at/attested/%s.json", g_root_dir, t_str);
+    json_error_t jerr;
+    json_t *rec = json_load_file(path, 0, &jerr);
+    ck_assert_ptr_nonnull(rec);
+    ck_assert_int_eq((int)json_integer_value(json_object_get(rec, "group_size")), 4);
+    json_decref(rec);
+    char cmd[300];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", g_root_dir);
+#ifndef _WIN32   /* cleanup only; Windows' system() shell has no rm */
+    ck_assert_int_eq(system(cmd), 0);
+#endif
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(RepArchive,
           test_the_conflict_file_is_read_and_reread,
           test_a_checkpoint_archives_its_attested_entries,
           test_a_checkpoint_short_of_quorum_archives_nothing,
-          test_a_checkpoint_off_our_window_archives_nothing)
+          test_a_checkpoint_off_our_window_archives_nothing,
+          test_the_group_size_is_the_one_the_certificate_was_made_in)

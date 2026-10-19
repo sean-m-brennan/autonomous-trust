@@ -37,6 +37,7 @@
 
 #define DEBUG_TESTS 1
 #include "test_setup.h"
+#include "autonomous_trust/utilities/socket_helpers.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -149,7 +150,7 @@ DEFINE_TEST(test_two_frames_on_one_connection_both_arrive)
     ck_assert_str_eq(peer, LOCAL_ADDR);
     free(buf);
 
-    close(sender);
+    at_socket_close(sender);
     t->close(ctx);
 }
 END_TEST_DEFINITION()
@@ -186,7 +187,7 @@ DEFINE_TEST(test_frame_sent_after_a_read_still_arrives)
     ck_assert_mem_eq(buf, "two", 3);
     free(buf);
 
-    close(sender);
+    at_socket_close(sender);
     t->close(ctx);
 }
 END_TEST_DEFINITION()
@@ -260,7 +261,7 @@ DEFINE_TEST(test_peer_hangup_frees_the_slot)
         if (ctx->live_conns[i].fd >= 0) held++;
     ck_assert_int_eq(held, 1);
 
-    close(sender);
+    at_socket_close(sender);
     /* One drain pass notices the EOF and reclaims the slot. */
     buf = NULL;
     ck_assert(t->recv(ctx, NET_CHAN_PEER, &buf, &len, NULL, 0, 10) == ENOMSG);
@@ -342,7 +343,7 @@ DEFINE_TEST(test_idle_connection_is_reaped)
         if (ctx->live_conns[i].fd >= 0) held++;
     ck_assert_int_eq(held, 0);
 
-    close(sender);
+    at_socket_close(sender);
     t->close(ctx);
 }
 END_TEST_DEFINITION()

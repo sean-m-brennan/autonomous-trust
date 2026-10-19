@@ -186,10 +186,17 @@ C's `_reverify_peers` asks the narrower `check_revocation` for an
 already-admitted peer. The full walk is a superset and cannot admit anything
 the narrower check would reject.
 
-Still C-only, and explicitly out of scope here: **revocation alerts** and
-**delegated verification / distributed PDP** (zta-integration.md §8-9), and
-the **audit log** (§10). The Python gate logs decisions through the standard
-logger. Porting those remains a follow-up tracked in zta-integration.md §15.
+**Revocation alerts and delegated verification are at parity as of
+2026-10-19** (zta-integration.md §8-9, ISSUES §2.20). Python's half lives in
+`zta/_python/delegation.py` (the decisions, twin of `zta_delegation.c`) and
+`admission.py` (the sweep sends, identity's handlers receive). The structural
+difference is the one above: C's `zta_verify` process receives the frames, and
+Python's identity process receives them through the extension's process alias.
+Python asks its reputation process for a sender's score with C's
+`local_rep_query`, which the Python reputation process now answers.
+
+Still C-only: the **audit log** (§10). The Python gate logs decisions through
+the standard logger.
 
 ## 7. Conformance
 

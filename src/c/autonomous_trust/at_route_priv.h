@@ -75,4 +75,21 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger);
 int at_route_internal_msgs(array_t *unhandled, const char *q_out,
                            logger_t *logger);
 
+/** How many one-time app events are held while no app is attached; past it
+ *  the oldest is dropped. */
+#define AT_APP_HELD_MAX 64
+
+/** True iff the roster pull re-emits events of @p type (state), so one sent
+ *  while no app is attached is dropped rather than held. */
+bool at_app_event_replayed(long type);
+
+/** If an app is now bound to @p q_out, send it the held events in order and
+ *  end the gap with one log line. at_route_internal_msgs calls it every pass
+ *  while no app is attached. Returns how many were sent. */
+size_t at_app_flush_held(const char *q_out, logger_t *logger);
+
+/** Test seams: how many events are held; forget them and the gap. */
+size_t at_app_held_count(void);
+void at_app_hold_reset(void);
+
 #endif /* AT_ROUTE_PRIV_H */

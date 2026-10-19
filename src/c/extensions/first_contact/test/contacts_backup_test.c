@@ -799,7 +799,11 @@ DEFINE_TEST(test_export_writes_a_private_file)
     ck_assert_int_eq(e->b.data.siblings, 0);
     struct stat st;
     ck_assert_ret_ok(stat(path, &st));
+#ifndef _WIN32
+    /* Owner-only. Windows has no mode bits: there the backup is as private as
+     * the per-user directory it is written to (ISSUES §2.74). */
     ck_assert_int_eq(st.st_mode & 0777, 0600);
+#endif
     bool big = false;
     FILE *fp = fopen(path, "r");
     char text[65536];

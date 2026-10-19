@@ -24,6 +24,7 @@ at_extension_library(fleet
     SOURCES
         update_proposal.c
         fleet_helpers.c
+        fleet_gate.c
         fleet_ops.c
         fleet_proc.c
         artifact_store.c
@@ -41,6 +42,7 @@ install(FILES at_fleet.h DESTINATION include)
 at_extension_tests(fleet
     update_proposal_test
     fleet_proc_test
+    fleet_gate_test
     artifact_store_test
     artifact_proc_test
     update_proc_test

@@ -637,10 +637,19 @@ def trust_seeds(proc):
     return seeds
 
 
+def _is_contact(proc, peer_uuid) -> bool:  # noqa: ARG001 -- the hook's shape
+    """Whether the user recorded ``peer_uuid`` as a contact, verified or not:
+    such a peer may ask to join our cohort through the vote (identity's
+    duplicate detection asks). Only while first contact is enabled. Mirrors C's
+    _fc_is_contact."""
+    return enabled() and str(peer_uuid) in _contact_records()
+
+
 EXTENSION = Extension(name='first_contact', enabled=enabled,
                       register_handlers=_register_extension,
                       identity=IdentityHooks(on_start=_on_start,
-                                             periodic_resync=_periodic),
+                                             periodic_resync=_periodic,
+                                             is_contact=_is_contact),
                       app_verbs=tuple((verb, CfgIds.identity) for verb in _app_verbs()),
                       negotiation=NegotiationHooks(capped_tier=_capped_tier),
                       # Each arrives before the sender is a peer here, so there

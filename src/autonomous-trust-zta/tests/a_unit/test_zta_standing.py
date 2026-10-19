@@ -228,6 +228,9 @@ class _ReverifyProc:
         self._zta_anchor_cache = [('default', verifier, False)]
         self._zta_capped = set()
         self._last_zta_reverify = None
+        self._zta_deleg = _zta_admission.delegation.ZtaDelegation()
+        self._zta_rep_cache = {}
+        self._zta_pending_findings = []
         self.lock = threading.RLock()
         self.logger = MagicMock()
         self.identity = SimpleNamespace(uuid='self-uuid')

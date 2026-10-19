@@ -9,6 +9,9 @@ description: |
     without the subject. The channel is part of the committed fact, and every
     remote node folds it at weight one.
 
+    A committed attestation waits in the pool for its placement, as every
+    entry does now that every group places its order.
+
 participants:
   - id: alice
     role: verifier
@@ -31,4 +34,5 @@ steps:
 
 expected_state:
   bob:
-    committed_tx_count: 1
+    committed_tx_count: 0
+    pool_count: 1

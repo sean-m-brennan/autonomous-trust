@@ -6,9 +6,8 @@ byte_pinning: false
 description: |
   Pins the reputation transaction-history cap DEFAULT_MAX_CHAIN_LEN /
   MAX_CHAIN_LEN = 200 cross-language. alice reports a hash-linked chain of
-  205 committed entries to dave via `latest update`; dave's catchup()
-  replays each through TransactionHistory.update(), which evicts the oldest
-  entry once the resident chain reaches 200 (FIFO). The window therefore
+  205 placed entries to dave via `latest update`; dave takes them verbatim
+  and evicts the oldest entry once the resident chain reaches 200 (FIFO). The window therefore
   converges to the most-recent 200 entries (sent indices 5..204).
 
   committed_tx_count==200 pins the cap; window_root (RFC 6962 ordered Merkle
@@ -21,6 +20,10 @@ description: |
   num_updates quorum lowered to 1 (fixture) so a single report fires the
   chain merge; the C harness resets state per step, so the whole chain must
   arrive in one message (same constraint as chain-catchup-verifies-links).
+
+  Every entry carries the placement certificate alice and dave signed for it,
+  as every catch-up segment does now that every group places its order
+  (doc/architecture/reputation.md, "Agreeing on an order").
 participants:
 - id: alice
   role: provider
@@ -39,618 +42,1028 @@ steps:
     - task: t000
       p1: 0.1
       p2: 0.1
+      batch: 1
+      placed_by: [alice, dave]
     - task: t001
       p1: 0.2
       p2: 0.2
+      batch: 2
+      placed_by: [alice, dave]
     - task: t002
       p1: 0.3
       p2: 0.3
+      batch: 3
+      placed_by: [alice, dave]
     - task: t003
       p1: 0.4
       p2: 0.4
+      batch: 4
+      placed_by: [alice, dave]
     - task: t004
       p1: 0.5
       p2: 0.5
+      batch: 5
+      placed_by: [alice, dave]
     - task: t005
       p1: 0.6
       p2: 0.6
+      batch: 6
+      placed_by: [alice, dave]
     - task: t006
       p1: 0.7
       p2: 0.7
+      batch: 7
+      placed_by: [alice, dave]
     - task: t007
       p1: 0.8
       p2: 0.1
+      batch: 8
+      placed_by: [alice, dave]
     - task: t008
       p1: 0.9
       p2: 0.2
+      batch: 9
+      placed_by: [alice, dave]
     - task: t009
       p1: 0.1
       p2: 0.3
+      batch: 10
+      placed_by: [alice, dave]
     - task: t010
       p1: 0.2
       p2: 0.4
+      batch: 11
+      placed_by: [alice, dave]
     - task: t011
       p1: 0.3
       p2: 0.5
+      batch: 12
+      placed_by: [alice, dave]
     - task: t012
       p1: 0.4
       p2: 0.6
+      batch: 13
+      placed_by: [alice, dave]
     - task: t013
       p1: 0.5
       p2: 0.7
+      batch: 14
+      placed_by: [alice, dave]
     - task: t014
       p1: 0.6
       p2: 0.1
+      batch: 15
+      placed_by: [alice, dave]
     - task: t015
       p1: 0.7
       p2: 0.2
+      batch: 16
+      placed_by: [alice, dave]
     - task: t016
       p1: 0.8
       p2: 0.3
+      batch: 17
+      placed_by: [alice, dave]
     - task: t017
       p1: 0.9
       p2: 0.4
+      batch: 18
+      placed_by: [alice, dave]
     - task: t018
       p1: 0.1
       p2: 0.5
+      batch: 19
+      placed_by: [alice, dave]
     - task: t019
       p1: 0.2
       p2: 0.6
+      batch: 20
+      placed_by: [alice, dave]
     - task: t020
       p1: 0.3
       p2: 0.7
+      batch: 21
+      placed_by: [alice, dave]
     - task: t021
       p1: 0.4
       p2: 0.1
+      batch: 22
+      placed_by: [alice, dave]
     - task: t022
       p1: 0.5
       p2: 0.2
+      batch: 23
+      placed_by: [alice, dave]
     - task: t023
       p1: 0.6
       p2: 0.3
+      batch: 24
+      placed_by: [alice, dave]
     - task: t024
       p1: 0.7
       p2: 0.4
+      batch: 25
+      placed_by: [alice, dave]
     - task: t025
       p1: 0.8
       p2: 0.5
+      batch: 26
+      placed_by: [alice, dave]
     - task: t026
       p1: 0.9
       p2: 0.6
+      batch: 27
+      placed_by: [alice, dave]
     - task: t027
       p1: 0.1
       p2: 0.7
+      batch: 28
+      placed_by: [alice, dave]
     - task: t028
       p1: 0.2
       p2: 0.1
+      batch: 29
+      placed_by: [alice, dave]
     - task: t029
       p1: 0.3
       p2: 0.2
+      batch: 30
+      placed_by: [alice, dave]
     - task: t030
       p1: 0.4
       p2: 0.3
+      batch: 31
+      placed_by: [alice, dave]
     - task: t031
       p1: 0.5
       p2: 0.4
+      batch: 32
+      placed_by: [alice, dave]
     - task: t032
       p1: 0.6
       p2: 0.5
+      batch: 33
+      placed_by: [alice, dave]
     - task: t033
       p1: 0.7
       p2: 0.6
+      batch: 34
+      placed_by: [alice, dave]
     - task: t034
       p1: 0.8
       p2: 0.7
+      batch: 35
+      placed_by: [alice, dave]
     - task: t035
       p1: 0.9
       p2: 0.1
+      batch: 36
+      placed_by: [alice, dave]
     - task: t036
       p1: 0.1
       p2: 0.2
+      batch: 37
+      placed_by: [alice, dave]
     - task: t037
       p1: 0.2
       p2: 0.3
+      batch: 38
+      placed_by: [alice, dave]
     - task: t038
       p1: 0.3
       p2: 0.4
+      batch: 39
+      placed_by: [alice, dave]
     - task: t039
       p1: 0.4
       p2: 0.5
+      batch: 40
+      placed_by: [alice, dave]
     - task: t040
       p1: 0.5
       p2: 0.6
+      batch: 41
+      placed_by: [alice, dave]
     - task: t041
       p1: 0.6
       p2: 0.7
+      batch: 42
+      placed_by: [alice, dave]
     - task: t042
       p1: 0.7
       p2: 0.1
+      batch: 43
+      placed_by: [alice, dave]
     - task: t043
       p1: 0.8
       p2: 0.2
+      batch: 44
+      placed_by: [alice, dave]
     - task: t044
       p1: 0.9
       p2: 0.3
+      batch: 45
+      placed_by: [alice, dave]
     - task: t045
       p1: 0.1
       p2: 0.4
+      batch: 46
+      placed_by: [alice, dave]
     - task: t046
       p1: 0.2
       p2: 0.5
+      batch: 47
+      placed_by: [alice, dave]
     - task: t047
       p1: 0.3
       p2: 0.6
+      batch: 48
+      placed_by: [alice, dave]
     - task: t048
       p1: 0.4
       p2: 0.7
+      batch: 49
+      placed_by: [alice, dave]
     - task: t049
       p1: 0.5
       p2: 0.1
+      batch: 50
+      placed_by: [alice, dave]
     - task: t050
       p1: 0.6
       p2: 0.2
+      batch: 51
+      placed_by: [alice, dave]
     - task: t051
       p1: 0.7
       p2: 0.3
+      batch: 52
+      placed_by: [alice, dave]
     - task: t052
       p1: 0.8
       p2: 0.4
+      batch: 53
+      placed_by: [alice, dave]
     - task: t053
       p1: 0.9
       p2: 0.5
+      batch: 54
+      placed_by: [alice, dave]
     - task: t054
       p1: 0.1
       p2: 0.6
+      batch: 55
+      placed_by: [alice, dave]
     - task: t055
       p1: 0.2
       p2: 0.7
+      batch: 56
+      placed_by: [alice, dave]
     - task: t056
       p1: 0.3
       p2: 0.1
+      batch: 57
+      placed_by: [alice, dave]
     - task: t057
       p1: 0.4
       p2: 0.2
+      batch: 58
+      placed_by: [alice, dave]
     - task: t058
       p1: 0.5
       p2: 0.3
+      batch: 59
+      placed_by: [alice, dave]
     - task: t059
       p1: 0.6
       p2: 0.4
+      batch: 60
+      placed_by: [alice, dave]
     - task: t060
       p1: 0.7
       p2: 0.5
+      batch: 61
+      placed_by: [alice, dave]
     - task: t061
       p1: 0.8
       p2: 0.6
+      batch: 62
+      placed_by: [alice, dave]
     - task: t062
       p1: 0.9
       p2: 0.7
+      batch: 63
+      placed_by: [alice, dave]
     - task: t063
       p1: 0.1
       p2: 0.1
+      batch: 64
+      placed_by: [alice, dave]
     - task: t064
       p1: 0.2
       p2: 0.2
+      batch: 65
+      placed_by: [alice, dave]
     - task: t065
       p1: 0.3
       p2: 0.3
+      batch: 66
+      placed_by: [alice, dave]
     - task: t066
       p1: 0.4
       p2: 0.4
+      batch: 67
+      placed_by: [alice, dave]
     - task: t067
       p1: 0.5
       p2: 0.5
+      batch: 68
+      placed_by: [alice, dave]
     - task: t068
       p1: 0.6
       p2: 0.6
+      batch: 69
+      placed_by: [alice, dave]
     - task: t069
       p1: 0.7
       p2: 0.7
+      batch: 70
+      placed_by: [alice, dave]
     - task: t070
       p1: 0.8
       p2: 0.1
+      batch: 71
+      placed_by: [alice, dave]
     - task: t071
       p1: 0.9
       p2: 0.2
+      batch: 72
+      placed_by: [alice, dave]
     - task: t072
       p1: 0.1
       p2: 0.3
+      batch: 73
+      placed_by: [alice, dave]
     - task: t073
       p1: 0.2
       p2: 0.4
+      batch: 74
+      placed_by: [alice, dave]
     - task: t074
       p1: 0.3
       p2: 0.5
+      batch: 75
+      placed_by: [alice, dave]
     - task: t075
       p1: 0.4
       p2: 0.6
+      batch: 76
+      placed_by: [alice, dave]
     - task: t076
       p1: 0.5
       p2: 0.7
+      batch: 77
+      placed_by: [alice, dave]
     - task: t077
       p1: 0.6
       p2: 0.1
+      batch: 78
+      placed_by: [alice, dave]
     - task: t078
       p1: 0.7
       p2: 0.2
+      batch: 79
+      placed_by: [alice, dave]
     - task: t079
       p1: 0.8
       p2: 0.3
+      batch: 80
+      placed_by: [alice, dave]
     - task: t080
       p1: 0.9
       p2: 0.4
+      batch: 81
+      placed_by: [alice, dave]
     - task: t081
       p1: 0.1
       p2: 0.5
+      batch: 82
+      placed_by: [alice, dave]
     - task: t082
       p1: 0.2
       p2: 0.6
+      batch: 83
+      placed_by: [alice, dave]
     - task: t083
       p1: 0.3
       p2: 0.7
+      batch: 84
+      placed_by: [alice, dave]
     - task: t084
       p1: 0.4
       p2: 0.1
+      batch: 85
+      placed_by: [alice, dave]
     - task: t085
       p1: 0.5
       p2: 0.2
+      batch: 86
+      placed_by: [alice, dave]
     - task: t086
       p1: 0.6
       p2: 0.3
+      batch: 87
+      placed_by: [alice, dave]
     - task: t087
       p1: 0.7
       p2: 0.4
+      batch: 88
+      placed_by: [alice, dave]
     - task: t088
       p1: 0.8
       p2: 0.5
+      batch: 89
+      placed_by: [alice, dave]
     - task: t089
       p1: 0.9
       p2: 0.6
+      batch: 90
+      placed_by: [alice, dave]
     - task: t090
       p1: 0.1
       p2: 0.7
+      batch: 91
+      placed_by: [alice, dave]
     - task: t091
       p1: 0.2
       p2: 0.1
+      batch: 92
+      placed_by: [alice, dave]
     - task: t092
       p1: 0.3
       p2: 0.2
+      batch: 93
+      placed_by: [alice, dave]
     - task: t093
       p1: 0.4
       p2: 0.3
+      batch: 94
+      placed_by: [alice, dave]
     - task: t094
       p1: 0.5
       p2: 0.4
+      batch: 95
+      placed_by: [alice, dave]
     - task: t095
       p1: 0.6
       p2: 0.5
+      batch: 96
+      placed_by: [alice, dave]
     - task: t096
       p1: 0.7
       p2: 0.6
+      batch: 97
+      placed_by: [alice, dave]
     - task: t097
       p1: 0.8
       p2: 0.7
+      batch: 98
+      placed_by: [alice, dave]
     - task: t098
       p1: 0.9
       p2: 0.1
+      batch: 99
+      placed_by: [alice, dave]
     - task: t099
       p1: 0.1
       p2: 0.2
+      batch: 100
+      placed_by: [alice, dave]
     - task: t100
       p1: 0.2
       p2: 0.3
+      batch: 101
+      placed_by: [alice, dave]
     - task: t101
       p1: 0.3
       p2: 0.4
+      batch: 102
+      placed_by: [alice, dave]
     - task: t102
       p1: 0.4
       p2: 0.5
+      batch: 103
+      placed_by: [alice, dave]
     - task: t103
       p1: 0.5
       p2: 0.6
+      batch: 104
+      placed_by: [alice, dave]
     - task: t104
       p1: 0.6
       p2: 0.7
+      batch: 105
+      placed_by: [alice, dave]
     - task: t105
       p1: 0.7
       p2: 0.1
+      batch: 106
+      placed_by: [alice, dave]
     - task: t106
       p1: 0.8
       p2: 0.2
+      batch: 107
+      placed_by: [alice, dave]
     - task: t107
       p1: 0.9
       p2: 0.3
+      batch: 108
+      placed_by: [alice, dave]
     - task: t108
       p1: 0.1
       p2: 0.4
+      batch: 109
+      placed_by: [alice, dave]
     - task: t109
       p1: 0.2
       p2: 0.5
+      batch: 110
+      placed_by: [alice, dave]
     - task: t110
       p1: 0.3
       p2: 0.6
+      batch: 111
+      placed_by: [alice, dave]
     - task: t111
       p1: 0.4
       p2: 0.7
+      batch: 112
+      placed_by: [alice, dave]
     - task: t112
       p1: 0.5
       p2: 0.1
+      batch: 113
+      placed_by: [alice, dave]
     - task: t113
       p1: 0.6
       p2: 0.2
+      batch: 114
+      placed_by: [alice, dave]
     - task: t114
       p1: 0.7
       p2: 0.3
+      batch: 115
+      placed_by: [alice, dave]
     - task: t115
       p1: 0.8
       p2: 0.4
+      batch: 116
+      placed_by: [alice, dave]
     - task: t116
       p1: 0.9
       p2: 0.5
+      batch: 117
+      placed_by: [alice, dave]
     - task: t117
       p1: 0.1
       p2: 0.6
+      batch: 118
+      placed_by: [alice, dave]
     - task: t118
       p1: 0.2
       p2: 0.7
+      batch: 119
+      placed_by: [alice, dave]
     - task: t119
       p1: 0.3
       p2: 0.1
+      batch: 120
+      placed_by: [alice, dave]
     - task: t120
       p1: 0.4
       p2: 0.2
+      batch: 121
+      placed_by: [alice, dave]
     - task: t121
       p1: 0.5
       p2: 0.3
+      batch: 122
+      placed_by: [alice, dave]
     - task: t122
       p1: 0.6
       p2: 0.4
+      batch: 123
+      placed_by: [alice, dave]
     - task: t123
       p1: 0.7
       p2: 0.5
+      batch: 124
+      placed_by: [alice, dave]
     - task: t124
       p1: 0.8
       p2: 0.6
+      batch: 125
+      placed_by: [alice, dave]
     - task: t125
       p1: 0.9
       p2: 0.7
+      batch: 126
+      placed_by: [alice, dave]
     - task: t126
       p1: 0.1
       p2: 0.1
+      batch: 127
+      placed_by: [alice, dave]
     - task: t127
       p1: 0.2
       p2: 0.2
+      batch: 128
+      placed_by: [alice, dave]
     - task: t128
       p1: 0.3
       p2: 0.3
+      batch: 129
+      placed_by: [alice, dave]
     - task: t129
       p1: 0.4
       p2: 0.4
+      batch: 130
+      placed_by: [alice, dave]
     - task: t130
       p1: 0.5
       p2: 0.5
+      batch: 131
+      placed_by: [alice, dave]
     - task: t131
       p1: 0.6
       p2: 0.6
+      batch: 132
+      placed_by: [alice, dave]
     - task: t132
       p1: 0.7
       p2: 0.7
+      batch: 133
+      placed_by: [alice, dave]
     - task: t133
       p1: 0.8
       p2: 0.1
+      batch: 134
+      placed_by: [alice, dave]
     - task: t134
       p1: 0.9
       p2: 0.2
+      batch: 135
+      placed_by: [alice, dave]
     - task: t135
       p1: 0.1
       p2: 0.3
+      batch: 136
+      placed_by: [alice, dave]
     - task: t136
       p1: 0.2
       p2: 0.4
+      batch: 137
+      placed_by: [alice, dave]
     - task: t137
       p1: 0.3
       p2: 0.5
+      batch: 138
+      placed_by: [alice, dave]
     - task: t138
       p1: 0.4
       p2: 0.6
+      batch: 139
+      placed_by: [alice, dave]
     - task: t139
       p1: 0.5
       p2: 0.7
+      batch: 140
+      placed_by: [alice, dave]
     - task: t140
       p1: 0.6
       p2: 0.1
+      batch: 141
+      placed_by: [alice, dave]
     - task: t141
       p1: 0.7
       p2: 0.2
+      batch: 142
+      placed_by: [alice, dave]
     - task: t142
       p1: 0.8
       p2: 0.3
+      batch: 143
+      placed_by: [alice, dave]
     - task: t143
       p1: 0.9
       p2: 0.4
+      batch: 144
+      placed_by: [alice, dave]
     - task: t144
       p1: 0.1
       p2: 0.5
+      batch: 145
+      placed_by: [alice, dave]
     - task: t145
       p1: 0.2
       p2: 0.6
+      batch: 146
+      placed_by: [alice, dave]
     - task: t146
       p1: 0.3
       p2: 0.7
+      batch: 147
+      placed_by: [alice, dave]
     - task: t147
       p1: 0.4
       p2: 0.1
+      batch: 148
+      placed_by: [alice, dave]
     - task: t148
       p1: 0.5
       p2: 0.2
+      batch: 149
+      placed_by: [alice, dave]
     - task: t149
       p1: 0.6
       p2: 0.3
+      batch: 150
+      placed_by: [alice, dave]
     - task: t150
       p1: 0.7
       p2: 0.4
+      batch: 151
+      placed_by: [alice, dave]
     - task: t151
       p1: 0.8
       p2: 0.5
+      batch: 152
+      placed_by: [alice, dave]
     - task: t152
       p1: 0.9
       p2: 0.6
+      batch: 153
+      placed_by: [alice, dave]
     - task: t153
       p1: 0.1
       p2: 0.7
+      batch: 154
+      placed_by: [alice, dave]
     - task: t154
       p1: 0.2
       p2: 0.1
+      batch: 155
+      placed_by: [alice, dave]
     - task: t155
       p1: 0.3
       p2: 0.2
+      batch: 156
+      placed_by: [alice, dave]
     - task: t156
       p1: 0.4
       p2: 0.3
+      batch: 157
+      placed_by: [alice, dave]
     - task: t157
       p1: 0.5
       p2: 0.4
+      batch: 158
+      placed_by: [alice, dave]
     - task: t158
       p1: 0.6
       p2: 0.5
+      batch: 159
+      placed_by: [alice, dave]
     - task: t159
       p1: 0.7
       p2: 0.6
+      batch: 160
+      placed_by: [alice, dave]
     - task: t160
       p1: 0.8
       p2: 0.7
+      batch: 161
+      placed_by: [alice, dave]
     - task: t161
       p1: 0.9
       p2: 0.1
+      batch: 162
+      placed_by: [alice, dave]
     - task: t162
       p1: 0.1
       p2: 0.2
+      batch: 163
+      placed_by: [alice, dave]
     - task: t163
       p1: 0.2
       p2: 0.3
+      batch: 164
+      placed_by: [alice, dave]
     - task: t164
       p1: 0.3
       p2: 0.4
+      batch: 165
+      placed_by: [alice, dave]
     - task: t165
       p1: 0.4
       p2: 0.5
+      batch: 166
+      placed_by: [alice, dave]
     - task: t166
       p1: 0.5
       p2: 0.6
+      batch: 167
+      placed_by: [alice, dave]
     - task: t167
       p1: 0.6
       p2: 0.7
+      batch: 168
+      placed_by: [alice, dave]
     - task: t168
       p1: 0.7
       p2: 0.1
+      batch: 169
+      placed_by: [alice, dave]
     - task: t169
       p1: 0.8
       p2: 0.2
+      batch: 170
+      placed_by: [alice, dave]
     - task: t170
       p1: 0.9
       p2: 0.3
+      batch: 171
+      placed_by: [alice, dave]
     - task: t171
       p1: 0.1
       p2: 0.4
+      batch: 172
+      placed_by: [alice, dave]
     - task: t172
       p1: 0.2
       p2: 0.5
+      batch: 173
+      placed_by: [alice, dave]
     - task: t173
       p1: 0.3
       p2: 0.6
+      batch: 174
+      placed_by: [alice, dave]
     - task: t174
       p1: 0.4
       p2: 0.7
+      batch: 175
+      placed_by: [alice, dave]
     - task: t175
       p1: 0.5
       p2: 0.1
+      batch: 176
+      placed_by: [alice, dave]
     - task: t176
       p1: 0.6
       p2: 0.2
+      batch: 177
+      placed_by: [alice, dave]
     - task: t177
       p1: 0.7
       p2: 0.3
+      batch: 178
+      placed_by: [alice, dave]
     - task: t178
       p1: 0.8
       p2: 0.4
+      batch: 179
+      placed_by: [alice, dave]
     - task: t179
       p1: 0.9
       p2: 0.5
+      batch: 180
+      placed_by: [alice, dave]
     - task: t180
       p1: 0.1
       p2: 0.6
+      batch: 181
+      placed_by: [alice, dave]
     - task: t181
       p1: 0.2
       p2: 0.7
+      batch: 182
+      placed_by: [alice, dave]
     - task: t182
       p1: 0.3
       p2: 0.1
+      batch: 183
+      placed_by: [alice, dave]
     - task: t183
       p1: 0.4
       p2: 0.2
+      batch: 184
+      placed_by: [alice, dave]
     - task: t184
       p1: 0.5
       p2: 0.3
+      batch: 185
+      placed_by: [alice, dave]
     - task: t185
       p1: 0.6
       p2: 0.4
+      batch: 186
+      placed_by: [alice, dave]
     - task: t186
       p1: 0.7
       p2: 0.5
+      batch: 187
+      placed_by: [alice, dave]
     - task: t187
       p1: 0.8
       p2: 0.6
+      batch: 188
+      placed_by: [alice, dave]
     - task: t188
       p1: 0.9
       p2: 0.7
+      batch: 189
+      placed_by: [alice, dave]
     - task: t189
       p1: 0.1
       p2: 0.1
+      batch: 190
+      placed_by: [alice, dave]
     - task: t190
       p1: 0.2
       p2: 0.2
+      batch: 191
+      placed_by: [alice, dave]
     - task: t191
       p1: 0.3
       p2: 0.3
+      batch: 192
+      placed_by: [alice, dave]
     - task: t192
       p1: 0.4
       p2: 0.4
+      batch: 193
+      placed_by: [alice, dave]
     - task: t193
       p1: 0.5
       p2: 0.5
+      batch: 194
+      placed_by: [alice, dave]
     - task: t194
       p1: 0.6
       p2: 0.6
+      batch: 195
+      placed_by: [alice, dave]
     - task: t195
       p1: 0.7
       p2: 0.7
+      batch: 196
+      placed_by: [alice, dave]
     - task: t196
       p1: 0.8
       p2: 0.1
+      batch: 197
+      placed_by: [alice, dave]
     - task: t197
       p1: 0.9
       p2: 0.2
+      batch: 198
+      placed_by: [alice, dave]
     - task: t198
       p1: 0.1
       p2: 0.3
+      batch: 199
+      placed_by: [alice, dave]
     - task: t199
       p1: 0.2
       p2: 0.4
+      batch: 200
+      placed_by: [alice, dave]
     - task: t200
       p1: 0.3
       p2: 0.5
+      batch: 201
+      placed_by: [alice, dave]
     - task: t201
       p1: 0.4
       p2: 0.6
+      batch: 202
+      placed_by: [alice, dave]
     - task: t202
       p1: 0.5
       p2: 0.7
+      batch: 203
+      placed_by: [alice, dave]
     - task: t203
       p1: 0.6
       p2: 0.1
+      batch: 204
+      placed_by: [alice, dave]
     - task: t204
       p1: 0.7
       p2: 0.2
+      batch: 205
+      placed_by: [alice, dave]
   description: |
     alice reports her 205-entry hash-linked chain to dave. With the
     quorum at 1, dave verifies the segment's prev_hash links, accepts
@@ -658,4 +1071,4 @@ steps:
 expected_state:
   dave:
     committed_tx_count: 200
-    window_root: 60220fa93f828b3ddda7cf6902ded8f2473b87bde61449c78f81acb69dbc5418
+    window_root: 7aca925f5fa36400235008088144860dd1ad0ff5d654cfd123605c0c0dbf8afd

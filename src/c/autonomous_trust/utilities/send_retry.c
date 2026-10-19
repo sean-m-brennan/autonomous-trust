@@ -40,6 +40,12 @@ typedef struct {
     double        first;        /* when it was first deferred */
     int           attempts;     /* drain attempts so far */
     at_send_sent_fn on_sent;    /* run once it lands or is given up on */
+    /* The subsystem that deferred it (at_send's proc), or NULL. A forked
+     * process holds only its own frames; in-process every subsystem shares
+     * this list, so a frame with an owner is retried only by that owner's
+     * tick (its on_sent callback runs on the owner's thread, against the
+     * owner's state). One with none is retried by the first tick to come. */
+    const process_t *owner;
     bool          sent;         /* the outcome on_sent is told */
     unsigned char ctx[AT_SEND_RETRY_CTX_MAX];
 } at_deferred_t;
@@ -117,18 +123,73 @@ static void _strip_identity(public_identity_t *p)
     p->num_zta_credentials = 0;
 }
 
+void at_msg_copy_release(generic_msg_t *copy)
+{
+    if (copy == NULL)
+        return;
+    if (copy->type == NET_MESSAGE) {
+        free(copy->info.net_msg.obj);
+        free(copy->info.net_msg.function);
+    } else if (copy->type == TASK_RESULT) {
+        free(copy->info.task_result.result_data);
+    }
+    /* A kept frame may carry a secret its sender zeroes after the send (a
+     * backup event's passphrase), so the copy is zeroed too. */
+    sodium_memzero(copy, sizeof(*copy));
+}
+
+int at_msg_copy(const generic_msg_t *msg, generic_msg_t *copy)
+{
+    if (msg == NULL || copy == NULL || !at_send_retry_supported(msg->type))
+        return -1;
+    memcpy(copy, msg, sizeof(generic_msg_t));
+    if (msg->type == NET_MESSAGE) {
+        net_msg_t *nm = &copy->info.net_msg;
+        const net_msg_t *src = &msg->info.net_msg;
+        nm->obj = NULL;
+        nm->function = NULL;
+        if (src->obj != NULL && src->len > 0) {
+            /* With the NUL every obj carries past len (net_msg_pack_json). */
+            nm->obj = malloc(src->len + 1);
+            if (nm->obj == NULL) {
+                at_msg_copy_release(copy);
+                return -1;
+            }
+            memcpy(nm->obj, src->obj, src->len);
+            nm->obj[src->len] = '\0';
+        }
+        if (src->function != NULL) {
+            nm->function = strdup(src->function);
+            if (nm->function == NULL) {
+                at_msg_copy_release(copy);
+                return -1;
+            }
+        }
+        _strip_identity(&nm->to_whom);
+        _strip_identity(&nm->from_whom);
+    } else if (msg->type == TASK_RESULT) {
+        task_result_msg_t *tr = &copy->info.task_result;
+        const task_result_msg_t *src = &msg->info.task_result;
+        tr->result_data = NULL;
+        if (src->result_data != NULL && src->result_len > 0) {
+            tr->result_data = malloc(src->result_len);
+            if (tr->result_data == NULL) {
+                at_msg_copy_release(copy);
+                return -1;
+            }
+            memcpy(tr->result_data, src->result_data, src->result_len);
+        } else {
+            tr->result_len = 0;
+        }
+    }
+    return 0;
+}
+
 static void _free_entry(at_deferred_t *e)
 {
     if (e == NULL)
         return;
-    if (e->msg.type == NET_MESSAGE) {
-        free(e->msg.info.net_msg.obj);
-        free(e->msg.info.net_msg.function);
-    } else if (e->msg.type == TASK_RESULT) {
-        free(e->msg.info.task_result.result_data);
-    }
-    /* A kept frame may carry a secret its sender zeroes after the send (a
-     * backup event's passphrase), so the copy is zeroed too. */
+    at_msg_copy_release(&e->msg);
     sodium_memzero(e, sizeof(*e));
     free(e);
 }
@@ -139,10 +200,23 @@ int at_send_retry_defer(const char *queue, const generic_msg_t *msg,
     return at_send_retry_defer_then(queue, msg, what, whom, now, NULL, NULL, 0);
 }
 
+static int _defer(const process_t *owner, const char *queue,
+                  const generic_msg_t *msg, const char *what, const char *whom,
+                  double now, at_send_sent_fn on_sent, const void *ctx,
+                  size_t ctx_len);
+
 int at_send_retry_defer_then(const char *queue, const generic_msg_t *msg,
                              const char *what, const char *whom, double now,
                              at_send_sent_fn on_sent, const void *ctx,
                              size_t ctx_len)
+{
+    return _defer(NULL, queue, msg, what, whom, now, on_sent, ctx, ctx_len);
+}
+
+static int _defer(const process_t *owner, const char *queue,
+                  const generic_msg_t *msg, const char *what, const char *whom,
+                  double now, at_send_sent_fn on_sent, const void *ctx,
+                  size_t ctx_len)
 {
     if (queue == NULL || msg == NULL || !at_send_retry_supported(msg->type)
         || ctx_len > AT_SEND_RETRY_CTX_MAX || (ctx_len > 0 && ctx == NULL))
@@ -151,49 +225,16 @@ int at_send_retry_defer_then(const char *queue, const generic_msg_t *msg,
     if (e == NULL)
         return -1;
     e->on_sent = on_sent;
+    e->owner = owner;
     if (ctx_len > 0)
         memcpy(e->ctx, ctx, ctx_len);
     snprintf(e->queue, sizeof(e->queue), "%s", queue);
     snprintf(e->what, sizeof(e->what), "%s", what != NULL ? what : "a frame");
     snprintf(e->whom, sizeof(e->whom), "%s", whom != NULL ? whom : "peer");
     e->first = now;
-    memcpy(&e->msg, msg, sizeof(generic_msg_t));
-    if (msg->type == NET_MESSAGE) {
-        net_msg_t *nm = &e->msg.info.net_msg;
-        const net_msg_t *src = &msg->info.net_msg;
-        nm->obj = NULL;
-        nm->function = NULL;
-        if (src->obj != NULL && src->len > 0) {
-            nm->obj = malloc(src->len);
-            if (nm->obj == NULL) {
-                free(e);
-                return -1;
-            }
-            memcpy(nm->obj, src->obj, src->len);
-        }
-        if (src->function != NULL) {
-            nm->function = strdup(src->function);
-            if (nm->function == NULL) {
-                _free_entry(e);
-                return -1;
-            }
-        }
-        _strip_identity(&nm->to_whom);
-        _strip_identity(&nm->from_whom);
-    } else if (msg->type == TASK_RESULT) {
-        task_result_msg_t *tr = &e->msg.info.task_result;
-        const task_result_msg_t *src = &msg->info.task_result;
-        tr->result_data = NULL;
-        if (src->result_data != NULL && src->result_len > 0) {
-            tr->result_data = malloc(src->result_len);
-            if (tr->result_data == NULL) {
-                free(e);
-                return -1;
-            }
-            memcpy(tr->result_data, src->result_data, src->result_len);
-        } else {
-            tr->result_len = 0;
-        }
+    if (at_msg_copy(msg, &e->msg) != 0) {
+        free(e);
+        return -1;
     }
     int rc = -1;
     pthread_mutex_lock(&g_deferred_lock);
@@ -232,11 +273,13 @@ size_t at_send_retry_drain(const process_t *proc, const char *queue, double now)
     char blocked[AT_SEND_RETRY_MAX][PROC_NAME_LEN + 1];
     size_t num_blocked = 0;
 
+    bool in_process = messaging_in_process();
     pthread_mutex_lock(&g_deferred_lock);
     size_t keep = 0;
     for (size_t i = 0; i < g_num_deferred; i++) {
         at_deferred_t *e = g_deferred[i];
-        bool mine = queue == NULL || strcmp(e->queue, queue) == 0;
+        bool mine = (queue == NULL || strcmp(e->queue, queue) == 0)
+                    && (!in_process || e->owner == NULL || e->owner == proc);
         if (!mine || _listed(blocked, num_blocked, e->queue)) {
             g_deferred[keep++] = e;
             continue;
@@ -302,6 +345,22 @@ size_t at_send_retry_pending(const char *queue)
     return n;
 }
 
+/* Frames @p owner has waiting for @p queue: what its next send must queue
+ * behind. Every pending frame is the owner's in a forked process. */
+static size_t _pending_for(const process_t *owner, const char *queue)
+{
+    if (!messaging_in_process())
+        return at_send_retry_pending(queue);
+    size_t n = 0;
+    pthread_mutex_lock(&g_deferred_lock);
+    for (size_t i = 0; i < g_num_deferred; i++)
+        if ((g_deferred[i]->owner == owner || g_deferred[i]->owner == NULL)
+            && (queue == NULL || strcmp(g_deferred[i]->queue, queue) == 0))
+            n++;
+    pthread_mutex_unlock(&g_deferred_lock);
+    return n;
+}
+
 void at_send_retry_reset(void)
 {
     pthread_mutex_lock(&g_deferred_lock);
@@ -322,10 +381,10 @@ int at_send(const process_t *proc, const char *queue, generic_msg_t *out,
     if (what == NULL)
         what = "a frame";
     double now = (double)time(NULL);
-    if (at_send_retry_pending(queue) > 0) {
+    if (_pending_for(proc, queue) > 0) {
         at_send_retry_drain(proc, queue, now);
-        if (at_send_retry_pending(queue) > 0
-            && at_send_retry_defer_then(queue, out, what, whom, now, on_sent,
+        if (_pending_for(proc, queue) > 0
+            && _defer(proc, queue, out, what, whom, now, on_sent,
                                         ctx, ctx_len) == 0) {
             log_info(logger, "%s: %s to %s waits behind earlier frames for a"
                      " full %s queue\n", who, what, to, queue);
@@ -344,12 +403,14 @@ int at_send(const process_t *proc, const char *queue, generic_msg_t *out,
             return 0;
         }
     }
-    if (ret == EAGAIN && at_send_retry_defer_then(queue, out, what, whom, now,
+    if (ret == EAGAIN && _defer(proc, queue, out, what, whom, now,
                                                   on_sent, ctx, ctx_len) == 0) {
         log_info(logger, "%s: %s to %s deferred (%s queue full); the tick"
                  " retries it\n", who, what, to, queue);
         return 0;
     }
+    if (ret != EAGAIN && (flags & AT_SEND_QUIET_FAULT))
+        return ret;
     log_warn(logger,
              "%s: could not send %s to %s after %d tr%s (%s) — the action DID"
              " NOT HAPPEN and nothing retries it\n",

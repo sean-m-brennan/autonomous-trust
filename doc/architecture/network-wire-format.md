@@ -251,6 +251,38 @@ maps and on bootstrap verbs, and a forwarded frame is opaque ciphertext from an
 address in no group we hold, so it takes the forward branch and returns before
 any check runs.
 
+## What a frame may carry, by its path
+
+Every inbound frame reaches its process through one funnel, C
+`route_to_process` and Python `_msg_to_queue`, and the funnel knows which path
+the frame came in on. Before routing it asks `net_wire_verb_admitted` (Python
+`wire_verb_admitted`) whether the frame's process and function may arrive that
+way (ISSUES §2.17):
+
+| Path | What it may carry |
+|---|---|
+| any | never an `app_*` verb: those are the local app's commands, and no node sends one to another |
+| any | to the network process, only a remote `stats_req`: an `exclude` from the wire would gate peers for us, and any other function was re-sent stamped as ours |
+| plaintext from an address we cannot place; relayed from a uuid we do not hold | only the plaintext verbs (core and granted) |
+| broadcast | the plaintext verbs, plus the identity verbs sent with no recipient: `group_key_update`, `peer_accepted`, `propose_peer` (C `ID_BROADCAST_ONLY_VERBS`, Python `BROADCAST_ONLY_VERBS`) |
+| from a peer we hold, or group-encrypted from one | anything the first two rows do not refuse |
+
+The check is made on the frame's names, never on the sender it claims. On a
+stranger's paths `from_whom` is the envelope's claim, and a stranger chooses
+it: leaving out `from_uuid`, or claiming ours, passed every handler's
+local-origin check (`identity_is_local_app_verb`). That check stays in every
+app verb's handler, core and social, as a second line.
+
+The group channel reads a frame as from the peer we hold at its address (or,
+through a gateway, at its source uuid), and drops one from anybody else.
+Before §2.17 C took the envelope's claim there with no lookup, so anyone
+holding the group key could say it was anyone; Python already dropped a
+non-peer.
+
+A refusal is logged at INFO, the first 20 and then every 100th (`refusing
+<process>.<function> from <address> on the <path> path: <why>`), so a
+legitimate verb the lists miss shows in the first cohort log.
+
 ## What is pinned
 
 Conformance (`protocol: network`), both runtimes:
@@ -266,6 +298,7 @@ Conformance (`protocol: network`), both runtimes:
 | `cross-group-format-fallback` | a group answers JSON for any address it cannot place — the cross-format merge handshake |
 | `gateway-boundary-verbs` | the membership AND size of the pre-admission verb set, both runtimes |
 | `unencrypted-verbs` | the plaintext allowlist, its size, and that `full_history` is bootstrap yet never plaintext |
+| `wire-verb-policy` | what a frame may carry on each path: 24 cases, both directions |
 | `transport-binds-the-recipient` | the envelope's `from_*` claim is read ONLY with no transport peer — both formats |
 
 The proto bytes are pinned as **inline hex in the vector**, not a fixture file,

@@ -26,16 +26,14 @@ class ReputationProtocol(Protocol):
 
     Permissioned consensus: assumes IdentityProtocol has previously succeeded
 
-    Leaderless Byzantine Multi-Paxos protocol:
-    1. request the floor: unique proposal id (timestamp + index + my uuid)
-    2. granted (or not) - from majority of peers: proposal id + last id + chain hash
-    2a. if timestamp < max approved -> nack: proposal id -> requestor must retry (exponential backoff?)
-    2b. if requestor index < my index -> update nack
-    2c. if my index < requestor index -> catch up
-    3. proposal: proposal id + value
-    4. accepted: proposal id -> confirmed iff #accepted >= #peers/2+1
-    5. To guarantee up-to-date do only steps 1,2
-    5a. request update from 3 peers: depth of chain
+    Every group places its order (doc/architecture/reputation.md, "Agreeing
+    on an order"):
+    1. transaction: our half, asking to be certified, naming its group
+    2. accepted: each acceptor signs the half's commit designation
+    3. committed: the certified half goes to every member's pool
+    4. placement (place request / grant / place / placed): Paxos decides
+       which pooled entries the chain holds at each index
+    5. update needed / latest update: catch up from peers
 
     Overall process
     1. transaction from main -> record, broadcast out
@@ -45,10 +43,11 @@ class ReputationProtocol(Protocol):
     4a. compute
     5. reputation response
     """
-    request = 'ask permission'
-    grant = 'permission granted'
-    nack = 'try again'
-    backdate = 'out of date'
+    # The half round's Phase 1, retired 2026-10-16 with every group placing
+    # its order. A node on a build that still runs it sends these; they are
+    # dropped and logged once per sender (ReputationProcess.handle_retired).
+    retired = ('ask permission', 'permission granted', 'try again',
+               'out of date')
     transaction = 'transaction'
     accepted = 'tx accepted'
     # Phase 3 — proposer announces commit to the group once majority
@@ -64,6 +63,11 @@ class ReputationProtocol(Protocol):
     update = 'latest update'
     rep_req = 'request reputation'
     rep_resp = 'reputation response'
+    # Another local process (ZTA's delegation bar) asks for one peer's score:
+    # {peer_uuid, return_process} -> {peer_uuid, score, found}, sent to
+    # return_process. Local only. C's REP_PROTO_LOCAL_QUERY / _RESP.
+    local_rep_query = 'local_rep_query'
+    local_rep_response = 'local_rep_response'
     # History-only reputation score for observer/dashboard use:
     # deterministic EMA over committed bilateral txs (see
     # ReputationProcess._consensus_reputation). Distinct request op

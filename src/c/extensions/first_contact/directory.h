@@ -92,11 +92,11 @@ int at_dir_entry_verify(const at_dir_signed_t *entry, const char *const *trusted
 /** Sign an attestation that @p handle belongs to @p key_hex, with the issuer
  *  keypair's 64-byte secret key @p issuer_sk. For tests and issuer tooling. */
 int at_dir_attest(const unsigned char *issuer_sk, const char *handle,
-                  const char *key_hex, long expiry, at_dir_signed_t *out);
+                  const char *key_hex, int64_t expiry, at_dir_signed_t *out);
 /** Sign @p self's entry for the handle @p att vouches for. @p expiry 0 = the
  *  default lifetime; either way capped at the attestation's expiry. */
 int at_dir_create_entry(const identity_t *self, const at_dir_signed_t *att,
-                        int64_t seq, const char *visibility, long expiry,
+                        int64_t seq, const char *visibility, int64_t expiry,
                         double now, at_dir_signed_t *out);
 
 /** Sign @p body (stolen, even on failure) with the 64-byte secret key @p sk
@@ -129,7 +129,7 @@ int at_dir_request_verify(const at_dir_signed_t *req, double now);
  *  AT_DIR_REQUEST_MAX_RELAYS of @p relays are kept. */
 int at_dir_request_create(const identity_t *self, const at_dir_signed_t *entry,
                           const char *const *relays, size_t n_relays,
-                          const char *nonce, long expiry, double now,
+                          const char *nonce, int64_t expiry, double now,
                           at_dir_signed_t *out);
 /** Request fields ("from", "to" lower-cased as Python's properties). */
 const char *at_dir_request_from(const at_dir_signed_t *req);
@@ -143,6 +143,6 @@ const char *at_dir_uuid(const at_dir_signed_t *obj);
 const char *at_dir_visibility(const at_dir_signed_t *obj);
 const char *at_dir_issuer(const at_dir_signed_t *obj);
 int64_t at_dir_seq(const at_dir_signed_t *obj);
-long at_dir_expiry(const at_dir_signed_t *obj);
+int64_t at_dir_expiry(const at_dir_signed_t *obj);
 
 #endif /* AT_CONTACTS_DIRECTORY_H */

@@ -1,0 +1,60 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: tenure-young-member-held-below-tier-three
+byte_pinning: false
+description: |
+    A member bob has held for less than its tenure holds at most tier 2,
+    however well it has answered (doc/architecture/reputation.md, "Tenure").
+
+    alice answered four of bob's tasks at 0.9 and bob scored her the same, a
+    tier-4 record. But bob first held her as a member 10 s ago, and the
+    minimum is 600 s. bob scores her by the ordinary algebra and then bounds
+    the result just below 0.80, the tier-3 floor. Stele's red team found the
+    case: the owner's shill answered four probes honestly and was counted as
+    a replica fourteen seconds after it joined (rt-3717776).
+
+    The expected 0.80 is the ceiling read at the corpus's 1e-3 tolerance; the
+    uncapped score is 0.90. That the ceiling sits BELOW the floor is pinned by
+    attest-propose-replication-young-verifier-declined.
+
+participants:
+  - id: carol
+    role: requestor
+  - id: bob
+    role: oracle
+  - id: alice
+    role: subject
+
+fixtures:
+  tx_history:
+    bob:
+      - {task_id: t-1, p1: alice, p1_score: 0.9, p2: bob, p2_score: 0.9}
+      - {task_id: t-2, p1: bob, p1_score: 0.9, p2: alice, p2_score: 0.9}
+      - {task_id: t-3, p1: alice, p1_score: 0.9, p2: bob, p2_score: 0.9}
+      - {task_id: t-4, p1: bob, p1_score: 0.9, p2: alice, p2_score: 0.9}
+  reputations:
+    bob:
+      alice: 0.2
+  coop_mode:
+    bob:
+      alice: false
+  tenure:
+    bob:
+      min_sec: 600
+      alice: 10
+
+steps:
+  - id: 1
+    from: carol
+    to: bob
+    function: request reputation
+    payload:
+      target: alice
+      proc: negotiation
+    description: carol asks bob for alice's reputation; bob scores and bounds it.
+
+expected_state:
+  bob:
+    reputation_of:
+      alice: 0.80

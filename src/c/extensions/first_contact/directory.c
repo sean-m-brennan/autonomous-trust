@@ -112,10 +112,10 @@ int64_t at_dir_seq(const at_dir_signed_t *obj)
     return json_is_integer(v) ? (int64_t)json_integer_value(v) : 0;
 }
 
-long at_dir_expiry(const at_dir_signed_t *obj)
+int64_t at_dir_expiry(const at_dir_signed_t *obj)
 {
     json_t *v = obj != NULL ? json_object_get(obj->body, "expiry") : NULL;
-    return json_is_integer(v) ? (long)json_integer_value(v) : 0;
+    return json_is_integer(v) ? (int64_t)json_integer_value(v) : 0;
 }
 
 static bool _is_version(const json_t *body, const char *typename)
@@ -270,7 +270,7 @@ static int _sign(const unsigned char *sk, const char *domain, json_t *body,
 }
 
 int at_dir_attest(const unsigned char *issuer_sk, const char *handle,
-                  const char *key_hex, long expiry, at_dir_signed_t *out)
+                  const char *key_hex, int64_t expiry, at_dir_signed_t *out)
 {
     char folded[AT_DIR_HANDLE_MAX + 1];
     if (issuer_sk == NULL || out == NULL
@@ -291,7 +291,7 @@ int at_dir_attest(const unsigned char *issuer_sk, const char *handle,
 }
 
 int at_dir_create_entry(const identity_t *self, const at_dir_signed_t *att,
-                        int64_t seq, const char *visibility, long expiry,
+                        int64_t seq, const char *visibility, int64_t expiry,
                         double now, at_dir_signed_t *out)
 {
     if (self == NULL || att == NULL || out == NULL || visibility == NULL)
@@ -303,7 +303,7 @@ int at_dir_create_entry(const identity_t *self, const at_dir_signed_t *att,
         && strcmp(visibility, AT_DIR_VISIBILITY_PUBLISHED) != 0)
         return AT_DIR_MALFORMED;
     if (expiry == 0)
-        expiry = (long)now + AT_DIR_DEFAULT_TTL_SECONDS;
+        expiry = (int64_t)now + AT_DIR_DEFAULT_TTL_SECONDS;
     if (at_dir_expiry(att) > 0 && expiry > at_dir_expiry(att))
         expiry = at_dir_expiry(att);
     char uu[UUID_STRING_LEN + 1];
@@ -380,7 +380,7 @@ int at_dir_request_verify(const at_dir_signed_t *req, double now)
 
 int at_dir_request_create(const identity_t *self, const at_dir_signed_t *entry,
                           const char *const *relays, size_t n_relays,
-                          const char *nonce, long expiry, double now,
+                          const char *nonce, int64_t expiry, double now,
                           at_dir_signed_t *out)
 {
     /* A directory entry names its handle; an area card, its area. */
@@ -398,7 +398,7 @@ int at_dir_request_create(const identity_t *self, const at_dir_signed_t *entry,
         nonce = fresh;
     }
     if (expiry == 0)
-        expiry = (long)now + AT_DIR_REQUEST_TTL_SECONDS;
+        expiry = (int64_t)now + AT_DIR_REQUEST_TTL_SECONDS;
     char uu[UUID_STRING_LEN + 1], to[UUID_STRING_LEN + 1];
     uuid_unparse_lower(self->uuid, uu);
     at_strlcpy(to, at_dir_uuid(entry), sizeof(to));

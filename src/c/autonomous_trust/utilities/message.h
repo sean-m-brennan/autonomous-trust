@@ -143,6 +143,24 @@ typedef struct
 int messaging_init(const char *id, queue_t *queue);
 
 /**
+ * @brief Initialize a queue that ANOTHER process sends to (the app link: the
+ *        daemon's inbound app queue, the app's event queue).
+ *
+ * Where processes have unix datagrams this is @ref messaging_init. Where they
+ * do not (Windows; $AT_IPC_STREAM=1 elsewhere) the queue is a stream socket
+ * instead, which senders reach through the same @ref messaging_send.
+ */
+int messaging_init_external(const char *id, queue_t *queue);
+
+/**
+ * @brief Do this node's subsystems run as threads of one process?
+ *
+ * True on Windows, which has no fork, and where $AT_IN_PROCESS=1. Their
+ * queues are then in-process FIFOs (@ref messaging_init), not sockets.
+ */
+bool messaging_in_process(void);
+
+/**
  * @brief Is a queue with this key actually bound — i.e. is somebody listening?
  *
  * The readiness question a host needs and could not previously ask. A forked

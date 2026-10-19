@@ -39,6 +39,8 @@
 #include "identity/identity.h"
 #include "identity/id_proc_priv.h"   /* identity_self_identity */
 #include "utilities/send_retry.h"   /* at_send: keep a refused frame (ISSUES §2.14) */
+#include "fleet/fleet_gate.h"
+#include "reputation/reputation.h"   /* REP_PROTO_LOCAL_RESP */
 
 #define EFLEET_PAXOS 260
 DEFINE_ERROR(EFLEET_PAXOS, "Fleet Paxos consensus error");
@@ -67,7 +69,7 @@ static struct {
     paxos_instance_t vote_paxos;
     map_t pending_proposals;   /* proposal_uuid_str -> update_proposal_t* */
     map_t accepted_updates;    /* proposal_uuid_str -> update_proposal_t* */
-    int num_peers;
+    json_t *rounds;            /* proposal_uuid_str -> {id1, id2, grants[]} (proposer) */
     pthread_mutex_t lock;
     bool initialized;
 } fleet_state;
@@ -78,346 +80,432 @@ static void _ensure_init(void)
     {
         map_init(&fleet_state.pending_proposals);
         map_init(&fleet_state.accepted_updates);
-        /* paxos_init is called in fleet_run after num_peers is known */
-        fleet_state.num_peers = 0;
+        fleet_state.rounds = json_object();
         pthread_mutex_init(&fleet_state.lock, NULL);
         fleet_state.initialized = true;
     }
 }
 
 /* Forward declarations */
+static bool handle_update_proposal(const process_t *proc, directory_t *queues, generic_msg_t *msg);
+static bool handle_vote_request(const process_t *proc, directory_t *queues, generic_msg_t *msg);
 static bool handle_update_accepted(const process_t *proc, directory_t *queues, generic_msg_t *msg);
 
-/****************************
- * Handler: handle_update_proposal
- * Receive an update proposal, verify signature, store it, initiate Paxos vote.
- ****************************/
+/* What a grant is signed over names the protocol, so a fleet grant cannot be
+ * replayed as a config grant. */
+static const char FLEET_KIND[] = "update";
 
-/*@
-  requires \valid(proc);
-  requires \valid(queues);
-  requires \valid(msg);
-  requires proc->logger == \null || \valid(proc->logger);
-*/
-static bool handle_update_proposal(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+static int _verify(const void *prop, const uint8_t *pk)
 {
-    net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Fleet: update proposal from %s\n", nmsg->from_whom.nickname);
+    return update_proposal_verify((const update_proposal_t *)prop, pk);
+}
 
-    /* Unpack proposal JSON from payload */
-    json_t *payload = NULL;
-    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
-    {
-        log_error(proc->logger, "Fleet: handle_update_proposal: failed to unpack JSON\n");
-        return false;
+/* Send @p body as @p function to every member of our group. */
+static void _send_to_members(const process_t *proc, const char *function, json_t *body,
+                             const char *what)
+{
+    public_identity_t *members = NULL;
+    size_t n = fleet_gate_members(proc, &members);
+    for (size_t i = 0; i < n; i++) {
+        generic_msg_t out = {0};
+        out.type = NET_MESSAGE;
+        at_strlcpy(out.info.net_msg.process, "fleet", sizeof(out.info.net_msg.process));
+        out.info.net_msg.function = (char *)function;
+        out.info.net_msg.encrypt = true;
+        memcpy(&out.info.net_msg.to_whom, &members[i], sizeof(public_identity_t));
+        at_strlcpy(out.info.net_msg.return_to, "fleet", sizeof(out.info.net_msg.return_to));
+        net_msg_pack_json(&out.info.net_msg, body);
+        at_send(proc, "network", &out, what, "network", 0, NULL, NULL, 0);
+        net_msg_free_obj(&out.info.net_msg);
     }
+    free(members);
+}
 
-    /* Deserialize proposal */
-    update_proposal_t proposal;
-    if (update_proposal_from_json(payload, &proposal) != 0)
-    {
-        json_decref(payload);
-        log_error(proc->logger, "Fleet: handle_update_proposal: invalid proposal JSON\n");
-        return false;
+/* Run the proposer checks (fleet_gate.h) on @p prop. PENDING holds @p msg for
+ * @p handler; a refusal is logged. True only on PASS. */
+static bool _gate(const process_t *proc, const update_proposal_t *prop, generic_msg_t *msg,
+                  fleet_gate_handler_fn handler, const char *stage)
+{
+    char why[160] = {0};
+    fleet_gate_t verdict = fleet_gate_proposer(proc, prop->signer_uuid, _verify, prop,
+                                               why, sizeof(why));
+    if (verdict == FLEET_GATE_PASS)
+        return true;
+    char u[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(prop->proposal_uuid, u);
+    if (verdict == FLEET_GATE_PENDING && msg != NULL && handler != NULL) {
+        log_info(proc->logger, "Fleet: %s for %s held: %s\n", stage, u, why);
+        fleet_gate_hold(proc, msg, handler);
+    } else {
+        log_warn(proc->logger, "Fleet: %s for %s refused: %s\n", stage, u, why);
     }
+    return false;
+}
 
-    /* Verify signature using sender's public key */
-    if (!fleet_validate_proposal(&proposal, nmsg->from_whom.signature.public))
-    {
-        json_decref(payload);
-        log_error(proc->logger, "Fleet: handle_update_proposal: signature verification failed\n");
+/* A proposal from @p body's "proposal", whose uuid must match "proposal_uuid"
+ * when the body names one. */
+static bool _proposal_of(const json_t *body, update_proposal_t *prop)
+{
+    const json_t *jp = json_object_get(body, "proposal");
+    if (!json_is_object(jp) || update_proposal_from_json(jp, prop) != 0)
         return false;
-    }
+    const char *named = json_string_value(json_object_get(body, "proposal_uuid"));
+    uuid_t u;
+    return named == NULL || (uuid_parse(named, u) == 0
+                             && uuid_compare(u, prop->proposal_uuid) == 0);
+}
 
-    /* Store proposal in pending map keyed by proposal UUID */
+/* Act on an update that carried: keep it, tell the app, fetch the artifact
+ * from @p from unless we hold it. Caller has verified the certificate. */
+static void _apply(const process_t *proc, const update_proposal_t *prop,
+                   const public_identity_t *from)
+{
     char prop_uuid_str[UUID_STRING_LEN + 1];
-    uuid_unparse_lower(proposal.proposal_uuid, prop_uuid_str);
+    uuid_unparse_lower(prop->proposal_uuid, prop_uuid_str);
+    char artifact_hash_hex[UPDATE_HASH_LEN * 2 + 1] = {0};
+    sodium_bin2hex(artifact_hash_hex, sizeof(artifact_hash_hex), prop->artifact_hash,
+                   UPDATE_HASH_LEN);
+
+    pthread_mutex_lock(&fleet_state.lock);
+    data_t *dat = NULL;
+    if (map_get(&fleet_state.accepted_updates, prop_uuid_str, &dat) == 0 && dat != NULL) {
+        pthread_mutex_unlock(&fleet_state.lock);
+        log_debug(proc->logger, "Fleet: %s already accepted\n", prop_uuid_str);
+        return;
+    }
+    /* A plain struct (no smrt header) owned by its data_t. */
+    update_proposal_t *copy = malloc(sizeof(update_proposal_t));
+    data_t *cd = copy != NULL ? owned_object_data(memcpy(copy, prop, sizeof(*prop)),
+                                                  sizeof(*prop))
+                              : NULL;
+    if (cd == NULL)
+        free(copy);
+    else if (map_set(&fleet_state.accepted_updates, prop_uuid_str, cd) != 0)
+        smrt_deref(cd);
+    if (map_get(&fleet_state.pending_proposals, prop_uuid_str, &dat) == 0)
+        map_remove(&fleet_state.pending_proposals, prop_uuid_str);
+    pthread_mutex_unlock(&fleet_state.lock);
+    log_info(proc->logger, "Fleet: proposal %s accepted\n", prop_uuid_str);
+
+    /* Tell the app, through the main process: FLEET_UPDATE_ACCEPTED is
+     * app-bound, so the main loop forwards it. */
+    generic_msg_t notify = {0};
+    notify.type = FLEET_UPDATE_ACCEPTED;
+    uuid_copy(AT_MSG_EXT(&notify, fleet_update_accepted_msg_t)->proposal_uuid,
+              prop->proposal_uuid);
+    at_send(proc, AT_MAIN_QUEUE, &notify, "an accepted update", AT_MAIN_QUEUE,
+            0, NULL, NULL, 0);
+
+    if (artifact_store_has(artifact_hash_hex)) {
+        log_info(proc->logger, "Fleet: already holding artifact %s\n", artifact_hash_hex);
+        return;
+    }
+    if (from == NULL || from->address[0] == '\0')
+        return;
+    json_t *fetch_req = json_pack("{s:s}", "hash", artifact_hash_hex);
+    if (fetch_req == NULL)
+        return;
+    generic_msg_t artifact_msg = {0};
+    artifact_msg.type = NET_MESSAGE;
+    net_msg_t *anmsg = &artifact_msg.info.net_msg;
+    at_strlcpy(anmsg->process, "artifact", sizeof(anmsg->process));
+    anmsg->function = ARTIFACT_PROTO_REQUEST;
+    memcpy(&anmsg->to_whom, from, sizeof(public_identity_t));
+    anmsg->encrypt = true;
+    at_strlcpy(anmsg->return_to, "artifact", sizeof(anmsg->return_to));
+    net_msg_pack_json(anmsg, fetch_req);
+    json_decref(fetch_req);
+    at_send(proc, "network", &artifact_msg, "an artifact request", "network",
+            0, NULL, NULL, 0);
+    net_msg_free_obj(anmsg);
+    log_info(proc->logger, "Fleet: triggered artifact fetch for %s from %s\n",
+             artifact_hash_hex, from->address);
+}
+
+/* The proposer's round: once ⌊N/2⌋ other members have granted, send the
+ * certificate (the proposal and its grants) to every member and apply it. */
+static void _try_commit(const process_t *proc, const char *prop_uuid_str)
+{
+    update_proposal_t prop;
+    bool have = false;
+    json_t *round = NULL;
+    pthread_mutex_lock(&fleet_state.lock);
+    data_t *dat = NULL;
+    update_proposal_t *p = NULL;
+    if (map_get(&fleet_state.pending_proposals, (map_key_t)prop_uuid_str, &dat) == 0
+        && dat != NULL && data_object_ptr(dat, (ptr_t *)&p) == 0 && p != NULL) {
+        memcpy(&prop, p, sizeof(prop));
+        have = true;
+    }
+    round = json_object_get(fleet_state.rounds, prop_uuid_str);
+    if (round != NULL)
+        json_incref(round);
+    pthread_mutex_unlock(&fleet_state.lock);
+    if (!have || round == NULL) {
+        json_decref(round);
+        return;
+    }
+    int64_t id1 = json_integer_value(json_object_get(round, "id1"));
+    int64_t id2 = json_integer_value(json_object_get(round, "id2"));
+    json_t *grants = json_object_get(round, "grants");
+    size_t n = fleet_gate_group_size(proc);
+    size_t need = fleet_gate_quorum(n);
+    size_t count = fleet_gate_count_grants(proc, grants, FLEET_KIND, prop.proposal_uuid,
+                                           prop.signer_uuid, id1, id2, prop.artifact_hash);
+    if (count < need) {
+        log_debug(proc->logger, "Fleet: %s has %zu of %zu grants (group of %zu)\n",
+                  prop_uuid_str, count, need, n);
+        json_decref(round);
+        return;
+    }
+    json_t *acc = json_pack("{s:o, s:I, s:I, s:s, s:O}", "proposal",
+                            update_proposal_to_json(&prop), "id1", (json_int_t)id1,
+                            "id2", (json_int_t)id2, "proposal_uuid", prop_uuid_str,
+                            "grants", grants);
+    json_decref(round);
+    pthread_mutex_lock(&fleet_state.lock);
+    json_object_del(fleet_state.rounds, prop_uuid_str);
+    pthread_mutex_unlock(&fleet_state.lock);
+    log_info(proc->logger, "Fleet: proposal %s carried (%zu of %zu grants, group of "
+             "%zu); sending the certificate\n", prop_uuid_str, count, need, n);
+    if (acc != NULL) {
+        _send_to_members(proc, FLEET_PROTO_ACCEPTED, acc, "an acceptance");
+        json_decref(acc);
+    }
+    paxos_advance_chain(&fleet_state.vote_paxos);
+    _apply(proc, &prop, NULL);
+}
+
+/* Start the vote on a proposal this node signed or holds. */
+static void _start_vote(const process_t *proc, const update_proposal_t *prop)
+{
+    char prop_uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(prop->proposal_uuid, prop_uuid_str);
+    int64_t id1, id2;
+    paxos_next_ids(&fleet_state.vote_paxos, &id1, &id2);
 
     pthread_mutex_lock(&fleet_state.lock);
     /* A plain struct (no smrt header) owned by its data_t, so the map
-     * releases it when the last reference goes (accepted_updates or not). */
+     * releases it when the last reference goes. */
     update_proposal_t *heap_prop = malloc(sizeof(update_proposal_t));
-    if (heap_prop == NULL)
-    {
-        pthread_mutex_unlock(&fleet_state.lock);
-        json_decref(payload);
-        return false;
-    }
-    memcpy(heap_prop, &proposal, sizeof(update_proposal_t));
-    data_t *prop_dat = owned_object_data(heap_prop, sizeof(update_proposal_t));
+    data_t *prop_dat = heap_prop != NULL
+        ? owned_object_data(memcpy(heap_prop, prop, sizeof(*prop)), sizeof(*prop))
+        : NULL;
     if (prop_dat == NULL)
         free(heap_prop);
     else if (map_set(&fleet_state.pending_proposals, prop_uuid_str, prop_dat) != 0)
         smrt_deref(prop_dat);
+    json_object_set_new(fleet_state.rounds, prop_uuid_str,
+                        json_pack("{s:I, s:I, s:[]}", "id1", (json_int_t)id1,
+                                  "id2", (json_int_t)id2, "grants"));
     pthread_mutex_unlock(&fleet_state.lock);
 
-    json_decref(payload);
-
-    /* Initiate Paxos vote: broadcast vote request to all peers */
-    int64_t id1, id2;
-    paxos_next_ids(&fleet_state.vote_paxos, &id1, &id2);
-
-    json_t *req_json = json_object();
-    if (!req_json)
-    {
-        log_error(proc->logger, "Fleet: json_object() OOM building vote request\n");
-        return false;
+    /* The vote request carries the proposal itself, so each voter checks
+     * what it is granting. */
+    json_t *req_json = json_pack("{s:I, s:I, s:s, s:o}", "id1", (json_int_t)id1,
+                                 "id2", (json_int_t)id2, "proposal_uuid", prop_uuid_str,
+                                 "proposal", update_proposal_to_json(prop));
+    if (req_json == NULL) {
+        log_error(proc->logger, "Fleet: out of memory building a vote request\n");
+        return;
     }
-    json_object_set_new(req_json, "id1", json_integer(id1));
-    json_object_set_new(req_json, "id2", json_integer(id2));
-    json_object_set_new(req_json, "proposal_uuid", json_string(prop_uuid_str));
-
-    peers_read_lock(proc);
-    for (size_t i = 0; i < proc->protocol.num_peers; i++)
-    {
-        generic_msg_t req = {0};
-        req.type = NET_MESSAGE;
-        strncpy(req.info.net_msg.process, "fleet", PROC_NAME_LEN);
-        req.info.net_msg.function = FLEET_PROTO_VOTE_REQ;
-        req.info.net_msg.encrypt = true;
-        memcpy(&req.info.net_msg.to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
-        strncpy(req.info.net_msg.return_to, "fleet", PROC_NAME_LEN);
-        net_msg_pack_json(&req.info.net_msg, req_json);
-        at_send(proc, "network", &req, "a vote request", "network",
-                0, NULL, NULL, 0);
-        net_msg_free_obj(&req.info.net_msg);
-    }
-    peers_read_unlock(proc);
+    _send_to_members(proc, FLEET_PROTO_VOTE_REQ, req_json, "a vote request");
     json_decref(req_json);
-
     log_info(proc->logger, "Fleet: Proposal %s stored, vote initiated\n", prop_uuid_str);
+    /* A group of one carries it at once (⌊1/2⌋ = 0 grants). */
+    _try_commit(proc, prop_uuid_str);
+}
+
+/****************************
+ * Handler: handle_update_proposal
+ * A local proposal (the node's own, or one handed to it to run): run the
+ * proposer checks, then the vote.
+ ****************************/
+
+/* Frama-C: skipped — [solver-timeout] json + gate + map cascade. */
+static bool handle_update_proposal(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    update_proposal_t proposal;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL
+        || update_proposal_from_json(payload, &proposal) != 0) {
+        json_decref(payload);
+        log_warn(proc->logger, "Fleet: update proposal refused: not a proposal\n");
+        return true;
+    }
+    json_decref(payload);
+    /* A node runs the vote only on a proposal it signed: another member's
+     * proposal reaches it as a vote request, and is checked there. */
+    if (!uuid_is_null(nmsg->from_whom.uuid)
+        && uuid_compare(nmsg->from_whom.uuid, proposal.signer_uuid) != 0) {
+        log_warn(proc->logger, "Fleet: update proposal from %s refused: it is signed "
+                 "by another node\n", nmsg->from_whom.nickname);
+        return true;
+    }
+    if (!fleet_gate_is_self(proc, proposal.signer_uuid)) {
+        log_warn(proc->logger, "Fleet: update proposal refused: this node runs the vote "
+                 "only on its own proposals\n");
+        return true;
+    }
+    if (!_gate(proc, &proposal, msg, handle_update_proposal, "proposal"))
+        return true;
+    _start_vote(proc, &proposal);
     return true;
 }
 
 /****************************
  * Handler: handle_vote_request
- * Paxos Phase 1a: check proposal via paxos_handle_request, send grant or nack.
+ * A voter checks the proposal it carries, then the ballot, and signs a grant.
  ****************************/
 
-/*@
-  requires \valid(proc);
-  requires \valid(queues);
-  requires \valid(msg);
-  requires proc->logger == \null || \valid(proc->logger);
-*/
+/* Frama-C: skipped — [solver-timeout] json + gate + crypto cascade. */
 static bool handle_vote_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
+    (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Fleet: vote request from %s\n", nmsg->from_whom.nickname);
 
     json_t *payload = NULL;
-    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
-    {
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL) {
         log_error(proc->logger, "Fleet: handle_vote_request: failed to unpack JSON\n");
-        return false;
+        return true;
     }
-
     json_t *j_id1 = json_object_get(payload, "id1");
     json_t *j_id2 = json_object_get(payload, "id2");
-    json_t *j_prop_uuid = json_object_get(payload, "proposal_uuid");
-
-    if (!j_id1 || !j_id2 || !j_prop_uuid)
-    {
+    update_proposal_t prop;
+    if (!json_is_integer(j_id1) || !json_is_integer(j_id2) || !_proposal_of(payload, &prop)) {
         json_decref(payload);
-        log_error(proc->logger, "Fleet: handle_vote_request: missing JSON fields\n");
-        return false;
+        log_warn(proc->logger, "Fleet: vote request from %s refused: no proposal to "
+                 "check\n", nmsg->from_whom.nickname);
+        return true;
     }
-
     int64_t id1 = json_integer_value(j_id1);
     int64_t id2 = json_integer_value(j_id2);
-    const char *prop_uuid_raw = json_string_value(j_prop_uuid);
-    char prop_uuid_str[UUID_STRING_LEN + 1];
-    strncpy(prop_uuid_str, prop_uuid_raw ? prop_uuid_raw : "", UUID_STRING_LEN);
-    prop_uuid_str[UUID_STRING_LEN] = '\0';
     json_decref(payload);
 
+    /* The requester runs the vote on its own proposal. */
+    if (uuid_compare(nmsg->from_whom.uuid, prop.signer_uuid) != 0) {
+        log_warn(proc->logger, "Fleet: vote request from %s refused: the proposal is "
+                 "signed by another node\n", nmsg->from_whom.nickname);
+        return true;
+    }
+    if (!_gate(proc, &prop, msg, handle_vote_request, "vote request"))
+        return true;
+
+    char prop_uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(prop.proposal_uuid, prop_uuid_str);
     int64_t out_last_id = 0;
     int out_chain_len = 0;
     paxos_response_t result = paxos_handle_request(&fleet_state.vote_paxos, id1, id2,
                                                    &out_last_id, &out_chain_len);
-
-    if (result == PAXOS_GRANT)
-    {
-        /* Build grant payload */
-        json_t *grant_json = json_object();
-        if (!grant_json)
-        {
-            log_error(proc->logger, "Fleet: json_object() OOM building grant\n");
-            return false;
+    json_t *reply = NULL;
+    const char *function = FLEET_PROTO_VOTE_NACK;
+    if (result == PAXOS_GRANT) {
+        reply = fleet_gate_sign_grant(proc, FLEET_KIND, prop.proposal_uuid, id1, id2,
+                                      prop.artifact_hash);
+        if (reply == NULL) {
+            log_error(proc->logger, "Fleet: could not sign a grant for %s\n", prop_uuid_str);
+            return true;
         }
-        json_object_set_new(grant_json, "id1", json_integer(id1));
-        json_object_set_new(grant_json, "id2", json_integer(id2));
-        json_object_set_new(grant_json, "proposal_uuid", json_string(prop_uuid_str));
-        json_object_set_new(grant_json, "last_id", json_integer(out_last_id));
-        json_object_set_new(grant_json, "chain_len", json_integer(out_chain_len));
-
-        generic_msg_t grant = {0};
-        grant.type = NET_MESSAGE;
-        strncpy(grant.info.net_msg.process, "fleet", PROC_NAME_LEN);
-        grant.info.net_msg.function = FLEET_PROTO_VOTE_GRANT;
-        grant.info.net_msg.encrypt = true;
-        memcpy(&grant.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
-        strncpy(grant.info.net_msg.return_to, "fleet", PROC_NAME_LEN);
-        net_msg_pack_json(&grant.info.net_msg, grant_json);
-        json_decref(grant_json);
-
-        log_debug(proc->logger, "Fleet: Vote granted\n");
-        at_send(proc, "network", &grant, "a vote grant", "network",
-                0, NULL, NULL, 0);
-        net_msg_free_obj(&grant.info.net_msg);
+        json_object_set_new(reply, "last_id", json_integer(out_last_id));
+        json_object_set_new(reply, "chain_len", json_integer(out_chain_len));
+        function = FLEET_PROTO_VOTE_GRANT;
+    } else {
+        reply = json_pack("{s:I, s:I, s:s}", "id1", (json_int_t)id1, "id2", (json_int_t)id2,
+                          "proposal_uuid", prop_uuid_str);
+        if (reply == NULL)
+            return true;
     }
-    else
-    {
-        /* NACK */
-        json_t *nack_json = json_object();
-        if (!nack_json)
-        {
-            log_error(proc->logger, "Fleet: json_object() OOM building nack\n");
-            return false;
-        }
-        json_object_set_new(nack_json, "id1", json_integer(id1));
-        json_object_set_new(nack_json, "id2", json_integer(id2));
-        json_object_set_new(nack_json, "proposal_uuid", json_string(prop_uuid_str));
-
-        generic_msg_t nack = {0};
-        nack.type = NET_MESSAGE;
-        strncpy(nack.info.net_msg.process, "fleet", PROC_NAME_LEN);
-        nack.info.net_msg.function = FLEET_PROTO_VOTE_NACK;
-        nack.info.net_msg.encrypt = true;
-        memcpy(&nack.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
-        strncpy(nack.info.net_msg.return_to, "fleet", PROC_NAME_LEN);
-        net_msg_pack_json(&nack.info.net_msg, nack_json);
-        json_decref(nack_json);
-
-        log_debug(proc->logger, "Fleet: Vote nacked\n");
-        at_send(proc, "network", &nack, "a vote refusal", "network",
-                0, NULL, NULL, 0);
-        net_msg_free_obj(&nack.info.net_msg);
-    }
-
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    at_strlcpy(out.info.net_msg.process, "fleet", sizeof(out.info.net_msg.process));
+    out.info.net_msg.function = (char *)function;
+    out.info.net_msg.encrypt = true;
+    memcpy(&out.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
+    at_strlcpy(out.info.net_msg.return_to, "fleet", sizeof(out.info.net_msg.return_to));
+    net_msg_pack_json(&out.info.net_msg, reply);
+    json_decref(reply);
+    log_debug(proc->logger, "Fleet: Vote %s\n", result == PAXOS_GRANT ? "granted" : "nacked");
+    at_send(proc, "network", &out,
+            result == PAXOS_GRANT ? "a vote grant" : "a vote refusal", "network",
+            0, NULL, NULL, 0);
+    net_msg_free_obj(&out.info.net_msg);
     return true;
 }
 
 /****************************
  * Handler: handle_vote_grant
- * Paxos Phase 1b: count grants; on quorum, broadcast accepted.
+ * The proposer keeps each member's signed grant; enough of them carry it.
  ****************************/
 
-/*@
-  requires \valid(proc);
-  requires \valid(queues);
-  requires \valid(msg);
-  requires proc->logger == \null || \valid(proc->logger);
-*/
+/* Frama-C: skipped — [solver-timeout] json + crypto cascade. */
 static bool handle_vote_grant(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
+    (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Fleet: vote grant from %s\n", nmsg->from_whom.nickname);
 
-    json_t *payload = NULL;
-    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
-    {
-        log_error(proc->logger, "Fleet: handle_vote_grant: failed to unpack JSON\n");
-        return false;
+    json_t *grant = NULL;
+    if (net_msg_unpack_json(nmsg, &grant) != 0 || grant == NULL)
+        return true;
+    const char *prop_uuid_raw = json_string_value(json_object_get(grant, "proposal_uuid"));
+    char prop_uuid_str[UUID_STRING_LEN + 1] = {0};
+    if (prop_uuid_raw != NULL)
+        at_strlcpy(prop_uuid_str, prop_uuid_raw, sizeof(prop_uuid_str));
+
+    update_proposal_t prop;
+    bool have = false;
+    pthread_mutex_lock(&fleet_state.lock);
+    data_t *dat = NULL;
+    update_proposal_t *p = NULL;
+    json_t *round = json_object_get(fleet_state.rounds, prop_uuid_str);
+    if (round != NULL && map_get(&fleet_state.pending_proposals, prop_uuid_str, &dat) == 0
+        && dat != NULL && data_object_ptr(dat, (ptr_t *)&p) == 0 && p != NULL) {
+        memcpy(&prop, p, sizeof(prop));
+        have = true;
     }
-
-    json_t *j_id1 = json_object_get(payload, "id1");
-    json_t *j_id2 = json_object_get(payload, "id2");
-    json_t *j_prop_uuid = json_object_get(payload, "proposal_uuid");
-
-    if (!j_id1 || !j_id2 || !j_prop_uuid)
-    {
-        json_decref(payload);
-        log_error(proc->logger, "Fleet: handle_vote_grant: missing JSON fields\n");
-        return false;
+    int64_t id1 = have ? json_integer_value(json_object_get(round, "id1")) : 0;
+    int64_t id2 = have ? json_integer_value(json_object_get(round, "id2")) : 0;
+    pthread_mutex_unlock(&fleet_state.lock);
+    if (!have) {
+        json_decref(grant);
+        log_debug(proc->logger, "Fleet: grant for %s, which is not an open round here\n",
+                  prop_uuid_str);
+        return true;
     }
-
-    int64_t id1 = json_integer_value(j_id1);
-    int64_t id2 = json_integer_value(j_id2);
-    const char *prop_uuid_raw = json_string_value(j_prop_uuid);
-    char prop_uuid_str[UUID_STRING_LEN + 1];
-    strncpy(prop_uuid_str, prop_uuid_raw ? prop_uuid_raw : "", UUID_STRING_LEN);
-    prop_uuid_str[UUID_STRING_LEN] = '\0';
-    json_decref(payload);
-
-    /* Record grant with score=1.0 (vote weight) */
-    int count = paxos_record_grant(&fleet_state.vote_paxos, id1, id2, 1.0);
-    bool quorum = (count >= PAXOS_MAJORITY(fleet_state.num_peers));
-
-    if (quorum)
-    {
-        /* Look up proposal to get artifact hash */
-        char artifact_hash_hex[UPDATE_HASH_LEN * 2 + 1] = {0};
-        pthread_mutex_lock(&fleet_state.lock);
-        data_t *p_dat = NULL;
-        if (map_get(&fleet_state.pending_proposals, prop_uuid_str, &p_dat) == 0 && p_dat != NULL)
-        {
-            update_proposal_t *p = NULL;
-            data_object_ptr(p_dat, (ptr_t *)&p);
-            if (p != NULL)
-                sodium_bin2hex(artifact_hash_hex, sizeof(artifact_hash_hex),
-                               p->artifact_hash, UPDATE_HASH_LEN);
-        }
-        pthread_mutex_unlock(&fleet_state.lock);
-
-        /* Broadcast FLEET_PROTO_ACCEPTED to all peers (include artifact hash) */
-        json_t *acc_json = json_object();
-        if (!acc_json)
-        {
-            log_error(proc->logger, "Fleet: json_object() OOM building accepted\n");
-            return false;
-        }
-        json_object_set_new(acc_json, "id1", json_integer(id1));
-        json_object_set_new(acc_json, "id2", json_integer(id2));
-        json_object_set_new(acc_json, "proposal_uuid", json_string(prop_uuid_str));
-        json_object_set_new(acc_json, "artifact_hash", json_string(artifact_hash_hex));
-
-        log_info(proc->logger, "Fleet: Quorum reached for proposal %s, broadcasting accepted\n",
-                 prop_uuid_str);
-
-        peers_read_lock(proc);
-        for (size_t i = 0; i < proc->protocol.num_peers; i++)
-        {
-            generic_msg_t acc_msg = {0};
-            acc_msg.type = NET_MESSAGE;
-            strncpy(acc_msg.info.net_msg.process, "fleet", PROC_NAME_LEN);
-            acc_msg.info.net_msg.function = FLEET_PROTO_ACCEPTED;
-            acc_msg.info.net_msg.encrypt = true;
-            memcpy(&acc_msg.info.net_msg.to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
-            strncpy(acc_msg.info.net_msg.return_to, "fleet", PROC_NAME_LEN);
-            net_msg_pack_json(&acc_msg.info.net_msg, acc_json);
-            at_send(proc, "network", &acc_msg, "an acceptance", "network",
-                    0, NULL, NULL, 0);
-            net_msg_free_obj(&acc_msg.info.net_msg);
-        }
-        peers_read_unlock(proc);
-        json_decref(acc_json);
-
-        paxos_advance_chain(&fleet_state.vote_paxos);
-
-        /* Also process acceptance locally (proposer has the proposal in pending) */
-        generic_msg_t self_acc = {0};
-        self_acc.type = NET_MESSAGE;
-        strncpy(self_acc.info.net_msg.process, "fleet", PROC_NAME_LEN);
-        self_acc.info.net_msg.function = FLEET_PROTO_ACCEPTED;
-        json_t *self_json = json_object();
-        if (!self_json)
-        {
-            log_error(proc->logger, "Fleet: json_object() OOM building self-accept\n");
-            return false;
-        }
-        json_object_set_new(self_json, "proposal_uuid", json_string(prop_uuid_str));
-        json_object_set_new(self_json, "artifact_hash", json_string(artifact_hash_hex));
-        net_msg_pack_json(&self_acc.info.net_msg, self_json);
-        json_decref(self_json);
-        handle_update_accepted(proc, queues, &self_acc);
-        net_msg_free_obj(&self_acc.info.net_msg);
+    uuid_t granter;
+    if (!fleet_gate_grant_valid(proc, grant, FLEET_KIND, prop.proposal_uuid, id1, id2,
+                                prop.artifact_hash, granter)
+        || uuid_compare(granter, nmsg->from_whom.uuid) != 0) {
+        json_decref(grant);
+        log_warn(proc->logger, "Fleet: grant for %s from %s refused: not a valid "
+                 "member's signature over this ballot\n", prop_uuid_str,
+                 nmsg->from_whom.nickname);
+        return true;
     }
-    else
-    {
-        log_debug(proc->logger, "Fleet: Vote grant recorded (%d so far)\n", count);
+    json_object_del(grant, "last_id");
+    json_object_del(grant, "chain_len");
+    pthread_mutex_lock(&fleet_state.lock);
+    round = json_object_get(fleet_state.rounds, prop_uuid_str);
+    if (round != NULL) {
+        /* One grant per member: a repeat is not kept, so the certificate
+         * carries each granter once. */
+        json_t *kept = json_object_get(round, "grants");
+        const char *who = json_string_value(json_object_get(grant, "granter"));
+        bool repeat = false;
+        size_t i;
+        json_t *g;
+        json_array_foreach(kept, i, g)
+            repeat = repeat || (who != NULL && json_string_value(json_object_get(g, "granter"))
+                                && strcmp(who, json_string_value(json_object_get(g, "granter"))) == 0);
+        if (!repeat)
+            json_array_append(kept, grant);
     }
-
+    pthread_mutex_unlock(&fleet_state.lock);
+    json_decref(grant);
+    _try_commit(proc, prop_uuid_str);
     return true;
 }
 
@@ -459,118 +547,49 @@ static bool handle_vote_nack(const process_t *proc, directory_t *queues, generic
 
 /****************************
  * Handler: handle_update_accepted
- * Move proposal from pending to accepted.
+ * An acceptance is a certificate: the proposal and its grants. Every node
+ * checks both itself, against its own view of the group, before acting.
  ****************************/
 
-/*@
-  requires \valid(proc);
-  requires \valid(queues);
-  requires \valid(msg);
-  requires proc->logger == \null || \valid(proc->logger);
-*/
+/* Frama-C: skipped — [solver-timeout] json + gate + crypto cascade. */
 static bool handle_update_accepted(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
+    (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Fleet: update accepted from %s\n", nmsg->from_whom.nickname);
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
-    {
-        log_error(proc->logger, "Fleet: handle_update_accepted: failed to unpack JSON\n");
-        return false;
-    }
-
-    json_t *j_prop_uuid = json_object_get(payload, "proposal_uuid");
-    if (!j_prop_uuid)
-    {
+        return true;
+    update_proposal_t prop;
+    json_t *j_id1 = json_object_get(payload, "id1");
+    json_t *j_id2 = json_object_get(payload, "id2");
+    if (!json_is_integer(j_id1) || !json_is_integer(j_id2) || !_proposal_of(payload, &prop)) {
         json_decref(payload);
-        log_error(proc->logger, "Fleet: handle_update_accepted: missing proposal_uuid\n");
-        return false;
+        log_warn(proc->logger, "Fleet: acceptance from %s ignored: it carries no "
+                 "proposal\n", nmsg->from_whom.nickname);
+        return true;
     }
-
-    const char *prop_uuid_raw = json_string_value(j_prop_uuid);
-    char prop_uuid_str[UUID_STRING_LEN + 2];
-    strncpy(prop_uuid_str, prop_uuid_raw ? prop_uuid_raw : "", sizeof(prop_uuid_str) - 1);
-    prop_uuid_str[sizeof(prop_uuid_str) - 1] = '\0';
-
-    /* Get artifact hash from accepted message (always present) */
-    json_t *j_artifact_hash = json_object_get(payload, "artifact_hash");
-    char artifact_hash_hex[UPDATE_HASH_LEN * 2 + 1] = {0};
-    if (j_artifact_hash)
-    {
-        const char *h = json_string_value(j_artifact_hash);
-        if (h) strncpy(artifact_hash_hex, h, sizeof(artifact_hash_hex) - 1);
+    if (!_gate(proc, &prop, msg, handle_update_accepted, "acceptance")) {
+        json_decref(payload);
+        return true;
     }
+    size_t n = fleet_gate_group_size(proc);
+    size_t need = fleet_gate_quorum(n);
+    size_t count = fleet_gate_count_grants(proc, json_object_get(payload, "grants"),
+                                           FLEET_KIND, prop.proposal_uuid, prop.signer_uuid,
+                                           json_integer_value(j_id1),
+                                           json_integer_value(j_id2), prop.artifact_hash);
     json_decref(payload);
-
-    pthread_mutex_lock(&fleet_state.lock);
-
-    /* Look up proposal in pending (only the proposer has it) */
-    data_t *prop_dat = NULL;
-    bool is_proposer = false;
-    if (map_get(&fleet_state.pending_proposals, prop_uuid_str, &prop_dat) == 0 && prop_dat != NULL)
-    {
-        /* Move to accepted. The ref is what makes it a move: map_set
-         * adopts the reference pending_proposals holds, and the map_remove
-         * releases it — without a second one the value would be freed out
-         * from under accepted_updates (see map.h on map_set). */
-        smrt_ref(prop_dat);
-        map_set(&fleet_state.accepted_updates, prop_uuid_str, prop_dat);
-        map_remove(&fleet_state.pending_proposals, prop_uuid_str);
-        is_proposer = true;
-        log_info(proc->logger, "Fleet: Proposal %s accepted and moved to accepted_updates\n",
-                 prop_uuid_str);
+    if (count < need) {
+        char u[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(prop.proposal_uuid, u);
+        log_warn(proc->logger, "Fleet: acceptance of %s from %s ignored: %zu valid "
+                 "grant(s) from other members, %zu needed in our group of %zu\n", u,
+                 nmsg->from_whom.nickname, count, need, n);
+        return true;
     }
-
-    pthread_mutex_unlock(&fleet_state.lock);
-
-    /* Also tell the app, through the main process: FLEET_UPDATE_ACCEPTED is
-     * app-bound, so the main loop forwards it. */
-    generic_msg_t notify = {0};
-    notify.type = FLEET_UPDATE_ACCEPTED;
-    uuid_parse(prop_uuid_str, AT_MSG_EXT(&notify, fleet_update_accepted_msg_t)->proposal_uuid);
-    at_send(proc, AT_MAIN_QUEUE, &notify, "an accepted update", AT_MAIN_QUEUE,
-            0, NULL, NULL, 0);
-
-    /* If we already have the artifact (proposer), mark complete.
-     * Otherwise, request the artifact from the sender (proposer). */
-    if (artifact_hash_hex[0] != '\0')
-    {
-        if (is_proposer && artifact_store_has(artifact_hash_hex))
-        {
-            log_info(proc->logger, "Fleet: proposer already has artifact %s\n", artifact_hash_hex);
-        }
-        else if (nmsg->from_whom.address[0] != '\0')
-        {
-            /* Request artifact from the proposer who sent us the acceptance */
-            json_t *fetch_req = json_object();
-            if (!fetch_req)
-            {
-                log_error(proc->logger, "Fleet: json_object() OOM building artifact fetch\n");
-                return false;
-            }
-            json_object_set_new(fetch_req, "hash", json_string(artifact_hash_hex));
-
-            generic_msg_t artifact_msg = {0};
-            artifact_msg.type = NET_MESSAGE;
-            net_msg_t *anmsg = &artifact_msg.info.net_msg;
-            strncpy(anmsg->process, "artifact", PROC_NAME_LEN);
-            anmsg->function = ARTIFACT_PROTO_REQUEST;
-            memcpy(&anmsg->to_whom, &nmsg->from_whom, sizeof(public_identity_t));
-            anmsg->encrypt = true;
-            strncpy(anmsg->return_to, "artifact", PROC_NAME_LEN);
-
-            net_msg_pack_json(anmsg, fetch_req);
-            json_decref(fetch_req);
-            at_send(proc, "network", &artifact_msg, "an artifact request", "network",
-                    0, NULL, NULL, 0);
-            net_msg_free_obj(anmsg);
-
-            log_info(proc->logger, "Fleet: triggered artifact fetch for %s from %s\n",
-                     artifact_hash_hex, nmsg->from_whom.address);
-        }
-    }
-
+    _apply(proc, &prop, &nmsg->from_whom);
     return true;
 }
 
@@ -588,9 +607,11 @@ char FLEET_APP_PROPOSE[] = AT_APP_FLEET_PROPOSE;
 /* The app proposes an update: {version, artifact_hash (64 hex), target_arch,
  * min_proposer_reputation}. An app holds no private key, so THIS node builds
  * the proposal, signs it with its identity key and names itself the signer,
- * then runs it through the same path a peer's proposal takes (signature check,
- * then the vote). Local only: a frame from the wire is refused. FEATURE_SPLIT_PLAN
- * Phase 8 (the user's call, 2026-10-02). */
+ * then runs it through the proposer checks (fleet_gate.h: this node must be
+ * operator-bound) and the vote. The bar the app names travels with the
+ * proposal but decides nothing: each node applies its own. Local only: a frame
+ * from the wire is refused. FEATURE_SPLIT_PLAN Phase 8 (the user's call,
+ * 2026-10-02). */
 bool fleet_handle_app_propose(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     _ensure_init();     /* idempotent; fleet_run has done it in a running node */
@@ -684,22 +705,31 @@ bool fleet_pending_proposal(const char *proposal_uuid, update_proposal_t *out)
 /* The app may send it, only to fleet (msg_registry.h). */
 AT_APP_VERB_REGISTER(fleet_propose, AT_APP_FLEET_PROPOSE, "fleet")
 
-int fleet_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
+/* The fleet handlers, registered on @p proc (fleet_run, and tests). */
+int fleet_register_handlers(const process_t *proc)
 {
     _ensure_init();
-
-    peers_read_lock(proc);
-    fleet_state.num_peers = (int)proc->protocol.num_peers;
-    peers_read_unlock(proc);
-    paxos_init(&fleet_state.vote_paxos, fleet_state.num_peers, logger);
-
-    /* Register protocol handlers */
+    /* The quorum is sized from the live group each time it is counted
+     * (fleet_gate_quorum), so Paxos here only orders the ballots. */
+    if (!fleet_state.vote_paxos.initialized)
+        paxos_init(&fleet_state.vote_paxos, 0, proc->logger);
     process_register_handler(proc, FLEET_PROTO_PROPOSE,    (handler_ptr_t)handle_update_proposal);
     process_register_handler(proc, FLEET_PROTO_VOTE_REQ,   (handler_ptr_t)handle_vote_request);
     process_register_handler(proc, FLEET_PROTO_VOTE_GRANT, (handler_ptr_t)handle_vote_grant);
     process_register_handler(proc, FLEET_PROTO_VOTE_NACK,  (handler_ptr_t)handle_vote_nack);
     process_register_handler(proc, FLEET_PROTO_ACCEPTED,   (handler_ptr_t)handle_update_accepted);
     process_register_handler(proc, FLEET_APP_PROPOSE,      (handler_ptr_t)fleet_handle_app_propose);
+    process_register_handler(proc, REP_PROTO_LOCAL_RESP,   (handler_ptr_t)fleet_gate_handle_rep_reply);
+
+    return 0;
+}
+
+int fleet_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
+{
+    _ensure_init();
+
+
+    fleet_register_handlers(proc);
 
     proc->protocol.phase = 1;
 

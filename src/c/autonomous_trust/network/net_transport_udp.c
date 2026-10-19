@@ -204,9 +204,9 @@ static int udp_open_common(net_transport_ctx_t **out_ctx,
     return 0;
 
 fail:
-    if (ctx->recv_ptp  > 0) close(ctx->recv_ptp);
-    if (ctx->recv_grp  > 0) close(ctx->recv_grp);
-    if (ctx->recv_cast > 0) close(ctx->recv_cast);
+    if (ctx->recv_ptp  > 0) at_socket_close(ctx->recv_ptp);
+    if (ctx->recv_grp  > 0) at_socket_close(ctx->recv_grp);
+    if (ctx->recv_cast > 0) at_socket_close(ctx->recv_cast);
     free(ctx);
     return -1;
 }
@@ -237,7 +237,7 @@ static int udp_send_unicast(net_transport_ctx_t *ctx,
     (void)net_transport_ip_bind_source(sock, ctx->local_addr, ctx->cfg.domain,
                                        false, ctx->logger);
     int ret = udp_send(sock, wire, wire_len, target, port, ctx->ipv6, ctx->logger);
-    close(sock);
+    at_socket_close(sock);
     return ret;
 }
 
@@ -299,7 +299,7 @@ static int udp_send_broadcast(net_transport_ctx_t *ctx, net_channel_t channel,
     (void)net_transport_ip_bind_source(sock, ctx->local_addr, ctx->cfg.domain,
                                        false, ctx->logger);
     int ret = udp_send(sock, wire, wire_len, target, send_port, ctx->ipv6, ctx->logger);
-    close(sock);
+    at_socket_close(sock);
     return ret;
 }
 
@@ -358,9 +358,9 @@ static int udp_recv(net_transport_ctx_t *ctx, net_channel_t channel,
 static void udp_close(net_transport_ctx_t *ctx)
 {
     if (ctx == NULL) return;
-    if (ctx->recv_ptp  > 0) close(ctx->recv_ptp);
-    if (ctx->recv_grp  > 0) close(ctx->recv_grp);
-    if (ctx->recv_cast > 0) close(ctx->recv_cast);
+    if (ctx->recv_ptp  > 0) at_socket_close(ctx->recv_ptp);
+    if (ctx->recv_grp  > 0) at_socket_close(ctx->recv_grp);
+    if (ctx->recv_cast > 0) at_socket_close(ctx->recv_cast);
     free(ctx);
 }
 

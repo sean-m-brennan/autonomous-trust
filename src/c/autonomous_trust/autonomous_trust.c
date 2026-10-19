@@ -174,11 +174,166 @@ int at_route_queue_msg(array_t *unhandled, generic_msg_t *msg)
 }
 
 
+/****************************
+ * App-bound events while no app is attached
+ ****************************/
+/* The app binds q_out (at_app_events_open), not the node, so between an app's
+ * sessions -- before it first opens, across a restart, or between a cohort's
+ * short-lived drivers -- every send found no socket. Each was a WARNING and an
+ * ENOENT (about a thousand a cohort run), and a one-time event (a DM, a post,
+ * a co-sign ask) was lost. Now, while nothing is bound, a state event the
+ * roster pull re-emits is counted and dropped, and a one-time event is held,
+ * oldest dropped past AT_APP_HELD_MAX, and sent in order once an app binds.
+ * One line reports each gap when it ends. */
+static generic_msg_t g_app_held[AT_APP_HELD_MAX];
+static size_t g_app_held_n = 0;
+static bool g_app_attached = false;     /* until a send or a probe says so */
+static size_t g_gap_state = 0;          /* state events dropped this gap */
+static size_t g_gap_overflow = 0;       /* held events dropped this gap */
+static time_t g_gap_since = 0;
+
+bool at_app_event_replayed(long type)
+{
+    switch (type)
+    {
+    case PEER_OBSERVED:      /* identity_emit_all_peers */
+    case PEER_REPUTATION:    /* reputation_emit_all */
+    case PEER_RTT_OBSERVED:  /* net_emit_all_rtts */
+    case PEER_PRESENCE:      /* net_emit_all_presence */
+        return true;
+    case TASK_RESULT:
+    case TRANSACTION_SCORE:
+        return false;
+    default:
+        break;
+    }
+    const at_msg_vtable_t *vt = at_msg_type_lookup(type);
+    return vt != NULL && vt->app_replayed;
+}
+
+static void _app_detached(logger_t *logger, const char *q_out)
+{
+    g_app_attached = false;
+    g_gap_state = 0;
+    g_gap_overflow = 0;
+    g_gap_since = time(NULL);
+    log_info(logger, "AutonomousTrust: no app attached to %s; holding one-time "
+             "events until one is\n", q_out);
+}
+
+static void _app_hold(const generic_msg_t *msg, logger_t *logger)
+{
+    if (at_app_event_replayed(msg->type))
+    {
+        g_gap_state++;
+        return;
+    }
+    if (g_app_held_n == AT_APP_HELD_MAX)
+    {
+        at_msg_copy_release(&g_app_held[0]);
+        memmove(&g_app_held[0], &g_app_held[1],
+                (AT_APP_HELD_MAX - 1) * sizeof(g_app_held[0]));
+        g_app_held_n--;
+        g_gap_overflow++;
+    }
+    if (at_msg_copy(msg, &g_app_held[g_app_held_n]) == 0)
+        g_app_held_n++;
+    else
+    {
+        g_gap_overflow++;
+        log_warn(logger, "AutonomousTrust: could not hold an app event of type "
+                 "%ld for the app; it is lost\n", msg->type);
+    }
+}
+
+size_t at_app_flush_held(const char *q_out, logger_t *logger)
+{
+    if (q_out == NULL || g_app_attached || !messaging_bound(q_out))
+        return 0;
+    size_t held = g_app_held_n, sent = 0;
+    while (sent < g_app_held_n)
+    {
+        /* 0 is sent or kept (a full app queue files it with send_retry, which
+         * keeps the order); anything else leaves the rest for the next pass. */
+        if (at_send(NULL, q_out, &g_app_held[sent], "a held app event", q_out,
+                    AT_SEND_NOW, NULL, NULL, 0) != 0)
+            break;
+        at_msg_copy_release(&g_app_held[sent]);
+        sent++;
+    }
+    memmove(&g_app_held[0], &g_app_held[sent],
+            (g_app_held_n - sent) * sizeof(g_app_held[0]));
+    g_app_held_n -= sent;
+    if (g_app_held_n > 0)
+        return sent;    /* still flushing; the gap ends when it is empty */
+    g_app_attached = true;
+    if (held > 0 || g_gap_state > 0 || g_gap_overflow > 0)
+        log_info(logger, "AutonomousTrust: an app attached to %s after %lld s: "
+                 "delivered %zu held event(s); %zu state event(s) were not "
+                 "delivered (the roster pull replays them); %zu held event(s) "
+                 "dropped past the hold of %d\n", q_out,
+                 (long long)(g_gap_since ? time(NULL) - g_gap_since : 0),
+                 sent, g_gap_state, g_gap_overflow, AT_APP_HELD_MAX);
+    g_gap_state = 0;
+    g_gap_overflow = 0;
+    return sent;
+}
+
+size_t at_app_held_count(void)
+{
+    return g_app_held_n;
+}
+
+void at_app_hold_reset(void)
+{
+    for (size_t i = 0; i < g_app_held_n; i++)
+        at_msg_copy_release(&g_app_held[i]);
+    g_app_held_n = 0;
+    g_app_attached = false;
+    g_gap_state = 0;
+    g_gap_overflow = 0;
+    g_gap_since = 0;
+}
+
+/* Deliver one app-bound event, or hold or count it while no app is attached.
+ * Returns 1 when sent (or kept by send_retry for a full queue). */
+static int _to_app(const char *q_out, generic_msg_t *msg, logger_t *logger)
+{
+    if (!g_app_attached)
+        (void)at_app_flush_held(q_out, logger);
+    if (g_app_attached)
+    {
+        if (at_send(NULL, q_out, msg, "an app event", q_out,
+                    AT_SEND_NOW | AT_SEND_QUIET_FAULT, NULL, NULL, 0) == 0)
+            return 1;
+        if (messaging_bound(q_out))
+        {
+            /* A real fault, with an app attached: lost, as before. */
+            log_warn(logger, "AutonomousTrust: could not send an app event to "
+                     "%s (send failed) — it is lost\n", q_out);
+            return 0;
+        }
+        _app_detached(logger, q_out);
+    }
+    else if (g_gap_since == 0)
+    {
+        g_gap_since = time(NULL);
+        log_info(logger, "AutonomousTrust: no app attached to %s yet; holding "
+                 "one-time events until one is\n", q_out);
+    }
+    _app_hold(msg, logger);
+    return 0;
+}
+
 int at_route_internal_msgs(array_t *unhandled, const char *q_out,
                            logger_t *logger)
 {
     if (unhandled == NULL)
         return 0;
+    /* Every pass, so held events reach an app that attaches while AT is
+     * quiet. Free while one is attached. */
+    if (q_out != NULL && !g_app_attached)
+        (void)at_app_flush_held(q_out, logger);
     int sent = 0;
     while (array_size(unhandled) > 0)
     {
@@ -225,12 +380,8 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
             case PEER_RTT_OBSERVED:
             case PEER_PRESENCE:
                 if (q_out == NULL)
-                    break;   /* no app attached; nothing to do */
-                if (at_send(NULL, q_out, inner,
-                            "an app event", q_out, AT_SEND_NOW, NULL, NULL, 0) != 0)
-                    log_exception(logger);
-                else
-                    sent++;
+                    break;   /* no app queue configured; nothing to do */
+                sent += _to_app(q_out, inner, logger);
                 break;
             default:
             {
@@ -240,11 +391,7 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
                 const at_msg_vtable_t *vt = at_msg_type_lookup(inner->type);
                 if (vt == NULL || !vt->app_bound || q_out == NULL)
                     break;
-                if (at_send(NULL, q_out, inner,
-                            "an app event", q_out, AT_SEND_NOW, NULL, NULL, 0) != 0)
-                    log_exception(logger);
-                else
-                    sent++;
+                sent += _to_app(q_out, inner, logger);
                 break;
             }
             }
@@ -355,9 +502,16 @@ int run_autonomous_trust(char *q_in, char *q_out,
          * controlling terminal / container stream instead of /dev/null. */
         process_child_extra_flags |= NO_STDERR_REDIRECT;
     }
-    int err = daemonize(data_dir, flags, &fd1, &fd2);
-    if (err != 0)
-        return err;
+    /* In-process the caller's process IS the node (agorad, or a host that
+     * runs the node on a thread): nothing forks, and this returns at shutdown
+     * with 0 instead of returning the daemon's pid at once. */
+    int err = 0;
+    if (!messaging_in_process())
+    {
+        err = daemonize(data_dir, flags, &fd1, &fd2);
+        if (err != 0)
+            return err;
+    }
 
     const char *name = AT_MAIN_QUEUE;
     logger_t logger = {0};
@@ -377,7 +531,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
     FILE *pid_fp = (pid_path[0] != '\0') ? fopen(pid_path, "w") : NULL;
     if (pid_fp != NULL)
     {
-        fprintf(pid_fp, "%d\n", my_pid);
+        fprintf(pid_fp, "%d\n", (int)my_pid);
         fclose(pid_fp);
     }
     else
@@ -459,7 +613,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
         log_exception(&logger);
     messaging_assign(&my_q);
     queue_t extern_q = {0};
-    if (messaging_init(q_in, &extern_q) != 0)
+    if (messaging_init_external(q_in, &extern_q) != 0)
         log_exception(&logger);
 
     log_info(&logger, "%s:                                          Ready.\n", name);
@@ -483,22 +637,19 @@ int run_autonomous_trust(char *q_in, char *q_out,
         map_entries_for_each(&procs, key, str_val)
         {
             pid_t pid = atoi(key);
-            err = kill(pid, 0);
-            if (err == 0)
+            int live = process_liveness(pid);
+            if (live == 1)
                 continue;
-            if (err == -1)
+            if (live == 0)
             {
-                if (errno == ESRCH)
-                {
-                    data_t *key_dat = string_data((char *)key, strlen(key) + 1);
-                    if (array_append(&dead_keys, key_dat) != 0)
-                        log_exception(&logger);
-                }
-                else
-                {
-                    SYS_EXCEPTION();
+                data_t *key_dat = string_data((char *)key, strlen(key) + 1);
+                if (array_append(&dead_keys, key_dat) != 0)
                     log_exception(&logger);
-                }
+            }
+            else
+            {
+                SYS_EXCEPTION();
+                log_exception(&logger);
             }
         }
         map_end_for_each
@@ -635,7 +786,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
             pthread_mutex_lock(&procs_lock);
             map_entries_for_each(&procs, pkey, pstr)
             {
-                if (kill((pid_t)atoi(pkey), 0) == 0)
+                if (process_liveness((pid_t)atoi(pkey)) == 1)
                 {
                     any_alive = true;
                     break;
@@ -655,10 +806,10 @@ int run_autonomous_trust(char *q_in, char *q_out,
         map_entries_for_each(&procs, pkey, pstr)
         {
             pid_t pid = (pid_t)atoi(pkey);
-            if (kill(pid, 0) == 0)
+            if (process_liveness(pid) == 1)
             {
                 log_warn(&logger, "Shutdown: pid %d did not exit; sending SIGKILL\n", pid);
-                kill(pid, SIGKILL);
+                process_force_stop(pid, &logger);
             }
         }
         map_end_for_each
