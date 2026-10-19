@@ -179,7 +179,7 @@ static const char *_dir_with(const char *text)
     return tmpl;
 }
 
-static void _rmdir(const char *dir)
+static void _rmdir_tree(const char *dir)
 {
     char path[128];
     snprintf(path, sizeof(path), "%s/%s", dir, PLAINTEXT_VERBS_FILENAME);
@@ -192,7 +192,7 @@ static int _configure(const char *text, bool first_contact)
     setenv("AT_FIRST_CONTACT", first_contact ? "1" : "0", 1);
     const char *dir = _dir_with(text);
     int rc = plaintext_verbs_configure(dir, NULL);
-    _rmdir(dir);
+    _rmdir_tree(dir);
     return rc;
 }
 

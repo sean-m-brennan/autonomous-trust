@@ -19,7 +19,7 @@ from queue import Full
 from uuid import uuid4, UUID
 from unittest.mock import MagicMock, patch, PropertyMock
 
-from autonomous_trust.core.reputation.repprocess import ReputationProcess, TxCount
+from autonomous_trust.core.reputation.repprocess import ReputationProcess
 from autonomous_trust.core.reputation.reputation import (
     Reputation,
     TransactionScore, Transaction, TransactionHistory, Reputations,
@@ -64,21 +64,11 @@ def _make_rep_process():
     return rp
 
 
-class TestTxCount:
-    def test_init(self):
-        score = TransactionScore(uuid4(), 0.8)
-        tc = TxCount(score=score, count=0)
-        assert tc.count == 0
-        assert tc.score is score
-
-
 class TestReputationProcessInit:
     def test_init(self):
         rp = _make_rep_process()
         assert isinstance(rp.history, TransactionHistory)
         assert isinstance(rp.reputations, Reputations)
-        assert rp.my_requests == {}
-        assert rp.requests == []
         assert rp.proposals == {}
 
     def test_properties(self):
@@ -95,145 +85,6 @@ class TestPaxosIdIndex:
     def test_larger(self):
         idx = ReputationProcess._paxos_id_index(1000, 99)
         assert idx == (1000, 99)
-
-
-class TestHandleRequest:
-    def test_grants_valid_request(self):
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        rp.protocol.peers.all = [peer]
-
-        net_q = queue.Queue()
-        queues = {CfgIds.network: net_q, CfgIds.reputation: queue.Queue()}
-
-        id1 = 100
-        id2 = 1  # len(history) + 1 == 0 + 1
-        peer_id = peer.uuid
-        msg = Message(CfgIds.reputation, ReputationProtocol.request,
-                      to_yaml_string((id1, id2, peer_id)),
-                      from_whom=peer)
-        result = rp.handle_request(queues, msg)
-        assert result is True
-        assert not net_q.empty()
-
-    def test_nacks_lower_id(self):
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        rp.protocol.peers.all = [peer]
-        rp.last_id = 200
-
-        net_q = queue.Queue()
-        queues = {CfgIds.network: net_q, CfgIds.reputation: queue.Queue()}
-
-        msg = Message(CfgIds.reputation, ReputationProtocol.request,
-                      to_yaml_string((100, 1, peer.uuid)),
-                      from_whom=peer)
-        result = rp.handle_request(queues, msg)
-        assert result is True
-
-    def test_ignores_non_peer(self):
-        rp = _make_rep_process()
-        rp.protocol.peers.all = []
-
-        queues = {CfgIds.network: queue.Queue(), CfgIds.reputation: queue.Queue()}
-        msg = Message(CfgIds.reputation, ReputationProtocol.request,
-                      to_yaml_string((100, 1, uuid4())),
-                      from_whom=MagicMock())
-        result = rp.handle_request(queues, msg)
-        assert result is True
-
-    def test_wrong_function(self):
-        rp = _make_rep_process()
-        queues = {CfgIds.network: queue.Queue()}
-        msg = Message(CfgIds.reputation, 'wrong_func', 'data')
-        result = rp.handle_request(queues, msg)
-        assert result is False
-
-    def test_grant_advances_last_id(self):
-        """Regression for BUGS.md P6.
-
-        Prior bug: handle_request granted but never assigned self.last_id,
-        so a duplicate (id1, id2) replay re-passed the `last_id is None or
-        last_id < id1` guard and double-appended to self.requests. C side
-        always advanced (paxos.c:123). After fix, both languages advance
-        last_id to id1 immediately after the grant message is emitted; the
-        ack itself still carries the PRIOR last_id (captured before
-        update), matching paxos.c:114.
-        """
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        rp.protocol.peers.all = [peer]
-
-        net_q = queue.Queue()
-        queues = {CfgIds.network: net_q, CfgIds.reputation: queue.Queue()}
-
-        id1 = 100
-        id2 = 1  # len(history) + 1 == 1
-        msg = Message(CfgIds.reputation, ReputationProtocol.request,
-                      to_yaml_string((id1, id2, peer.uuid)),
-                      from_whom=peer)
-        rp.handle_request(queues, msg)
-        first = net_q.get_nowait()
-        assert first.function == ReputationProtocol.grant
-        assert rp.last_id == id1, (
-            f'last_id must advance to {id1} after grant; '
-            f'got {rp.last_id!r} (P6 regression)'
-        )
-
-    def test_replay_after_grant_is_nacked(self):
-        """Regression for BUGS.md P6: duplicate ask must NACK after grant.
-
-        With last_id correctly pinned by the first grant, the second
-        identical ask hits `last_id < id1` → False and falls through to the
-        nack branch. requests stays length 1 (no double-append). Mirrors
-        C's behavior in paxos_handle_request when id1 is NOT > last_id.
-        """
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        rp.protocol.peers.all = [peer]
-
-        net_q = queue.Queue()
-        queues = {CfgIds.network: net_q, CfgIds.reputation: queue.Queue()}
-
-        id1 = 100
-        id2 = 1
-        msg = Message(CfgIds.reputation, ReputationProtocol.request,
-                      to_yaml_string((id1, id2, peer.uuid)),
-                      from_whom=peer)
-        rp.handle_request(queues, msg)
-        first = net_q.get_nowait()
-        assert first.function == ReputationProtocol.grant
-
-        # Replay the SAME ask. Before P6 fix this re-granted and
-        # doubled requests; after fix it NACKs.
-        rp.handle_request(queues, msg)
-        second = net_q.get_nowait()
-        assert second.function == ReputationProtocol.nack, (
-            f'replayed ask must NACK after first grant, '
-            f'got {second.function!r} (P6 regression)'
-        )
-        assert len(rp.requests) == 1, (
-            'replayed ask must not double-append to requests; '
-            f'got len={len(rp.requests)} (P6 regression)'
-        )
-
-
-class TestHandleGrant:
-    def test_wrong_function(self):
-        rp = _make_rep_process()
-        msg = Message(CfgIds.reputation, 'wrong_func', 'data')
-        result = rp.handle_grant({}, msg)
-        assert result is False
-
-    def test_not_for_me(self):
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        ack = ((100, 1, uuid4()), (None, 0), None)  # different peer_id
-        msg = Message(CfgIds.reputation, ReputationProtocol.grant,
-                      to_yaml_string(ack), from_whom=peer)
-        msg.verified = True
-        result = rp.handle_grant({CfgIds.network: queue.Queue()}, msg)
-        assert result is True
 
 
 class TestHandleTransaction:
@@ -262,14 +113,6 @@ class TestHandleAccepted:
         assert result is False
 
 
-class TestHandleBackdate:
-    def test_wrong_function(self):
-        rp = _make_rep_process()
-        msg = Message(CfgIds.reputation, 'wrong', 'data')
-        result = rp.handle_backdate({}, msg)
-        assert result is False
-
-
 class TestHandleOutdated:
     def test_wrong_function(self):
         rp = _make_rep_process()
@@ -294,14 +137,6 @@ class TestHandleUpdate:
         rp = _make_rep_process()
         msg = Message(CfgIds.reputation, 'wrong', 'data')
         result = rp.handle_update({}, msg)
-        assert result is False
-
-
-class TestHandleNack:
-    def test_wrong_function(self):
-        rp = _make_rep_process()
-        msg = Message(CfgIds.reputation, 'wrong', 'data')
-        result = rp.handle_nack({}, msg)
         assert result is False
 
 
@@ -371,83 +206,41 @@ class TestPureReputation:
         assert isinstance(result, float)
 
 
-class TestHandleRequestBackdate:
-    def test_backdate_id_mismatch(self):
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        rp.protocol.peers.all = [peer]
-        rp.last_id = None
-
-        net_q = queue.Queue()
-        queues = {CfgIds.network: net_q, CfgIds.reputation: queue.Queue()}
-        # id2 != len(history) + 1
-        msg = Message(CfgIds.reputation, ReputationProtocol.request,
-                      to_yaml_string((100, 999, peer.uuid)),
-                      from_whom=peer)
-        result = rp.handle_request(queues, msg)
-        assert result is True
-        assert not net_q.empty()
-        sent_msg = net_q.get()
-        assert sent_msg.function == ReputationProtocol.backdate
-
-
-class TestHandleGrantDeeper:
-    def test_grant_for_me_quorum_reached(self):
-        rp = _make_rep_process()
-        peer1 = _make_mock_peer(nickname='p1')
-        peer2 = _make_mock_peer(nickname='p2')
-        rp.protocol.peers.all = [peer1, peer2]
-
-        id1 = 100
-        id2 = 1
-        idx = rp._paxos_id_index(id1, id2)
-        score = TransactionScore(uuid4(), 0.8)
-        rp.my_requests[idx] = TxCount(score=score, count=0)
-
-        ack = ((id1, id2, rp.identity.uuid), (None, 0), None)
-        net_q = queue.Queue()
-        queues = {CfgIds.network: net_q}
-
-        # First grant from peer1
-        msg = Message(CfgIds.reputation, ReputationProtocol.grant,
-                      to_yaml_string(ack), from_whom=peer1)
-        msg.verified = True
-        rp.handle_grant(queues, msg)
-
-        # With 2 peers, quorum is 1 (2//2), so 1 grant should trigger transaction
-        assert not net_q.empty()
-
-    def test_grant_already_completed(self):
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        ack = ((100, 1, rp.identity.uuid), (None, 0), None)
-        msg = Message(CfgIds.reputation, ReputationProtocol.grant,
-                      to_yaml_string(ack), from_whom=peer)
-        msg.verified = True
-        # my_requests is empty, so idx not in my_requests
-        result = rp.handle_grant({CfgIds.network: queue.Queue()}, msg)
-        assert result is True
-
-
 class TestHandleTransactionDeeper:
-    def test_granted_transaction(self):
+    def test_a_proposal_naming_its_group_is_accepted(self):
         rp = _make_rep_process()
         peer = _make_mock_peer()
         id1 = 100
         id2 = 1
         idx = rp._paxos_id_index(id1, id2)
-        rp.requests.append(idx)
         score = TransactionScore(uuid4(), 0.8)
 
+        rp._detached_sig = MagicMock(return_value='ab')  # a mock cannot sign
         net_q = queue.Queue()
         msg = Message(CfgIds.reputation, ReputationProtocol.transaction,
-                      to_yaml_string(((id1, id2, peer.uuid), score)),
+                      to_yaml_string(((id1, id2, peer.uuid), score, True, '')),
                       from_whom=peer)
         msg.verified = True  # simulate signed message (mock peer can't sign)
         result = rp.handle_transaction({CfgIds.network: net_q}, msg)
         assert result is True
-        assert idx not in rp.requests
         assert idx in rp.proposals
+        assert not net_q.empty()       # `tx accepted` went back
+
+    def test_a_half_round_proposal_is_dropped(self):
+        """A two-element proposal is what a build from before every group
+        placed its order sent after a grant. Nothing grants now, so it is
+        dropped: no acceptance, nothing recorded."""
+        rp = _make_rep_process()
+        peer = _make_mock_peer()
+        net_q = queue.Queue()
+        msg = Message(CfgIds.reputation, ReputationProtocol.transaction,
+                      to_yaml_string(((100, 1, peer.uuid),
+                                      TransactionScore(uuid4(), 0.8))),
+                      from_whom=peer)
+        msg.verified = True
+        assert rp.handle_transaction({CfgIds.network: net_q}, msg) is True
+        assert net_q.empty()
+        assert rp.proposals == {}
 
     def test_unknown_evidence_channel_is_dropped_not_raised(self):
         """A peer-supplied evidence channel outside the closed set is refused
@@ -457,16 +250,14 @@ class TestHandleTransactionDeeper:
         `from_yaml_string`/`from_json_string` reconstruction runs, so without the
         handler's catch a remote could raise inside this node's reputation
         process loop just by misspelling a channel. Same reasoning as the
-        off-scale score path. The grant is left UNCONSUMED, since the drop
-        happens before the `requests` lookup."""
+        off-scale score path."""
         rp = _make_rep_process()
         peer = _make_mock_peer()
         id1, id2 = 100, 1
         idx = rp._paxos_id_index(id1, id2)
-        rp.requests.append(idx)
         score = TransactionScore(uuid4(), 0.8, channel='physical')
 
-        payload = to_yaml_string(((id1, id2, peer.uuid), score))
+        payload = to_yaml_string(((id1, id2, peer.uuid), score, True, ''))
         assert 'physical' in payload
         payload = payload.replace('physical', 'physicall')
 
@@ -476,7 +267,6 @@ class TestHandleTransactionDeeper:
         msg.verified = True
         result = rp.handle_transaction({CfgIds.network: net_q}, msg)
         assert result is True          # consumed, not passed to another handler
-        assert idx in rp.requests      # grant not consumed by a refused proposal
         assert net_q.empty()           # and no `tx accepted` went back
         assert idx not in rp.proposals  # nothing recorded from a refused payload
 
@@ -501,36 +291,9 @@ class TestHandleAcceptedDeeper:
         msg.verified = True
         result = rp.handle_accepted(None, msg)
         assert result is True
-        assert rp.acceptances[idx] == {str(peer1.uuid)}
+        # It carries no signature over the half, so it is not counted.
+        assert idx not in rp.acceptances
 
-    def test_accepted_reaches_majority(self):
-        rp = _make_rep_process()
-        peer1 = _make_mock_peer(nickname='p1')
-        rp.protocol.peers.all = [peer1]  # 2 members: both must accept
-
-        id1 = 100
-        id2 = 1
-        idx = rp._paxos_id_index(id1, id2)
-        tid = uuid4()
-        score = TransactionScore(tid, 0.8)
-        rp.proposals[idx] = score
-
-        # Pre-populate history with peer1's side of the transaction, so
-        # our half completes the entry.
-        rp.history.update(tid, peer1.uuid, 0.8)
-
-        # Our round: sending the transaction was our own acceptance.
-        msg = Message(CfgIds.reputation, ReputationProtocol.accepted,
-                      to_yaml_string((id1, id2, rp.identity.uuid)),
-                      from_whom=peer1)
-        msg.verified = True  # simulate signed message (mock peer can't sign)
-        # Crossing the majority threshold triggers a `committed`
-        # broadcast through queues[CfgIds.network]; previously this
-        # test passed None and crashed at the broadcast site.
-        net_q = queue.Queue()
-        rp.handle_accepted({CfgIds.network: net_q}, msg)
-        # peer1's acceptance and ours: 1 + 1 > (1 + 1) // 2, so it commits
-        assert len(rp.history) > 0
 
 
 class TestHandleUpdateDeeper:
@@ -579,22 +342,6 @@ class TestForwardTransactionDeeper:
         assert not net_q.empty()  # propose-message queued for network
 
 
-class TestHandleBackdateDeeper:
-    def test_backdate_requests_update(self):
-        rp = _make_rep_process()
-        peer1 = _make_mock_peer(nickname='p1')
-        peer2 = _make_mock_peer(nickname='p2')
-        # Configure find_top_n to return peers
-        rp.protocol.peers.find_top_n.return_value = [peer1, peer2]
-
-        net_q = queue.Queue()
-        msg = Message(CfgIds.reputation, ReputationProtocol.backdate,
-                      'data', from_whom=peer1)
-        result = rp.handle_backdate({CfgIds.network: net_q}, msg)
-        assert result is True
-        assert not net_q.empty()
-
-
 class TestStartPaxos:
     def test_start_paxos(self):
         rp = _make_rep_process()
@@ -602,7 +349,7 @@ class TestStartPaxos:
         net_q = queue.Queue()
         rp._start_paxos({CfgIds.network: net_q}, score)
         assert not net_q.empty()
-        assert len(rp.my_requests) == 1
+        assert len(rp.awaiting_commit) == 1
         assert len(rp.proposals) == 1
 
 
@@ -755,43 +502,6 @@ class TestForwardReputationDeeper:
         assert not proc_q.empty()
 
 
-class TestHandleGrantDeeper:
-    def test_grant_faulty_peer(self):
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        id1 = 100
-        id2 = 1
-        idx = rp._paxos_id_index(id1, id2)
-        tid = uuid4()
-        score = TransactionScore(tid, 0.8)
-        rp.my_requests[idx] = TxCount(score, 0)
-        # Faulty: last_id >= id1
-        ack = ((id1, id2, rp.identity.uuid), (200, 0), None)  # last_id=200 >= id1=100
-        msg = Message(CfgIds.reputation, ReputationProtocol.grant,
-                      to_yaml_string(ack), from_whom=peer)
-        msg.verified = True
-        result = rp.handle_grant({CfgIds.network: queue.Queue()}, msg)
-        assert result is True
-
-    def test_grant_increments_count(self):
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        id1 = 100
-        id2 = 1
-        idx = rp._paxos_id_index(id1, id2)
-        tid = uuid4()
-        score = TransactionScore(tid, 0.8)
-        rp.my_requests[idx] = TxCount(score, 0)
-        rp.protocol.peers.all = [peer] + [_make_mock_peer(nickname='p%d' % i) for i in range(4)]  # 5 peers, quorum=2
-        ack = ((id1, id2, rp.identity.uuid), (None, 0), None)
-        msg = Message(CfgIds.reputation, ReputationProtocol.grant,
-                      to_yaml_string(ack), from_whom=peer)
-        msg.verified = True
-        result = rp.handle_grant({CfgIds.network: queue.Queue()}, msg)
-        assert result is True
-        assert rp.my_requests[idx].count == 1
-
-
 class TestPureReputation:
     def test_pure_rep_computation(self):
         rp = _make_rep_process()
@@ -803,69 +513,6 @@ class TestPureReputation:
         rp.history.update(tid, other.uuid, 0.9)
         result = rp._pure_reputation(peer)
         assert isinstance(result, float)
-
-
-class TestHandleNackDeeper:
-    def test_nack_starts_retry(self):
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        id1 = 100
-        id2 = 1
-        idx = rp._paxos_id_index(id1, id2)
-        score = TransactionScore(uuid4(), 0.8)
-        # handle_nack reads the score from my_requests (proposer-side state
-        # populated by _start_paxos), not the acceptor-side `requests` list.
-        rp.my_requests[idx] = TxCount(score, 0)
-
-        msg = Message(CfgIds.reputation, ReputationProtocol.nack,
-                      to_yaml_string((id1, id2, peer.uuid)),
-                      from_whom=peer)
-        # handle_nack spawns a thread; just verify it returns True
-        result = rp.handle_nack({CfgIds.network: queue.Queue()}, msg)
-        assert result is True
-        assert idx in rp.backoff
-
-    def test_backdate_starts_retry(self):
-        """A backdate used to request the chain and abandon the round, so one
-        every acceptor backdated never committed (moderation_cohort.sh's
-        report). It now arms the same retry a nack does. Mirrors C's
-        test_a_backdated_round_is_re_proposed_and_can_commit."""
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        idx = rp._paxos_id_index(100, 1)
-        rp.my_requests[idx] = TxCount(TransactionScore(uuid4(), 0.15), 0)
-        rp._request_update = MagicMock()
-        msg = Message(CfgIds.reputation, ReputationProtocol.backdate,
-                      to_yaml_string((100, 1, peer.uuid)), from_whom=peer)
-        assert rp.handle_backdate({CfgIds.network: queue.Queue()}, msg) is True
-        rp._request_update.assert_called_once()
-        assert idx in rp.backoff
-
-    def test_backdate_unknown_request_arms_nothing(self):
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        idx = rp._paxos_id_index(100, 1)
-        rp._request_update = MagicMock()
-        msg = Message(CfgIds.reputation, ReputationProtocol.backdate,
-                      to_yaml_string((100, 1, peer.uuid)), from_whom=peer)
-        assert rp.handle_backdate({CfgIds.network: queue.Queue()}, msg) is True
-        assert idx not in rp.backoff
-
-    def test_nack_unknown_request_dropped(self):
-        """A nack for an idx not in my_requests is dropped without retry."""
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        id1 = 100
-        id2 = 1
-        idx = rp._paxos_id_index(id1, id2)
-        # do NOT populate my_requests — handle_nack should short-circuit
-
-        msg = Message(CfgIds.reputation, ReputationProtocol.nack,
-                      to_yaml_string((id1, id2, peer.uuid)),
-                      from_whom=peer)
-        result = rp.handle_nack({CfgIds.network: queue.Queue()}, msg)
-        assert result is True
-        assert idx not in rp.backoff
 
 
 class TestHandleUpdateMajority:
@@ -880,6 +527,8 @@ class TestHandleUpdateMajority:
         tid = uuid4()
         tx = Transaction(tid, peer1.uuid, 0.8, peer2.uuid, 0.7, index=1)
         chain_data = [tx]
+        # The vote, not the certificates (test_commit_certificates.py).
+        rp._chain_certified = lambda *a, **k: True
         for peer in [peer1, peer2, peer3]:
             msg = Message(CfgIds.reputation, ReputationProtocol.update,
                           to_yaml_string(chain_data), from_whom=peer)
@@ -957,271 +606,8 @@ class TestHandleAcceptedAlreadyAccepted:
 # Additional tests targeting previously-uncovered lines
 # ---------------------------------------------------------------------------
 
-class TestHandleRequestFullException:
-    """Cover Full exception in handle_request (lines 107-108)."""
-
-    def test_request_full_queue(self):
-        """Full exception when putting grant/nack/backdate onto network queue."""
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        rp.protocol.peers.all = [peer]
-        rp.last_id = None
-
-        full_q = MagicMock()
-        full_q.put = MagicMock(side_effect=Full)
-        queues = {CfgIds.network: full_q, CfgIds.reputation: queue.Queue()}
-
-        # id2 == len(history)+1 == 1, so grant path is taken and Full is raised
-        msg = Message(CfgIds.reputation, ReputationProtocol.request,
-                      to_yaml_string((100, 1, peer.uuid)),
-                      from_whom=peer)
-        result = rp.handle_request(queues, msg)
-        assert result is True  # caught internally, still returns True
-
-    def test_request_nack_full_queue(self):
-        """Full exception on the nack path (last_id >= id1)."""
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        rp.protocol.peers.all = [peer]
-        rp.last_id = 200  # force nack path
-
-        full_q = MagicMock()
-        full_q.put = MagicMock(side_effect=Full)
-        queues = {CfgIds.network: full_q, CfgIds.reputation: queue.Queue()}
-
-        msg = Message(CfgIds.reputation, ReputationProtocol.request,
-                      to_yaml_string((100, 1, peer.uuid)),
-                      from_whom=peer)
-        result = rp.handle_request(queues, msg)
-        assert result is True
-
-
-class TestHandleGrantFaultyPeer:
-    """Cover faulty peer path in handle_grant (lines 135-139): last_id >= id1 → demote."""
-
-    def test_faulty_peer_last_id_geq_id1(self):
-        """Peer with last_id >= id1 is demoted."""
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        id1 = 100
-        id2 = 1
-        idx = rp._paxos_id_index(id1, id2)
-        score = TransactionScore(uuid4(), 0.8)
-        rp.my_requests[idx] = TxCount(score, 0)
-        # last_id=200 >= id1=100 → faulty peer
-        ack = ((id1, id2, rp.identity.uuid), (200, 0), None)
-        msg = Message(CfgIds.reputation, ReputationProtocol.grant,
-                      to_yaml_string(ack), from_whom=peer)
-        msg.verified = True
-        result = rp.handle_grant({CfgIds.network: queue.Queue()}, msg)
-        assert result is True
-        rp.protocol.peers.demote.assert_called_once_with(peer)
-
-    def test_faulty_peer_wrong_last_idx(self):
-        """Peer with wrong last_idx (last_idx != len(history)) is demoted."""
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        id1 = 100
-        id2 = 1
-        idx = rp._paxos_id_index(id1, id2)
-        score = TransactionScore(uuid4(), 0.8)
-        rp.my_requests[idx] = TxCount(score, 0)
-        # last_id=None (ok) but last_idx=999 != len(history)=0 → faulty
-        ack = ((id1, id2, rp.identity.uuid), (None, 999), None)
-        msg = Message(CfgIds.reputation, ReputationProtocol.grant,
-                      to_yaml_string(ack), from_whom=peer)
-        msg.verified = True
-        result = rp.handle_grant({CfgIds.network: queue.Queue()}, msg)
-        assert result is True
-        rp.protocol.peers.demote.assert_called_once_with(peer)
-
-
-class TestHandleGrantAlreadyCompleted:
-    """Cover already-completed path in handle_grant (lines 141-143): idx not in my_requests."""
-
-    def test_grant_for_completed_request_returns_true(self):
-        """If idx not in my_requests, log and return True without doing anything."""
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        id1 = 100
-        id2 = 1
-        # Do NOT add idx to my_requests
-        ack = ((id1, id2, rp.identity.uuid), (None, 0), None)
-        msg = Message(CfgIds.reputation, ReputationProtocol.grant,
-                      to_yaml_string(ack), from_whom=peer)
-        msg.verified = True
-        result = rp.handle_grant({CfgIds.network: queue.Queue()}, msg)
-        assert result is True
-
-
-class TestHandleGrantMajorityReached:
-    """Cover majority path in handle_grant (lines 145-155): submit transaction."""
-
-    def test_grant_majority_submits_transaction(self):
-        """When count >= len(peers)//2, send transaction to group."""
-        rp = _make_rep_process()
-        peer1 = _make_mock_peer(nickname='p1')
-        peer2 = _make_mock_peer(nickname='p2')
-        rp.protocol.peers.all = [peer1, peer2]  # 2 peers → quorum=1
-
-        id1 = 100
-        id2 = 1
-        idx = rp._paxos_id_index(id1, id2)
-        score = TransactionScore(uuid4(), 0.8)
-        rp.my_requests[idx] = TxCount(score, 0)
-
-        ack = ((id1, id2, rp.identity.uuid), (None, 0), None)
-        net_q = queue.Queue()
-        msg = Message(CfgIds.reputation, ReputationProtocol.grant,
-                      to_yaml_string(ack), from_whom=peer1)
-        msg.verified = True
-        result = rp.handle_grant({CfgIds.network: net_q}, msg)
-        assert result is True
-        assert not net_q.empty()
-        sent = net_q.get_nowait()
-        assert sent.function == ReputationProtocol.transaction
-        # idx removed from my_requests after transaction submitted
-        assert idx not in rp.my_requests
-
-    def test_grant_majority_full_queue(self):
-        """Full exception when submitting transaction after majority reached."""
-        rp = _make_rep_process()
-        peer1 = _make_mock_peer(nickname='p1')
-        peer2 = _make_mock_peer(nickname='p2')
-        rp.protocol.peers.all = [peer1, peer2]
-
-        id1 = 100
-        id2 = 1
-        idx = rp._paxos_id_index(id1, id2)
-        score = TransactionScore(uuid4(), 0.8)
-        rp.my_requests[idx] = TxCount(score, 0)
-
-        ack = ((id1, id2, rp.identity.uuid), (None, 0), None)
-        full_q = MagicMock()
-        full_q.put = MagicMock(side_effect=Full)
-        msg = Message(CfgIds.reputation, ReputationProtocol.grant,
-                      to_yaml_string(ack), from_whom=peer1)
-        msg.verified = True
-        result = rp.handle_grant({CfgIds.network: full_q}, msg)
-        assert result is True
-
-
-class TestTryAgain:
-    """Cover _try_again method (lines 159-166).
-
-    NOTE: The source _try_again loop condition is `start - now() < wait`,
-    which is effectively always True and the loop never exits without mocking.
-    We patch `now()` so that `start - now()` is not less than `wait`, skipping
-    the loop and reaching the _start_paxos call.
-    """
-
-    def test_try_again_calls_start_paxos(self):
-        """_try_again calls _start_paxos after the wait exits."""
-        from datetime import timedelta, datetime
-        rp = _make_rep_process()
-        score = TransactionScore(uuid4(), 0.7)
-        net_q = queue.Queue()
-        # Patch now() so start - now() >= wait from the first check, skipping loop
-        frozen = datetime(2020, 1, 1, 12, 0, 0)
-        with patch('autonomous_trust.core.reputation.repprocess.now', return_value=frozen):
-            rp._try_again(0, {CfgIds.network: net_q}, score)
-        assert not net_q.empty()
-
-    def test_try_again_full_exception(self):
-        """_try_again catches Full exception from _start_paxos."""
-        from datetime import timedelta, datetime
-        rp = _make_rep_process()
-        score = TransactionScore(uuid4(), 0.7)
-        full_q = MagicMock()
-        full_q.put = MagicMock(side_effect=Full)
-        frozen = datetime(2020, 1, 1, 12, 0, 0)
-        with patch('autonomous_trust.core.reputation.repprocess.now', return_value=frozen):
-            # Should not raise; Full is caught inside _try_again
-            rp._try_again(0, {CfgIds.network: full_q}, score)
-
-
-class TestHandleNackDeeper2:
-    """Cover handle_nack (lines 191-192): starts retry thread."""
-
-    def test_nack_wrong_function(self):
-        """Wrong function returns False."""
-        rp = _make_rep_process()
-        msg = Message(CfgIds.reputation, 'wrong', 'data')
-        result = rp.handle_nack({}, msg)
-        assert result is False
-
-    def test_nack_new_backoff(self):
-        """First nack for an idx initialises backoff and starts retry."""
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        id1 = 100
-        id2 = 1
-        idx = rp._paxos_id_index(id1, id2)
-        score = TransactionScore(uuid4(), 0.8)
-        rp.my_requests[idx] = TxCount(score, 0)
-
-        msg = Message(CfgIds.reputation, ReputationProtocol.nack,
-                      to_yaml_string((id1, id2, peer.uuid)),
-                      from_whom=peer)
-        result = rp.handle_nack({CfgIds.network: queue.Queue()}, msg)
-        assert result is True
-        assert idx in rp.backoff
-        assert rp.backoff[idx] == rp.backoff_mult  # 1 * backoff_mult after first nack
-
-    def test_nack_existing_backoff(self):
-        """Existing backoff below max is multiplied."""
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        id1 = 100
-        id2 = 1
-        idx = rp._paxos_id_index(id1, id2)
-        score = TransactionScore(uuid4(), 0.8)
-        rp.my_requests[idx] = TxCount(score, 0)
-        rp.backoff[idx] = 2.0  # pre-existing backoff
-
-        msg = Message(CfgIds.reputation, ReputationProtocol.nack,
-                      to_yaml_string((id1, id2, peer.uuid)),
-                      from_whom=peer)
-        result = rp.handle_nack({CfgIds.network: queue.Queue()}, msg)
-        assert result is True
-        assert rp.backoff[idx] == 2.0 * rp.backoff_mult
-
-
 class TestHandleAcceptedDeeper2:
     """Cover handle_accepted majority path (lines 229-230 area): commits transaction."""
-
-    def test_accepted_majority_commits_history(self):
-        """Majority of acceptances commits transaction to history.
-
-        Once the threshold is crossed, handle_accepted broadcasts a
-        `committed` message via queues[CfgIds.network] (repprocess.py:
-        488). Pass a real queue rather than None — the prior None
-        crashed the test with TypeError before reaching the
-        assertion.
-        """
-        rp = _make_rep_process()
-        peer1 = _make_mock_peer(nickname='p1')
-        rp.protocol.peers.all = [peer1]  # 2 members: both must accept
-
-        id1 = 100
-        id2 = 1
-        idx = rp._paxos_id_index(id1, id2)
-        tid = uuid4()
-        score = TransactionScore(tid, 0.9)
-        rp.proposals[idx] = score
-        # pre-populate peer1's side of tx, so our half completes it
-        rp.history.update(tid, peer1.uuid, 0.9)
-
-        # Our round: sending the transaction was our own acceptance.
-        msg = Message(CfgIds.reputation, ReputationProtocol.accepted,
-                      to_yaml_string((id1, id2, rp.identity.uuid)),
-                      from_whom=peer1)
-        msg.verified = True  # simulate signed message (mock peer can't sign)
-        net_q = queue.Queue()
-        result = rp.handle_accepted({CfgIds.network: net_q}, msg)
-        assert result is True
-        # peer1's acceptance and ours make both members
-        assert len(rp.history) > 0
 
     def test_accepted_below_majority_no_commit(self):
         """Below-majority acceptances does NOT commit to history."""
@@ -1261,6 +647,8 @@ class TestHandleUpdateFullPaths:
         tid = uuid4()
         tx = Transaction(tid, peer1.uuid, 0.8, peer2.uuid, 0.7, index=1)
         chain = [tx]
+        # The vote, not the certificates (test_commit_certificates.py).
+        rp._chain_certified = lambda *a, **k: True
 
         for peer in [peer1, peer2]:
             msg = Message(CfgIds.reputation, ReputationProtocol.update,
@@ -1290,51 +678,6 @@ class TestHandleUpdateFullPaths:
             rp.handle_update({CfgIds.network: queue.Queue()}, msg)
 
         assert len(rp.updates) == 3
-
-
-class TestCatchupAtTheDefaultQuorum:
-    """The catch-up quorum was 3, counted per sender, so a node with two peers
-    never merged a chain and Paxos stalled once chain lengths drifted
-    (moderation cohort run 7, 2026-09-23). Mirrors C's
-    chain-catchup-default-quorum and test_tx_catchup_skips_entries_already_held."""
-
-    @staticmethod
-    def _chain(n):
-        from autonomous_trust.core.config import to_json_string
-        hist = TransactionHistory()
-        p1, p2 = uuid4(), uuid4()
-        for _ in range(n):
-            tid = uuid4()
-            hist.update(tid, p1, 0.8)
-            hist.update(tid, p2, 0.6)
-        return to_json_string(hist.era(0))
-
-    def _update(self, rp, chain, peer):
-        msg = Message(CfgIds.reputation, ReputationProtocol.update, chain,
-                      from_whom=peer)
-        return rp.handle_update({CfgIds.network: queue.Queue()}, msg)
-
-    def test_one_peer_report_catches_up(self):
-        rp = _make_rep_process()
-        assert self._update(rp, self._chain(2), _make_mock_peer()) is True
-        assert len(rp.history) == 2
-        assert rp.updates == {}
-
-    def test_a_repeated_report_adds_nothing(self):
-        rp = _make_rep_process()
-        chain = self._chain(2)
-        self._update(rp, chain, _make_mock_peer(nickname='p1'))
-        self._update(rp, chain, _make_mock_peer(nickname='p2'))
-        assert len(rp.history) == 2
-
-    def test_a_backdate_leaves_the_quorum_alone(self):
-        rp = _make_rep_process()
-        rp.protocol.peers.find_top_n = MagicMock(return_value=[])
-        peer = _make_mock_peer()
-        msg = Message(CfgIds.reputation, ReputationProtocol.backdate,
-                      to_yaml_string((100, 1, peer.uuid)), from_whom=peer)
-        rp.handle_backdate({CfgIds.network: queue.Queue()}, msg)
-        assert rp.num_updates == 1
 
 
 class TestPureReputationBranches:
@@ -1578,7 +921,7 @@ class TestScoreRangeAtTheRemoteBoundary:
         payload = ('[[%d, %d, "%s"], {"__type__": "autonomous_trust.core.'
                    '_python.reputation.reputation.TransactionScore", '
                    '"task_id": {"__type__": "UUID", "__value__": "%s"}, '
-                   '"score": %s, "capability_name": null}]'
+                   '"score": %s, "capability_name": null}, true, ""]'
                    % (id1, id2, peer_id, uuid4(), score_json))
         msg = MagicMock()
         msg.function = ReputationProtocol.transaction
@@ -1589,35 +932,41 @@ class TestScoreRangeAtTheRemoteBoundary:
 
     def test_an_out_of_range_proposal_is_dropped_not_raised(self):
         rp = _make_rep_process()
-        rp.requests.append((100, 5))
         msg = self._proposal('7.5')
         assert rp.handle_transaction({}, msg) is True     # consumed, no raise
         assert rp.proposals == {}                         # nothing recorded
 
     def test_a_nan_proposal_is_dropped(self):
         rp = _make_rep_process()
-        rp.requests.append((100, 5))
         assert rp.handle_transaction({}, self._proposal('NaN')) is True
         assert rp.proposals == {}
 
     def test_an_in_range_proposal_still_lands(self):
         """The negative control: the drop must not swallow honest traffic."""
         rp = _make_rep_process()
-        rp.requests.append((100, 5))
         queues = {CfgIds.network: queue.Queue()}
         assert rp.handle_transaction(queues, self._proposal('0.75')) is True
         assert list(rp.proposals.values())[0].score == 0.75
 
     @staticmethod
+    def _rp():
+        rp = _make_rep_process()
+        rp._commit_cert_ok = lambda *a, **k: True
+        return rp
+
+    @staticmethod
     def _committed(score_json, peer_id=None, task_id=None):
         """`committed` carries a BARE float, so it bypasses the constructor
-        entirely -- and it is the path that writes history on every acceptor."""
+        entirely -- and it is the path that pools a half on every acceptor.
+        It carries a stand-in certificate, which `_rp` accepts: the range
+        check is the subject here, certificates are test_commit_certificates'."""
         peer_id = peer_id or uuid4()
         task_id = task_id or uuid4()
         msg = MagicMock()
         msg.function = ReputationProtocol.committed
         msg.obj = ('[{"__type__": "UUID", "__value__": "%s"}, '
-                   '{"__type__": "UUID", "__value__": "%s"}, %s]'
+                   '{"__type__": "UUID", "__value__": "%s"}, %s, null, null, '
+                   '{"signer": "ab"}]'
                    % (task_id, peer_id, score_json))
         msg.verified = True
         msg.from_whom = _make_mock_peer()
@@ -1627,54 +976,50 @@ class TestScoreRangeAtTheRemoteBoundary:
         return msg
 
     def _assert_not_staged(self, rp, score_json):
-        """A single-sided update STAGES a pending Transaction and leaves the
-        committed chain empty, so asserting on `len(history)` alone would pass
-        whether or not the score was rejected. Assert on the staging map."""
+        """An accepted half waits in the pool and leaves the chain empty, so
+        asserting on `len(history)` alone would pass whether or not the score
+        was rejected. Assert on the pool."""
         task_id = uuid4()
         before = len(rp.history)
         assert rp.handle_committed(
             None, self._committed(score_json, task_id=task_id)) is True
-        assert task_id not in rp.history._task_mapping    # never even staged
+        assert rp.history.pooled(task_id) is None          # never even pooled
         assert len(rp.history) == before
 
     def test_an_out_of_range_committed_tx_never_reaches_history(self):
-        self._assert_not_staged(_make_rep_process(), '42.0')
+        self._assert_not_staged(self._rp(), '42.0')
 
     def test_a_negative_committed_tx_never_reaches_history(self):
-        self._assert_not_staged(_make_rep_process(), '-3.0')
+        self._assert_not_staged(self._rp(), '-3.0')
 
     def test_a_nan_committed_tx_never_reaches_history(self):
-        self._assert_not_staged(_make_rep_process(), 'NaN')
+        self._assert_not_staged(self._rp(), 'NaN')
 
     def test_an_honest_committed_tx_is_staged(self):
         """Control for the assertion above: an in-range score DOES stage."""
-        rp = _make_rep_process()
+        rp = self._rp()
         task_id = uuid4()
         rp.handle_committed(None, self._committed('0.9', task_id=task_id))
-        assert task_id in rp.history._task_mapping
+        assert rp.history.pooled(task_id) is not None
 
     def test_an_in_range_committed_tx_is_recorded(self):
         """The negative control: the drop must not swallow honest traffic.
-
-        Two sides of ONE task, because `len(history)` counts committed BILATERAL
-        entries -- a single-sided update stages a pending tx and leaves the chain
-        empty, which is why the out-of-range assertions above check the chain
-        stayed empty AND this one drives it to a real commit."""
-        rp = _make_rep_process()
+        Two sides of ONE task make an entry ready to be placed."""
+        rp = self._rp()
         task_id = uuid4()
-        before = len(rp.history)
         assert rp.handle_committed(None, self._committed('0.9', task_id=task_id)) is True
         assert rp.handle_committed(None, self._committed('0.8', task_id=task_id)) is True
-        assert len(rp.history) == before + 1
+        assert len(rp.history.pooled(task_id)) == 2
 
     def test_a_rejected_side_cannot_complete_a_transaction(self):
         """The consequence that matters: one honest side plus one out-of-range
         side must NOT commit, or the rejection would only have delayed it."""
-        rp = _make_rep_process()
+        rp = self._rp()
         task_id = uuid4()
         rp.handle_committed(None, self._committed('0.9', task_id=task_id))
         rp.handle_committed(None, self._committed('42.0', task_id=task_id))
         assert len(rp.history) == 0
+        assert len(rp.history.pooled(task_id)) == 1
 
 
 class TestAppFacingReputationRated:
@@ -1745,8 +1090,21 @@ class TestAppFacingReputationRated:
         rp, queues, main_q = self._rp_with_queue([peer_a, peer_b])
         msg = MagicMock()
         msg.function = ReputationProtocol.app_roster_request
+        msg.from_whom = None                            # the local app's
         assert rp.handle_app_roster_request(queues, msg) is True
         assert len(self._drain(main_q)) == 2            # the peers; never self
+
+    def test_a_peers_pull_is_refused(self):
+        """The local app's verb only (ISSUES §2.17): a frame carrying a
+        peer's identity replays nothing. Mirrors the C guard in
+        handle_app_roster_request."""
+        peer = _make_mock_peer()
+        rp, queues, main_q = self._rp_with_queue([peer])
+        msg = MagicMock()
+        msg.function = ReputationProtocol.app_roster_request
+        msg.from_whom = peer
+        assert rp.handle_app_roster_request(queues, msg) is True
+        assert self._drain(main_q) == []
 
     def test_the_roster_never_carries_this_node_itself(self):
         """Peers only. A reputation is what the network observed ABOUT a peer,
@@ -1787,61 +1145,3 @@ class TestAppFacingReputationRated:
         assert not hasattr(rep, 'rated')
 
 
-class TestForkProbe:
-    """ISSUES §2.51: a request names the head it extends. Same length,
-    different head: an equal-length fork, which Paxos's length check never
-    sees. The acceptor does not grant; it backdates and asks for the
-    proposer's chain, rate-limited per peer. Mirrors C handle_request."""
-
-    def _rp_with_chain(self):
-        rp = _make_rep_process()
-        peer = _make_mock_peer()
-        rp.protocol.peers.all = [peer]
-        tid = uuid4()
-        rp.history.update(tid, peer.uuid, 0.5)
-        rp.history.update(tid, rp.identity.uuid, 0.7)
-        assert len(rp.history) == 1 and rp._our_head()
-        return rp, peer
-
-    def _ask(self, rp, peer, head=None, id1=100):
-        net_q = queue.Queue()
-        parts = (id1, len(rp.history) + 1, peer.uuid) + ((head,) if head else ())
-        msg = Message(CfgIds.reputation, ReputationProtocol.request,
-                      to_yaml_string(parts), from_whom=peer)
-        assert rp.handle_request({CfgIds.network: net_q,
-                                  CfgIds.reputation: queue.Queue()}, msg) is True
-        out = []
-        while not net_q.empty():
-            out.append(net_q.get_nowait())
-        return out
-
-    def test_a_different_head_at_our_length_is_backdated_and_probed(self):
-        rp, peer = self._rp_with_chain()
-        sent = self._ask(rp, peer, head='ff' * 32)
-        assert [m.function for m in sent] == [ReputationProtocol.backdate,
-                                              ReputationProtocol.outdated]
-        assert rp.last_id is None and not rp.requests
-        again = self._ask(rp, peer, head='ff' * 32, id1=101)
-        assert [m.function for m in again] == [ReputationProtocol.backdate]
-
-    def test_our_own_head_or_none_is_granted(self):
-        rp, peer = self._rp_with_chain()
-        sent = self._ask(rp, peer, head=rp._our_head())
-        assert [m.function for m in sent] == [ReputationProtocol.grant]
-        rp2, peer2 = self._rp_with_chain()
-        assert [m.function for m in self._ask(rp2, peer2)] == [ReputationProtocol.grant]
-
-    def test_the_echo_stays_three_elements(self):
-        from autonomous_trust.core.config import from_json_string
-        rp, peer = self._rp_with_chain()
-        sent = self._ask(rp, peer, head='ff' * 32)
-        assert len(from_json_string(sent[0].obj)) == 3
-
-    def test_outdated_sends_the_whole_window_at_equal_length(self):
-        from autonomous_trust.core.config import from_json_string
-        rp, peer = self._rp_with_chain()
-        net_q = queue.Queue()
-        msg = Message(CfgIds.reputation, ReputationProtocol.outdated,
-                      str(len(rp.history)), from_whom=peer)
-        rp.handle_outdated({CfgIds.network: net_q}, msg)
-        assert len(from_json_string(net_q.get_nowait().obj)) == len(rp.history)

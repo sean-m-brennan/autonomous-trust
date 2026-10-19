@@ -74,7 +74,7 @@ int at_area_card_verify(const at_dir_signed_t *card, double now);
 /** Sign @p self's card for @p area. @p expiry 0 = @p now + the default life.
  *  AT_DIR_MALFORMED for an area, bucket or name no hub would take. */
 int at_area_card_create(const identity_t *self, const char *area, const char *bucket,
-                        const char *name, int64_t seq, long expiry, double now,
+                        const char *name, int64_t seq, int64_t expiry, double now,
                         at_dir_signed_t *out);
 
 /** Borrowed field accessors (NULL when absent). uuid/key/seq/expiry are the

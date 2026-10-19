@@ -1,0 +1,33 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: app-roster-pull-from-the-wire-refused
+byte_pinning: false
+description: |
+    The app's roster pull is the local app's verb, never a peer's (ISSUES
+    §2.17). The same request as app-roster-pull, but it arrives carrying a
+    peer's identity, as a frame off the wire would: node replays nothing. The
+    network layer refuses any app_* verb from the wire before routing
+    (network/wire-verb-policy); this pins the handler's own guard behind it.
+
+participants:
+  - id: app
+    role: requestor
+  - id: node
+    role: oracle
+  - id: alpha
+    role: subject
+
+steps:
+  - id: 1
+    from: app
+    to: node
+    function: app_roster_request
+    payload:
+      from_wire: true
+    description: |
+        A peer sends node the app's verb. node answers nobody.
+
+expected_state:
+  node:
+    app_roster: []

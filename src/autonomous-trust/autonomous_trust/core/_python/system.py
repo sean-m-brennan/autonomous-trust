@@ -254,27 +254,6 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return default
 
 
-def resolve_commit_certificates() -> bool:
-    """Whether a group this node MINTS requires a quorum certificate on every
-    ordinary reputation commit (``AT_COMMIT_CERTIFICATES``, default off).
-
-    Like :func:`resolve_net_wire_mode`, this stamps a new group and nothing
-    else: an existing group's members read the declaration off the group
-    (``Group.commit_certificates``), which is what keeps a cohort from
-    disagreeing about which commits it writes. Mirrors C's
-    ``commit_certificates_resolve``."""
-    return _env_bool('AT_COMMIT_CERTIFICATES', False)
-
-
-def resolve_ordered_placement() -> bool:
-    """Whether Paxos decides the chain order of a group this node MINTS
-    (``AT_ORDERED_PLACEMENT``, ON by default since 2026-10-13; set it to 0 to
-    mint a group that converges the old way). Stamps a new group and nothing
-    else, like :func:`resolve_commit_certificates`: an existing group keeps
-    what it declares. Mirrors C's ``group_ordered_placement_resolve``."""
-    return _env_bool('AT_ORDERED_PLACEMENT', True)
-
-
 def _env_num(name: str, default, cast):
     raw = os.environ.get(name)
     if raw is None:

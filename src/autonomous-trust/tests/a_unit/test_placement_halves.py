@@ -32,9 +32,8 @@ from tests.a_unit.test_commit_certificates import (_msg, _node, _roster, _sent,
                                                    four)  # noqa: F401
 
 
-def _placing(me, everyone, on=True):
+def _placing(me, everyone):
     rp, q = _node(me, _roster(me, everyone))
-    rp.protocol.group.ordered_placement = on
     return rp, q
 
 
@@ -51,19 +50,13 @@ class TestProposer:
     def test_a_placing_proposer_sends_its_half_without_asking(self, four):
         rp, q = _placing(four[0], four)
         out = _proposal(rp, q)
-        assert ReputationProtocol.request not in out
+        assert not set(ReputationProtocol.retired) & set(out)
         assert len(out[ReputationProtocol.transaction]) == 1
         parts = from_json_string(out[ReputationProtocol.transaction][0].obj)
         assert parts[2] is True
         assert parts[3] == str(rp.protocol.group.uuid)
-        assert not rp.my_requests and len(rp.proposals) == 1
+        assert len(rp.proposals) == 1
 
-    def test_a_proposer_whose_group_does_not_place_still_asks(self, four):
-        rp, q = _placing(four[0], four, on=False)
-        out = _proposal(rp, q)
-        assert ReputationProtocol.transaction not in out
-        assert len(out[ReputationProtocol.request]) == 1
-        assert len(rp.my_requests) == 1
 
 
 class TestAcceptor:
@@ -84,11 +77,6 @@ class TestAcceptor:
         acc, q = _placing(four[1], four)
         assert self._offer(acc, q, four[0], (False, '')) == []
 
-    def test_where_order_is_not_placed_the_grant_is_still_needed(self, four):
-        acc, q = _placing(four[1], four, on=False)
-        assert self._offer(acc, q, four[0], (True, '')) == []
-        acc.requests.append((7, 1))
-        assert len(self._offer(acc, q, four[0], (True, ''))) == 1
 
 
 def test_end_to_end_the_half_reaches_every_pool(four):

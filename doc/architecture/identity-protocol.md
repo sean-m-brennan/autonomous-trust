@@ -148,12 +148,35 @@ and then adopts the group key from the history that follows. And the
 group-selection step in the newcomer picks the longest history when several
 groups answered, sending back any steps the group turns out to be missing.
 
-Two alternate paths exist. Under *amnesia readmission*, a leader that recognizes
-the UUID of the newcomer from history, meaning a previously known peer
-rejoining, skips the voting round entirely and emits confirmation, acceptance
-and history directly. Under *group key rotation*, a change in group composition
-causes the leader to broadcast a key update peer-to-peer so existing members
-rotate to the new key. Both are pinned by their own conformance scenarios.
+Two alternate paths exist. Under *amnesia readmission*, a member that lost its
+state and asks again skips the voting round, and the leader emits confirmation,
+acceptance and history directly. Under *group key rotation*, a change in group
+composition causes the leader to broadcast a key update peer-to-peer so existing
+members rotate to the new key. Both are pinned by their own conformance
+scenarios.
+
+### Amnesia
+
+Readmission hands over the group key with no vote, so recognition is narrow. The
+leader readmits a requester only when its UUID is in the leader's group address
+map, meaning a member, and it presents the signing and encryption keys the
+leader holds for that UUID. Address and nickname are not compared: a member that
+returns from a new network is recognized, and the leader records its new address
+and tells the group. A known UUID presenting different keys is refused and
+logged, member or not.
+
+Anything else in the peer list takes the ordinary path, admission gate and vote
+included. A first-contact direct peer is the case that matters: it is a peer, not
+a member, and until 2026-10-19 the leader recognized it from the peer list alone
+and handed it the group key. The identity history is deliberately not consulted
+either. The C runtime does not keep one, and Python's also records provisional
+admissions, which have not yet earned the key.
+
+A contact still has a way in, which is the vote. Duplicate detection would
+otherwise refuse it, since its UUID and keys are already in every peer list that
+holds it. A UUID that first contact recorded as a contact, presenting the keys it
+is known by and not yet a member, is therefore voted on like any newcomer. No
+other peer gets that exemption.
 
 ## What travels, and in what form
 
@@ -223,6 +246,11 @@ the next chapters layer on top of this rather than replacing it.
 |---|---|
 | Admission happy path | [`identity-canonical.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/identity-canonical.yaml) |
 | Amnesia readmission | [`amnesia-readmission.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/amnesia-readmission.yaml) |
+| A peer that is not a member is not readmitted | [`amnesia-direct-peer-not-readmitted.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/amnesia-direct-peer-not-readmitted.yaml) |
+| ... and goes to the vote | [`amnesia-non-member-goes-to-the-vote.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/amnesia-non-member-goes-to-the-vote.yaml) |
+| A known UUID under new keys is refused | [`amnesia-known-uuid-new-keys-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/amnesia-known-uuid-new-keys-refused.yaml) |
+| A member that moved is readmitted | [`amnesia-moved-address-readmitted.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/amnesia-moved-address-readmitted.yaml) |
+| A recorded contact is voted on, not refused as a sybil | [`propose-vote-admits-known-contact.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/propose-vote-admits-known-contact.yaml) |
 | Group key rotation | [`group-key-update.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/group-key-update.yaml) |
 
 The diagram tool does not render alternate branches, so we keep the readmission

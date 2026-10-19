@@ -622,7 +622,7 @@ DEFINE_TEST(test_tx_channel_field_holds_the_longest_spelling)
     ck_assert_str_eq(tx.channel, TX_CHANNEL_SWARM_DISAGREEMENT);
     ck_assert(tx_channel_valid(tx.channel));
 
-    /* A zeroed tx_score_t (how reputation_install_my_request and every
+    /* A zeroed tx_score_t (how every
      * `= {0}` message producer leaves it) reads as absent -> task outcome. */
     tx_score_t zeroed;
     memset(&zeroed, 0, sizeof(zeroed));

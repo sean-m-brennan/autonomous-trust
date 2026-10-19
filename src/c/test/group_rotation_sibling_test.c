@@ -284,6 +284,59 @@ DEFINE_TEST(test_an_update_before_phase_3_is_replayed_and_settles_the_tiebreak)
     _end();
 }
 
+/* Reputation cohort rep-4070096-11 (2026-10-16), ISSUES §2.61: carol held
+ * epoch 2 and adopted a DIFFERENT, larger group from a stale membership
+ * update carrying that group's epoch-1 key. She kept her own epoch, so she
+ * announced an epoch-1 key as epoch 2; it sorted lowest, and the members who
+ * had retired it refused it for good. The key now comes with its own epoch
+ * (and no retired keys from the group we left), so the node is simply behind
+ * and the next rotation lifts it. */
+DEFINE_TEST(test_an_adopted_groups_key_keeps_its_own_epoch)
+{
+    _begin();
+    identity_t *me = _mk_identity("carol", "10.0.0.3");
+    identity_t *alice = _mk_identity("alice", "10.0.0.1");
+    process_t *proc = _mk_process(me);
+    ck_assert(group_rotate_key(&proc->protocol.group) == 1);
+    ck_assert(group_rotate_key(&proc->protocol.group) == 2);
+    ck_assert_int_eq((int)proc->protocol.group.num_previous_keys, 2);
+
+    /* Alice's group: another uuid, three members, its key at epoch 1. */
+    group_t *theirs = NULL;
+    uuid_t huuid;
+    uuid_generate(huuid);
+    ck_assert_ret_ok(group_create(&huuid, (char *)"10.0.0.1", &theirs));
+    ck_assert_ret_ok(group_add_address(theirs, "uuid-alice", "10.0.0.1"));
+    ck_assert_ret_ok(group_add_address(theirs, "uuid-bob", "10.0.0.2"));
+    ck_assert_ret_ok(group_add_address(theirs, "uuid-dee", "10.0.0.4"));
+    ck_assert(group_rotate_key(theirs) == 1);
+
+    _dispatch_update(proc, alice, theirs);
+
+    group_t *mine = &proc->protocol.group;
+    ck_assert_mem_eq(mine->uuid, huuid, sizeof(uuid_t));
+    ck_assert_mem_eq(mine->encryptor.public, theirs->encryptor.public,
+                     crypto_box_PUBLICKEYBYTES);
+    ck_assert_int_eq((int)mine->key_epoch, 1);
+    ck_assert_int_eq((int)mine->num_previous_keys, 0);
+    ck_assert_int_eq((int)g_group_to_network, 1);
+
+    /* Behind, not forked: the group's real epoch-2 key is taken. */
+    group_t next;
+    _copy_group(proc, &next);
+    ck_assert(group_rotate_key(theirs) == 2);
+    next.encryptor = theirs->encryptor;
+    next.key_epoch = 2;
+    _dispatch_update(proc, alice, &next);
+    ck_assert_int_eq((int)mine->key_epoch, 2);
+    ck_assert_mem_eq(mine->encryptor.public, theirs->encryptor.public,
+                     crypto_box_PUBLICKEYBYTES);
+
+    _drop_copy(&next);
+    group_free(theirs);
+    _end();
+}
+
 /* The hold is bounded: past ID_HELD_GROUP_UPDATES the oldest goes. */
 DEFINE_TEST(test_held_updates_are_bounded)
 {
@@ -311,4 +364,5 @@ RUN_TESTS(GroupRotationSibling,
           test_an_equal_size_rotation_reaches_the_network_process,
           test_a_declined_rotation_sends_nothing,
           test_an_update_before_phase_3_is_replayed_and_settles_the_tiebreak,
-          test_held_updates_are_bounded)
+          test_held_updates_are_bounded,
+          test_an_adopted_groups_key_keeps_its_own_epoch)

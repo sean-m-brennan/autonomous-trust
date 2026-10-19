@@ -192,8 +192,46 @@ const char *gai_ext_strlist[] = {
   ensures \valid_read(\result);
 */
 /* Frama-C: skipped — [large-branch] static error string lookup over ~50 entries */
+#ifdef _WIN32
+#include <errno.h>
+/* The tables above are Linux's errno numbering; the UCRT numbers the POSIX
+ * supplement (the socket codes among them) differently, so a Windows build
+ * names its own values. */
+static const char *_win32_errno_name(int err)
+{
+    switch (err)
+    {
+#define AT_ERRNAME(e) case e: return #e;
+    AT_ERRNAME(EPERM) AT_ERRNAME(ENOENT) AT_ERRNAME(ESRCH) AT_ERRNAME(EINTR)
+    AT_ERRNAME(EIO) AT_ERRNAME(EBADF) AT_ERRNAME(EAGAIN) AT_ERRNAME(ENOMEM)
+    AT_ERRNAME(EACCES) AT_ERRNAME(EFAULT) AT_ERRNAME(EBUSY) AT_ERRNAME(EEXIST)
+    AT_ERRNAME(ENOTDIR) AT_ERRNAME(EISDIR) AT_ERRNAME(EINVAL) AT_ERRNAME(EMFILE)
+    AT_ERRNAME(ENOSPC) AT_ERRNAME(EPIPE) AT_ERRNAME(ERANGE) AT_ERRNAME(ENAMETOOLONG)
+    AT_ERRNAME(ENOSYS) AT_ERRNAME(ENOTEMPTY) AT_ERRNAME(EADDRINUSE)
+    AT_ERRNAME(EADDRNOTAVAIL) AT_ERRNAME(EAFNOSUPPORT) AT_ERRNAME(EALREADY)
+    AT_ERRNAME(ECONNABORTED) AT_ERRNAME(ECONNREFUSED) AT_ERRNAME(ECONNRESET)
+    AT_ERRNAME(EDESTADDRREQ) AT_ERRNAME(EHOSTUNREACH) AT_ERRNAME(EINPROGRESS)
+    AT_ERRNAME(EISCONN) AT_ERRNAME(EMSGSIZE) AT_ERRNAME(ENETDOWN)
+    AT_ERRNAME(ENETRESET) AT_ERRNAME(ENETUNREACH) AT_ERRNAME(ENOBUFS)
+    AT_ERRNAME(ENOPROTOOPT) AT_ERRNAME(ENOTCONN) AT_ERRNAME(ENOTSOCK)
+    AT_ERRNAME(EOPNOTSUPP) AT_ERRNAME(EPROTONOSUPPORT) AT_ERRNAME(EPROTOTYPE)
+    AT_ERRNAME(ETIMEDOUT) AT_ERRNAME(EWOULDBLOCK) AT_ERRNAME(ENOMSG)
+    AT_ERRNAME(EDEADLK)
+#undef AT_ERRNAME
+    default: return NULL;
+    }
+}
+#endif
+
 const char *_get_err_str(int err)
 {
+#ifdef _WIN32
+    if (err > 0)
+    {
+        const char *name = _win32_errno_name(err);
+        return name != NULL ? name : "";
+    }
+#endif
     if (err < 0)
     {
         int abs_err = abs(err);

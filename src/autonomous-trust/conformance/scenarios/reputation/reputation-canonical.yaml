@@ -28,8 +28,7 @@ participants:
     role: acceptor
 
 fixtures:
-  ordered_placement: true
-  my_requests:
+  proposals:
     alice:
       - id1: 1000
         id2: 1

@@ -221,8 +221,11 @@ static int _drive_assertion(sce_run_ctx_t *ctx, json_t *step, int in_resp) {
      * adapter callback for type-safety). `repeat` is meaningless on an
      * assertion step (the inbound message is whatever the source emitted,
      * once), so pin to 1. */
-    return _build_and_deliver(ctx, sid, from, to, function,
-                              json_object_get(step, "payload"), 1);
+    ctx->responding = true;
+    int rc = _build_and_deliver(ctx, sid, from, to, function,
+                                json_object_get(step, "payload"), 1);
+    ctx->responding = false;
+    return rc;
 }
 
 static int _check_expected_state(sce_run_ctx_t *ctx) {

@@ -19,7 +19,6 @@ participants:
     role: member
 
 fixtures:
-  ordered_placement: true
   roster:
     bob: [alice, bob, carol]
 

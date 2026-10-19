@@ -14,10 +14,12 @@
  *   limitations under the License.
  *******************/
 
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 #include <jansson.h>
+#include <sodium.h>
 
 #include "processes/processes.h"
 #include "processes/process_tracker.h"
@@ -37,6 +39,8 @@
 #include "zta_audit.h"
 #include "zta_protocol.h"
 #include "zta_msg_types.h"
+#include "zta_delegation.h"
+#include "network/net_message.h"
 #include "utilities/send_retry.h"   /* at_send: keep a refused frame */
 
 /* Protocol-string definitions (declared `extern char[]` in
@@ -46,31 +50,14 @@ char ZTA_PROTO_REVOCATION_ALERT[] = "zta_revoked";
 char ZTA_PROTO_VERIFICATION[]     = "zta_verified";
 char ZTA_PROTO_REVERIFY_REQ[]     = "zta_reverify";
 
+
 /****************************
  * Process state
  ****************************/
 
-#define MAX_DELEGATED_PEERS 256
-#define MAX_VOUCHES_PER_PEER 16
 #define MAX_REP_CACHE 128
-#define MAX_PENDING_VOUCHES 32
+#define MAX_PENDING_FINDINGS 32
 #define REP_CACHE_TTL_SEC 600   /* Cache entries expire after 10 minutes */
-
-/**
- * @brief Tracks delegated verification vouches for a DDIL-admitted peer.
- *
- * When the local node cannot reach ZTA infrastructure, other peers that CAN
- * reach it may verify the credential and broadcast a ZTA_PROTO_VERIFICATION
- * message.  Each such message is a "vouch".  When enough distinct peers
- * have vouched (>= delegated_verification_quorum), the DDIL reputation cap
- * is lifted.
- */
-typedef struct {
-    uuid_t peer_uuid;                            /* The peer being vouched for */
-    uuid_t vouchers[MAX_VOUCHES_PER_PEER];       /* UUIDs of peers who vouched */
-    int vouch_count;
-    bool cap_lifted;
-} delegated_vouch_t;
 
 /**
  * @brief Cached reputation score for a peer, obtained via local IPC query
@@ -84,28 +71,31 @@ typedef struct {
 } rep_cache_entry_t;
 
 /**
- * @brief A delegated vouch that arrived before we had the voucher's
- *        reputation cached.  Held until the reputation response arrives.
+ * @brief A member's finding (a vouch or an alert) that arrived before we had
+ *        the sender's reputation. Offered again when the reputation arrives.
  */
 typedef struct {
-    zta_event_msg_t event;
-    uuid_t voucher_uuid;
+    zta_deleg_kind_t kind;
+    char from[ZTA_DELEG_UUID_LEN + 1];
+    char peer[ZTA_DELEG_UUID_LEN + 1];
+    uint8_t hash[ZTA_HASH_LEN];
+    zta_status_t status;
     bool active;
-} pending_vouch_t;
+} pending_finding_t;
 
 static struct {
     zta_policy_t *policy;
     zta_verifier_t *verifier;
     zta_audit_log_t audit;
     uuid_t self_uuid;               /* Our own identity UUID */
-    delegated_vouch_t vouches[MAX_DELEGATED_PEERS];
-    int vouch_count;
-    /* Reputation cache: local view of peer reputations for vouch gating */
+    /* What members told us about peers (zta_delegation.h). */
+    zta_deleg_t deleg;
+    /* Reputation cache: local view of peer reputations for the bar */
     rep_cache_entry_t rep_cache[MAX_REP_CACHE];
     int rep_cache_count;
-    /* Vouches waiting for a reputation lookup to complete */
-    pending_vouch_t pending_vouches[MAX_PENDING_VOUCHES];
-    int pending_vouch_count;
+    /* Findings waiting for a reputation lookup to complete */
+    pending_finding_t pending[MAX_PENDING_FINDINGS];
+    int pending_count;
     bool initialized;
 } zta_state;
 
@@ -179,77 +169,6 @@ static void _send_reputation_penalty(process_t *proc, const uuid_t peer_uuid,
     if (ceiling > 1.0) ceiling = 1.0;
     _send_zta_standing(proc, peer_uuid, PEER_STANDING_FAILED, ceiling,
                        "credential verification failed", logger);
-}
-
-/**
- * @brief Broadcast a revocation alert to the group
- */
-/* Frama-C: skipped — [solver-timeout] logging/network preconditions */
-static void _broadcast_revocation_alert(process_t *proc, const uuid_t peer_uuid,
-                                        const uint8_t *cred_hash, logger_t *logger)
-{
-    generic_msg_t msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.type = ZTA_REVOCATION_ALERT;
-    zta_event_msg_t *ext = AT_MSG_EXT(&msg, zta_event_msg_t);
-    msg.size = sizeof(zta_event_msg_t);
-
-    memcpy(ext->peer_uuid, peer_uuid, sizeof(uuid_t));
-    memcpy(ext->voucher_uuid, zta_state.self_uuid, sizeof(uuid_t));
-    memcpy(ext->credential_hash, cred_hash, ZTA_HASH_LEN);
-    ext->status = (int)ZTA_REVOKED;
-    snprintf(ext->reason, sizeof(ext->reason),
-             "credential revoked");
-
-    messaging_send("network", NET_MESSAGE, &msg, false);
-
-    char uuid_str[37];
-    uuid_unparse_lower(peer_uuid, uuid_str);
-    log_warn(logger, "ZTA: broadcast revocation alert for peer %s\n", uuid_str);
-}
-
-/**
- * @brief Find or create a vouch tracker for a peer
- */
-/* Frama-C: skipped —
- * zta_process_run + all helpers: [solver-timeout] memcpy of public_identity_t/uuid_t (19
- * sites) + reputation cache + delegated vouch lifecycle + peer iteration + json/network
- * cascades.
- */
-/*@
-  requires zta_state.vouch_count >= 0;
-  requires zta_state.vouch_count <= MAX_DELEGATED_PEERS;
-  assigns zta_state.vouch_count, zta_state.vouches[0 .. MAX_DELEGATED_PEERS - 1];
-*/
-static delegated_vouch_t *_find_or_create_vouch(const uuid_t peer_uuid)
-{
-    for (int i = 0; i < zta_state.vouch_count; i++) {
-        if (uuid_compare(zta_state.vouches[i].peer_uuid, peer_uuid) == 0)
-            return &zta_state.vouches[i];
-    }
-    if (zta_state.vouch_count >= MAX_DELEGATED_PEERS)
-        return NULL;
-    delegated_vouch_t *v = &zta_state.vouches[zta_state.vouch_count++];
-    memset(v, 0, sizeof(*v));
-    memcpy(v->peer_uuid, peer_uuid, sizeof(uuid_t));
-    return v;
-}
-
-/**
- * @brief Check if a voucher UUID is already recorded for this peer
- */
-/*@
-  requires \valid_read(v);
-  requires v->vouch_count >= 0;
-  requires \valid_read(v->vouchers + (0 .. v->vouch_count - 1));
-*/
-static bool _has_voucher(const delegated_vouch_t *v, const uuid_t voucher_uuid)
-{
-    for (int i = 0; i < v->vouch_count; i++) {
-        if (uuid_compare(v->vouchers[i], voucher_uuid) == 0)
-            return true;
-    }
-    return false;
 }
 
 /**
@@ -377,161 +296,288 @@ static void _request_reputation(process_t *proc, const uuid_t peer_uuid,
     log_debug(logger, "ZTA: requested reputation for voucher %s\n", uuid_str);
 }
 
-/**
- * @brief Store a vouch as pending until we get the voucher's reputation.
- */
-/* Frama-C: skipped — [solver-timeout] array/map lifecycle preconditions */
-static void _defer_vouch(const zta_event_msg_t *event, const uuid_t voucher_uuid,
-                         logger_t *logger)
+/****************************
+ * Delegated verification (zta_delegation.h)
+ ****************************/
+
+/* The decisions' view of this process. */
+
+static bool _ctx_is_member(void *user, const char *uuid)
 {
-    if (zta_state.pending_vouch_count >= MAX_PENDING_VOUCHES) {
-        log_warn(logger, "ZTA: pending vouch queue full, dropping vouch\n");
-        return;
-    }
-    pending_vouch_t *pv = &zta_state.pending_vouches[zta_state.pending_vouch_count++];
-    memcpy(&pv->event, event, sizeof(zta_event_msg_t));
-    memcpy(pv->voucher_uuid, voucher_uuid, sizeof(uuid_t));
-    pv->active = true;
+    const process_t *proc = (const process_t *)user;
+    if (proc->protocol.group.address_map.items == NULL)
+        return false;
+    char key[UUID_STRING_LEN + 1];
+    at_strlcpy(key, uuid, sizeof(key));
+    data_t *value = NULL;
+    return map_get((map_t *)&proc->protocol.group.address_map, key, &value) == 0;
 }
 
-/**
- * @brief Broadcast our own verification result so other peers can use it
- */
-/* Frama-C: skipped — [solver-timeout] logging/network preconditions */
-static void _broadcast_verification(process_t *proc, const uuid_t peer_uuid,
-                                    const zta_result_t *result, logger_t *logger)
+/* The peers[] record for @p uuid_str, copied out; false when absent. */
+static bool _peer_record(const process_t *proc, const char *uuid_str,
+                         public_identity_t *out)
 {
-    generic_msg_t msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.type = ZTA_VERIFICATION_RESULT;
-    zta_event_msg_t *ext = AT_MSG_EXT(&msg, zta_event_msg_t);
-    msg.size = sizeof(zta_event_msg_t);
-
-    _Static_assert(sizeof(ext->credential_hash) == ZTA_HASH_LEN,
-                   "zta_event credential_hash size must equal ZTA_HASH_LEN");
-    memcpy(ext->peer_uuid, peer_uuid, sizeof(uuid_t));
-    memcpy(ext->voucher_uuid, zta_state.self_uuid, sizeof(uuid_t));
-    memcpy(ext->credential_hash, result->credential_hash, ZTA_HASH_LEN);
-    ext->status = (int)result->status;
-    /* reason[ZTA_REASON_LEN=256] -> the narrower wire field; bound the
-     * conversion width to the destination so the (intentional) truncation is
-     * explicit and -Wformat-truncation is satisfied. */
-    snprintf(ext->reason, sizeof(ext->reason),
-             "%.*s", (int)(sizeof(ext->reason) - 1),
-             result->reason);
-
-    messaging_send("network", NET_MESSAGE, &msg, false);
-
-    char uuid_str[37];
-    uuid_unparse_lower(peer_uuid, uuid_str);
-    log_debug(logger, "ZTA: broadcast verification result (%s) for peer %s\n",
-              zta_status_str(result->status), uuid_str);
-}
-
-/**
- * @brief Handle a delegated verification message from another peer.
- *
- * If the vouching peer is admitted (message came through the encrypted
- * group channel), has sufficient reputation, and the result is ZTA_VERIFIED,
- * record the vouch.  When quorum is reached, lift the DDIL reputation cap
- * by resolving the deferred audit entry.
- *
- * Reputation gating prevents a DDIL-admitted attacker (capped at
- * ddil_fallback_reputation_cap) from vouching for a confederate.
- */
-/* Frama-C: skipped — [solver-timeout] logging/json handler */
-static void _handle_delegated_verification(process_t *proc,
-                                           const zta_event_msg_t *event,
-                                           const uuid_t voucher_uuid,
-                                           logger_t *logger)
-{
-    /* Only accept VERIFIED results as vouches */
-    if ((zta_status_t)event->status != ZTA_VERIFIED)
-        return;
-
-    char peer_str[37], voucher_str[37];
-    uuid_unparse_lower(event->peer_uuid, peer_str);
-    uuid_unparse_lower(voucher_uuid, voucher_str);
-
-    /* --- Reputation gate ------------------------------------------------
-     * The vouching peer must have at least delegated_verification_min_reputation
-     * for their vouch to count.  If we don't have a cached score yet, defer
-     * the vouch and request the score from the reputation process.
-     * ------------------------------------------------------------------ */
-    double voucher_rep = 0.0;
-    if (!_rep_cache_lookup(voucher_uuid, &voucher_rep)) {
-        /* Score not cached — defer this vouch and request it */
-        log_debug(logger, "ZTA: voucher %s reputation not cached, deferring vouch for %s\n",
-                  voucher_str, peer_str);
-        _defer_vouch(event, voucher_uuid, logger);
-        _request_reputation(proc, voucher_uuid, logger);
-        return;
-    }
-
-    if (voucher_rep < zta_state.policy->delegated_verification_min_reputation) {
-        log_warn(logger, "ZTA: rejecting vouch from %s for %s — "
-                 "reputation %.2f < threshold %.2f\n",
-                 voucher_str, peer_str, voucher_rep,
-                 zta_state.policy->delegated_verification_min_reputation);
-        return;
-    }
-
-    delegated_vouch_t *v = _find_or_create_vouch(event->peer_uuid);
-    if (!v) {
-        log_warn(logger, "ZTA: delegated vouch table full, ignoring vouch for %s\n",
-                 peer_str);
-        return;
-    }
-
-    if (v->cap_lifted) {
-        log_debug(logger, "ZTA: cap already lifted for peer %s, ignoring vouch\n",
-                  peer_str);
-        return;
-    }
-
-    /* Don't count duplicate vouches from the same peer */
-    if (_has_voucher(v, voucher_uuid)) {
-        log_debug(logger, "ZTA: duplicate vouch from %s for %s, ignoring\n",
-                  voucher_str, peer_str);
-        return;
-    }
-
-    if (v->vouch_count >= MAX_VOUCHES_PER_PEER)
-        return;
-
-    memcpy(v->vouchers[v->vouch_count], voucher_uuid, sizeof(uuid_t));
-    v->vouch_count++;
-
-    log_info(logger, "ZTA: delegated vouch from %s for %s (%d/%d quorum)\n",
-             voucher_str, peer_str, v->vouch_count,
-             zta_state.policy->delegated_verification_quorum);
-
-    /* Check quorum */
-    if (v->vouch_count >= zta_state.policy->delegated_verification_quorum) {
-        v->cap_lifted = true;
-
-        /* Resolve the deferred audit entry */
-        zta_result_t resolution;
-        zta_result_set(&resolution, ZTA_VERIFIED, "delegated verification quorum met");
-        memcpy(resolution.credential_hash, event->credential_hash, ZTA_HASH_LEN);
-        zta_audit_resolve(&zta_state.audit, event->peer_uuid, &resolution);
-
-        log_info(logger, "ZTA: delegated verification quorum met for peer %s "
-                 "(%d vouches) — DDIL reputation cap lifted\n",
-                 peer_str, v->vouch_count);
-
-        /* Record the cap-lift event */
-        if (zta_state.policy->audit_deferred_verifications) {
-            zta_audit_entry_t entry;
-            memset(&entry, 0, sizeof(entry));
-            gettimeofday(&entry.timestamp, NULL);
-            memcpy(entry.peer_uuid, event->peer_uuid, sizeof(uuid_t));
-            snprintf(entry.action, ZTA_ACTION_LEN, "delegated_cap_lift");
-            memcpy(&entry.result, &resolution, sizeof(zta_result_t));
-            entry.deferred = false;
-            zta_audit_record(&zta_state.audit, &entry);
+    uuid_t u;
+    if (uuid_parse(uuid_str, u) != 0)
+        return false;
+    bool found = false;
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers && !found; i++) {
+        if (uuid_compare(proc->protocol.peers[i].uuid, u) == 0) {
+            memcpy(out, &proc->protocol.peers[i], sizeof(*out));
+            found = true;
         }
     }
+    peers_read_unlock(proc);
+    return found;
+}
+
+static bool _has_hash(const uint8_t hash[ZTA_HASH_LEN])
+{
+    for (int i = 0; i < ZTA_HASH_LEN; i++)
+        if (hash[i] != 0)
+            return true;
+    return false;
+}
+
+static bool _ctx_recorded_hash(void *user, const char *peer, uint8_t out[ZTA_HASH_LEN])
+{
+    public_identity_t *rec = malloc(sizeof(*rec));
+    if (rec == NULL)
+        return false;
+    bool ok = _peer_record((const process_t *)user, peer, rec)
+              && _has_hash(rec->zta_credential_hash);
+    if (ok)
+        memcpy(out, rec->zta_credential_hash, ZTA_HASH_LEN);
+    free(rec);
+    return ok;
+}
+
+static int _ctx_reputation(void *user, const char *uuid, double *score)
+{
+    uuid_t u;
+    if (uuid_parse(uuid, u) != 0)
+        return 0;
+    if (_rep_cache_lookup(u, score))
+        return 1;
+    _request_reputation((process_t *)user, u, ((process_t *)user)->logger);
+    return 0;
+}
+
+/* This node's own answer for one peer's credential: the check the sweep runs. */
+static zta_status_t _check_one(const uint8_t hash[ZTA_HASH_LEN], zta_result_t *result)
+{
+    zta_state.verifier->check_revocation(zta_state.verifier, hash, result);
+    return result->status;
+}
+
+static zta_status_t _ctx_own_check(void *user, const char *peer)
+{
+    uint8_t hash[ZTA_HASH_LEN];
+    if (!_ctx_recorded_hash(user, peer, hash))
+        return ZTA_UNAVAILABLE;
+    zta_result_t result;
+    zta_status_t status = _check_one(hash, &result);
+    log_info(((process_t *)user)->logger, "ZTA: re-checked %s on an alert: %s\n",
+             peer, zta_status_str(status));
+    return status;
+}
+
+static void _ctx_standing(void *user, const char *peer, peer_standing_t standing,
+                          double ceiling, const char *reason)
+{
+    uuid_t u;
+    if (uuid_parse(peer, u) != 0)
+        return;
+    _send_zta_standing((process_t *)user, u, standing,
+                       ceiling < 0.0 ? PEER_NO_CEILING : ceiling, reason,
+                       ((process_t *)user)->logger);
+}
+
+static zta_deleg_ctx_t _ctx(process_t *proc)
+{
+    zta_deleg_ctx_t ctx = {
+        .user = proc,
+        .is_member = _ctx_is_member,
+        .recorded_hash = _ctx_recorded_hash,
+        .reputation = _ctx_reputation,
+        .own_check = _ctx_own_check,
+        .standing = _ctx_standing,
+        .min_reputation = zta_state.policy->delegated_verification_min_reputation,
+        .quorum = zta_state.policy->delegated_verification_quorum,
+        .ddil_cap = zta_state.policy->ddil_fallback_reputation_cap,
+        .revocation_penalty = zta_state.policy->revocation_reputation_penalty,
+    };
+    return ctx;
+}
+
+/**
+ * @brief Tell every other member of our group what our own check found.
+ *
+ * Wire form, both verbs: {"credential_hash": hex, "peer_uuid", "reason",
+ * "status": "VERIFIED"|"REVOKED"}, sent to process "zta_verify" (the Python
+ * runtime's network maps that name to its identity process). The sender is
+ * the transport's, never a payload field.
+ */
+/* Frama-C: skipped — [solver-timeout] logging/network preconditions */
+static void _send_finding(process_t *proc, char *verb, const char *peer_str,
+                          const uint8_t hash[ZTA_HASH_LEN], zta_status_t status,
+                          const char *reason)
+{
+    char hex[ZTA_HASH_LEN * 2 + 1];
+    sodium_bin2hex(hex, sizeof(hex), hash, ZTA_HASH_LEN);
+    json_t *body = json_pack("{s:s, s:s, s:s, s:s}", "credential_hash", hex,
+                             "peer_uuid", peer_str, "reason", reason ? reason : "",
+                             "status", zta_status_str(status));
+    if (body == NULL) {
+        log_error(proc->logger, "ZTA: json_pack OOM (%s)\n", verb);
+        return;
+    }
+    public_identity_t *members = calloc(proc->protocol.num_peers + 1, sizeof(*members));
+    size_t n = 0;
+    if (members != NULL) {
+        peers_read_lock(proc);
+        for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+            char u[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(proc->protocol.peers[i].uuid, u);
+            if (uuid_compare(proc->protocol.peers[i].uuid, zta_state.self_uuid) != 0
+                && strcmp(u, peer_str) != 0 && _ctx_is_member(proc, u))
+                memcpy(&members[n++], &proc->protocol.peers[i], sizeof(*members));
+        }
+        peers_read_unlock(proc);
+    }
+    for (size_t i = 0; i < n; i++) {
+        generic_msg_t msg = {0};
+        msg.type = NET_MESSAGE;
+        strncpy(msg.info.net_msg.process, "zta_verify", PROC_NAME_LEN);
+        msg.info.net_msg.function = verb;
+        msg.info.net_msg.encrypt = true;
+        memcpy(&msg.info.net_msg.to_whom, &members[i], sizeof(public_identity_t));
+        strncpy(msg.info.net_msg.return_to, "zta_verify", PROC_NAME_LEN);
+        net_msg_pack_json(&msg.info.net_msg, body);
+        (void)at_send(proc, "network", &msg, "a ZTA finding", "network",
+                      0, NULL, NULL, 0);
+        net_msg_free_obj(&msg.info.net_msg);
+    }
+    free(members);
+    json_decref(body);
+    log_debug(proc->logger, "ZTA: sent %s for %s to %zu member(s)\n", verb, peer_str, n);
+}
+
+static void _hold(zta_deleg_kind_t kind, const char *from, const char *peer,
+                  const uint8_t hash[ZTA_HASH_LEN], zta_status_t status, logger_t *logger)
+{
+    for (int i = 0; i < zta_state.pending_count; i++) {
+        pending_finding_t *pf = &zta_state.pending[i];
+        if (pf->active && pf->kind == kind && strcmp(pf->from, from) == 0
+            && strcmp(pf->peer, peer) == 0)
+            return;   /* already held */
+    }
+    if (zta_state.pending_count >= MAX_PENDING_FINDINGS) {
+        log_warn(logger, "ZTA: pending finding queue full, dropping one from %s\n", from);
+        return;
+    }
+    pending_finding_t *pf = &zta_state.pending[zta_state.pending_count++];
+    pf->kind = kind;
+    at_strlcpy(pf->from, from, sizeof(pf->from));
+    at_strlcpy(pf->peer, peer, sizeof(pf->peer));
+    memcpy(pf->hash, hash, ZTA_HASH_LEN);
+    pf->status = status;
+    pf->active = true;
+}
+
+/** One member's finding, decided and logged. */
+static void _decide(process_t *proc, zta_deleg_kind_t kind, const char *from,
+                    const char *peer, const uint8_t hash[ZTA_HASH_LEN], zta_status_t status)
+{
+    zta_deleg_ctx_t ctx = _ctx(proc);
+    zta_deleg_verdict_t v = zta_deleg_event(&zta_state.deleg, &ctx, kind, from, peer,
+                                            hash, status);
+    const char *what = kind == ZTA_DELEG_VOUCH ? "vouch" : "revocation alert";
+    if (v == ZTA_DELEG_PENDING) {
+        _hold(kind, from, peer, hash, status, proc->logger);
+        log_debug(proc->logger, "ZTA: %s from %s for %s held: reputation not known yet\n",
+                  what, from, peer);
+    } else if (v == ZTA_DELEG_COUNTED || v == ZTA_DELEG_QUORUM
+               || v == ZTA_DELEG_OWN_FAILED || v == ZTA_DELEG_OWN_VERIFIED) {
+        log_info(proc->logger, "ZTA: %s from %s for %s: %s\n", what, from, peer,
+                 zta_deleg_verdict_str(v));
+    } else {
+        log_warn(proc->logger, "ZTA: %s from %s for %s ignored: %s\n", what, from, peer,
+                 zta_deleg_verdict_str(v));
+    }
+}
+
+/* Offer each held finding whose sender's reputation is now cached. */
+/* Frama-C: skipped — [solver-timeout] array lifecycle preconditions */
+static void _process_pending(process_t *proc, logger_t *logger)
+{
+    (void)logger;
+    for (int i = zta_state.pending_count - 1; i >= 0; i--) {
+        pending_finding_t pf = zta_state.pending[i];
+        uuid_t u;
+        double score = 0.0;
+        if (!pf.active || uuid_parse(pf.from, u) != 0 || !_rep_cache_lookup(u, &score))
+            continue;
+        /* Out of the list first: deciding it may hold it again. */
+        zta_state.pending[i] = zta_state.pending[--zta_state.pending_count];
+        _decide(proc, pf.kind, pf.from, pf.peer, pf.hash, pf.status);
+    }
+}
+
+/* A member's `zta_verified` / `zta_revoked`. */
+/* Frama-C: skipped — [solver-timeout] logging/json handler */
+static bool _handle_finding(const process_t *cproc, generic_msg_t *msg, zta_deleg_kind_t kind)
+{
+    process_t *proc = (process_t *)cproc;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (!zta_state.initialized)
+        return true;
+    if (uuid_is_null(nmsg->from_whom.uuid)) {
+        log_warn(proc->logger, "ZTA: %s with no sender refused\n", nmsg->function);
+        return true;
+    }
+    char from[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, from);
+    json_t *body = NULL;
+    if (net_msg_unpack_json(nmsg, &body) != 0 || !json_is_object(body)) {
+        json_decref(body);
+        log_warn(proc->logger, "ZTA: %s from %s: unreadable body\n", nmsg->function, from);
+        return true;
+    }
+    const char *peer = json_string_value(json_object_get(body, "peer_uuid"));
+    const char *hex = json_string_value(json_object_get(body, "credential_hash"));
+    const char *status_s = json_string_value(json_object_get(body, "status"));
+    uuid_t pu;
+    uint8_t hash[ZTA_HASH_LEN];
+    size_t hlen = 0;
+    if (peer == NULL || uuid_parse(peer, pu) != 0 || hex == NULL || status_s == NULL
+        || sodium_hex2bin(hash, sizeof(hash), hex, strlen(hex), NULL, &hlen, NULL) != 0
+        || hlen != ZTA_HASH_LEN) {
+        json_decref(body);
+        log_warn(proc->logger, "ZTA: %s from %s: malformed\n", nmsg->function, from);
+        return true;
+    }
+    char peer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(pu, peer_str);
+    zta_status_t status = strcmp(status_s, "VERIFIED") == 0 ? ZTA_VERIFIED
+                        : strcmp(status_s, "REVOKED") == 0 ? ZTA_REVOKED
+                        : ZTA_REJECTED;   /* anything else: neither finding */
+    json_decref(body);
+    _decide(proc, kind, from, peer_str, hash, status);
+    return true;
+}
+
+static bool _handle_vouch(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    return _handle_finding(proc, msg, ZTA_DELEG_VOUCH);
+}
+
+static bool _handle_alert(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    return _handle_finding(proc, msg, ZTA_DELEG_ALERT);
 }
 
 /**
@@ -540,31 +586,38 @@ static void _handle_delegated_verification(process_t *proc,
 /* Frama-C: skipped — [solver-timeout] peer iteration preconditions */
 static void _reverify_peers(process_t *proc, logger_t *logger)
 {
+    /* Snapshot (uuid, credential hash) and act with the lock released: acting
+     * walks the peer list again to reach the members. */
+    size_t cap = proc->protocol.num_peers;
+    uuid_t *uuids = calloc(cap + 1, sizeof(uuid_t));
+    uint8_t (*hashes)[ZTA_HASH_LEN] = calloc(cap + 1, ZTA_HASH_LEN);
+    size_t n = 0;
+    if (uuids == NULL || hashes == NULL) {
+        free(uuids);
+        free(hashes);
+        return;
+    }
     peers_read_lock(proc);
-    for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+    for (size_t i = 0; i < proc->protocol.num_peers && n < cap; i++) {
         public_identity_t *peer = &proc->protocol.peers[i];
+        if (!_has_hash(peer->zta_credential_hash))
+            continue;   /* Skip peers without ZTA credentials */
+        memcpy(uuids[n], peer->uuid, sizeof(uuid_t));
+        memcpy(hashes[n], peer->zta_credential_hash, ZTA_HASH_LEN);
+        n++;
+    }
+    peers_read_unlock(proc);
 
-        /* Skip peers without ZTA credentials */
-        bool has_cred = false;
-        for (int j = 0; j < 32; j++) {
-            if (peer->zta_credential_hash[j] != 0) {
-                has_cred = true;
-                break;
-            }
-        }
-        if (!has_cred)
-            continue;
-
+    for (size_t i = 0; i < n; i++) {
         zta_result_t result;
-        zta_state.verifier->check_revocation(
-            zta_state.verifier, peer->zta_credential_hash, &result);
+        _check_one(hashes[i], &result);
 
         /* Record audit entry */
         if (zta_state.policy->audit_deferred_verifications) {
             zta_audit_entry_t entry;
             memset(&entry, 0, sizeof(entry));
             gettimeofday(&entry.timestamp, NULL);
-            memcpy(entry.peer_uuid, peer->uuid, sizeof(uuid_t));
+            memcpy(entry.peer_uuid, uuids[i], sizeof(uuid_t));
             snprintf(entry.action, ZTA_ACTION_LEN, "periodic_reverify");
             memcpy(&entry.result, &result, sizeof(zta_result_t));
             entry.deferred = (result.status == ZTA_UNAVAILABLE ||
@@ -573,23 +626,25 @@ static void _reverify_peers(process_t *proc, logger_t *logger)
         }
 
         char uuid_str[37];
-        uuid_unparse_lower(peer->uuid, uuid_str);
+        uuid_unparse_lower(uuids[i], uuid_str);
+        zta_deleg_own_result(&zta_state.deleg, uuid_str, result.status);
 
         switch (result.status) {
         case ZTA_REVOKED:
             log_warn(logger, "ZTA: peer %s credential REVOKED: %s\n",
                      uuid_str, result.reason);
-            _send_reputation_penalty(proc, peer->uuid,
+            _send_reputation_penalty(proc, uuids[i],
                                      zta_state.policy->revocation_reputation_penalty,
                                      logger);
-            _broadcast_revocation_alert(proc, peer->uuid,
-                                        peer->zta_credential_hash, logger);
+            /* Tell the group; each member re-checks before it acts. */
+            _send_finding(proc, ZTA_PROTO_REVOCATION_ALERT, uuid_str, hashes[i],
+                          ZTA_REVOKED, "credential revoked");
             break;
 
         case ZTA_EXPIRED:
             log_warn(logger, "ZTA: peer %s credential EXPIRED: %s\n",
                      uuid_str, result.reason);
-            _send_reputation_penalty(proc, peer->uuid,
+            _send_reputation_penalty(proc, uuids[i],
                                      zta_state.policy->revocation_reputation_penalty * 0.5,
                                      logger);
             break;
@@ -607,23 +662,26 @@ static void _reverify_peers(process_t *proc, logger_t *logger)
              * not reach back past this point. Also lifts any ceiling the peer
              * was under, which is what lets a DDIL admission recover once the
              * infrastructure returns. Mirrors the Python sweep. */
-            _send_zta_standing(proc, peer->uuid, PEER_STANDING_PROVED,
+            _send_zta_standing(proc, uuids[i], PEER_STANDING_PROVED,
                                PEER_NO_CEILING, "re-verified", logger);
-            /* Share result so DDIL peers can use it for delegated verification */
-            _broadcast_verification(proc, peer->uuid, &result, logger);
+            /* Vouch, so a member that cannot reach the verifier can lift its cap */
+            _send_finding(proc, ZTA_PROTO_VERIFICATION, uuid_str, hashes[i],
+                          ZTA_VERIFIED, "re-verified");
             break;
 
         case ZTA_REJECTED:
             log_warn(logger, "ZTA: peer %s credential REJECTED: %s\n",
                      uuid_str, result.reason);
-            _send_reputation_penalty(proc, peer->uuid,
+            _send_reputation_penalty(proc, uuids[i],
                                      zta_state.policy->revocation_reputation_penalty,
                                      logger);
             break;
         }
     }
-    peers_read_unlock(proc);
+    free(uuids);
+    free(hashes);
 }
+
 
 /**
  * @brief Attempt to resolve deferred verifications
@@ -676,6 +734,11 @@ static void _resolve_deferred(process_t *proc, logger_t *logger)
             continue; /* still can't resolve */
 
         zta_audit_resolve(&zta_state.audit, entry.peer_uuid, &result);
+        {
+            char peer_str[37];
+            uuid_unparse_lower(entry.peer_uuid, peer_str);
+            zta_deleg_own_result(&zta_state.deleg, peer_str, result.status);
+        }
 
         char uuid_str[37];
         uuid_unparse_lower(entry.peer_uuid, uuid_str);
@@ -701,44 +764,6 @@ static void _resolve_deferred(process_t *proc, logger_t *logger)
 }
 
 /**
- * @brief Process pending vouches after a reputation response arrives.
- *
- * Re-evaluates each pending vouch whose voucher now has a cached score.
- * Accepted vouches are fed back through _handle_delegated_verification;
- * rejected ones are logged and discarded.
- */
-/* Frama-C: skipped —
- * zta_process_run + all helpers: [solver-timeout] memcpy of public_identity_t/uuid_t (19
- * sites) + reputation cache + delegated vouch lifecycle + peer iteration + json/network
- * cascades.
- */
-static void _process_pending_vouches(process_t *proc, logger_t *logger)
-{
-    for (int i = zta_state.pending_vouch_count - 1; i >= 0; i--) {
-        pending_vouch_t *pv = &zta_state.pending_vouches[i];
-        if (!pv->active)
-            continue;
-
-        double score = 0.0;
-        if (!_rep_cache_lookup(pv->voucher_uuid, &score))
-            continue;  /* still waiting */
-
-        pv->active = false;
-
-        /* Re-enter the vouch through the normal path (reputation is now cached) */
-        _handle_delegated_verification(proc, &pv->event,
-                                       pv->voucher_uuid, logger);
-
-        /* Compact: swap with last active entry */
-        if (i < zta_state.pending_vouch_count - 1)
-            memcpy(pv, &zta_state.pending_vouches[--zta_state.pending_vouch_count],
-                   sizeof(pending_vouch_t));
-        else
-            zta_state.pending_vouch_count--;
-    }
-}
-
-/**
  * @brief Handler for local_rep_response messages from the reputation process.
  *
  * Updates the reputation cache and triggers pending vouch processing.
@@ -749,6 +774,17 @@ static bool _handle_rep_response(const process_t *proc, directory_t *queues,
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+
+    /* Local only: a member forging one would set its own score past the bar.
+     * The rule of identity_is_local_app_verb (no sender, or ourselves). */
+    if (!uuid_is_null(nmsg->from_whom.uuid)
+        && uuid_compare(nmsg->from_whom.uuid, zta_state.self_uuid) != 0) {
+        char who[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(nmsg->from_whom.uuid, who);
+        log_warn(proc->logger, "ZTA: refusing %s from the wire (peer %s)\n",
+                 nmsg->function, who);
+        return true;
+    }
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL) {
@@ -788,11 +824,10 @@ static bool _handle_rep_response(const process_t *proc, directory_t *queues,
                   uuid_str);
     }
 
-    /* Re-evaluate pending vouches now that we have new cache data */
-    _process_pending_vouches((process_t *)proc, proc->logger);
+    /* Offer the held findings again now that we have new cache data */
+    _process_pending((process_t *)proc, proc->logger);
     return true;
 }
-
 /****************************
  * Process runner
  ****************************/
@@ -849,6 +884,7 @@ int zta_process_run(process_t *proc, directory_t *queues,
         zta_state.verifier->destroy(zta_state.verifier);
         return -1;
     }
+    zta_deleg_init(&zta_state.deleg);
     zta_state.initialized = true;
 
     log_info(logger, "ZTA: process started (reverify interval: %d sec)\n",
@@ -857,6 +893,9 @@ int zta_process_run(process_t *proc, directory_t *queues,
     /* Register handler for reputation responses from the reputation process */
     process_register_handler(proc, REP_PROTO_LOCAL_RESP,
                              (handler_ptr_t)_handle_rep_response);
+    /* Members' findings (zta_delegation.h) */
+    process_register_handler(proc, ZTA_PROTO_VERIFICATION, (handler_ptr_t)_handle_vouch);
+    process_register_handler(proc, ZTA_PROTO_REVOCATION_ALERT, (handler_ptr_t)_handle_alert);
 
     /* Standard process setup */
     process_ctx_t pctx;
@@ -877,18 +916,11 @@ int zta_process_run(process_t *proc, directory_t *queues,
     while (keep_running(proc, &pctx.sig_q, logger)) {
         sleep_until(proc, cadence);
 
-        /* Handle incoming messages (revocation alerts, verification results) */
+        /* Handle incoming messages (members' findings, reputation answers) */
         messaging_recv_release(&buf);   /* the previous pass's */
         int err = messaging_recv(&buf);
-        if (err == 0) {
-            if (buf.type == ZTA_VERIFICATION_RESULT) {
-                /* Delegated verification from another peer */
-                const zta_event_msg_t *event = AT_MSG_EXT_CONST(&buf, zta_event_msg_t);
-                _handle_delegated_verification(proc, event, event->voucher_uuid,
-                                               logger);
-            }
+        if (err == 0)
             run_message_handlers(proc, queues, buf.type, &buf);
-        }
 
         /* Periodic re-verification */
         if (reverify_cycles > 0 && ++cycle >= reverify_cycles) {

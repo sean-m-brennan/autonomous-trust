@@ -18,19 +18,18 @@ description: |
     verifier|subject|digest, so both adapters reach the same entry from the
     same content.
 
-    The fixture commits the attested entry about carol directly, through the
-    chain's own rule (TransactionHistory.append_attested /
-    tx_history_append_attested); the quorum round that normally precedes it
-    is pinned by its own scenarios. The step then completes an ordinary
-    entry, which must take the next index and link to the attested entry's
-    hash.
+    The fixture writes the attested entry about carol, then an ordinary
+    entry, through the chain's own writers (TransactionHistory.append_attested
+    and update / their C twins); the quorum round and the placement that
+    normally put them there are pinned by their own scenarios. The ordinary
+    entry takes the next index and links to the attested entry's hash. The
+    step (`update needed`) leaves bob's chain as it is.
 
     The pin is bob's `window_root`, over both entries. A divergence anywhere
     in the attested form -- field order, the marker, the subject's spelling,
     the digest, or the forced channel block -- changes the root on one side
-    only. The legacy roots elsewhere in this corpus (for instance
-    `committed-channel-in-the-entry-hash`, `chain-catchup-verifies-links`)
-    are the control: the change did not move them.
+    only. `committed-channel-in-the-entry-hash` is the control: the attested
+    form did not move its root.
 
 participants:
   - id: alice
@@ -52,18 +51,18 @@ fixtures:
       - task_id: t-1
         p1: carol
         p1_score: 0.9
+        p2: alice
+        p2_score: 0.8
 
 steps:
   - id: 1
     from: alice
     to: bob
-    function: tx committed
-    payload:
-      task_id: t-1
-      score: 0.8
+    function: update needed
+    payload: {}
     description: |
-        The commit that completes ordinary task t-1. It takes index 1 and
-        links to the attested entry at index 0.
+        A request that leaves bob's chain as it is, so the assertion reads the
+        staged entries.
 
 expected_state:
   bob:

@@ -19,6 +19,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>  /* mkdtemp: Darwin declares it here, not in stdlib.h */
 #include <limits.h>
 
 #include "autonomous_trust/config/configuration.h"
@@ -26,6 +27,7 @@
 #include "autonomous_trust/structures/map.h"
 #include "autonomous_trust/utilities/exception.h"
 #include "autonomous_trust/utilities/logger.h"
+#include "autonomous_trust/utilities/util.h"   /* makedirs */
 
 extern int config_absolute_path(const char *path_in, char *path_out);
 extern int load_all_configs(char *cfg_dir, map_t *configs, logger_t *logger);
@@ -316,9 +318,7 @@ DEFINE_TEST(test_an_unregistered_config_section_is_skipped_not_fatal)
     ck_assert_ptr_nonnull(mkdtemp(root));
     char cfg_dir[256];
     snprintf(cfg_dir, sizeof(cfg_dir), "%s/etc/at", root);
-    char mk[512];
-    snprintf(mk, sizeof(mk), "mkdir -p %s", cfg_dir);
-    ck_assert_int_eq(system(mk), 0);
+    ck_assert_int_eq(makedirs(cfg_dir, 0700), 0);
     setenv("AUTONOMOUS_TRUST_ROOT", root, 1);
 
     /* One file the registry owns, and one it does not — the reputation
@@ -360,9 +360,7 @@ DEFINE_TEST(test_a_malformed_known_config_is_still_fatal)
     ck_assert_ptr_nonnull(mkdtemp(root));
     char cfg_dir[256];
     snprintf(cfg_dir, sizeof(cfg_dir), "%s/etc/at", root);
-    char mk[512];
-    snprintf(mk, sizeof(mk), "mkdir -p %s", cfg_dir);
-    ck_assert_int_eq(system(mk), 0);
+    ck_assert_int_eq(makedirs(cfg_dir, 0700), 0);
     setenv("AUTONOMOUS_TRUST_ROOT", root, 1);
 
     char path[512];

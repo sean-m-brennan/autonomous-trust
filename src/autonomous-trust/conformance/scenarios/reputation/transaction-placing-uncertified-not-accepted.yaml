@@ -5,10 +5,10 @@ name: transaction-placing-uncertified-not-accepted
 byte_pinning: false
 description: |
     Ordered placement (doc/architecture/reputation.md, "Agreeing on an
-    order"). A half proposed without a grant is accepted only when it asks to
-    be certified: a placed entry carries its halves' certificates, and an
-    unsigned acceptance would certify nothing. This one names a placing group
-    but does not ask, and bob never granted it, so bob does not accept it.
+    order"). A half is accepted only when it asks to be certified: a placed
+    entry carries its halves' certificates, and an unsigned acceptance would
+    certify nothing. This one names its group but does not ask, so bob does
+    not accept it.
 
 participants:
   - id: alice
@@ -16,8 +16,7 @@ participants:
   - id: bob
     role: acceptor
 
-fixtures:
-  ordered_placement: true
+fixtures: {}
 
 steps:
   - id: 1
@@ -30,6 +29,7 @@ steps:
       proposer: alice
       task_id: t-1
       score: 0.8
+      certify: false
       placing: true
 
   - id: 2

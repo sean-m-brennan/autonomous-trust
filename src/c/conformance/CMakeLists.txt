@@ -182,9 +182,12 @@ target_compile_definitions(conformance_runner PRIVATE ${AT_CONFORMANCE_DEFS})
 # pull in symbols defined later in the archive's link order. Without this,
 # protobuf_c_message_* symbols come up undefined even though they're in
 # libprotobuf-c, because libsymbols are resolved single-pass.
+# (AT_TEST_LIBS is that group, and plain archives on Apple, whose linker
+# rescans by itself.)
+at_whole_archive(_conformance_whole ${AT_CONFORMANCE_EXTENSIONS})
 set(AT_CONFORMANCE_LIBS
-    -Wl,--whole-archive ${AT_CONFORMANCE_EXTENSIONS} -Wl,--no-whole-archive
-    -Wl,--start-group autonomous_trust_static ${TEST_DEPENDENCIES} -Wl,--end-group
+    ${_conformance_whole}
+    ${AT_TEST_LIBS}
     at_ryu
 )
 target_link_libraries(conformance_runner PRIVATE ${AT_CONFORMANCE_LIBS})

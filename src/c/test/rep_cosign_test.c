@@ -33,6 +33,7 @@
  */
 
 #define DEBUG_TESTS 1
+#include "utilities/portable.h"  /* uuid_generate_sha1 / st_mtim on Darwin */
 #include "test_setup.h"
 
 #include <errno.h>
@@ -59,11 +60,10 @@
 #include "utilities/msg_types_priv.h"
 #include "utilities/allocation.h"
 
-static char GRANT_FN[]    = "permission granted";
 static char ACCEPTED_FN[] = "tx accepted";
 static char PROPOSE_FN[]  = "checkpoint propose";
 
-#define REQUEST_VERB "ask permission"
+#define TX_VERB      "transaction"
 #define COMMIT_VERB  "tx committed"
 #define SIGN_VERB    "checkpoint sign"
 
@@ -73,8 +73,6 @@ static char PROPOSE_FN[]  = "checkpoint propose";
 static size_t  g_commit_count;
 static size_t  g_sign_count;
 static size_t  g_refuse_commits;   /* EAGAIN this many commit sends first */
-static size_t  g_refuse_requests;  /* EAGAIN this many Paxos asks first */
-static size_t  g_request_tries;    /* every ask handed to the queue, refused or not */
 static int64_t g_req_id1;
 static int64_t g_req_id2;
 static char    g_req_peer_uuid[UUID_STRING_LEN + 1];
@@ -100,12 +98,7 @@ static int _capture_hook(const char *key, const message_type_t type,
     if (type != NET_MESSAGE || msg->info.net_msg.function == NULL)
         return 0;
     const char *fn = msg->info.net_msg.function;
-    if (strcmp(fn, REQUEST_VERB) == 0) {
-        g_request_tries++;
-        if (g_refuse_requests > 0) {
-            g_refuse_requests--;
-            return EAGAIN;
-        }
+    if (strcmp(fn, TX_VERB) == 0) {
         json_t *p = _payload_of(msg);
         if (p != NULL) {
             g_req_id1 = json_integer_value(json_object_get(p, "id1"));
@@ -195,7 +188,6 @@ static void _begin(void)
     ck_assert(sodium_init() >= 0);
     reputation_reset_state(2);
     g_commit_count = g_sign_count = g_refuse_commits = 0;
-    g_refuse_requests = g_request_tries = 0;
     g_req_id1 = g_req_id2 = g_sign_epoch = 0;
     g_req_peer_uuid[0] = '\0';
     messaging_set_test_hook(_capture_hook);
@@ -226,18 +218,18 @@ static void _round(cohort_t *c, uuid_t task, char *task_str)
     _forward_transaction(c->proc, task, c->me->uuid, 0.9, "agora-post",
                          NULL, subject, 0.0);
     identity_t *voters[2] = { c->alice, c->bob };
+    uint8_t desig[512];
+    size_t dlen = commit_designation(c->me->uuid, task, 0.9, NULL, desig,
+                                     sizeof(desig));
+    ck_assert(dlen > 0);
     for (int i = 0; i < 2; i++) {
+        unsigned char sig[crypto_sign_BYTES];
+        ck_assert(crypto_sign_detached(sig, NULL, desig, dlen,
+                                       voters[i]->signature.private) == 0);
+        char hex[crypto_sign_BYTES * 2 + 1];
+        hexlify(sig, crypto_sign_BYTES, (unsigned char *)hex);
         json_t *p = json_object();
-        json_object_set_new(p, "id1", json_integer(g_req_id1));
-        json_object_set_new(p, "id2", json_integer(g_req_id2));
-        json_object_set_new(p, "peer_uuid", json_string(g_req_peer_uuid));
-        json_object_set_new(p, "last_id", json_integer(0));
-        json_object_set_new(p, "chain_len", json_integer(0));
-        _dispatch(c->proc, voters[i], GRANT_FN, p);
-        json_decref(p);
-    }
-    for (int i = 0; i < 2; i++) {
-        json_t *p = json_object();
+        json_object_set_new(p, "sig", json_string(hex));
         json_object_set_new(p, "id1", json_integer(g_req_id1));
         json_object_set_new(p, "id2", json_integer(g_req_id2));
         json_object_set_new(p, "peer_uuid", json_string(g_req_peer_uuid));
@@ -245,6 +237,13 @@ static void _round(cohort_t *c, uuid_t task, char *task_str)
         _dispatch(c->proc, voters[i], ACCEPTED_FN, p);
         json_decref(p);
     }
+}
+
+/* How many entries wait in the primary chain's pool. */
+static int _pooled(void)
+{
+    uuid_t got[8];
+    return reputation_get_pool_tasks(got, 8);
 }
 
 /* THE REGRESSION (part-3518232): the queue refuses the first sends of the
@@ -258,7 +257,7 @@ DEFINE_TEST(test_a_commit_broadcast_survives_a_full_network_queue)
     char task_str[UUID_STRING_LEN + 1];
     g_refuse_commits = 3;
     _round(&c, task, task_str);
-    ck_assert_int_eq(reputation_get_chain_len(), 1);
+    ck_assert_int_eq(_pooled(), 1);
     ck_assert_uint_eq(g_commit_count, 2);   /* one per peer, none lost */
     ck_assert_uint_eq(g_refuse_commits, 0);
     _end();
@@ -278,32 +277,14 @@ DEFINE_TEST(test_a_wedged_network_queue_keeps_the_commits_for_the_tick)
     char task_str[UUID_STRING_LEN + 1];
     g_refuse_commits = 1000;
     _round(&c, task, task_str);
-    ck_assert_int_eq(reputation_get_chain_len(), 1);  /* the commit stands */
+    ck_assert_int_eq(_pooled(), 1);  /* the commit stands */
     ck_assert_uint_eq(g_commit_count, 0);
     ck_assert_uint_eq(at_send_retry_pending("network"), 2);
     g_refuse_commits = 0;                             /* the queue drains */
-    ck_assert_uint_eq(at_send_retry_drain(NULL, NULL, (double)time(NULL)), 2);
+    /* As the reputation process's own tick would (the frames are its own). */
+    ck_assert_uint_eq(at_send_retry_drain(c.proc, NULL, (double)time(NULL)), 2);
     ck_assert_uint_eq(g_commit_count, 2);
     ck_assert_uint_eq(at_send_retry_pending("network"), 0);
-    _end();
-}
-END_TEST_DEFINITION()
-
-/* Paxos chatter gets ONE try (part-3614473): retrying it kept the network
- * queue full for seconds and starved identity's hand-offs. The protocol
- * re-sends it, so a full queue costs nothing but that round. */
-DEFINE_TEST(test_paxos_chatter_is_not_retried)
-{
-    _begin();
-    cohort_t c;
-    _cohort(&c);
-    uuid_t task, subject;
-    uuid_generate(task);
-    uuid_clear(subject);
-    g_refuse_requests = 100;
-    _forward_transaction(c.proc, task, c.me->uuid, 0.9, "agora-post",
-                         NULL, subject, 0.0);
-    ck_assert_uint_eq(g_request_tries, 2);   /* one per peer, no retries */
     _end();
 }
 END_TEST_DEFINITION()
@@ -474,7 +455,6 @@ END_TEST_DEFINITION()
 RUN_TESTS(RepCosign,
           test_a_commit_broadcast_survives_a_full_network_queue,
           test_a_wedged_network_queue_keeps_the_commits_for_the_tick,
-          test_paxos_chatter_is_not_retried,
           test_a_signer_ahead_of_the_proposal_signs_its_range,
           test_a_signer_behind_signs_once_it_catches_up,
           test_a_diverged_range_is_never_signed_and_expires,

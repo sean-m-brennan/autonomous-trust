@@ -104,6 +104,21 @@ void handle_inbound_group(net_thread_ctx_t *ctx,
                           uint8_t *buf, size_t nbytes,
                           const char *from_addr);
 
+/** How many group frames that did not open are held for a key change, and for
+ *  how long (seconds) before one is dropped if no new key arrives. */
+#define NET_HELD_GROUP_FRAMES 16
+#define NET_HELD_GROUP_FRAME_SEC 10
+
+/** Try again every held group frame whose key differs from the one installed
+ *  now; one that still does not open is dropped. Drops frames held longer than
+ *  NET_HELD_GROUP_FRAME_SEC. The group receiver calls it every poll; returns
+ *  how many were retried. */
+size_t net_retry_held_group_frames(net_thread_ctx_t *ctx);
+
+/** Test seams: how many group frames are held; forget them all. */
+size_t net_held_group_frame_count(void);
+void net_held_group_frames_reset(void);
+
 /**
  * @brief The registered peer whose identity uuid is @p uuid, or NULL.
  *
@@ -176,9 +191,43 @@ void net_proc_test_get_last_routed_from_addr(char *out, size_t outlen);
 
 /** @brief route_to_process (the hand-off of every inbound wire frame to its
  *         sibling process), for a test that drives it with a refusing
- *         messaging hook (ISSUES §2.14). Not public API. */
+ *         messaging hook (ISSUES §2.14). Not public API. Routes as a frame
+ *         from a peer we hold (NET_PATH_PEER). */
 int net_proc_test_route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
                                    logger_t *logger);
+
+/** The receive path an inbound wire frame came in on. It decides which verbs
+ *  route_to_process lets through (ISSUES §2.17): a stranger's paths carry only
+ *  what a node says before it shares a key with us. */
+typedef enum {
+    NET_PATH_PEER,           /* decrypted from a peer we hold, or replayed after
+                              * its admission */
+    NET_PATH_PLAIN_KNOWN,    /* plaintext from a peer we hold (allowlisted at
+                              * try_unencrypted_from_known_peer) */
+    NET_PATH_STRANGER,       /* plaintext from an address we cannot place */
+    NET_PATH_RELAY_STRANGER, /* relayed from a uuid we do not hold */
+    NET_PATH_BROADCAST,      /* the broadcast (discovery) channel */
+    NET_PATH_GROUP,          /* group-encrypted, from a peer we hold */
+} net_route_path_t;
+
+/** route_to_process's return when the frame's verb is not let in on its path
+ *  (the frame is dropped, not routed). */
+#define NET_ROUTE_REFUSED 1
+
+/** @brief Whether a wire frame for @p process / @p function may be routed when
+ *         it came in on @p path. Never an `app_*` verb (those are the local
+ *         app's commands and never travel), never a command to the network
+ *         process except a remote stats_req, and on a stranger's or the
+ *         broadcast path only the plaintext / broadcast verbs. @p why, when
+ *         not NULL, is set to a static reason on refusal. */
+bool net_wire_verb_admitted(const char *process, const char *function,
+                            net_route_path_t path, const char **why);
+
+/** @brief route_to_process for @p wmsg as if it came in on @p path. Returns
+ *         NET_ROUTE_REFUSED when the verb is not let in there. Not public
+ *         API. */
+int net_proc_test_route_on_path(const net_wire_msg_t *wmsg, process_t *proc,
+                                logger_t *logger, net_route_path_t path);
 
 /* ---- ping_at refusal (divergence: C implements no PingAT) ----
  * The outbound drain answers the `ping_at` selector with an explicit refusal

@@ -97,7 +97,7 @@ process|function|data
 ```
 
 - **process.** Target subsystem name (e.g., `identity`, `negotiation`, `reputation`)
-- **function.** Protocol message type (e.g., `request_access`, `invitation`, `ask permission`)
+- **function.** Protocol message type (e.g., `request_access`, `invitation`, `transaction`)
 - **data.** JSON-serialized payload (Configuration objects auto-deserialize if they contain `__type__`)
 
 For encrypted channels, the entire serialized string is encrypted before

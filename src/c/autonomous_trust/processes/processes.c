@@ -18,13 +18,14 @@
 #include <string.h>
 #include <fcntl.h>
 #include <sys/types.h>
-#include <sys/msg.h>
 #include <errno.h>
 #include <stdlib.h>   /* EXIT_SUCCESS / EXIT_FAILURE */
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
 
 #include <jansson.h>
 #include <sodium.h>
@@ -48,6 +49,117 @@ const char *sig_quit = "quit";
 int process_child_extra_flags = 0;
 
 const long cadence = 500000L; // microseconds
+
+/* ---- in-process subsystems ----------------------------------------------
+ * When the node runs in-process (messaging_in_process(): AT_IN_PROCESS=1, and
+ * always on Windows), a subsystem's runner runs on a thread of this process
+ * instead of in a forked child. process_setup then does not daemonize, so the
+ * runner takes its child path, and returns only when its loop ends (the quit
+ * signal). The daemon's pid bookkeeping is kept: each thread gets a small id
+ * in place of a pid, and process_liveness / process_force_stop answer for it
+ * what kill(pid, 0) and SIGKILL answered for a child. */
+typedef struct proc_thread
+{
+    pid_t id;
+    pthread_t thread;
+    atomic_bool done;
+    int rc;
+    process_t *proc;
+    directory_t *queues;
+    /* Copied: the caller's is on its stack, which a fork duplicated and a
+     * thread would outlive. */
+    char sig[SIG_NAME_LEN + 1];
+    logger_t *logger;
+    struct proc_thread *next;
+} proc_thread_t;
+
+static pthread_mutex_t g_threads_mu = PTHREAD_MUTEX_INITIALIZER;
+static proc_thread_t *g_threads = NULL;
+static pid_t g_next_thread_id = 1;
+
+static void *_proc_thread_main(void *arg)
+{
+    proc_thread_t *t = arg;
+    t->rc = t->proc->runner(t->proc, t->queues, t->sig, t->logger);
+    atomic_store(&t->done, true);
+    return NULL;
+}
+
+static pid_t _start_thread(process_t *proc, directory_t *queues, const char *sig,
+                           logger_t *logger)
+{
+    proc_thread_t *t = calloc(1, sizeof(*t));
+    if (t == NULL)
+        return EXCEPTION(ENOMEM);
+    t->proc = proc;
+    t->queues = queues;
+    snprintf(t->sig, sizeof(t->sig), "%s", sig);
+    t->logger = logger;
+    atomic_init(&t->done, false);
+    pthread_mutex_lock(&g_threads_mu);
+    t->id = g_next_thread_id++;
+    int err = pthread_create(&t->thread, NULL, _proc_thread_main, t);
+    if (err != 0)
+    {
+        pthread_mutex_unlock(&g_threads_mu);
+        free(t);
+        return EXCEPTION(err);
+    }
+    t->next = g_threads;
+    g_threads = t;
+    pthread_mutex_unlock(&g_threads_mu);
+    return t->id;
+}
+
+int process_liveness(pid_t id)
+{
+    if (!messaging_in_process())
+    {
+#ifdef _WIN32
+        return 0;   /* never: Windows nodes are always in-process */
+#else
+        if (kill(id, 0) == 0)
+            return 1;
+        return errno == ESRCH ? 0 : -1;
+#endif
+    }
+    pthread_mutex_lock(&g_threads_mu);
+    proc_thread_t **link = &g_threads;
+    while (*link != NULL && (*link)->id != id)
+        link = &(*link)->next;
+    proc_thread_t *t = *link;
+    int alive = 0;
+    if (t != NULL && !atomic_load(&t->done))
+        alive = 1;
+    else if (t != NULL)
+    {
+        /* Finished: reap it, as waitpid would a child. */
+        (void)pthread_join(t->thread, NULL);
+        *link = t->next;
+        free(t);
+    }
+    pthread_mutex_unlock(&g_threads_mu);
+    return alive;
+}
+
+void process_force_stop(pid_t id, logger_t *logger)
+{
+    if (!messaging_in_process())
+    {
+#ifndef _WIN32
+        kill(id, SIGKILL);
+#endif
+        return;
+    }
+    /* A thread cannot be killed without taking the process's state with it.
+     * Leave it to end with the process, and say so. */
+    pthread_mutex_lock(&g_threads_mu);
+    for (proc_thread_t *t = g_threads; t != NULL; t = t->next)
+        if (t->id == id && !atomic_load(&t->done))
+            log_warn(logger, "Subsystem %s did not stop; it ends with the process\n",
+                     t->proc->name);
+    pthread_mutex_unlock(&g_threads_mu);
+}
 
 typedef bool (*msg_handler_t)(const process_t *proc, directory_t *queues, generic_msg_t *msg);
 
@@ -109,7 +221,7 @@ int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs
     if (orig > 0)
     {
         char pid_str[32] = {0};
-        snprintf(pid_str, 31, "%d", orig);
+        snprintf(pid_str, 31, "%d", (int)orig);
         if (procs_lock != NULL)
             pthread_mutex_lock(procs_lock);
         int rc = map_remove(procs, pid_str);
@@ -160,10 +272,16 @@ int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs
      * handlers and stdio buffers. Running them here would flush and tear down state the
      * daemon still owns. The runner has already closed its own descriptors by this
      * point. */
-    pid_t caller = getpid();
-    pid_t pid = proc->runner(proc, queues, sig, logger);
-    if (getpid() != caller)
-        _exit(pid == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
+    pid_t pid;
+    if (messaging_in_process())
+        pid = _start_thread(proc, queues, sig, logger);
+    else
+    {
+        pid_t caller = getpid();
+        pid = proc->runner(proc, queues, sig, logger);
+        if (getpid() != caller)
+            _exit(pid == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
+    }
     if (pid == -1)
     {
         log_error(logger, "Error starting process '%s'\n", pname);
@@ -172,7 +290,7 @@ int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs
 
     // record pids for monitoring
     char pid_str[32] = {0};
-    snprintf(pid_str, 31, "%d", pid);
+    snprintf(pid_str, 31, "%d", (int)pid);
     // data_t *key_val = string_data(pname, strlen(pname));
     data_t *proc_val = object_ptr_data(proc, sizeof(process_t));
     if (procs_lock != NULL)
@@ -220,8 +338,13 @@ int set_process_name(const char *name_in)
 {
     char name[PROC_NAME_LEN + 1] = {0};
     strncpy(name, name_in, PROC_NAME_LEN - 1);
+#ifdef __APPLE__
+    /* Darwin's takes the name only, and can name only the calling thread. */
+    int err = pthread_setname_np(name);
+#else
     pthread_t tid = pthread_self();
     int err = pthread_setname_np(tid, name);
+#endif
     if (err != 0)
         return EXCEPTION(err);
     return 0;
@@ -552,21 +675,26 @@ int process_setup(process_t *proc, queue_id_t signal, logger_t *logger,
     /* In foreground mode the daemon keeps stderr; propagate that to children so
      * their post-daemonize log output isn't redirected to /dev/null. */
     proc->flags |= process_child_extra_flags;
-    int err = daemonize(data_path, proc->flags, &ctx->fd1, &ctx->fd2);
-    if (err != 0)
-        return err;
+    /* In-process this already IS the subsystem's thread (_start_thread): no
+     * fork, no descriptor sweep, and the shared logger stays open. */
+    if (!messaging_in_process())
+    {
+        int err = daemonize(data_path, proc->flags, &ctx->fd1, &ctx->fd2);
+        if (err != 0)
+            return err;
 
-    /* Child only (daemonize returned 0). When the close-all-fds sweep ran
-     * (NO_CLOSE_FILES unset, the default for everything but net_proc), it
-     * closed the descriptor under a file-backed logger — re-open it so this
-     * child's log output keeps reaching the log file in daemon mode. No-op for
-     * a stderr/terminal logger (file_name empty). net_proc sets NO_CLOSE_FILES
-     * to keep its sockets, which also preserves its log fd, so skip it there. */
-    if (!(proc->flags & NO_CLOSE_FILES))
-        logger_reopen(logger);
+        /* Child only (daemonize returned 0). When the close-all-fds sweep ran
+         * (NO_CLOSE_FILES unset, the default for everything but net_proc), it
+         * closed the descriptor under a file-backed logger — re-open it so this
+         * child's log output keeps reaching the log file in daemon mode. No-op for
+         * a stderr/terminal logger (file_name empty). net_proc sets NO_CLOSE_FILES
+         * to keep its sockets, which also preserves its log fd, so skip it there. */
+        if (!(proc->flags & NO_CLOSE_FILES))
+            logger_reopen(logger);
+    }
 
     pid_t pid = getpid();
-    log_debug(logger, "Child pid %d\n", pid);
+    log_debug(logger, "Child pid %d\n", (int)pid);
     if (messaging_init(proc->name, &ctx->my_q) != 0)
         log_exception(logger);
     messaging_assign(&ctx->my_q);
@@ -627,7 +755,10 @@ int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
         // Hook point for sub-process specific post-message activity (e.g. periodic tasks)
     }
     messaging_recv_release(&buf);
-    array_free(queues);
+    /* A forked subsystem frees its own copy; in-process the directory is the
+     * daemon's, still in use by every other subsystem thread. */
+    if (!messaging_in_process())
+        array_free(queues);
     if (ctx->fd1 > 0)
         close(ctx->fd1);
     if (ctx->fd2 > 0)

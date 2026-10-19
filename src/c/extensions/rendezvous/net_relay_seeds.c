@@ -190,7 +190,7 @@ size_t net_relay_seeds_merge(const net_relay_seed_list_t *shipped,
     return n;
 }
 
-static char *_read(const char *path)
+static char *_read_seeds(const char *path)
 {
     FILE *f = fopen(path, "rb");
     if (f == NULL)
@@ -303,7 +303,7 @@ size_t net_relay_seeds_load(const char *release_key_hex, net_relay_ep_t *out,
     net_relay_seed_list_t *shipped = &lists[0], *adds = &lists[1], *removes = &lists[2];
 
     char path[CFG_PATH_LEN + 64];
-    char *text = net_relay_seeds_path(path, sizeof(path)) == 0 ? _read(path) : NULL;
+    char *text = net_relay_seeds_path(path, sizeof(path)) == 0 ? _read_seeds(path) : NULL;
     if (text != NULL) {
         long long seq = 0;
         if (key[0] == '\0') {
@@ -323,7 +323,7 @@ size_t net_relay_seeds_load(const char *release_key_hex, net_relay_ep_t *out,
         free(text);
     }
 
-    text = _data_path(AT_RELAY_SEEDS_LOCAL_FILE, path, sizeof(path)) == 0 ? _read(path) : NULL;
+    text = _data_path(AT_RELAY_SEEDS_LOCAL_FILE, path, sizeof(path)) == 0 ? _read_seeds(path) : NULL;
     if (text != NULL) {
         char node_key[2 * crypto_sign_PUBLICKEYBYTES + 1] = {0};
         (void)net_relay_seeds_node_key(node_key, sizeof(node_key));
@@ -361,7 +361,7 @@ int net_relay_signed_hints(const json_t *body, const char *field, net_relay_seed
 
 char *net_relay_signed_read(const char *path)
 {
-    return _read(path);
+    return _read_seeds(path);
 }
 
 int net_relay_signed_data_path(const char *name, char *out, size_t out_len)

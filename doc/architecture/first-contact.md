@@ -205,6 +205,16 @@ by different mechanisms, Python by calling `peers.add` and deliberately not
 `identity_admit_direct_peer`, which is the provisional half of `_add_peer`, so
 it is a corpus case rather than a comment that keeps them agreeing.
 
+The same property has to hold later, when the contact asks the cohort for
+access. Amnesia readmission skips the vote for a node the leader already knows,
+and it used to know the node from the peer list, which a direct peer is in. So
+the contact was handed the group key on its first `request_access`, ahead of
+both the vote and the ZTA gate. Readmission now requires membership in the
+group, so a contact's request goes to the vote, and duplicate detection lets a
+recorded contact through to it rather than refusing it as a sybil of itself
+([Becoming a peer](identity-protocol.md#amnesia)). Joining the cohort is the
+cohort's decision, and an invitation is not a vote.
+
 A contact admitted this way is still **unverified**, since the handshake proves
 reachability and possession of the ticket rather than that the human on the
 other end is who Bob thinks. Only the out-of-band safety-number comparison flips
@@ -877,8 +887,9 @@ both live tests in a quick C run with `ctest -LE live`.
 ## Further reading
 
 - [Becoming a peer](identity-protocol.md): the cohort analog of this two-party
-  flow, the nickname/petname distinction, and amnesia readmission (re-adding a
-  known UUID skips the vote).
+  flow, the nickname/petname distinction, and amnesia readmission (a returning
+  member skips the vote; a contact does not, and joins the cohort only through
+  it).
 - [Networking](networking.md): why discovery is LAN-only, which is the gap first
   contact fills.
 - [The API](../api.md): the calls a hosting application uses to mint, redeem, and

@@ -388,6 +388,68 @@ DEFINE_TEST(test_child_group_survives_the_ipc_serializer)
 }
 END_TEST_DEFINITION()
 
+/* A GROUP handed to a sibling keeps its epoch and its retired keys, so the
+ * network process (group_decrypt's only caller) can open a frame sealed under
+ * a key identity rotated away from moments ago. Neither crossed the serializer
+ * before: siblings held epoch 0 and no retired key at all. */
+DEFINE_TEST(test_group_epoch_and_retired_keys_survive_the_ipc_serializer)
+{
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t uuid;
+    uuid_generate(uuid);
+    group_t *grp = NULL;
+    ck_assert_ret_ok(group_create(&uuid, (char *)"172.16.0.10", &grp));
+
+    /* A frame a lagging member seals under the key about to be retired. */
+    unsigned char plain[] = "sent a moment before the rotation";
+    msg_str_t pin = { plain, sizeof(plain) };
+    unsigned char nonce[crypto_box_NONCEBYTES];
+    randombytes_buf(nonce, sizeof(nonce));
+    unsigned char cipher[sizeof(plain) + crypto_box_MACBYTES];
+    ck_assert_ret_ok(group_encrypt(grp, &pin, grp, nonce, cipher));
+
+    ck_assert(group_rotate_key(grp) == 1);
+    ck_assert(group_rotate_key(grp) == 2);
+    ck_assert_int_eq((int)grp->num_previous_keys, 2);
+
+    generic_msg_t out;
+    memset(&out, 0, sizeof(out));
+    out.type = GROUP;
+    out.size = message_size(GROUP);
+    out.info.group = *grp;
+
+    void *data = NULL;
+    size_t data_len = 0;
+    ck_assert_ret_ok(generic_msg_to_proto(&out, &data, &data_len));
+
+    generic_msg_t in;
+    memset(&in, 0, sizeof(in));
+    ck_assert_ret_ok(proto_to_generic_msg(data, data_len, &in));
+    group_t *got = &in.info.group;
+    ck_assert_int_eq((int)got->key_epoch, 2);
+    ck_assert_int_eq((int)got->num_previous_keys, 2);
+    for (size_t i = 0; i < 2; i++)
+    {
+        ck_assert_mem_eq(got->previous_keys[i].private,
+                         grp->previous_keys[i].private, crypto_box_SECRETKEYBYTES);
+        ck_assert_mem_eq(got->previous_keys[i].public,
+                         grp->previous_keys[i].public, crypto_box_PUBLICKEYBYTES);
+        ck_assert_double_eq_tol(got->previous_retired_at[i],
+                                grp->previous_retired_at[i], 1e-6);
+    }
+
+    /* The sibling's decrypt, as net_proc calls it. */
+    msg_str_t ct = { cipher, sizeof(cipher) };
+    unsigned char opened[sizeof(plain)] = {0};
+    ck_assert_ret_ok(group_decrypt(got, &ct, got, nonce, opened));
+    ck_assert_mem_eq(opened, plain, sizeof(plain));
+
+    free(data);
+    group_free(grp);
+}
+END_TEST_DEFINITION()
+
 /* --- The registry (msg_registry.h): a feature's type crosses the same
  * serializer as a core type, through the opaque payload arm. The test type
  * sits in the fleet range, which nothing registers yet. --- */
@@ -558,6 +620,7 @@ RUN_TESTS(MsgTypes3, test_net_msg_pack_unpack_json, test_net_msg_pack_null_json,
           test_every_type_name_round_trips,
           test_every_type_size_fits_the_message,
           test_child_group_survives_the_ipc_serializer,
+          test_group_epoch_and_retired_keys_survive_the_ipc_serializer,
           test_registry_refuses_bad_registrations,
           test_registered_type_survives_the_ipc_serializer,
           test_short_registered_payload_is_rejected,

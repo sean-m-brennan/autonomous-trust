@@ -198,6 +198,15 @@ void at_node_shutdown(at_node_t *node);
 int         at_node_daemon_pid(const at_node_t *node);
 
 /**
+ * @brief Is the node's daemon still running?
+ *
+ * A forked daemon is probed with kill(pid, 0). An in-process one
+ * (messaging_in_process()) runs on a thread of this process, started by
+ * at_node_start, and is running until that thread returns.
+ */
+bool        at_node_daemon_running(const at_node_t *node);
+
+/**
  * @brief Return a pointer to the node's embedded logger.
  *
  * Intended for use from inside a tick callback so the application can log

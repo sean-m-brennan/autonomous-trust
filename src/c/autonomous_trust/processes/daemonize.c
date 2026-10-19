@@ -66,6 +66,15 @@
  * on write() would otherwise force a dummy branch. `(void)!` is the idiom
  * to suppress the warning while making intent visible. */
 /* Frama-C: skipped — [syscall] fork, setsid, chdir, dup2, close */
+#ifdef _WIN32
+/* No fork on Windows: every node runs in-process (messaging_in_process()), so
+ * process_setup and run_autonomous_trust never ask for this. */
+int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
+{
+    (void)data_dir; (void)flags; (void)fd1; (void)fd2;
+    return EXCEPTION(ENOSYS);
+}
+#else
 int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
 {
     int io[2] = {0};
@@ -200,3 +209,4 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
     }
     return 0;
 }
+#endif /* _WIN32 */

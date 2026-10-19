@@ -253,6 +253,22 @@ int start_process(char *pname, handler_ptr_t runner, map_t *configs, tracker_t *
 
 int restart_process(pid_t orig, char *pname, proc_context_t *ctx);
 
+/**
+ * @brief Is a started subsystem still running?
+ *
+ * The pid a subsystem was started under (start_process) answers kill(pid, 0)
+ * for a forked child; for an in-process subsystem it names a thread, and a
+ * finished thread is reaped here.
+ * @return 1 running, 0 gone, -1 on an error probing it (errno set).
+ */
+int process_liveness(pid_t id);
+
+/**
+ * @brief Stop a subsystem that ignored the quit signal: SIGKILL for a child.
+ *        A thread cannot be killed; it is logged and ends with the process.
+ */
+void process_force_stop(pid_t id, logger_t *logger);
+
 
 /**
  * @brief 

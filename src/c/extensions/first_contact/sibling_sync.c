@@ -18,6 +18,7 @@
  *  of first_contact/sibling_sync.py). See sibling_sync.h. */
 
 #define _GNU_SOURCE
+#include "utilities/portable.h"  /* uuid_generate_sha1 / st_mtim on Darwin */
 #include "first_contact/sibling_sync.h"
 
 #include <pthread.h>
@@ -185,8 +186,8 @@ bool at_sibling_is(const char *uuid)
     bool present = stat(path, &st) == 0;
     pthread_mutex_lock(&cache.lock);
     bool stale = !cache.loaded || strcmp(cache.path, path) != 0
-        || (present && (st.st_mtim.tv_sec != cache.mtime.tv_sec
-                        || st.st_mtim.tv_nsec != cache.mtime.tv_nsec))
+        || (present && (at_file_mtim(path, &st).tv_sec != cache.mtime.tv_sec
+                        || at_file_mtim(path, &st).tv_nsec != cache.mtime.tv_nsec))
         || (!present && cache.count > 0);
     if (stale) {
         free(cache.uuids);
@@ -195,7 +196,7 @@ bool at_sibling_is(const char *uuid)
         at_strlcpy(cache.path, path, sizeof(cache.path));
         memset(&cache.mtime, 0, sizeof(cache.mtime));
         if (present) {
-            cache.mtime = st.st_mtim;
+            cache.mtime = at_file_mtim(path, &st);
             at_siblings_t sib;
             at_siblings_load(dir, &sib);
             if (sib.count > 0)

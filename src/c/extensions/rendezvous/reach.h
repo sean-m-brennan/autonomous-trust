@@ -74,14 +74,14 @@ int at_reach_verify(const at_reach_record_t *rec, double now);
 int at_reach_create(const identity_t *self, int64_t seq,
                     const char *const *relays, size_t n_relays,
                     const char *const *endpoints, size_t n_endpoints,
-                    long expiry, at_reach_record_t *out);
+                    int64_t expiry, at_reach_record_t *out);
 /** {body, sig}, new reference. */
 json_t *at_reach_to_wire(const at_reach_record_t *rec);
 
 const char *at_reach_uuid(const at_reach_record_t *rec);
 const char *at_reach_key(const at_reach_record_t *rec);
 int64_t at_reach_seq(const at_reach_record_t *rec);
-long at_reach_expiry(const at_reach_record_t *rec);
+int64_t at_reach_expiry(const at_reach_record_t *rec);
 /** The relays / endpoints arrays (borrowed; may be NULL). */
 json_t *at_reach_relays(const at_reach_record_t *rec);
 json_t *at_reach_endpoints(const at_reach_record_t *rec);

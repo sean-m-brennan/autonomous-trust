@@ -1,0 +1,56 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: amnesia-direct-peer-not-readmitted
+byte_pinning: false
+description: |
+    A node in bg's peer list that is NOT a member of bg's group
+    re-announces, with the keys bg knows it by. A first-contact direct peer is
+    exactly this: admitted 1:1, never voted into the cohort. Before the fix the
+    amnesia branch recognized it from the peer list alone and handed it the
+    group key (`full_history`) ahead of both the vote and the ZTA admission
+    gate.
+
+    Recognition now requires membership, so the request takes the ordinary
+    path, and the admission gate decides. Here the gate requires a credential
+    the requester does not have: no proposal, and no group key.
+
+    See doc/architecture/identity-protocol.md, "Amnesia".
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: contact
+    role: new_node
+
+fixtures:
+  # In bg's peer list, not in its group address map.
+  amnesia_known: true
+  zta_policy:
+    enabled: true
+    require_at_admission: true
+    binding_mode: "off"
+    verifier_type: x509
+    ca_bundle_path: testdata/zta/ca-bundle.pem
+  # No `credentials` entry for contact: it announces unsigned.
+
+steps:
+  - id: 1
+    from: contact
+    to: broadcast
+    function: request_access
+    description: |
+        The contact asks for access. It is a peer of bg, not a member.
+
+  - id: 2
+    from: bg
+    to: contact
+    function: full_history
+    in_response_to: 1
+    expect_none: true
+    description: |
+        No group key: the admission gate refused it.
+
+expected_state:
+  bg:
+    propose_emitted: 0

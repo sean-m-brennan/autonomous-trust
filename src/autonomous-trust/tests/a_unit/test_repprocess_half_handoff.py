@@ -26,9 +26,8 @@ import queue
 from uuid import uuid4
 
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
-from autonomous_trust.core.network.message import Message
 from autonomous_trust.core.system import CfgIds, now
-from autonomous_trust.core.config import from_json_string, to_json_string
+from autonomous_trust.core.config import from_json_string
 
 from .test_repprocess import _make_rep_process, _make_mock_peer
 
@@ -58,10 +57,10 @@ class TestPendingHalvesAreHandedToJoiners:
         rp, queues, net_q, alice, carol = _cohort()
         me = rp.identity.uuid
         mine, both, theirs = uuid4(), uuid4(), uuid4()
-        rp.history.update(mine, me, 0.9, 'probe')
-        rp.history.update(both, me, 0.9)
-        rp.history.update(both, alice.uuid, 0.9)
-        rp.history.update(theirs, alice.uuid, 0.9)
+        rp.history.record_half(mine, me, 0.9, 'probe')
+        rp.history.record_half(both, me, 0.9)
+        rp.history.record_half(both, alice.uuid, 0.9)
+        rp.history.record_half(theirs, alice.uuid, 0.9)
 
         t0 = now().timestamp()
         assert rp._hand_off_pending_halves(queues, t0) == 0
@@ -88,40 +87,10 @@ class TestPendingHalvesAreHandedToJoiners:
         assert rp._hand_off_pending_halves(queues, t0) == 0
         assert rp._hand_off_pending_halves(queues, t0 + 100) == 0  # none pending
 
-        rp.history.update(uuid4(), rp.identity.uuid, 0.9)
+        rp.history.record_half(uuid4(), rp.identity.uuid, 0.9)
         rp.protocol.peers.all = []
         assert rp._hand_off_pending_halves(queues, t0 + 400) == 0  # alice left
         rp.protocol.peers.all = [alice]
         assert rp._hand_off_pending_halves(queues, t0 + 401) == 0  # first seen
         assert rp._hand_off_pending_halves(queues, t0 + 406) == 1
         assert [f.to_whom.nickname for f in _frames(net_q)] == ['alice']
-
-    def test_the_joiner_pairs_the_late_half(self):
-        """THE REGRESSION's receiving side, as carol."""
-        rp, queues, net_q, alice, carol = _cohort()
-        task = uuid4()
-        rp.history.update(task, rp.identity.uuid, 0.9, 'probe')
-        rp.protocol.peers.all = [alice, carol]
-        t0 = now().timestamp()
-        rp._hand_off_pending_halves(queues, t0)
-        rp._hand_off_pending_halves(queues, t0 + 6)
-        handed, = [f for f in _frames(net_q) if f.to_whom is carol]
-
-        def late_half(joiner):
-            msg = Message(CfgIds.reputation, ReputationProtocol.committed,
-                          to_json_string((task, alice.uuid, 0.9, None, None)),
-                          from_whom=alice)
-            msg.verified = True
-            joiner.handle_committed(None, msg)
-
-        # Control: without it, carol holds alice's half alone.
-        joiner = _make_rep_process()
-        late_half(joiner)
-        assert len(joiner.history) == 0
-
-        joiner = _make_rep_process()
-        handed.verified = True
-        joiner.handle_committed(None, handed)
-        assert len(joiner.history) == 0
-        late_half(joiner)
-        assert len(joiner.history) == 1

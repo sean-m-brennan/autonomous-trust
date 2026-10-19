@@ -635,6 +635,23 @@ void identity_free(identity_t *ident);
  */
 bool identity_verb_is_unencrypted(const char *verb);
 
+/**
+ * @brief True if @p verb may arrive on the broadcast (discovery) channel.
+ *
+ * That channel is plaintext and open to anyone on the segment, so it carries
+ * only what a node must say before it shares a key with the listener: every
+ * plaintext verb (identity_verb_is_unencrypted), plus the identity verbs a
+ * node broadcasts with no recipient (group_key_update, peer_accepted,
+ * propose_peer). Anything else arriving there is refused before routing
+ * (ISSUES §2.17). Mirrors Python identity.protocol.is_broadcast_verb.
+ *
+ * MAINTENANCE: a new send with an empty recipient and no group multicast
+ * needs its verb here (or in the plaintext lists), on both sides.
+ *
+ * @param verb Wire function selector; NULL is safe and returns false.
+ */
+bool identity_verb_is_broadcast(const char *verb);
+
 /** @brief Is @p verb one of the CORE's plaintext verbs? Mirrors Python's
  *  identity.protocol.CORE_UNENCRYPTED_VERBS. NULL is safe and returns false. */
 bool identity_verb_is_core_unencrypted(const char *verb);

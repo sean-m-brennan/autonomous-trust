@@ -35,7 +35,7 @@
 #define ERR_INFO_FMT "%s (%s)"
 #define ERR_INFO_LEN (1024 + 64 + 3)
 
-#define ORIGIN_FMT "\tfrom %s, line %ld\n"
+#define ORIGIN_FMT "\tfrom %s, line %zu\n"
 #define ORIGIN_LEN (MAX_FILENAME + MAX_INT_STR + 14)
 
 extern _Thread_local exception_t _exception;
@@ -214,7 +214,7 @@ void _vlogging(logger_t *logger_ptr, log_level_t level, const char *srcfile, con
     else
         fprintf(logger->file, "%-10s", log_level_strings[level]);
 
-    fprintf(logger->file, "%s: line %lu: ", srcfile, line);
+    fprintf(logger->file, "%s: line %zu: ", srcfile, line);
 
     vfprintf(logger->file, fmt, argp);
 }

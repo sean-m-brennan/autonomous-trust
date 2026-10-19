@@ -171,3 +171,14 @@ def is_unencrypted(verb) -> bool:
     if not isinstance(verb, str) or not verb:
         return False
     return verb in _core() or verb in _configured
+
+
+def is_broadcast(verb) -> bool:
+    """Whether ``verb`` may arrive on the broadcast (stranger/multicast)
+    channel: a plaintext verb, or an identity verb sent with no recipient.
+    Anything else arriving there is refused before routing (ISSUES §2.17).
+    Mirrors C identity_verb_is_broadcast."""
+    if is_unencrypted(verb):
+        return True
+    from .identity.protocol import BROADCAST_ONLY_VERBS
+    return verb in BROADCAST_ONLY_VERBS

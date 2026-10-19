@@ -34,6 +34,7 @@
 #include <jansson.h>
 #include <sodium.h>
 
+#include "utilities/portable.h"  /* uuid_generate_sha1 / st_mtim on Darwin */
 #include "rendezvous/net_relay.h"
 #include "rendezvous/net_relay_seeds.h"
 #include "rendezvous/net_relay_rosters.h"
@@ -228,7 +229,7 @@ static void _seed_stamp(_seed_stamp_t *st)
         struct stat sb;
         if (st[i].path[0] != '\0' && stat(st[i].path, &sb) == 0) {
             st[i].exists = true;
-            st[i].mtime = sb.st_mtim;
+            st[i].mtime = at_file_mtim(st[i].path, &sb);
             st[i].size = sb.st_size;
         }
     }
@@ -316,7 +317,7 @@ static void _roster_stamp(_seed_stamp_t *st)
         struct stat sb;
         if (st[i].path[0] != '\0' && stat(st[i].path, &sb) == 0) {
             st[i].exists = true;
-            st[i].mtime = sb.st_mtim;
+            st[i].mtime = at_file_mtim(st[i].path, &sb);
             st[i].size = sb.st_size;
         }
     }
@@ -890,7 +891,7 @@ static void *_server_conn(void *arg)
      * client may say nothing for as long as it likes. */
     (void)at_set_rcvtimeo(fd, AT_RELAY_HANDSHAKE_TIMEOUT_MS, srv->logger);
     if (_server_register(srv, fd, uuid, sizeof(uuid), pub, sizeof(pub)) != 0) {
-        close(fd);
+        at_socket_close(fd);
         return NULL;
     }
     (void)at_set_rcvtimeo(fd, 0, srv->logger);
@@ -908,7 +909,7 @@ static void *_server_conn(void *arg)
         srv->entries[i].send_lock = NULL;
     } else {
         pthread_mutex_unlock(&srv->lock);
-        close(fd);
+        at_socket_close(fd);
         return NULL;
     }
     at_strlcpy(srv->entries[i].uuid, uuid, sizeof(srv->entries[i].uuid));
@@ -992,7 +993,7 @@ static void *_server_conn(void *arg)
     pthread_mutex_unlock(&srv->lock);
     if (mine)
         _server_drop(srv, fd);
-    close(fd);
+    at_socket_close(fd);
     return NULL;
 }
 
@@ -1012,17 +1013,18 @@ static void *_server_accept(void *arg)
                 break;
             continue;
         }
+        (void)at_socket_nosigpipe(fd);
         relay_conn_arg_t *a = malloc(sizeof(*a));
         pthread_t t;
         if (a == NULL) {
-            close(fd);
+            at_socket_close(fd);
             continue;
         }
         a->srv = srv;
         a->fd = fd;
         if (pthread_create(&t, NULL, _server_conn, a) != 0) {
             free(a);
-            close(fd);
+            at_socket_close(fd);
             continue;
         }
         pthread_detach(t);
@@ -1050,13 +1052,12 @@ net_relay_server_t *net_relay_server_start(const char *host, int port,
         return NULL;
     }
     srv->fd = socket(res->ai_family, SOCK_STREAM, 0);
-    int one = 1;
     if (srv->fd < 0
-        || setsockopt(srv->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0
+        || at_socket_listener_opts(srv->fd) != 0
         || bind(srv->fd, res->ai_addr, res->ai_addrlen) != 0
         || listen(srv->fd, 64) != 0) {
         if (srv->fd >= 0)
-            close(srv->fd);
+            at_socket_close(srv->fd);
         freeaddrinfo(res);
         free(srv);
         return NULL;
@@ -1069,7 +1070,7 @@ net_relay_server_t *net_relay_server_start(const char *host, int port,
                       ? ((struct sockaddr_in6 *)&ss)->sin6_port
                       : ((struct sockaddr_in *)&ss)->sin_port);
     if (pthread_create(&srv->accept_thread, NULL, _server_accept, srv) != 0) {
-        close(srv->fd);
+        at_socket_close(srv->fd);
         free(srv);
         return NULL;
     }
@@ -1168,7 +1169,7 @@ void net_relay_server_stop(net_relay_server_t *srv)
         return;
     srv->stopped = true;
     pthread_join(srv->accept_thread, NULL);
-    close(srv->fd);
+    at_socket_close(srv->fd);
     pthread_mutex_lock(&srv->lock);
     for (size_t i = 0; i < srv->count; i++)
         shutdown(srv->entries[i].fd, SHUT_RDWR);
@@ -1479,7 +1480,7 @@ static void _client_mark_down(net_relay_client_t *c, int fd)
     if (c->fd == fd)
         c->fd = -1;
     pthread_mutex_unlock(&c->lock);
-    close(fd);
+    at_socket_close(fd);
 }
 
 static void *_client_reader(void *arg)
@@ -1564,10 +1565,11 @@ static int _client_dial(net_relay_client_t *c)
         return -1;
     int fd = socket(res->ai_family, SOCK_STREAM, 0);
     if (fd >= 0) {
+        (void)at_socket_nosigpipe(fd);
         (void)at_set_rcvtimeo(fd, AT_RELAY_HANDSHAKE_TIMEOUT_MS, c->logger);
         (void)at_set_sndtimeo(fd, AT_RELAY_HANDSHAKE_TIMEOUT_MS, c->logger);
         if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
-            close(fd);
+            at_socket_close(fd);
             fd = -1;
         }
     }
@@ -1634,7 +1636,7 @@ int net_relay_client_connect(net_relay_client_t *c)
     json_decref(ch);
     json_decref(ans);
     if (rc != 0) {
-        close(fd);
+        at_socket_close(fd);
         at_strlcpy(c->refused, why, sizeof(c->refused));
         pthread_mutex_unlock(&c->lock);
         if (why[0] != '\0')

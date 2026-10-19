@@ -15,6 +15,10 @@ description: |
     reputation state before every step, so pages cannot accumulate across steps
     here.
 
+    Every entry carries the placement certificate alice and dave signed for
+    it, as every catch-up segment does now that every group places its order
+    (doc/architecture/reputation.md, "Agreeing on an order").
+
 participants:
   - id: alice
     role: provider
@@ -35,11 +39,11 @@ steps:
       of: 1
       head: "aa"
       chain:
-        - {task: a, p1: 0.7, p2: 0.5}
-        - {task: b, p1: 0.9, p2: 0.3}
-        - {task: c, p1: 0.6, p2: 0.4}
+        - {task: a, p1: 0.7, p2: 0.5, batch: 1, placed_by: [alice, dave]}
+        - {task: b, p1: 0.9, p2: 0.3, batch: 2, placed_by: [alice, dave]}
+        - {task: c, p1: 0.6, p2: 0.4, batch: 3, placed_by: [alice, dave]}
 
 expected_state:
   dave:
     committed_tx_count: 3
-    window_root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+    window_root: "5c9aab7f06ce90acfe36fecbfac4fd06dd7a679ee43d1e342cf4f7d019edb411"

@@ -425,16 +425,27 @@ int dag_diff(step_dag_t *dag, const char *branch, const char *target,
   assigns \nothing;
   ensures \result == -1 || \result == 0 || \result == 1;
 */
+/* A step and where it stood before sorting: qsort is not stable, and steps
+ * stamped in the same second compare equal. glibc's qsort happens to keep
+ * equal elements in order; the Windows CRT's does not, so two nodes merging
+ * the same branches built different chains. Equal stamps now keep their
+ * original order on every platform (what glibc gave). */
+typedef struct
+{
+    linked_step_t *step;
+    int pos;
+} positioned_step_t;
+
 /* Frama-C: skipped — [func-ptr] used as qsort comparator callback */
 static int _cmp_steps_by_timestamp(const void *a, const void *b)
 {
-    const linked_step_t *sa = *(const linked_step_t **)a;
-    const linked_step_t *sb = *(const linked_step_t **)b;
-    time_t ta = mktime((struct tm *)&sa->timestamp);
-    time_t tb = mktime((struct tm *)&sb->timestamp);
+    const positioned_step_t *pa = a;
+    const positioned_step_t *pb = b;
+    time_t ta = mktime((struct tm *)&pa->step->timestamp);
+    time_t tb = mktime((struct tm *)&pb->step->timestamp);
     if (ta < tb) return -1;
     if (ta > tb) return 1;
-    return 0;
+    return (pa->pos > pb->pos) - (pa->pos < pb->pos);
 }
 
 /* Frama-C: skipped — [recursive-ds] three-way merge with array operations */
@@ -462,16 +473,24 @@ int dag_merge(step_dag_t *dag, const char *branch, const char *target, bool keep
         return 0;
 
     linked_step_t **sorted = malloc(sizeof(linked_step_t *) * total);
-    if (sorted == NULL)
+    positioned_step_t *order = malloc(sizeof(positioned_step_t) * total);
+    if (sorted == NULL || order == NULL)
+    {
+        free(sorted);
+        free(order);
         return ENOMEM;
+    }
 
     int n = 0;
-    for (int i = idx; i < b_size; i++)
-        sorted[n++] = _get_step_from_list(b_list, i);
-    for (int i = idx; i < t_size; i++)
-        sorted[n++] = _get_step_from_list(t_list, i);
+    for (int i = idx; i < b_size; i++, n++)
+        order[n] = (positioned_step_t){_get_step_from_list(b_list, i), n};
+    for (int i = idx; i < t_size; i++, n++)
+        order[n] = (positioned_step_t){_get_step_from_list(t_list, i), n};
 
-    qsort(sorted, n, sizeof(linked_step_t *), _cmp_steps_by_timestamp);
+    qsort(order, n, sizeof(positioned_step_t), _cmp_steps_by_timestamp);
+    for (int i = 0; i < n; i++)
+        sorted[i] = order[i].step;
+    free(order);
 
     /* create temp branch from common root */
     char temp_name[16];

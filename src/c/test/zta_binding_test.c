@@ -72,7 +72,7 @@ static const char PINNED_CRED_SHA256[] =
 static void bytes_to_hex(const uint8_t *in, size_t len, char *out)
 {
     for (size_t i = 0; i < len; i++)
-        sprintf(out + (i * 2), "%02x", in[i]);
+        snprintf(out + (i * 2), 3, "%02x", in[i]);
     out[len * 2] = '\0';
 }
 

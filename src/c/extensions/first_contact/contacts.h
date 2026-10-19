@@ -174,12 +174,12 @@ int at_redeem_invitation(const char *blob, bool in_person, double now,
  * malloc'd; caller frees. rendezvous is n_rv opaque strings (may be 0). */
 int at_create_invitation(const identity_t *self,
                          const char *const *rendezvous, size_t n_rv,
-                         long expiry, const char *nonce, char **blob_out);
+                         int64_t expiry, const char *nonce, char **blob_out);
 /* at_create_invitation with a `purpose` (AT_INVITATION_PURPOSE_PAIR); NULL or
  * "" writes none. */
 int at_create_invitation_purpose(const identity_t *self,
                                  const char *const *rendezvous, size_t n_rv,
-                                 long expiry, const char *nonce,
+                                 int64_t expiry, const char *nonce,
                                  const char *purpose, char **blob_out);
 /* The invitation's purpose, "" when it has none. Borrowed from @p inv. */
 const char *at_invitation_purpose(const at_invitation_t *inv);

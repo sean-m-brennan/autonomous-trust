@@ -27,8 +27,8 @@ description: |
 
     First identity scenario to exercise the universal scenario engine's
     `repeat: N` field (the agreement adapter pioneered the grammar; the
-    reputation `ask-permission-replay-rejected` was the first universal
-    case).
+    reputation `ask-permission-replay-rejected`, retired 2026-10-16 with the
+    half round, was the first universal case).
 
 participants:
   - id: bg

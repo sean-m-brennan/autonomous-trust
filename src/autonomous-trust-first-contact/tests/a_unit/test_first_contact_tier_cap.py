@@ -218,3 +218,19 @@ def test_a_direct_peer_is_asked_for_its_capabilities_on_admission(bob):
     # Re-admitting the same identity is idempotent and asks nothing more.
     fc._admit_direct_peer(proc, {}, proc.peers.find_by_uuid(bob.uuid))
     assert len(asked) == 1
+
+
+# -- is_contact: who duplicate detection lets through to the vote -------------
+
+def test_is_contact_names_a_recorded_contact_verified_or_not(bob):
+    assert fc.EXTENSION.identity.is_contact is fc._is_contact
+    assert not fc._is_contact(_proc(), bob.uuid)
+    _record(bob, verified=False)
+    assert fc._is_contact(_proc(), bob.uuid)
+    assert not fc._is_contact(_proc(), uuid4())
+
+
+def test_is_contact_is_false_with_first_contact_off(bob, monkeypatch):
+    _record(bob, verified=True)
+    monkeypatch.delenv('AT_FIRST_CONTACT')
+    assert not fc._is_contact(_proc(), bob.uuid)

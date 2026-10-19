@@ -85,7 +85,6 @@ static process_t *_mk_process(identity_t *self, identity_t *peer)
     pthread_rwlock_init(&proc->protocol.peers_rwlock, NULL);
     strncpy(proc->name, "reputation", PROC_NAME_LEN);
     proc->protocol.phase = 1;
-    proc->protocol.group.ordered_placement = true;
     config_t *id_cfg = calloc(1, sizeof(config_t));
     ck_assert_ptr_nonnull(id_cfg);
     id_cfg->name = "identity";

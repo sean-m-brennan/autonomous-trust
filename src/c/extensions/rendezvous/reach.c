@@ -86,10 +86,10 @@ int64_t at_reach_seq(const at_reach_record_t *rec)
     return json_is_integer(v) ? (int64_t)json_integer_value(v) : 0;
 }
 
-long at_reach_expiry(const at_reach_record_t *rec)
+int64_t at_reach_expiry(const at_reach_record_t *rec)
 {
     json_t *v = rec != NULL ? json_object_get(rec->body, "expiry") : NULL;
-    return json_is_integer(v) ? (long)json_integer_value(v) : 0;
+    return json_is_integer(v) ? (int64_t)json_integer_value(v) : 0;
 }
 
 json_t *at_reach_relays(const at_reach_record_t *rec)
@@ -133,7 +133,7 @@ int at_reach_verify(const at_reach_record_t *rec, double now)
     free(msg);
     if (ok != 0)
         return AT_REACH_BAD_SIG;
-    long exp = at_reach_expiry(rec);
+    int64_t exp = at_reach_expiry(rec);
     if (exp != 0 && now >= (double)exp)
         return AT_REACH_EXPIRED;
     return AT_REACH_OK;
@@ -151,7 +151,7 @@ static char *_lower_dup(const char *s)
 int at_reach_create(const identity_t *self, int64_t seq,
                     const char *const *relays, size_t n_relays,
                     const char *const *endpoints, size_t n_endpoints,
-                    long expiry, at_reach_record_t *out)
+                    int64_t expiry, at_reach_record_t *out)
 {
     if (self == NULL || out == NULL)
         return AT_REACH_MALFORMED;

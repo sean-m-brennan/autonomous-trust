@@ -17,6 +17,8 @@
 #define DEBUG_TESTS 1
 #include "test_setup.h"
 
+#include <errno.h>
+
 #include <string.h>
 
 /* _get_err_str has external linkage but no header declaration */
@@ -35,6 +37,14 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_extended_errors)
 {
+#ifdef _WIN32
+    /* The UCRT numbers these differently from Linux; the names must match. */
+    ck_assert_str_eq(_get_err_str(EDEADLK), "EDEADLK");
+    ck_assert_str_eq(_get_err_str(ENOMSG), "ENOMSG");
+    ck_assert_str_eq(_get_err_str(ETIMEDOUT), "ETIMEDOUT");
+    ck_assert_str_eq(_get_err_str(ECONNREFUSED), "ECONNREFUSED");
+    return;
+#endif
     ck_assert_str_eq(_get_err_str(35), "EDEADLK");
     ck_assert_str_eq(_get_err_str(42), "ENOMSG");
     ck_assert_str_eq(_get_err_str(110), "ETIMEDOUT");

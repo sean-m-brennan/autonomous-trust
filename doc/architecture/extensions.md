@@ -884,15 +884,55 @@ registered app-bound type.
 `version`, `artifact_hash` (64 hex), `target_arch` and
 `min_proposer_reputation`. An app holds no private key, so the node builds the
 proposal, signs it with its own identity key and names itself the signer, then
-runs it through the same signature check and vote a peer's proposal gets. A
-frame from the wire is refused. An app on the flat ABI uses
+runs it through the checks below and the vote. The `min_proposer_reputation` it
+names still travels in the proposal, but no node decides on it. A frame from the
+wire is refused. An app on the flat ABI uses
 [`at_fleet.h`](../../src/c/extensions/fleet/at_fleet.h): `at_app_fleet_propose()`
 sends the verb, checking the fields before anything is sent, and an acceptance
 arrives as kind `AT_APP_EVENT_FLEET_UPDATE_ACCEPTED` (1100, fleet's block is
-1100–1109), read with `at_fleet_accepted_event()`. It names the proposal only:
-fleet does not count the votes where it announces the acceptance.
-`fleet_propose_update()` is still there for a program that holds its own
-signing key, as `at_demo` does.
+1100–1109), read with `at_fleet_accepted_event()`. It names the proposal only.
+`fleet_propose_update()` is still there for a program that holds the node's
+signing key, and `fleet_propose_update_as_node()` reads that key from the
+node's configuration, as `at_demo` does.
+
+### Who may propose an update
+
+Fleet and config proposals pass the same checks (`fleet/fleet_gate.h`). The
+node that signed a proposal runs its vote, each voter runs the checks before it
+grants, and every node runs them again on an acceptance before acting on it.
+
+- **The proposer is a member.** Its uuid is in this node's group address map. A
+  first-contact contact or any other peer outside the group is refused.
+- **The signature verifies under the key this node holds for that member.** The
+  key the message carries is not used. The signature covers the signer's uuid
+  and the proposal's uuid as well as the content, so a proposal cannot be
+  re-labelled, or replayed as a new vote under a fresh uuid.
+- **The proposer is operator-bound.** Its operator credential was verified. A
+  node without ZTA has no operator-bound members, so nobody there can propose.
+- **Its reputation reaches this node's bar.** The bar is `min_proposer_reputation`
+  in this node's `fleet.cfg.json` (default `FLEET_DEFAULT_MIN_REPUTATION`, 0.7).
+  The reputation is asked of the local reputation process. The message waits for
+  the answer, and an answer is reused for a minute. A node holds no reputation
+  for itself, so its own proposal skips this check, and the others apply it.
+- A config proposal may not replace `identity`, `fleet` (the file the bar is
+  in) or `zta_policy` (which decides who is operator-bound). Without that, a
+  carried proposal could lower the bar for the next one, or change who may
+  propose at all. The name must also be plain (letters, digits, `_`, `-`),
+  because it becomes `<cfg_dir>/<name>.cfg.json`: `./identity` or `../x` would
+  otherwise reach a file the exact names do not.
+
+**The vote.** The vote request carries the signed proposal, so a voter checks
+what it grants. A grant is the voter's signature over the protocol (`update` or
+`config`), the proposal's uuid, the ballot and the content hash. The proposal
+carries when ⌊N/2⌋ members other than the proposer have granted it, where N is
+the size of the group (this node included) when the grants are counted. That is
+the rule the reputation commit uses. A group of one carries its own proposal.
+
+**The acceptance is a certificate.** `update accepted` and `config accepted`
+carry the proposal and its grants (`proposal`, `id1`, `id2`, `proposal_uuid`,
+`grants`). A receiver counts the valid grants from distinct members other than
+the proposer, checked against its own view of the group, and does nothing
+(no app event, no artifact fetch, no config write) below ⌊N/2⌋.
 
 ## DTN (`libat_dtn`, `autonomous_trust.dtn`)
 
@@ -1116,7 +1156,10 @@ whether it built.
   processes and subsystems are there and accepted, `app_fleet_propose` targets
   `fleet`, `FLEET_UPDATE_ACCEPTED` is app-bound in fleet's range, and the app's
   proposal is signed by the node, names it the signer, and starts the vote;
-  refused from the wire or malformed, nothing is sent. `at_fleet.h`'s sender
+  refused from the wire, malformed, or from a node that is not operator-bound,
+  nothing is sent. `fleet_gate_test.c` pins who may propose, the ⌊N/2⌋ quorum
+  over the live group, grant counting, and the acceptance certificate, for both
+  fleet and config. `at_fleet.h`'s sender
   refuses bad fields and reports a node not yet listening, and its decoder
   turns an acceptance into kind 1100. `zta_link_test` checks `zta_verify` is a
   default subsystem. `data_source_test` does

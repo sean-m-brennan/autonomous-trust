@@ -370,6 +370,19 @@ class _Participant:
                             f'{self.id}: {pid} landed in the GROUP address map; '
                             f'a first-contact peer must not become a group '
                             f'member (the group key would follow)')
+            elif key == 'member_address':
+                # {participant_id: address}: the address this participant's
+                # group address map holds for that member. C mirrors via
+                # map_get on protocol.group.address_map.
+                grp = self.process.group
+                raw = getattr(grp, '_address_map', None) if grp is not None else None
+                members = {str(u): a for u, a in raw.items()} if isinstance(raw, dict) else {}
+                for pid, want in (expected or {}).items():
+                    actual = members.get(str(self._uuid_for_pid(pid)))
+                    if actual != want:
+                        raise AssertionError(
+                            f'{self.id}: member_address[{pid}]={actual!r}, '
+                            f'expected {want!r}')
             elif key == 'contacts':
                 # The durable address book the handshake leaves behind, as
                 # {participant_id: {field: value} | false}. Read from DISK, not
@@ -642,15 +655,12 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: group_size={actual}, expected {int(expected)}'
                     )
-            elif key in ('group_wire_format', 'group_commit_certificates'):
-                # The group-carried declarations, after any merge: an absorbed
+            elif key == 'group_wire_format':
+                # The group-carried declaration, after any merge: an absorbed
                 # node takes the surviving group's. C mirrors via
-                # group_t.wire_format / group_t.commit_certificates.
+                # group_t.wire_format.
                 grp = self.process.group
-                if key == 'group_wire_format':
-                    actual = str(grp.wire_format) if grp is not None else None
-                else:
-                    actual = bool(grp.commit_certificates) if grp is not None else None
+                actual = str(grp.wire_format) if grp is not None else None
                 if actual != expected:
                     raise AssertionError(
                         f'{self.id}: {key}={actual}, expected {expected}')
@@ -1140,6 +1150,9 @@ class IdentityAdapter:
         store.save()
 
     def run_scenario(self, case: Case) -> None:
+        if (case.data.get('fixtures', {}) or {}).get('zta_delegation') is not None:
+            self._run_zta_delegation(case)
+            return
         if ZtaPolicy is None and (case.data.get('fixtures', {}) or {}).get('zta_policy') is not None:
             raise NotImplementedError('ZTA scenario skipped: autonomous-trust-zta is not '
                                       'installed (put src/autonomous-trust-zta on the path '
@@ -1182,6 +1195,75 @@ class IdentityAdapter:
             self._scratch = None
 
     # Phase C does not yet wire wire/crypto/negative kinds for identity.
+    def _run_zta_delegation(self, case: Case) -> None:
+        """Members' ZTA findings (scenarios ``zta-delegation-*``, ISSUES §2.20):
+        the fixture's event table offered to the delegation decisions, each
+        verdict and each standing published compared with the table. Every
+        answer the decisions ask for comes from the fixture. Mirrors C
+        run_zta_delegation."""
+        if ZtaPolicy is None:
+            raise NotImplementedError('ZTA scenario skipped: autonomous-trust-zta is not '
+                                      'installed (put src/autonomous-trust-zta on the path '
+                                      'to run it symmetrically)')
+        from autonomous_trust.zta import delegation
+        from autonomous_trust.zta.zta_verifier import ZtaStatus
+        fx = case.data['fixtures']['zta_delegation']
+        pol = fx['policy']
+        members = set(fx.get('members') or [])
+        records = fx.get('records') or {}
+        own_checks = fx.get('own_checks') or {}
+        reputations = dict(fx.get('reputations') or {})
+        published = []
+
+        def _status(name):
+            try:
+                return ZtaStatus(name)
+            except ValueError:
+                return ZtaStatus.REJECTED
+
+        ctx = delegation.DelegationContext(
+            is_member=lambda u: u in members,
+            recorded_hash=lambda p: bytes.fromhex(records[p]) if p in records else None,
+            reputation=lambda u: reputations.get(u),
+            own_check=lambda p: _status(own_checks[p]) if p in own_checks
+            else ZtaStatus.UNAVAILABLE,
+            standing=lambda p, st, ceiling, _reason: published.append(
+                {'peer': p, 'standing': st, 'ceiling': ceiling}),
+            min_reputation=float(pol['min_reputation']), quorum=int(pol['quorum']),
+            ddil_cap=float(pol['ddil_cap']),
+            revocation_penalty=float(pol['revocation_penalty']))
+        deleg = delegation.ZtaDelegation()
+        mismatched = []
+        for i, ev in enumerate(fx['events']):
+            published.clear()
+            if 'reputation' in ev:
+                reputations.update(ev['reputation'])
+                continue
+            if 'own_result' in ev:
+                deleg.own_result(ev['peer'], _status(ev['own_result']))
+                continue
+            kind = delegation.VOUCH if ev['kind'] == 'vouch' else delegation.ALERT
+            verdict = deleg.event(ctx, kind, ev['from'], ev['peer'],
+                                  bytes.fromhex(ev['hash']), _status(ev['status']))
+            want = ev.get('standings') or []
+            same = len(want) == len(published) and all(
+                w['peer'] == g['peer'] and w['standing'] == g['standing']
+                and ((w.get('ceiling') is None) == (g['ceiling'] is None))
+                and (w.get('ceiling') is None
+                     or abs(float(w['ceiling']) - g['ceiling']) <= 1e-9)
+                for w, g in zip(want, published))
+            if verdict != ev['verdict'] or not same:
+                mismatched.append((i, verdict, ev['verdict'], list(published)))
+        if mismatched:
+            print('zta-delegation mismatches:', mismatched)
+        want = ((case.data.get('expected_state') or {}).get('node') or {}).get(
+            'all_cases_match')
+        if not isinstance(want, bool):
+            raise AssertionError('scenario: expected_state.node.all_cases_match missing')
+        if want != (not mismatched):
+            raise AssertionError('node: all_cases_match mismatch: expected %s, got %s'
+                                 % (want, not mismatched))
+
     def run_wire_vector(self, case: Case) -> None:  # noqa: ARG002
         raise NotImplementedError('identity wire_vector kind not implemented (Phase C: scenarios only)')
 
@@ -1386,6 +1468,16 @@ class IdentityAdapter:
         # `amnesia_known` opt-in adds the newcomer to existing peers up front,
         # which is what the amnesia scenario asserts on.
         amnesia_known = bool((case.data.get('fixtures') or {}).get('amnesia_known', False))
+        # `amnesia_member` goes one step further: the newcomer is also in the
+        # existing participants' group address map, i.e. a MEMBER that lost its
+        # state, which is the only node the amnesia branch readmits without a
+        # vote. Mirrors the C adapter.
+        amnesia_member = bool((case.data.get('fixtures') or {}).get('amnesia_member', False))
+        if amnesia_member:
+            amnesia_known = True
+            if group is not None and newcomer_pid is not None:
+                group.add_address(identities[newcomer_pid].uuid,
+                                  identities[newcomer_pid].address)
 
         handles: dict[str, ParticipantHandle] = {}
         for spec in spec_participants:
@@ -1618,14 +1710,12 @@ class IdentityAdapter:
         # `key_epoch` pins how many rotations this participant's group key has
         # been through, so a scenario can hand a member an update from a
         # sender an epoch behind it (ISSUES §2.31).
-        # `wire_format` and `commit_certificates` are the group-carried
-        # declarations a merge hands from the surviving group to the absorbed
-        # node (Group.adopt_membership).
+        # `wire_format` is the group-carried declaration a merge hands from
+        # the surviving group to the absorbed node (Group.adopt_membership).
         grp = Group(group_uuid, {identity.uuid: identity.address},
                     f'grp-{pid}', enc, public_only,
                     _key_epoch=int(spec.get('key_epoch', 0)),
-                    _wire_format=spec.get('wire_format'),
-                    _commit_certificates=spec.get('commit_certificates') is True)
+                    _wire_format=spec.get('wire_format'))
         _FIXTURE_GROUP_PUB[pid] = enc.publish()
         ns = UUID('00000000-0000-0000-0000-000000000aaa')
         for k in range(max(0, size - 1)):
@@ -2069,6 +2159,19 @@ class IdentityAdapter:
             # idprocess._broadcast_request_access and the C _build_announcement.
             caps_list = payload.get('capabilities', [])
             obj = to_json_string((self._package_hash, caps_list))
+            # `rekeyed: true` presents the sender's uuid under fresh signing
+            # and encryption keys; `address` presents it from another address
+            # (a node that moved networks). Both model a returning node.
+            if payload.get('rekeyed') or payload.get('address'):
+                sender_identity = Identity(
+                    sender_identity.uuid,
+                    payload.get('address') or sender_identity.address,
+                    sender_identity.nickname,
+                    Signature.generate() if payload.get('rekeyed')
+                    else sender_identity.signature,
+                    Encryptor.generate() if payload.get('rekeyed')
+                    else sender_identity.encryptor,
+                    _public_only=False).publish()
         elif function == IdentityProtocol.accept:
             caps_list = payload.get('capabilities', [])
             obj = to_json_string((sender_identity.publish(),

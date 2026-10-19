@@ -137,7 +137,7 @@ bool at_app_node_alive(at_app_node_t *node)
     /* Probe rather than trust the flag: a daemon that exited looks exactly like
      * one with nothing to say from the queue's side. Mirrors the liveness check
      * in at_node_run's loop. */
-    if (kill(node->node.daemon_pid, 0) == -1)
+    if (!at_node_daemon_running(&node->node))
     {
         node->node.daemon_alive = false;
         return false;
