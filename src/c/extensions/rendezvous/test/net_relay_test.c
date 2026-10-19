@@ -309,15 +309,15 @@ DEFINE_TEST(test_a_relay_route_is_refused_from_the_wire)
 }
 END_TEST_DEFINITION()
 
-/* A plaintext first-contact hello from `sender`, as the relay would carry it. */
-static uint8_t *_hello_wire(const identity_t *sender, size_t *len)
+/* A plaintext identity frame @p fn from `sender`, as the relay would carry it. */
+static uint8_t *_plain_wire(const identity_t *sender, const char *fn, size_t *len)
 {
     public_identity_t *pub = NULL;
     ck_assert_ret_ok(identity_publish((identity_t *)sender, &pub));
     net_wire_msg_t w;
     memset(&w, 0, sizeof(w));
     snprintf(w.process, sizeof(w.process), "identity");
-    w.function = strdup("first_contact_hello");
+    w.function = strdup(fn);
     w.data = (uint8_t *)strdup("at+contact:x");
     w.data_len = strlen((char *)w.data);
     w.to_whom.type = RECIPIENT_BROADCAST;
@@ -339,7 +339,10 @@ DEFINE_TEST(test_a_relayed_frame_must_claim_the_sender_the_relay_stamped)
     strncpy(proc->name, "network", PROC_NAME_LEN);
     net_thread_ctx_t ctx = { .proc = proc, .logger = g_log, .myself = alice };
     size_t len = 0;
-    uint8_t *frame = _hello_wire(bob, &len);
+    /* access_granted: a core plaintext verb, so a sender we do not hold may
+     * send it (first contact's hello is granted the same way, by
+     * unencrypted_verbs.cfg.json, which this suite does not link). */
+    uint8_t *frame = _plain_wire(bob, "access_granted", &len);
     char bu[UUID_STR_LEN + 1], mu[UUID_STR_LEN + 1];
     uuid_unparse_lower(bob->uuid, bu);
     uuid_unparse_lower(mallory->uuid, mu);
@@ -352,7 +355,18 @@ DEFINE_TEST(test_a_relayed_frame_must_claim_the_sender_the_relay_stamped)
     /* Stamped as Bob, the envelope says Bob: delivered to identity. */
     handle_inbound_relayed(&ctx, frame, len, bu);
     ck_assert_int_eq(g_routed, 1);
-    ck_assert_str_eq(g_routed_fn, "first_contact_hello");
+    ck_assert_str_eq(g_routed_fn, "access_granted");
+    free(frame);
+    /* A verb that is not plaintext, from a sender we do not hold: refused
+     * before routing, whoever the relay stamped (ISSUES §2.17). */
+    g_routed = 0;
+    frame = _plain_wire(bob, "peer_dm", &len);
+    handle_inbound_relayed(&ctx, frame, len, bu);
+    ck_assert_int_eq(g_routed, 0);
+    free(frame);
+    frame = _plain_wire(bob, "app_send_dm", &len);
+    handle_inbound_relayed(&ctx, frame, len, bu);
+    ck_assert_int_eq(g_routed, 0);
     messaging_set_test_hook(NULL);
     free(frame);
 }

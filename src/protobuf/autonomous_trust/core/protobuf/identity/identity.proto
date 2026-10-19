@@ -143,14 +143,22 @@ message Group {
   // joiner adopts this at admission, and AT_NET_WIRE_MODE only stamps a group
   // its node MINTS. Absent/0 = json.
   NetWireFormat wire_format = 6;
-  // Whether this group's members require a quorum certificate on every
-  // ordinary reputation commit (doc/architecture/reputation.md, "Commit
-  // certificates"). Group-carried for the reason wire_format is; absent/false
-  // = not required, which is every group minted before this field.
-  bool commit_certificates = 7;
-  // Whether Paxos decides this group's chain order (doc/architecture/
-  // reputation.md, "Agreeing on an order"). Group-carried for the reason
-  // commit_certificates is; absent/false = entries go in as they complete,
-  // which is every group minted before this field.
-  bool ordered_placement = 8;
+  // 7 and 8 were commit_certificates and ordered_placement, retired
+  // 2026-10-16: every group places its order and certifies its commits
+  // (doc/architecture/reputation.md, "Agreeing on an order").
+  reserved 7, 8;
+  reserved "commit_certificates", "ordered_placement";
+  // ON-NODE ONLY: the C identity process's GROUP hand-off to its sibling
+  // processes, which never leaves the node. Never set these on a wire
+  // encoding: previous_keys holds retired PRIVATE keys. A sibling needs both
+  // to decrypt a frame sent under a key it retired in the last
+  // GROUP_PREVIOUS_KEY_GRACE seconds (group_decrypt), and to log the epoch it
+  // holds. Absent = epoch 0, nothing retired, so a group that has never
+  // rotated encodes to the bytes it did before these fields.
+  message RetiredKey {
+    bytes secret = 1;       // the raw box private key
+    double retired_at = 2;  // epoch seconds
+  }
+  int64 key_epoch = 9;
+  repeated RetiredKey previous_keys = 10;  // newest first
 }

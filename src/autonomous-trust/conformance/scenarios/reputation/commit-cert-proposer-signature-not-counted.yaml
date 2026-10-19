@@ -23,7 +23,6 @@ participants:
     role: member
 
 fixtures:
-  commit_certificates: true
   tx_history:
     bob:
       - task_id: t-1

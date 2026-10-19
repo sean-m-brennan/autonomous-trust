@@ -145,7 +145,7 @@ int at_invitation_is_expired(const at_invitation_t *inv, double now)
     if (inv == NULL || inv->body == NULL)
         return 0;
     json_t *e = json_object_get(inv->body, "expiry");
-    long exp = json_is_integer(e) ? (long)json_integer_value(e) : 0;
+    int64_t exp = json_is_integer(e) ? (int64_t)json_integer_value(e) : 0;
     if (exp == 0)
         return 0;
     return now >= (double)exp ? 1 : 0;
@@ -211,7 +211,7 @@ int at_redeem_invitation(const char *blob, bool in_person, double now,
 
 int at_create_invitation(const identity_t *self,
                          const char *const *rendezvous, size_t n_rv,
-                         long expiry, const char *nonce, char **blob_out)
+                         int64_t expiry, const char *nonce, char **blob_out)
 {
     return at_create_invitation_purpose(self, rendezvous, n_rv, expiry, nonce,
                                         NULL, blob_out);
@@ -226,7 +226,7 @@ const char *at_invitation_purpose(const at_invitation_t *inv)
 
 int at_create_invitation_purpose(const identity_t *self,
                                  const char *const *rendezvous, size_t n_rv,
-                                 long expiry, const char *nonce,
+                                 int64_t expiry, const char *nonce,
                                  const char *purpose, char **blob_out)
 {
     if (self == NULL || blob_out == NULL)

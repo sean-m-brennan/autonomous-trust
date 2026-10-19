@@ -37,6 +37,7 @@
 #include "utilities/util.h"   /* makedirs */
 #include "fleet/update_proposal.h"
 #include "identity/identity.h"
+#include "identity/group.h"
 #include "processes/process_tracker.h"
 #include "utilities/message.h"
 #include "utilities/msg_registry.h"
@@ -101,6 +102,17 @@ static process_t *_mk_process(identity_t *self, identity_t *peer)
     memcpy(&proc->protocol.peers[0], pub, sizeof(public_identity_t));
     proc->protocol.num_peers = 1;
     smrt_deref(pub);
+    /* Both are members of the group, and this node is operator-bound: only
+     * such a node may propose (fleet_gate.h). */
+    uuid_t guuid;
+    uuid_generate(guuid);
+    group_init(&guuid, (char *)self->address, &proc->protocol.group);
+    char u[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(self->uuid, u);
+    group_add_address(&proc->protocol.group, u, self->address);
+    uuid_unparse_lower(peer->uuid, u);
+    group_add_address(&proc->protocol.group, u, peer->address);
+    self->operator_bound = true;
     return proc;
 }
 
@@ -175,6 +187,14 @@ DEFINE_TEST(test_the_node_signs_the_apps_proposal_and_starts_the_vote)
     ck_assert_int_eq(uuid_compare(prop.signer_uuid, self->uuid), 0);
     ck_assert(fleet_validate_proposal(&prop, self->signature.public));
     ck_assert(!fleet_validate_proposal(&prop, peer->signature.public));
+
+    /* A node that is not operator-bound may not propose: nothing is sent. */
+    self->operator_bound = false;
+    memset(&g_sent, 0, sizeof(g_sent));
+    _propose(proc, json_pack("{s:s, s:s, s:s}", "version", "2.0.2",
+                             "artifact_hash", HASH, "target_arch", "aarch64"), NULL);
+    ck_assert_int_eq(g_sent.vote_requests, 0);
+    self->operator_bound = true;
 
     /* Refused: from the wire, a bad hash, no version. Nothing is sent. */
     memset(&g_sent, 0, sizeof(g_sent));

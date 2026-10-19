@@ -69,6 +69,9 @@
  *  200 ms per frame: a receiver thread, the main daemon's hop, an app-bound
  *  emit inside a roster replay. */
 #define AT_SEND_NOW 0x1u
+/** The caller handles a hard fault (anything but a full queue) itself: return
+ *  it without the "DID NOT HAPPEN" warning. */
+#define AT_SEND_QUIET_FAULT 0x2u
 
 /** The outcome of a frame @ref at_send owned: @p sent true once it is on its
  *  queue (at once if the inline send took it, or from the tick that drained
@@ -99,6 +102,15 @@ int at_send(const process_t *proc, const char *queue, generic_msg_t *out,
 
 /** Whether a frame of @p type can be kept (its payload can be copied). */
 bool at_send_retry_supported(long type);
+
+/** A deep copy of @p msg into @p copy that outlives the caller's buffers: the
+ *  copy @ref at_send_retry_defer keeps, for anyone who must keep a frame.
+ *  Release it with @ref at_msg_copy_release.
+ *  @return 0, or -1 for a type that cannot be kept or out of memory. */
+int at_msg_copy(const generic_msg_t *msg, generic_msg_t *copy);
+
+/** Free what @ref at_msg_copy allocated, and zero the copy. */
+void at_msg_copy_release(generic_msg_t *copy);
 
 /** Keep a copy of @p msg for @p queue, first deferred at @p now (seconds).
  *  @p what / @p whom name it in later log lines. The caller keeps ownership of

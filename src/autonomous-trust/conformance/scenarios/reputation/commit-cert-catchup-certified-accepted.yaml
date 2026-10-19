@@ -19,8 +19,7 @@ participants:
   - id: dave
     role: member
 
-fixtures:
-  commit_certificates: true
+fixtures: {}
 
 steps:
   - id: 1

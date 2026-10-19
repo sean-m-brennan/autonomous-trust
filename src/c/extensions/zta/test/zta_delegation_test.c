@@ -14,311 +14,158 @@
  *   limitations under the License.
  *******************/
 
-/**
- * Unit tests for delegated verification reputation gating.
- *
- * Tests the reputation cache and vouch gating logic that controls
- * whether delegated verification vouches are accepted.  The cache
- * logic mirrors zta_process.c exactly — this validates the algorithm
- * independent of IPC plumbing.
- */
-
 #define DEBUG_TESTS 1
 #include "test_setup.h"
 
+#include <stdio.h>
 #include <string.h>
-#include <stdbool.h>
-#include <uuid/uuid.h>
-#include <sys/time.h>
 
-/* --- Standalone cache implementation (mirrors zta_process.c) --- */
+#include "zta/zta_delegation.h"
 
-#define ZTA_HASH_LEN 32
-#define MAX_REP_CACHE 128
-#define MAX_PENDING_VOUCHES 32
-#define REP_CACHE_TTL_SEC 600
+/*
+ * Members' ZTA findings (zta_delegation.h, ISSUES §2.20). The verdicts are
+ * pinned in both runtimes by the conformance scenarios zta-delegation-vouch
+ * and zta-delegation-alert; these cover what a table there cannot reach
+ * cheaply: the capacity limits, a quorum configured at 0, the expiry ceiling,
+ * and that this node's own answer clears what was counted.
+ *
+ * Replaces a test that exercised a copy of the old vouch logic rather than
+ * the code itself.
+ */
 
-typedef struct {
-    uuid_t uuid;
-    double score;
-    struct timeval fetched_at;
-    bool valid;
-} rep_cache_entry_t;
+static const uint8_t HASH[ZTA_HASH_LEN] = { 1, 2, 3 };
+static const char *SUBJECT = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
-typedef struct {
-    uuid_t peer_uuid;
-    uuid_t voucher_uuid;
-    bool active;
-} pending_vouch_t;
+static int g_standings;
+static peer_standing_t g_last;
+static double g_ceiling;
+static zta_status_t g_own = ZTA_UNAVAILABLE;
 
-static rep_cache_entry_t g_cache[MAX_REP_CACHE];
-static int g_cache_count = 0;
-static pending_vouch_t g_pending[MAX_PENDING_VOUCHES];
-static int g_pending_count = 0;
-
-static bool cache_lookup(const uuid_t peer_uuid, double *score_out)
+static bool _member(void *u, const char *uuid) { (void)u; (void)uuid; return true; }
+static bool _hash(void *u, const char *p, uint8_t out[ZTA_HASH_LEN])
 {
-    struct timeval now;
-    gettimeofday(&now, NULL);
-    for (int i = 0; i < g_cache_count; i++) {
-        rep_cache_entry_t *e = &g_cache[i];
-        if (!e->valid) continue;
-        if (uuid_compare(e->uuid, peer_uuid) != 0) continue;
-        long age = now.tv_sec - e->fetched_at.tv_sec;
-        if (age > REP_CACHE_TTL_SEC) {
-            e->valid = false;
-            return false;
-        }
-        *score_out = e->score;
-        return true;
+    (void)u; (void)p;
+    memcpy(out, HASH, ZTA_HASH_LEN);
+    return true;
+}
+static int _rep(void *u, const char *uuid, double *s) { (void)u; (void)uuid; *s = 0.9; return 1; }
+static zta_status_t _own(void *u, const char *p) { (void)u; (void)p; return g_own; }
+static void _standing(void *u, const char *p, peer_standing_t st, double c, const char *r)
+{
+    (void)u; (void)p; (void)r;
+    g_standings++;
+    g_last = st;
+    g_ceiling = c;
+}
+
+static zta_deleg_ctx_t _ctx(int quorum)
+{
+    g_standings = 0;
+    g_own = ZTA_UNAVAILABLE;
+    zta_deleg_ctx_t c = { .is_member = _member, .recorded_hash = _hash, .reputation = _rep,
+                          .own_check = _own, .standing = _standing, .min_reputation = 0.7,
+                          .quorum = quorum, .ddil_cap = 0.5, .revocation_penalty = 0.8 };
+    return c;
+}
+
+static void _sender(int i, char out[ZTA_DELEG_UUID_LEN + 1])
+{
+    snprintf(out, ZTA_DELEG_UUID_LEN + 1, "00000000-0000-4000-8000-%012d", i);
+}
+
+DEFINE_TEST(test_quorum_zero_means_one)
+{
+    static zta_deleg_t d;
+    zta_deleg_init(&d);
+    zta_deleg_ctx_t c = _ctx(0);
+    zta_deleg_own_result(&d, SUBJECT, ZTA_DEFERRED);
+    ck_assert_str_eq(zta_deleg_verdict_str(
+        zta_deleg_event(&d, &c, ZTA_DELEG_VOUCH, "s", SUBJECT, HASH, ZTA_VERIFIED)), "quorum");
+    ck_assert_int_eq(g_standings, 1);
+    ck_assert_int_eq(g_last, PEER_STANDING_PROVED);
+    ck_assert(g_ceiling < 0.0);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_senders_beyond_capacity_are_full)
+{
+    static zta_deleg_t d;
+    zta_deleg_init(&d);
+    zta_deleg_ctx_t c = _ctx(ZTA_DELEG_MAX_SENDERS + 5);
+    zta_deleg_own_result(&d, SUBJECT, ZTA_UNAVAILABLE);
+    char s[ZTA_DELEG_UUID_LEN + 1];
+    for (int i = 0; i < ZTA_DELEG_MAX_SENDERS; i++) {
+        _sender(i, s);
+        ck_assert_str_eq(zta_deleg_verdict_str(
+            zta_deleg_event(&d, &c, ZTA_DELEG_ALERT, s, SUBJECT, HASH, ZTA_REVOKED)), "counted");
     }
-    return false;
+    _sender(ZTA_DELEG_MAX_SENDERS, s);
+    ck_assert_str_eq(zta_deleg_verdict_str(
+        zta_deleg_event(&d, &c, ZTA_DELEG_ALERT, s, SUBJECT, HASH, ZTA_REVOKED)), "full");
+    ck_assert_int_eq(g_standings, 0);
 }
+END_TEST_DEFINITION()
 
-static void cache_update(const uuid_t peer_uuid, double score)
+DEFINE_TEST(test_peers_beyond_capacity_are_full)
 {
-    for (int i = 0; i < g_cache_count; i++) {
-        if (g_cache[i].valid &&
-            uuid_compare(g_cache[i].uuid, peer_uuid) == 0) {
-            g_cache[i].score = score;
-            gettimeofday(&g_cache[i].fetched_at, NULL);
-            return;
-        }
+    static zta_deleg_t d;
+    zta_deleg_init(&d);
+    zta_deleg_ctx_t c = _ctx(2);
+    char p[ZTA_DELEG_UUID_LEN + 1];
+    for (int i = 0; i < ZTA_DELEG_MAX_PEERS; i++) {
+        _sender(i, p);
+        zta_deleg_own_result(&d, p, ZTA_DEFERRED);
     }
-    int slot = -1;
-    for (int i = 0; i < g_cache_count; i++) {
-        if (!g_cache[i].valid) { slot = i; break; }
+    ck_assert_int_eq(d.n, ZTA_DELEG_MAX_PEERS);
+    /* A new peer an alert would start tracking has no room. */
+    ck_assert_str_eq(zta_deleg_verdict_str(
+        zta_deleg_event(&d, &c, ZTA_DELEG_ALERT, "s", SUBJECT, HASH, ZTA_REVOKED)), "full");
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_own_answer_clears_what_was_counted)
+{
+    static zta_deleg_t d;
+    zta_deleg_init(&d);
+    zta_deleg_ctx_t c = _ctx(2);
+    zta_deleg_own_result(&d, SUBJECT, ZTA_UNAVAILABLE);
+    ck_assert_str_eq(zta_deleg_verdict_str(
+        zta_deleg_event(&d, &c, ZTA_DELEG_ALERT, "a", SUBJECT, HASH, ZTA_REVOKED)), "counted");
+    zta_deleg_own_result(&d, SUBJECT, ZTA_VERIFIED);
+    ck_assert_int_eq(d.peers[0].n_alert, 0);
+    ck_assert(!d.peers[0].unverified);
+    /* "a" counts afresh, so one more sender does not reach the quorum of 2. */
+    ck_assert_str_eq(zta_deleg_verdict_str(
+        zta_deleg_event(&d, &c, ZTA_DELEG_ALERT, "a", SUBJECT, HASH, ZTA_REVOKED)), "counted");
+    ck_assert_int_eq(g_standings, 0);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_failed_ceiling)
+{
+    ck_assert_double_eq_tol(zta_deleg_failed_ceiling(ZTA_REVOKED, 0.8), 0.2, 1e-9);
+    ck_assert_double_eq_tol(zta_deleg_failed_ceiling(ZTA_REJECTED, 0.8), 0.2, 1e-9);
+    ck_assert_double_eq_tol(zta_deleg_failed_ceiling(ZTA_EXPIRED, 0.8), 0.6, 1e-9);
+    ck_assert_double_eq_tol(zta_deleg_failed_ceiling(ZTA_REVOKED, 1.5), 0.0, 1e-9);
+    ck_assert_double_eq_tol(zta_deleg_failed_ceiling(ZTA_REVOKED, -1.0), 1.0, 1e-9);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_verdict_strings_are_distinct)
+{
+    for (int a = ZTA_DELEG_NOT_MEMBER; a <= ZTA_DELEG_FULL; a++) {
+        ck_assert(strcmp(zta_deleg_verdict_str((zta_deleg_verdict_t)a), "unknown") != 0);
+        for (int b = a + 1; b <= ZTA_DELEG_FULL; b++)
+            ck_assert(strcmp(zta_deleg_verdict_str((zta_deleg_verdict_t)a),
+                             zta_deleg_verdict_str((zta_deleg_verdict_t)b)) != 0);
     }
-    if (slot < 0) {
-        if (g_cache_count < MAX_REP_CACHE)
-            slot = g_cache_count++;
-        else {
-            slot = 0;
-            for (int i = 1; i < MAX_REP_CACHE; i++) {
-                if (g_cache[i].fetched_at.tv_sec < g_cache[slot].fetched_at.tv_sec)
-                    slot = i;
-            }
-        }
-    }
-    rep_cache_entry_t *e = &g_cache[slot];
-    memcpy(e->uuid, peer_uuid, sizeof(uuid_t));
-    e->score = score;
-    gettimeofday(&e->fetched_at, NULL);
-    e->valid = true;
-}
-
-static void defer_vouch(const uuid_t peer_uuid, const uuid_t voucher_uuid)
-{
-    if (g_pending_count >= MAX_PENDING_VOUCHES) return;
-    pending_vouch_t *pv = &g_pending[g_pending_count++];
-    memcpy(pv->peer_uuid, peer_uuid, sizeof(uuid_t));
-    memcpy(pv->voucher_uuid, voucher_uuid, sizeof(uuid_t));
-    pv->active = true;
-}
-
-static int process_pending(double threshold, int *accepted, int *rejected)
-{
-    *accepted = 0;
-    *rejected = 0;
-    int resolved = 0;
-    for (int i = g_pending_count - 1; i >= 0; i--) {
-        pending_vouch_t *pv = &g_pending[i];
-        if (!pv->active) continue;
-        double score = 0.0;
-        if (!cache_lookup(pv->voucher_uuid, &score)) continue;
-        pv->active = false;
-        resolved++;
-        if (score >= threshold)
-            (*accepted)++;
-        else
-            (*rejected)++;
-        if (i < g_pending_count - 1)
-            memcpy(pv, &g_pending[--g_pending_count], sizeof(pending_vouch_t));
-        else
-            g_pending_count--;
-    }
-    return resolved;
-}
-
-static void reset_state(void)
-{
-    memset(g_cache, 0, sizeof(g_cache));
-    g_cache_count = 0;
-    memset(g_pending, 0, sizeof(g_pending));
-    g_pending_count = 0;
-}
-
-/* ---------- tests ---------- */
-
-DEFINE_TEST(test_cache_empty_lookup)
-{
-    reset_state();
-    uuid_t peer;
-    uuid_generate(peer);
-    double score = -1.0;
-    ck_assert(!cache_lookup(peer, &score));
-}
-END_TEST_DEFINITION()
-
-DEFINE_TEST(test_cache_insert_and_lookup)
-{
-    reset_state();
-    uuid_t peer;
-    uuid_generate(peer);
-    cache_update(peer, 0.85);
-
-    double score = 0.0;
-    ck_assert(cache_lookup(peer, &score));
-    ck_assert_double_eq_tol(score, 0.85, 0.001);
-}
-END_TEST_DEFINITION()
-
-DEFINE_TEST(test_cache_update_existing)
-{
-    reset_state();
-    uuid_t peer;
-    uuid_generate(peer);
-    cache_update(peer, 0.5);
-    cache_update(peer, 0.9);
-
-    double score = 0.0;
-    ck_assert(cache_lookup(peer, &score));
-    ck_assert_double_eq_tol(score, 0.9, 0.001);
-
-    /* Only one entry should exist */
-    int count = 0;
-    for (int i = 0; i < g_cache_count; i++)
-        if (g_cache[i].valid) count++;
-    ck_assert_int_eq(count, 1);
-}
-END_TEST_DEFINITION()
-
-DEFINE_TEST(test_cache_expiry)
-{
-    reset_state();
-    uuid_t peer;
-    uuid_generate(peer);
-    cache_update(peer, 0.75);
-
-    /* Backdate the entry past TTL */
-    for (int i = 0; i < g_cache_count; i++) {
-        if (g_cache[i].valid && uuid_compare(g_cache[i].uuid, peer) == 0) {
-            g_cache[i].fetched_at.tv_sec -= REP_CACHE_TTL_SEC + 10;
-            break;
-        }
-    }
-
-    double score = -1.0;
-    ck_assert(!cache_lookup(peer, &score));
-}
-END_TEST_DEFINITION()
-
-DEFINE_TEST(test_cache_multiple_peers)
-{
-    reset_state();
-    uuid_t p1, p2, p3;
-    uuid_generate(p1);
-    uuid_generate(p2);
-    uuid_generate(p3);
-    cache_update(p1, 0.1);
-    cache_update(p2, 0.5);
-    cache_update(p3, 0.9);
-
-    double s = 0.0;
-    ck_assert(cache_lookup(p1, &s));
-    ck_assert_double_eq_tol(s, 0.1, 0.001);
-    ck_assert(cache_lookup(p2, &s));
-    ck_assert_double_eq_tol(s, 0.5, 0.001);
-    ck_assert(cache_lookup(p3, &s));
-    ck_assert_double_eq_tol(s, 0.9, 0.001);
-}
-END_TEST_DEFINITION()
-
-DEFINE_TEST(test_gating_above_threshold)
-{
-    reset_state();
-    double threshold = 0.7;
-    uuid_t voucher;
-    uuid_generate(voucher);
-    cache_update(voucher, 0.85);
-
-    double rep = 0.0;
-    ck_assert(cache_lookup(voucher, &rep));
-    ck_assert(rep >= threshold);
-}
-END_TEST_DEFINITION()
-
-DEFINE_TEST(test_gating_below_threshold)
-{
-    reset_state();
-    double threshold = 0.7;
-    uuid_t voucher;
-    uuid_generate(voucher);
-    cache_update(voucher, 0.4);
-
-    double rep = 0.0;
-    ck_assert(cache_lookup(voucher, &rep));
-    ck_assert(rep < threshold);
-}
-END_TEST_DEFINITION()
-
-DEFINE_TEST(test_pending_vouch_defer_and_resolve)
-{
-    reset_state();
-    double threshold = 0.7;
-    uuid_t peer, voucher_good, voucher_bad;
-    uuid_generate(peer);
-    uuid_generate(voucher_good);
-    uuid_generate(voucher_bad);
-
-    /* Both vouchers not cached — defer both */
-    defer_vouch(peer, voucher_good);
-    defer_vouch(peer, voucher_bad);
-    ck_assert_int_eq(g_pending_count, 2);
-
-    /* Reputation responses arrive */
-    cache_update(voucher_good, 0.85); /* above threshold */
-    cache_update(voucher_bad, 0.3);   /* below threshold */
-
-    int accepted = 0, rejected = 0;
-    int resolved = process_pending(threshold, &accepted, &rejected);
-    ck_assert_int_eq(resolved, 2);
-    ck_assert_int_eq(accepted, 1);
-    ck_assert_int_eq(rejected, 1);
-    ck_assert_int_eq(g_pending_count, 0);
-}
-END_TEST_DEFINITION()
-
-DEFINE_TEST(test_pending_vouch_partial_resolve)
-{
-    reset_state();
-    double threshold = 0.7;
-    uuid_t peer, v1, v2;
-    uuid_generate(peer);
-    uuid_generate(v1);
-    uuid_generate(v2);
-
-    defer_vouch(peer, v1);
-    defer_vouch(peer, v2);
-
-    /* Only v1's reputation arrives */
-    cache_update(v1, 0.9);
-
-    int accepted = 0, rejected = 0;
-    int resolved = process_pending(threshold, &accepted, &rejected);
-    ck_assert_int_eq(resolved, 1);
-    ck_assert_int_eq(accepted, 1);
-    ck_assert_int_eq(g_pending_count, 1); /* v2 still pending */
 }
 END_TEST_DEFINITION()
 
 RUN_TESTS(ZTA_Delegation,
-    test_cache_empty_lookup,
-    test_cache_insert_and_lookup,
-    test_cache_update_existing,
-    test_cache_expiry,
-    test_cache_multiple_peers,
-    test_gating_above_threshold,
-    test_gating_below_threshold,
-    test_pending_vouch_defer_and_resolve,
-    test_pending_vouch_partial_resolve)
+    test_quorum_zero_means_one,
+    test_senders_beyond_capacity_are_full,
+    test_peers_beyond_capacity_are_full,
+    test_own_answer_clears_what_was_counted,
+    test_failed_ceiling,
+    test_verdict_strings_are_distinct)

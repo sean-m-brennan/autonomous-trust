@@ -53,6 +53,8 @@
 #include "utilities/msg_types.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/allocation.h"
+#include "utilities/util.h"
+#include "rep_placed_segment.h"
 
 static char LATEST_UPDATE_FN[] = "latest update";
 static char UPDATE_NEEDED_FN[] = "update needed";
@@ -149,16 +151,41 @@ static void _dispatch(process_t *proc, identity_t *sender, char *function,
     smrt_deref(pub);
 }
 
-/* ENTRIES bilateral entries between @p a and @p b, in our own chain. */
-static void _stage_chain(const identity_t *a, const identity_t *b)
+/* @p a and @p b as members of @p proc's group. */
+static void _add_peers(process_t *proc, identity_t *a, identity_t *b)
 {
+    identity_t *who[2] = { a, b };
+    for (int i = 0; i < 2; i++)
+    {
+        public_identity_t *pub = NULL;
+        ck_assert_ret_ok(identity_publish(who[i], &pub));
+        memcpy(&proc->protocol.peers[proc->protocol.num_peers++], pub,
+               sizeof(public_identity_t));
+        smrt_deref(pub);
+    }
+}
+
+/* The group {a, b, c}'s placed chain in our own: its genesis, then ENTRIES
+ * bilateral entries between @p a and @p b, so CHAIN_LEN entries in all. */
+#define CHAIN_LEN (ENTRIES + 1)
+static void _stage_chain(identity_t *a, identity_t *b, identity_t *c)
+{
+    identity_t *all[3] = { a, b, c };
+    tx_history_t h;
+    ck_assert_ret_ok(tx_history_init(&h));
+    rps_found(&h, all, 3);
     for (int i = 0; i < ENTRIES; i++)
     {
         uuid_t task;
         uuid_generate(task);
-        reputation_install_tx_pair(task, a->uuid, 0.3 + 0.01 * i,
-                                   b->uuid, 0.9 - 0.01 * i);
+        rps_pair(&h, task, a, 0.3 + 0.01 * i, b, 0.9 - 0.01 * i, all, 3);
     }
+    json_t *arr = NULL;
+    ck_assert_ret_ok(tx_history_era_to_json(&h, 0, tx_history_len(&h), &arr));
+    ck_assert(reputation_install_chain_json(arr) >= 0);
+    ck_assert_int_eq(reputation_get_committed_tx_count(), CHAIN_LEN);
+    json_decref(arr);
+    tx_history_free(&h);
 }
 
 /* Ask @p proc for its chain, as @p asker, at a page size of @p bytes; the
@@ -173,11 +200,12 @@ static void _ask(process_t *proc, identity_t *asker, size_t bytes)
 
 /* The staged chain's pages at a 1000-byte page size, as the wire carries
  * them; the caller owns the array. */
-static json_t *_pages_of_a_staged_chain(identity_t *me, identity_t *bob)
+static json_t *_pages_of_a_staged_chain(identity_t *me, identity_t *bob,
+                                        identity_t *cal)
 {
     _begin();
     process_t *proc = _mk_process(me);
-    _stage_chain(me, bob);
+    _stage_chain(me, bob, cal);
     _ask(proc, bob, 1000);
     json_t *pages = json_array();
     for (size_t i = 0; i < g_num_sent; i++)
@@ -191,8 +219,9 @@ DEFINE_TEST(test_a_window_over_the_page_size_goes_in_pages)
     _begin();
     identity_t *me = _mk_identity("ada", "10.0.0.1");
     identity_t *bob = _mk_identity("bob", "10.0.0.2");
+    identity_t *cal = _mk_identity("cal", "10.0.0.3");
     process_t *proc = _mk_process(me);
-    _stage_chain(me, bob);
+    _stage_chain(me, bob, cal);
 
     _ask(proc, bob, 0);                     /* default: fits in one */
     ck_assert_int_eq((int)g_num_sent, 1);
@@ -223,7 +252,7 @@ DEFINE_TEST(test_a_window_over_the_page_size_goes_in_pages)
     }
     /* Together, exactly the window an unpaged reply carries. */
     ck_assert(json_equal(joined, whole));
-    ck_assert_int_eq((int)json_array_size(joined), ENTRIES);
+    ck_assert_int_eq((int)json_array_size(joined), CHAIN_LEN);
     json_decref(joined);
     json_decref(whole);
     _end();
@@ -234,20 +263,21 @@ DEFINE_TEST(test_pages_are_put_together_in_any_order)
 {
     identity_t *me = _mk_identity("ada", "10.0.0.1");
     identity_t *bob = _mk_identity("bob", "10.0.0.2");
-    json_t *pages = _pages_of_a_staged_chain(me, bob);
+    identity_t *cal = _mk_identity("cal", "10.0.0.3");
+    json_t *pages = _pages_of_a_staged_chain(me, bob, cal);
     size_t n = json_array_size(pages);
     ck_assert(n > 2);
 
     _begin();                               /* the receiver: an empty chain */
-    identity_t *cal = _mk_identity("cal", "10.0.0.3");
     process_t *proc = _mk_process(cal);
+    _add_peers(proc, me, bob);
     for (size_t i = n; i-- > 1;)            /* last first, the first held back */
     {
         _dispatch(proc, me, LATEST_UPDATE_FN, json_array_get(pages, i));
         ck_assert_int_eq(reputation_get_committed_tx_count(), 0);
     }
     _dispatch(proc, me, LATEST_UPDATE_FN, json_array_get(pages, 0));
-    ck_assert_int_eq(reputation_get_committed_tx_count(), ENTRIES);
+    ck_assert_int_eq(reputation_get_committed_tx_count(), CHAIN_LEN);
     json_decref(pages);
     _end();
 }
@@ -257,13 +287,14 @@ DEFINE_TEST(test_a_page_of_another_head_starts_over)
 {
     identity_t *me = _mk_identity("ada", "10.0.0.1");
     identity_t *bob = _mk_identity("bob", "10.0.0.2");
-    json_t *pages = _pages_of_a_staged_chain(me, bob);
+    identity_t *cal = _mk_identity("cal", "10.0.0.3");
+    json_t *pages = _pages_of_a_staged_chain(me, bob, cal);
     size_t n = json_array_size(pages);
     ck_assert(n > 2);
 
     _begin();
-    identity_t *cal = _mk_identity("cal", "10.0.0.3");
     process_t *proc = _mk_process(cal);
+    _add_peers(proc, me, bob);
     /* Every page but the last, then the last as if from a window that moved
      * on: nothing is applied. */
     for (size_t i = 0; i + 1 < n; i++)
@@ -280,7 +311,7 @@ DEFINE_TEST(test_a_page_of_another_head_starts_over)
         ck_assert_int_eq(reputation_get_committed_tx_count(), 0);
         _dispatch(proc, me, LATEST_UPDATE_FN, json_array_get(pages, i));
     }
-    ck_assert_int_eq(reputation_get_committed_tx_count(), ENTRIES);
+    ck_assert_int_eq(reputation_get_committed_tx_count(), CHAIN_LEN);
     json_decref(pages);
     _end();
 }
@@ -290,13 +321,14 @@ DEFINE_TEST(test_pages_from_two_senders_do_not_mix)
 {
     identity_t *me = _mk_identity("ada", "10.0.0.1");
     identity_t *bob = _mk_identity("bob", "10.0.0.2");
-    json_t *pages = _pages_of_a_staged_chain(me, bob);
+    identity_t *cal = _mk_identity("cal", "10.0.0.3");
+    json_t *pages = _pages_of_a_staged_chain(me, bob, cal);
     size_t n = json_array_size(pages);
     ck_assert(n > 1);
 
     _begin();
-    identity_t *cal = _mk_identity("cal", "10.0.0.3");
     process_t *proc = _mk_process(cal);
+    _add_peers(proc, me, bob);
     for (size_t i = 0; i < n; i++)
         _dispatch(proc, i % 2 == 0 ? me : bob, LATEST_UPDATE_FN,
                   json_array_get(pages, i));

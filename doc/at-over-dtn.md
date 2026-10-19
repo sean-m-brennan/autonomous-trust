@@ -317,7 +317,7 @@ station, DTN for the space-to-ground link.
 A constellation of satellites, each running an AT node. Ground stations are also
 AT nodes. The fleet update system distributes new binaries:
 
-- Ground proposes update via `fleet_propose_update()`
+- Ground proposes update via `fleet_propose_update_as_node()`
 - Proposal bundles propagate through DTN to all satellites
 - Each satellite votes (bundles carrying votes traverse the network)
 - On acceptance, artifact bundles (pre-fragmented) are distributed
@@ -326,8 +326,9 @@ AT nodes. The fleet update system distributes new binaries:
 - Each satellite applies the update autonomously when complete
 
 The DTN contact graph ensures bundles reach all nodes even with limited contact
-windows. The AT reputation system ensures only trusted nodes can propose
-updates.
+windows. Only an operator-bound member whose reputation reaches each receiver's
+bar can propose an update, and a satellite applies one only on a certificate of
+grants from half its group ([extensions](architecture/extensions.md#who-may-propose-an-update)).
 
 ### 5.2 Disaster Recovery Mesh
 

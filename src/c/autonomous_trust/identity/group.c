@@ -14,7 +14,6 @@
  *   limitations under the License.
  *******************/
 
-#include <ctype.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,8 +42,6 @@ int group_init(uuid_t *uuid, char *address, group_t *group)
     map_init(&group->address_map);
     /* Explicit rather than left to zeroed storage: a group initialized here
      * has declared nothing, whatever memory it was handed. */
-    group->commit_certificates = false;
-    group->ordered_placement = false;
     unsigned char *eseed = encryptor_generate();
     if (eseed == NULL)
         return -1;
@@ -82,14 +79,20 @@ int group_decrypt(const group_t *ident, const msg_str_t *cipher, const group_t *
      * processed the key update is still sending under the old one. Retry the
      * recently retired keys rather than drop those frames. Bounded by age, so a
      * retired key stops working soon after it is retired — an unbounded
-     * fallback would make rotation decorative. Mirrors Python Group.decrypt. */
+     * fallback would make rotation decorative. Mirrors Python Group.decrypt.
+     *
+     * Each retired key is tried as the pair it was: its own public with its own
+     * private, which is how a group frame is sealed (the shared key to itself).
+     * The network process passes the group as `whom`, so pairing the retired
+     * private with whom's public meant the CURRENT public, and no frame sealed
+     * under a retired key ever opened. */
     double stamp = (double)time(NULL);
     for (size_t i = 0; i < ident->num_previous_keys; i++)
     {
         if (stamp - ident->previous_retired_at[i] > GROUP_PREVIOUS_KEY_GRACE)
             continue;
         if (crypto_box_open_easy(out, cipher->msg, cipher->len, nonce,
-                                 whom->encryptor.public,
+                                 ident->previous_keys[i].public,
                                  ident->previous_keys[i].private) == 0)
             return 0;
     }
@@ -110,11 +113,31 @@ static bool _group_owns_private(const group_t *group)
  * Returns the new epoch, or -1 when we do not hold the current private key —
  * a public-only view of somebody else's group has no standing to rotate it,
  * and silently minting a key here would fork the cohort into two halves that
- * cannot hear each other. Mirrors Python Group.rotate_key. */
+ * cannot hear each other — or when minting fails. Mirrors Python
+ * Group.rotate_key.
+ *
+ * The new key is minted BEFORE the current one is retired. Retiring first left
+ * a failed mint holding a live key that was also in its own retired list, and
+ * group_rotation_refusal then refused every update carrying that key, the
+ * cohort's winner included, as "a key we already retired". */
 int64_t group_rotate_key(group_t *group)
 {
     if (!_group_owns_private(group))
         return -1;
+    unsigned char *seed = encryptor_generate();
+    if (seed == NULL)
+        return -1;
+    encryptor_t minted = {0};
+    int rc = encryptor_init_from_private(&minted, seed,
+                                         crypto_box_SECRETKEYBYTES * 2);
+    sodium_memzero(seed, crypto_box_SECRETKEYBYTES * 2);
+    free(seed);
+    if (rc != 0)
+    {
+        sodium_memzero(&minted, sizeof(minted));
+        return -1;
+    }
+
     size_t keep = group->num_previous_keys;
     if (keep > GROUP_PREVIOUS_KEY_MAX - 1)
         keep = GROUP_PREVIOUS_KEY_MAX - 1;
@@ -127,14 +150,12 @@ int64_t group_rotate_key(group_t *group)
     group->previous_retired_at[0] = (double)time(NULL);
     group->num_previous_keys = keep + 1;
 
-    unsigned char *seed = encryptor_generate();
-    if (seed == NULL)
-        return -1;
-    int rc = encryptor_init_from_private(&group->encryptor, seed,
-                                         crypto_box_SECRETKEYBYTES * 2);
-    free(seed);
-    if (rc != 0)
-        return -1;
+    /* The key fields only: the embedded smrt header stays the group's. */
+    memcpy(group->encryptor.private, minted.private, sizeof(minted.private));
+    memcpy(group->encryptor.public, minted.public, sizeof(minted.public));
+    memcpy(group->encryptor.public_hex, minted.public_hex,
+           sizeof(minted.public_hex));
+    sodium_memzero(&minted, sizeof(minted));
     group->key_epoch += 1;
     return group->key_epoch;
 }
@@ -272,46 +293,6 @@ int group_add_address(group_t *group, const char *uuid_str, const char *address)
     return map_set(&group->address_map, (map_key_t)uuid_str, addr_data);
 }
 
-/* Frama-C: skipped — [env] getenv */
-/* The boolean knob @p name: "1", "true", "yes" or "on" (trimmed, any case) is
- * true, "0", "false", "no" or "off" is false, and anything else, or unset, is
- * @p dflt -- a knob that is on by default must be turned off explicitly, not
- * by a typo. Mirrors Python system._env_bool. */
-static bool _env_bool(const char *name, bool dflt)
-{
-    const char *raw = getenv(name);
-    if (raw == NULL)
-        return dflt;
-    char norm[8];
-    size_t n = 0;
-    for (const char *c = raw; *c != '\0'; c++)
-    {
-        if (*c == ' ' || *c == '\t')
-            continue;
-        if (n + 1 >= sizeof(norm))
-            return dflt;   /* longer than any spelling */
-        norm[n++] = (char)tolower((unsigned char)*c);
-    }
-    norm[n] = '\0';
-    if (strcmp(norm, "1") == 0 || strcmp(norm, "true") == 0
-        || strcmp(norm, "yes") == 0 || strcmp(norm, "on") == 0)
-        return true;
-    if (strcmp(norm, "0") == 0 || strcmp(norm, "false") == 0
-        || strcmp(norm, "no") == 0 || strcmp(norm, "off") == 0)
-        return false;
-    return dflt;
-}
-
-bool group_commit_certificates_resolve(void)
-{
-    return _env_bool("AT_COMMIT_CERTIFICATES", false);
-}
-
-bool group_ordered_placement_resolve(void)
-{
-    return _env_bool("AT_ORDERED_PLACEMENT", true);
-}
-
 /* Frama-C: skipped — [serialization] jansson JSON serialization */
 /* The envelope format this group speaks to `address`
  * (doc/architecture/network-wire-format.md).
@@ -426,15 +407,6 @@ int group_to_json(const void *data_struct, json_t **obj_ptr)
      * predates it stays compatible. */
     json_object_set_new(obj, "wire_format",
                         json_string(net_wire_format_name(ident->wire_format)));
-    /* The commit-certificate declaration, emitted ONLY when set, so a group
-     * that does not declare it keeps the bytes it had before the field existed
-     * (every byte-pinned group form in the corpus). Mirrors Python
-     * to_canonical. */
-    if (ident->commit_certificates)
-        json_object_set_new(obj, "commit_certificates", json_true());
-    /* Likewise the ordered-placement declaration. */
-    if (ident->ordered_placement)
-        json_object_set_new(obj, "ordered_placement", json_true());
 
     return 0;
 }
@@ -509,11 +481,6 @@ int group_from_json(const json_t *obj, void *data_struct)
      * the format every node can read rather than fail the load. */
     const char *wf = json_string_value(json_object_get(obj, "wire_format"));
     group->wire_format = net_wire_format_from_name(wf);
-    /* Only a literal true turns it on, as Python's from_canonical reads it. */
-    group->commit_certificates =
-        json_is_true(json_object_get(obj, "commit_certificates"));
-    group->ordered_placement =
-        json_is_true(json_object_get(obj, "ordered_placement"));
     return 0;
 }
 
@@ -531,9 +498,40 @@ int group_sync_out(group_t *group, AutonomousTrust__Core__Protobuf__Identity__Gr
     proto->wire_format = (group->wire_format == NET_WIRE_PROTO)
         ? AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__NET_WIRE_FORMAT__NET_WIRE_PROTO
         : AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__NET_WIRE_FORMAT__NET_WIRE_JSON;
-    /* false is the proto3 default: an undeclared group's bytes are unchanged. */
-    proto->commit_certificates = group->commit_certificates;
-    proto->ordered_placement = group->ordered_placement;
+    /* The epoch and the retired keys, so a sibling's group_decrypt has the
+     * same grace window identity's does (the network process is its only
+     * caller). On-node only, like the shared private below; the secrets are
+     * SHARED with the group and group_proto_free frees only the entries. */
+    proto->key_epoch = group->key_epoch;
+    proto->n_previous_keys = 0;
+    proto->previous_keys = NULL;
+    size_t retired = group->num_previous_keys;
+    if (retired > GROUP_PREVIOUS_KEY_MAX)
+        retired = GROUP_PREVIOUS_KEY_MAX;
+    if (retired > 0)
+    {
+        proto->previous_keys = calloc(
+            retired, sizeof(AutonomousTrust__Core__Protobuf__Identity__Group__RetiredKey *));
+        if (proto->previous_keys == NULL)
+            return EXCEPTION(ENOMEM);
+        for (size_t i = 0; i < retired; i++)
+        {
+            if (sodium_is_zero(group->previous_keys[i].private,
+                               crypto_box_SECRETKEYBYTES))
+                continue;
+            AutonomousTrust__Core__Protobuf__Identity__Group__RetiredKey *rk =
+                malloc(sizeof(*rk));
+            if (rk == NULL)
+                return EXCEPTION(ENOMEM);
+            AutonomousTrust__Core__Protobuf__Identity__Group__RetiredKey tmp_r =
+                AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__GROUP__RETIRED_KEY__INIT;
+            memcpy(rk, &tmp_r, sizeof(tmp_r));
+            rk->secret.data = group->previous_keys[i].private;
+            rk->secret.len = crypto_box_SECRETKEYBYTES;
+            rk->retired_at = group->previous_retired_at[i];
+            proto->previous_keys[proto->n_previous_keys++] = rk;
+        }
+    }
 
     /* Full address_map (doc/architecture/identity-protocol.md) as a proto3 map (repeated key/value entries).
      * Keys/values are SHARED with group->address_map: group_to_proto packs
@@ -610,8 +608,28 @@ int group_sync_in(AutonomousTrust__Core__Protobuf__Identity__Group *proto, group
     group->wire_format =
         (proto->wire_format == AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__NET_WIRE_FORMAT__NET_WIRE_PROTO)
         ? NET_WIRE_PROTO : NET_WIRE_JSON;
-    group->commit_certificates = proto->commit_certificates != 0;
-    group->ordered_placement = proto->ordered_placement != 0;
+    /* Mirror of group_sync_out: the epoch and the retired keys, newest first. */
+    group->key_epoch = proto->key_epoch;
+    group->num_previous_keys = 0;
+    for (size_t i = 0; i < proto->n_previous_keys
+                       && group->num_previous_keys < GROUP_PREVIOUS_KEY_MAX; i++)
+    {
+        const AutonomousTrust__Core__Protobuf__Identity__Group__RetiredKey *rk =
+            proto->previous_keys[i];
+        if (rk == NULL || rk->secret.len != crypto_box_SECRETKEYBYTES)
+            continue;
+        char priv_hex[crypto_box_SECRETKEYBYTES * 2 + 1];
+        sodium_bin2hex(priv_hex, sizeof(priv_hex), rk->secret.data,
+                       crypto_box_SECRETKEYBYTES);
+        int rc = encryptor_init_from_private(
+            &group->previous_keys[group->num_previous_keys],
+            (const unsigned char *)priv_hex, crypto_box_SECRETKEYBYTES * 2);
+        sodium_memzero(priv_hex, sizeof(priv_hex));
+        if (rc != 0)
+            continue;
+        group->previous_retired_at[group->num_previous_keys] = rk->retired_at;
+        group->num_previous_keys++;
+    }
 
     /* Rebuild the full address_map (doc/architecture/identity-protocol.md). proto_to_group deserializes into a
      * fresh (zeroed) group, so initialise the map before populating it. */
@@ -652,6 +670,9 @@ void group_proto_free(AutonomousTrust__Core__Protobuf__Identity__Group *proto)
     for (size_t i = 0; i < proto->n_address_map; i++)
         free(proto->address_map[i]);
     free(proto->address_map);
+    for (size_t i = 0; i < proto->n_previous_keys; i++)
+        free(proto->previous_keys[i]);   /* the secrets are the group's */
+    free(proto->previous_keys);
     free(proto->encryptor);
 }
 
@@ -674,8 +695,15 @@ int proto_to_group(uint8_t *data, size_t len, group_t *group)
 {
     AutonomousTrust__Core__Protobuf__Identity__Group *msg =
         autonomous_trust__core__protobuf__identity__group__unpack(NULL, len, data);
-    group_sync_in(msg, group);
-    free(msg);
+    if (msg == NULL)
+        return EXCEPTION(EINVAL);
+    /* Its status is not returned, as before: a group handed over before it
+     * holds any key fails the key parse and is still installed. */
+    (void)group_sync_in(msg, group);
+    /* group_sync_in copies everything it keeps (uuid, address, map entries,
+     * keys), so the unpacked message goes with all its nested allocations. A
+     * plain free() leaked the encryptor and every map entry per GROUP. */
+    autonomous_trust__core__protobuf__identity__group__free_unpacked(msg, NULL);
     return 0;
 }
 

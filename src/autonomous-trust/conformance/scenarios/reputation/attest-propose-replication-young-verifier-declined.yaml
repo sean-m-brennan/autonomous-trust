@@ -1,0 +1,48 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-propose-replication-young-verifier-declined
+byte_pinning: false
+description: |
+    A replication from a verifier short of its tenure is not vouched for, even
+    when the stored score clears tier 3 (doc/architecture/reputation.md,
+    "Tenure").
+
+    bob holds alice at 0.9, but first held her as a member 10 s ago and the
+    minimum is 600 s. The co-sign gate bounds her by her tenure, as it bounds
+    her by any standing: tier 2, below the replication tier (3). The stored
+    score can predate the hold (a snapshot restored before the first rescore
+    sweep), so the gate does not trust it alone. A sybil the subject spins up
+    cannot be the second voice by answering a few probes.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+fixtures:
+  reputations:
+    bob:
+      alice: 0.9
+  tenure:
+    bob:
+      min_sec: 600
+      alice: 10
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest propose
+    payload:
+      subject: carol
+      score: 0.3
+      channel: replication
+    description: a replication from a verifier bob has held for 10 s.
+
+expected_state:
+  bob:
+    attest_signs_sent: 0

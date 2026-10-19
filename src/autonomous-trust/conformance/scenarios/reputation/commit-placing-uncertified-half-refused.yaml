@@ -20,8 +20,7 @@ participants:
   - id: dave
     role: member
 
-fixtures:
-  ordered_placement: true
+fixtures: {}
 
 steps:
   - id: 1

@@ -92,7 +92,7 @@ static char *_roster(const unsigned char *seed, int seq, const char *relays_json
 #define HINT(i) "\"relay://00000000-0000-4000-8000-00000000000" #i \
     ":abababababababababababababababab@198.51.100." #i ":27790\""
 
-static void _write(const char *dir, const char *name, const char *text)
+static void _write_file(const char *dir, const char *name, const char *text)
 {
     char path[512];
     snprintf(path, sizeof(path), "%s/%s/%s", g_root, dir, name);
@@ -110,7 +110,7 @@ static void _publish(const char *name, const unsigned char *seed, int seq, const
      * and a host publishing a roster does not. */
     usleep(20000);
     char *t = _roster(seed, seq, relays);
-    _write("etc/at/relay_rosters", name, t);
+    _write_file("etc/at/relay_rosters", name, t);
     free(t);
 }
 
@@ -118,7 +118,7 @@ static void _pin_file(const char *keys_json)
 {
     char doc[512];
     snprintf(doc, sizeof(doc), "{\"issuers\":%s}", keys_json);
-    _write("etc/at", AT_RELAY_ROSTER_ISSUERS_FILE, doc);
+    _write_file("etc/at", AT_RELAY_ROSTER_ISSUERS_FILE, doc);
 }
 
 /* A fresh root, first contact on, no explicit relay, no pinned issuer. */
@@ -257,7 +257,7 @@ DEFINE_TEST(test_rosters_stand_in_ahead_of_the_seed_list)
                  "{\"v\":1,\"typename\":\"at-seeds\",\"seq\":1,\"relays\":[" HINT(9) "]}");
         seeds = _signed(g_release_seed, AT_RELAY_SEEDS_DOMAIN, body);
     }
-    _write("etc/at", AT_RELAY_SEEDS_FILE, seeds);
+    _write_file("etc/at", AT_RELAY_SEEDS_FILE, seeds);
     free(seeds);
     _publish("community.cfg.json", g_seed_a, 1, "[" HINT(1) "]");
     net_relay_ep_t eps[AT_RELAY_MAX];
@@ -472,14 +472,14 @@ DEFINE_TEST(test_a_hub_for_our_own_bucket_is_registered_first)
     char *t = _roster_areas(g_seed_a, 1,
                             "[" HINT(1) "," HINT(2) "," HINT(3) "," HINT(4) "," HINT(5) ","
                             HINT(6) "]", "{" HINT(6) ":[\"u4pr\"]," HINT(5) ":[\"gcpv\"]}");
-    _write("etc/at/relay_rosters", "a.cfg.json", t);
+    _write_file("etc/at/relay_rosters", "a.cfg.json", t);
     free(t);
     net_relay_ep_t eps[AT_RELAY_MAX];
     ck_assert_uint_eq(_own(eps), AT_RELAY_MAX);
     ck_assert_str_eq(eps[0].host, "198.51.100.1");
     /* Listed under u4pru: the u4pr hub moves to the front, inside the cap. */
     usleep(20000);
-    _write("var/at", "area.cfg.json",
+    _write_file("var/at", "area.cfg.json",
            "{\"u4pr\":{\"seq\":1,\"bucket\":\"u4pru\",\"name\":\"\",\"card\":{}}}");
     ck_assert_uint_eq(_own(eps), AT_RELAY_MAX);
 #ifdef AT_FIRST_CONTACT_ENABLED

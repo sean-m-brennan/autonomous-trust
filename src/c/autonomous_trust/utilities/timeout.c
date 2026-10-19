@@ -19,6 +19,8 @@
 
 #include <jansson.h>
 
+#include <stdint.h>
+
 #include "config/configuration.h"
 #include "structures/data.h"
 #include "structures/map.h"
@@ -29,10 +31,11 @@ int at_timeout_apply_scale(int base_ms, int max_rtt_ms, int multiplier)
 {
     if (multiplier <= 0)       multiplier  = AT_TIMEOUT_DEFAULT_MULTIPLIER;
     if (max_rtt_ms < 0)        max_rtt_ms  = 0;
-    /* long arithmetic avoids 32-bit overflow for multi-minute DTN links. */
-    long scaled = (long)max_rtt_ms * (long)multiplier;
-    if (scaled < (long)base_ms) return base_ms;
-    if (scaled > (long)0x7FFFFFFF) return 0x7FFFFFFF;
+    /* 64-bit arithmetic avoids 32-bit overflow for multi-minute DTN links.
+     * int64_t, not long: long is 32 bits on Windows (LLP64). */
+    int64_t scaled = (int64_t)max_rtt_ms * (int64_t)multiplier;
+    if (scaled < (int64_t)base_ms) return base_ms;
+    if (scaled > (int64_t)0x7FFFFFFF) return 0x7FFFFFFF;
     return (int)scaled;
 }
 

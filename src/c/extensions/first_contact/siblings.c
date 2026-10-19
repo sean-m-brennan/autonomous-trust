@@ -16,6 +16,7 @@
 
 /** @file This user's own other devices (C twin of first_contact/siblings.py). */
 
+#include "utilities/portable.h"  /* at_tmp_path */
 #include "first_contact/siblings.h"
 #include "first_contact/device.h"
 #include "identity/identity_priv.h"   /* public_identity_to_json / _from_json */
@@ -301,7 +302,10 @@ int at_siblings_save(const at_siblings_t *s, const char *data_dir)
         return -1;
     /* Atomic, as contacts_save: a temp beside the target, then rename. */
     char tmp[4096 + 16];
-    snprintf(tmp, sizeof(tmp), "%s.tmp%d", path, (int)getpid());
+    if (at_tmp_path(tmp, sizeof(tmp), path) != 0) {
+        json_decref(root);
+        return -1;
+    }
     int rc = json_dump_file(root, tmp, JSON_INDENT(2) | JSON_SORT_KEYS);
     json_decref(root);
     if (rc != 0 || rename(tmp, path) != 0) {

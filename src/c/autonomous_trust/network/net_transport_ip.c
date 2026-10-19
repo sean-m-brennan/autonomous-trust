@@ -29,6 +29,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "utilities/socket_helpers.h"  /* at_socket_close */
 #include "net_transport_priv.h"
 #include "utilities/exception.h"
 
@@ -96,6 +97,15 @@ int net_transport_ip_bind(const socket_cfg_t *cfg, const char *address,
     struct addrinfo hints = {0};
     hints.ai_family = cfg->domain;
     hints.ai_socktype = cfg->type;
+#ifdef _WIN32
+    /* Winsock will not bind a broadcast or multicast group address, which is
+     * what the shared (reuse) sockets bind elsewhere; a socket bound to the
+     * wildcard address on that port receives them instead (the group join
+     * still names the group). UDP only; a TCP listener keeps its address.
+     * Unconfirmed on a Windows host: see ISSUES §2.74. */
+    if (reuse && cfg->type == SOCK_DGRAM)
+        address = NULL;
+#endif
     if (address == NULL)
         hints.ai_flags = AI_PASSIVE;
 
@@ -128,17 +138,45 @@ int net_transport_ip_bind(const socket_cfg_t *cfg, const char *address,
      * on this socket, the option is also what would let a SECOND node bind the
      * identical addr:port and take delivery of every datagram, so the unicast
      * recv sockets opt out and get EADDRINUSE instead. */
-    if (reuse)
+    if (reuse && cfg->type == SOCK_STREAM)
     {
-        int one = 1;
-        if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0)
+        /* A TCP listener: SO_REUSEADDR (TIME_WAIT only, never over a live
+         * LISTEN) on POSIX; SO_EXCLUSIVEADDRUSE on Windows, whose SO_REUSEADDR
+         * WOULD let a second listener take the port. */
+        if (at_socket_listener_opts(sock) != 0)
         {
-            close(sock);
+            at_socket_close(sock);
             freeaddrinfo(res);
             SYS_EXCEPTION();
             log_exception(logger);
             return -1;
         }
+    }
+    else if (reuse)
+    {
+        int one = 1;
+        if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0)
+        {
+            at_socket_close(sock);
+            freeaddrinfo(res);
+            SYS_EXCEPTION();
+            log_exception(logger);
+            return -1;
+        }
+#ifdef __APPLE__
+        /* BSD sockets share a UDP port only with SO_REUSEPORT too (Linux's
+         * SO_REUSEADDR covers it, and there REUSEPORT would load-balance
+         * unicast between the sockets instead). UDP only, by the branch above:
+         * on a TCP listener it would let a second node share the port. */
+        if (setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) != 0)
+        {
+            at_socket_close(sock);
+            freeaddrinfo(res);
+            SYS_EXCEPTION();
+            log_exception(logger);
+            return -1;
+        }
+#endif
     }
 
     if (bind(sock, res->ai_addr, res->ai_addrlen) != 0)
@@ -156,7 +194,7 @@ int net_transport_ip_bind(const socket_cfg_t *cfg, const char *address,
                       "node a distinct base port (config net_cfg.port, or "
                       "AT_COMM_PORT).\n",
                       address ? address : "*", port);
-        close(sock);
+        at_socket_close(sock);
         freeaddrinfo(res);
         EXCEPTION(bind_errno);
         log_exception(logger);
@@ -167,7 +205,7 @@ int net_transport_ip_bind(const socket_cfg_t *cfg, const char *address,
     {
         if (listen(sock, 5) != 0)
         {
-            close(sock);
+            at_socket_close(sock);
             freeaddrinfo(res);
             SYS_EXCEPTION();
             log_exception(logger);

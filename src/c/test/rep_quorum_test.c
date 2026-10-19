@@ -66,6 +66,8 @@
 #include "utilities/msg_types.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/allocation.h"
+#include "utilities/util.h"
+#include "rep_placed_segment.h"
 
 /* net_msg_t.function is `char *`, so const literals cannot be assigned. */
 static char SLASH_PROPOSE_FN[]     = "slash propose";
@@ -985,6 +987,41 @@ static json_t *_peer_chain(const identity_t *p1, const identity_t *p2, const cha
     return arr;
 }
 
+/* The group's placed chain: a genesis of @p members, then a task per letter,
+ * each placed by all of them. */
+static void _placed(tx_history_t *h, identity_t **members, int n,
+                    identity_t *p1, identity_t *p2, const char *letters)
+{
+    ck_assert_ret_ok(tx_history_init(h));
+    rps_found(h, members, n);
+    for (const char *c = letters; *c; c++)
+        rps_pair(h, g_ft[*c - 'a'], p1, 0.3 + 0.02 * (*c - 'a'),
+                 p2, 0.9 - 0.02 * (*c - 'a'), members, n);
+}
+
+static json_t *_placed_chain(identity_t **members, int n, identity_t *p1,
+                             identity_t *p2, const char *letters)
+{
+    tx_history_t h;
+    _placed(&h, members, n, p1, p2, letters);
+    json_t *arr = NULL;
+    ck_assert_ret_ok(tx_history_era_to_json(&h, 0, tx_history_len(&h), &arr));
+    tx_history_free(&h);
+    return arr;
+}
+
+/* Our chain: @p placed_letters placed, then @p tail committed after them but
+ * not yet placed. */
+static void _stage_placed(identity_t **members, int n, identity_t *p1,
+                          identity_t *p2, const char *placed_letters,
+                          const char *tail)
+{
+    json_t *arr = _placed_chain(members, n, p1, p2, placed_letters);
+    ck_assert(reputation_install_chain_json(arr) >= 0);
+    json_decref(arr);
+    _stage_local(p1, p2, tail);
+}
+
 DEFINE_TEST(test_our_own_unsigned_proposal_does_not_block_adoption)
 {
     _begin(3);
@@ -998,14 +1035,16 @@ DEFINE_TEST(test_our_own_unsigned_proposal_does_not_block_adoption)
     char me_u[UUID_STRING_LEN + 1];
     _uuid_str(me->uuid, me_u);
 
-    _stage_local(me, bob, "abx");
+    identity_t *all[3] = { me, bob, carol };
+    _stage_placed(all, 3, me, bob, "ab", "x");
     reputation_force_checkpoint(proc, me_u, "");   /* stored, one signature */
     ck_assert(g_ckpt_final_count == 0);
 
-    json_t *theirs = _peer_chain(me, bob, "abcd");
+    /* The group placed c where we hold x unplaced, and d after it. */
+    json_t *theirs = _placed_chain(all, 3, me, bob, "abcd");
     _dispatch(proc, bob, LATEST_UPDATE_FN, theirs);
     json_decref(theirs);
-    ck_assert_int_eq(reputation_get_committed_tx_count(), 4);
+    ck_assert_int_eq(reputation_get_committed_tx_count(), 5);
     _end();
 }
 END_TEST_DEFINITION()
@@ -1024,12 +1063,13 @@ DEFINE_TEST(test_a_quorate_checkpoint_over_our_chain_blocks_adoption)
     _uuid_str(me->uuid, me_u);
     _uuid_str(bob->uuid, bob_u);
 
-    _stage_local(me, bob, "abx");
+    identity_t *all[3] = { me, bob, carol };
+    _stage_placed(all, 3, me, bob, "ab", "x");
     char root[TX_HASH_HEX_LEN + 1] = {0};
     reputation_get_window_root(root);
     reputation_force_checkpoint(proc, me_u, "");
     uint8_t desig[512];
-    size_t dlen = _ckpt_desig(me_u, root, 1, 0, 3, desig, sizeof(desig));
+    size_t dlen = _ckpt_desig(me_u, root, 1, 0, 4, desig, sizeof(desig));
     char b_sig[SIG_HEX_LEN + 1];
     _sign_hex(bob, desig, dlen, b_sig);
     json_t *p = json_object();
@@ -1041,10 +1081,10 @@ DEFINE_TEST(test_a_quorate_checkpoint_over_our_chain_blocks_adoption)
     json_decref(p);
     ck_assert(g_ckpt_final_count > 0);             /* quorum: now final */
 
-    json_t *theirs = _peer_chain(me, bob, "abcd");
+    json_t *theirs = _placed_chain(all, 3, me, bob, "abcd");
     _dispatch(proc, carol, LATEST_UPDATE_FN, theirs);
     json_decref(theirs);
-    ck_assert_int_eq(reputation_get_committed_tx_count(), 3);
+    ck_assert_int_eq(reputation_get_committed_tx_count(), 4);
     char after[TX_HASH_HEX_LEN + 1] = {0};
     reputation_get_window_root(after);
     ck_assert_str_eq(after, root);

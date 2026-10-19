@@ -15,7 +15,9 @@
 # ******************
 cmake_minimum_required(VERSION 3.23)
 
-if(DEFINED ENV{CONDA_PREFIX})
+# Only where the env ships conda's Linux sysroot: a macOS (or compiler-less)
+# env has none, and APPLE is not yet defined before project().
+if(DEFINED ENV{CONDA_PREFIX} AND EXISTS "$ENV{CONDA_PREFIX}/x86_64-conda-linux-gnu/sysroot")
     set(CONDA_ROOT $ENV{CONDA_PREFIX} CACHE PATH "Conda base directory")
     set(CMAKE_C_COMPILE_OPTIONS_SYSROOT "--sysroot=")
     set(CMAKE_CXX_COMPILE_OPTIONS_SYSROOT "--sysroot=")
@@ -38,6 +40,28 @@ if(DEFINED ENV{CONDA_PREFIX})
 endif()
 
 project(autonomous_trust C CXX)
+
+if(WIN32)
+    # Windows (MinGW-w64, UCRT): the POSIX the sources are written against comes
+    # from compat/win32 — stand-ins for the POSIX headers MinGW lacks, and
+    # at_win32.h, force-included everywhere, with the Winsock wrappers. A
+    # consumer compiling against AT's headers (Agora's native layer) applies the
+    # same options: AT_WIN32_COMPILE_OPTIONS / AT_WIN32_INCLUDE_DIR.
+    set(AT_WIN32_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/compat/win32"
+        CACHE INTERNAL "AT's POSIX stand-in headers for Windows")
+    set(AT_WIN32_COMPILE_OPTIONS "SHELL:-include ${AT_WIN32_INCLUDE_DIR}/at_win32.h"
+        CACHE INTERNAL "Force-include AT's Windows POSIX layer")
+    include_directories(BEFORE ${AT_WIN32_INCLUDE_DIR})
+    add_compile_options(${AT_WIN32_COMPILE_OPTIONS})
+endif()
+
+if(APPLE)
+    # The sources ask for POSIX (_XOPEN_SOURCE/_POSIX_C_SOURCE), which on Darwin
+    # HIDES the BSD extensions they also use (struct ip_mreq, IP_ADD_MEMBERSHIP);
+    # _DARWIN_C_SOURCE restores them, as _DEFAULT_SOURCE does on glibc.
+    # UUID_STR_LEN is util-linux's; the libSystem <uuid/uuid.h> lacks it.
+    add_compile_definitions(_DARWIN_C_SOURCE UUID_STR_LEN=37)
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -126,7 +150,13 @@ if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
     list(APPEND useful_warnings -Wuse-after-free -Wfree-nonheap-object -Wno-cast-function-type)
 endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
-    list(APPEND useful_warnings -Wno-microsoft-anon-tag -Wno-deprecated-non-prototype -Wno-unused-but-set-variable -Wno-unknown-pragmas -Wno-cast-align -Wno-cast-function-type-mismatch)
+    list(APPEND useful_warnings -Wno-microsoft-anon-tag -Wno-deprecated-non-prototype -Wno-unused-but-set-variable -Wno-unknown-pragmas -Wno-cast-align)
+    # LLVM 19+; an older (Apple) clang rejects the unknown flag under -Werror.
+    include(CheckCCompilerFlag)
+    check_c_compiler_flag(-Wno-cast-function-type-mismatch AT_HAVE_WNO_CFTM)
+    if(AT_HAVE_WNO_CFTM)
+        list(APPEND useful_warnings -Wno-cast-function-type-mismatch)
+    endif()
     # conda's default CFLAGS are GCC-tuned (e.g. -fno-merge-constants) and leak
     # into CMAKE_C_FLAGS; clang ignores them but, under -Werror, the resulting
     # -Wignored-optimization-argument would otherwise fail the build.
@@ -201,6 +231,9 @@ if(AT_ORACLE_REPLICATION AND NOT AT_ORACLE_CERTIFICATES)
     message(FATAL_ERROR "AT_ORACLE_REPLICATION=ON requires AT_ORACLE_CERTIFICATES=ON (SplitMix64)")
 endif()
 
+if(AT_STATIC AND APPLE)
+    message(FATAL_ERROR "AT_STATIC is not supported on macOS: Apple's linker has no -static for user programs")
+endif()
 if(AT_STATIC)
     # Prefer .a archives in subsequent find_library() calls AND pass -static to
     # the linker so transitive deps resolve statically too. Must come BEFORE the
@@ -217,6 +250,19 @@ endif()
 # library/program dependencies
 
 # UUID
+if(WIN32)
+    # compat/win32/uuid.c implements the libuuid API AT uses.
+    set(LIBUUID_INCLUDE_DIR "")
+    set(LIBUUID_LIBRARY "")
+    message("-- libuuid: compat/win32 (Windows)")
+elseif(APPLE)
+    # libuuid is part of libSystem, and the SDK's <uuid/uuid.h> has the same API.
+    # Do NOT search: Homebrew's ossp-uuid installs a libuuid and a uuid.h with a
+    # different API, and util-linux's is keg-only.
+    set(LIBUUID_INCLUDE_DIR "")
+    set(LIBUUID_LIBRARY "")
+    message("-- libuuid: from libSystem (macOS)")
+else()
 find_path(LIBUUID_INCLUDE_DIR uuid.h PATH_SUFFIXES uuid HINTS ${CONDA_ROOT})
 find_library(LIBUUID_LIBRARY NAMES uuid HINTS ${CONDA_ROOT})
 include_directories(${LIBUUID_INCLUDE_DIR})
@@ -224,6 +270,7 @@ if(LIBUUID_LIBRARY)
     message("-- Found libuuid at ${LIBUUID_LIBRARY}")
 else()
     message(FATAL_ERROR "Required dependency libuuid not found.")
+endif()
 endif()
 
 # libsodium
@@ -367,7 +414,13 @@ if(NOT LIBSUBUNIT_LIBRARY)
     set(LIBSUBUNIT_LIBRARY "")
 endif()
 
+set(AT_PLATFORM_LIBS)
+if(WIN32)
+    set(AT_PLATFORM_LIBS ws2_32 iphlpapi)
+endif()
+
 set(DEPENDENCIES
+    ${AT_PLATFORM_LIBS}
     ${LIBUUID_LIBRARY}
     ${LIBSODIUM_LIBRARY}
     ${Protobuf_LIBRARIES}
@@ -506,9 +559,18 @@ set(libsrc
     autonomous_trust/utilities/queue_pool.c
     autonomous_trust/utilities/sighandler.c
     autonomous_trust/utilities/socket_helpers.c
+    autonomous_trust/utilities/portable.c
+    autonomous_trust/utilities/message_inproc.c
+    autonomous_trust/utilities/message_stream.c
     autonomous_trust/utilities/timeout.c
     autonomous_trust/utilities/util.c
 )
+if(WIN32)
+    list(APPEND libsrc
+        compat/win32/uuid.c
+        compat/win32/ifaddrs.c
+        compat/win32/win32.c)
+endif()
 
 
 
@@ -610,6 +672,9 @@ endforeach()
 ####################
 # generate tables headers
 
+# macOS (and many distros) ship `python3` with no `python`.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
 function(preprocess _file_in)
     get_filename_component(_base ${_file_in} NAME_WE)
     set(_fullpath ${CMAKE_CURRENT_SOURCE_DIR}/${_file_in})
@@ -621,7 +686,7 @@ function(preprocess _file_in)
     set(_exclude_args --exclude extensions)
     add_custom_command(
         OUTPUT ${_header_file}
-        COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/preprocess.py ${_fullpath} ${_header_file} ${_src_dir}/ autonomous_trust ${_exclude_args}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/preprocess.py ${_fullpath} ${_header_file} ${_src_dir}/ autonomous_trust ${_exclude_args}
         COMMENT "Preprocessing table header from ${_file_in}"
         # Depend on the generator too: a change to preprocess.py (e.g. which
         # directories it scans) must re-run generation, or stale tables linger.
@@ -717,6 +782,11 @@ target_compile_options(at_ryu PRIVATE -O2 -Wno-error -Wno-unused-function)
 
 add_library(autonomous_trust SHARED ${libsrc} ${libhdr} ${proto_c_src} ${table_hdrs})
 set_target_properties(autonomous_trust PROPERTIES COMPILE_FLAGS "${lib_compile_flags}")
+# The shared library names its own dependencies. It used to leave them to each
+# final executable (a .so may carry unresolved symbols), which Apple's linker
+# refuses for a dylib; on Linux it adds the DT_NEEDED entries the library always
+# had in practice through its consumers.
+target_link_libraries(autonomous_trust PRIVATE ${DEPENDENCIES})
 target_sources(autonomous_trust PUBLIC ${libsrc}
     PUBLIC FILE_SET HEADERS
     BASE_DIRS ${CMAKE_CURRENT_BINARY_DIR} FILES ${genhdr}
@@ -746,7 +816,27 @@ target_sources(autonomous_trust PUBLIC ${libsrc}
 # the protobuf-c generated objects pull in symbols defined later in the
 # archive, and a single-pass linker scans it once; --start-group/--end-group
 # allows multiple passes.
-set(AT_TEST_LIBS -Wl,--start-group autonomous_trust_static ${TEST_DEPENDENCIES} -Wl,--end-group)
+# Apple's linker searches archives repeatedly by itself and has no group flags.
+if(APPLE)
+    set(AT_TEST_LIBS autonomous_trust_static ${TEST_DEPENDENCIES})
+else()
+    set(AT_TEST_LIBS -Wl,--start-group autonomous_trust_static ${TEST_DEPENDENCIES} -Wl,--end-group)
+endif()
+
+# at_whole_archive(<out-var> <static-target>...): link items that keep every
+# member of each archive (registration constructors live in members nothing
+# references). GNU ld: --whole-archive; Apple ld: -force_load per archive.
+function(at_whole_archive out)
+    if(APPLE)
+        set(_items)
+        foreach(_t ${ARGN})
+            list(APPEND _items "-Wl,-force_load,$<TARGET_FILE:${_t}>" ${_t})
+        endforeach()
+    else()
+        set(_items -Wl,--whole-archive ${ARGN} -Wl,--no-whole-archive)
+    endif()
+    set(${out} ${_items} PARENT_SCOPE)
+endfunction()
 
 if(LIBCHECK_LIBRARY)
 
@@ -853,12 +943,26 @@ target_link_libraries(identity_resync_test PRIVATE ${AT_TEST_LIBS})
 add_executable(group_rotation_sibling_test test/group_rotation_sibling_test.c)
 set_source_files_properties(test/group_rotation_sibling_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(group_rotation_sibling_test PRIVATE ${AT_TEST_LIBS})
+add_executable(bridged_group_test test/bridged_group_test.c)
+set_source_files_properties(test/bridged_group_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(bridged_group_test PRIVATE ${AT_TEST_LIBS})
+add_executable(amnesia_recognition_test test/amnesia_recognition_test.c)
+set_source_files_properties(test/amnesia_recognition_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(amnesia_recognition_test PRIVATE ${AT_TEST_LIBS})
 add_executable(handoff_retry_test test/handoff_retry_test.c)
 set_source_files_properties(test/handoff_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(handoff_retry_test PRIVATE ${AT_TEST_LIBS})
 add_executable(net_presence_test test/net_presence_test.c)
 set_source_files_properties(test/net_presence_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(net_presence_test PRIVATE ${AT_TEST_LIBS})
+add_executable(net_route_policy_test test/net_route_policy_test.c)
+set_source_files_properties(test/net_route_policy_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_route_policy_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME net_route_policy_test COMMAND $<TARGET_FILE:net_route_policy_test>)
+add_executable(net_held_group_test test/net_held_group_test.c)
+set_source_files_properties(test/net_held_group_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_held_group_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME net_held_group_test COMMAND $<TARGET_FILE:net_held_group_test>)
 add_executable(send_retry_test test/send_retry_test.c)
 set_source_files_properties(test/send_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(send_retry_test PRIVATE ${AT_TEST_LIBS})
@@ -897,9 +1001,6 @@ add_executable(rep_update_pages_test test/rep_update_pages_test.c)
 set_source_files_properties(test/rep_update_pages_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rep_update_pages_test PRIVATE ${AT_TEST_LIBS})
 
-add_executable(rep_paxos_round_test test/rep_paxos_round_test.c)
-set_source_files_properties(test/rep_paxos_round_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(rep_paxos_round_test PRIVATE ${AT_TEST_LIBS})
 add_executable(rep_round_majority_test test/rep_round_majority_test.c)
 set_source_files_properties(test/rep_round_majority_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rep_round_majority_test PRIVATE ${AT_TEST_LIBS})
@@ -965,6 +1066,14 @@ add_executable(b64_test test/b64_test.c)
 set_source_files_properties(test/b64_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(b64_test PRIVATE ${AT_TEST_LIBS})
 
+add_executable(portable_test test/portable_test.c)
+set_source_files_properties(test/portable_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(portable_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(ipc_paths_test test/ipc_paths_test.c)
+set_source_files_properties(test/ipc_paths_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(ipc_paths_test PRIVATE ${AT_TEST_LIBS} pthread)
+
 add_executable(clock_test test/clock_test.c)
 set_source_files_properties(test/clock_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(clock_test PRIVATE ${AT_TEST_LIBS})
@@ -1018,7 +1127,7 @@ target_link_libraries(jcs_test PRIVATE
     ${LIBSUBUNIT_LIBRARY}  # empty (and skipped) unless a subunit lib was found
     m
     pthread
-    rt
+    $<$<NOT:$<OR:$<PLATFORM_ID:Darwin>,$<PLATFORM_ID:Windows>>>:rt>
 )
 
 enable_testing()
@@ -1049,6 +1158,8 @@ add_test(NAME partition_recovery_test COMMAND $<TARGET_FILE:partition_recovery_t
 add_test(NAME late_joiner_caps_resync_test COMMAND $<TARGET_FILE:late_joiner_caps_resync_test>)
 add_test(NAME identity_resync_test COMMAND $<TARGET_FILE:identity_resync_test>)
 add_test(NAME group_rotation_sibling_test COMMAND $<TARGET_FILE:group_rotation_sibling_test>)
+add_test(NAME bridged_group_test COMMAND $<TARGET_FILE:bridged_group_test>)
+add_test(NAME amnesia_recognition_test COMMAND $<TARGET_FILE:amnesia_recognition_test>)
 add_test(NAME handoff_retry_test COMMAND $<TARGET_FILE:handoff_retry_test>)
 add_test(NAME net_presence_test COMMAND $<TARGET_FILE:net_presence_test>)
 add_test(NAME send_retry_test COMMAND $<TARGET_FILE:send_retry_test>)
@@ -1063,7 +1174,6 @@ add_test(NAME package_hash_test COMMAND $<TARGET_FILE:package_hash_test>)
 add_test(NAME admission_send_test COMMAND $<TARGET_FILE:admission_send_test>)
 add_test(NAME rep_quorum_test COMMAND $<TARGET_FILE:rep_quorum_test>)
 add_test(NAME rep_update_pages_test COMMAND $<TARGET_FILE:rep_update_pages_test>)
-add_test(NAME rep_paxos_round_test COMMAND $<TARGET_FILE:rep_paxos_round_test>)
 add_test(NAME rep_round_majority_test COMMAND $<TARGET_FILE:rep_round_majority_test>)
 add_test(NAME rep_commit_cert_test COMMAND $<TARGET_FILE:rep_commit_cert_test>)
 add_test(NAME reputation_place_test COMMAND $<TARGET_FILE:reputation_place_test>)
@@ -1082,6 +1192,8 @@ add_test(NAME data_test COMMAND $<TARGET_FILE:data_test>)
 add_test(NAME net_proc_ageout_test COMMAND $<TARGET_FILE:net_proc_ageout_test>)
 add_test(NAME datetime_test COMMAND $<TARGET_FILE:datetime_test>)
 add_test(NAME b64_test COMMAND $<TARGET_FILE:b64_test>)
+add_test(NAME portable_test COMMAND $<TARGET_FILE:portable_test>)
+add_test(NAME ipc_paths_test COMMAND $<TARGET_FILE:ipc_paths_test>)
 add_test(NAME clock_test COMMAND $<TARGET_FILE:clock_test>)
 add_test(NAME group_test COMMAND $<TARGET_FILE:group_test>)
 add_test(NAME data_json_test COMMAND $<TARGET_FILE:data_json_test>)
@@ -1254,6 +1366,16 @@ target_link_libraries(identity2_test PRIVATE ${AT_TEST_LIBS})
 add_executable(group2_test test/group2_test.c)
 set_source_files_properties(test/group2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(group2_test PRIVATE ${AT_TEST_LIBS})
+# A failed mint, for test_group_rotate_key_failed_mint_retires_nothing: the
+# test's __wrap_encryptor_generate returns NULL on demand. Works because the
+# library is linked statically, so group.o's reference resolves at this link.
+if(APPLE OR WIN32)
+    # Apple's linker and lld-link have no --wrap; the failed-mint case is
+    # skipped there (AT_NO_LINK_WRAP in test/group2_test.c).
+    target_compile_definitions(group2_test PRIVATE AT_NO_LINK_WRAP)
+else()
+    target_link_options(group2_test PRIVATE -Wl,--wrap=encryptor_generate)
+endif()
 
 add_executable(vote_collection_test test/vote_collection_test.c)
 set_source_files_properties(test/vote_collection_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1377,6 +1499,11 @@ set_source_files_properties(test/peer_standing_test.c PROPERTIES COMPILE_FLAGS "
 target_link_libraries(peer_standing_test PRIVATE ${AT_TEST_LIBS} m)
 add_test(NAME peer_standing_test COMMAND $<TARGET_FILE:peer_standing_test>)
 
+add_executable(rep_tenure_test test/rep_tenure_test.c)
+set_source_files_properties(test/rep_tenure_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_tenure_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rep_tenure_test COMMAND $<TARGET_FILE:rep_tenure_test>)
+
 add_executable(group_adopt_test test/group_adopt_test.c)
 set_source_files_properties(test/group_adopt_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(group_adopt_test PRIVATE ${AT_TEST_LIBS} m)
@@ -1431,9 +1558,9 @@ if(AT_ZTA)
             target_compile_definitions(${_t} PRIVATE AT_ZTA_ENABLED)
             target_include_directories(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/extensions)
             # The core group again after the library: it reaches back into the core.
+            at_whole_archive(_whole at_zta_static)
             target_link_libraries(${_t} PRIVATE
-                -Wl,--whole-archive at_zta_static -Wl,--no-whole-archive
-                ${AT_TEST_LIBS} OpenSSL::SSL OpenSSL::Crypto)
+                ${_whole} ${AT_TEST_LIBS} OpenSSL::SSL OpenSSL::Crypto)
         endforeach()
     endif()
 endif()
@@ -1458,16 +1585,14 @@ if(AT_FIRST_CONTACT_LIB)
         foreach(_t extension_test unencrypted_verbs_test)
             target_compile_definitions(${_t} PRIVATE AT_FIRST_CONTACT_ENABLED)
             target_include_directories(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/extensions)
-            target_link_libraries(${_t} PRIVATE
-                -Wl,--whole-archive at_first_contact_static at_rendezvous_static
-                -Wl,--no-whole-archive ${AT_TEST_LIBS})
+            at_whole_archive(_whole at_first_contact_static at_rendezvous_static)
+            target_link_libraries(${_t} PRIVATE ${_whole} ${AT_TEST_LIBS})
         endforeach()
         # Rendezvous's own roster test (it links rendezvous already): the hub
         # preference needs first contact's area provider.
         target_compile_definitions(net_relay_rosters_test PRIVATE AT_FIRST_CONTACT_ENABLED)
-        target_link_libraries(net_relay_rosters_test PRIVATE
-            -Wl,--whole-archive at_first_contact_static -Wl,--no-whole-archive
-            ${AT_TEST_LIBS})
+        at_whole_archive(_whole at_first_contact_static)
+        target_link_libraries(net_relay_rosters_test PRIVATE ${_whole} ${AT_TEST_LIBS})
     endif()
 endif()
 foreach(_ext_dir ${AT_EXTERNAL_EXTENSIONS})
@@ -1486,6 +1611,20 @@ endforeach()
 # at build time, runs each case through C-side adapters, emits a results
 # JSON whose shape matches the Python harness output. Optional — only
 # wired when the autonomous-trust Python sources are present alongside.
+# Tests that need fork, pipes between processes or POSIX signals: not built on
+# Windows, whose nodes run in-process (the in-process and stream paths have
+# their own tests, ipc_paths_test).
+if(WIN32 AND LIBCHECK_LIBRARY)
+    foreach(_t msg_test process_child_exit_test socket_helpers_test first_contact_live_test)
+        if(TARGET ${_t})
+            set_target_properties(${_t} PROPERTIES EXCLUDE_FROM_ALL TRUE)
+            # Registered in its own directory (an extension's, for some).
+            get_target_property(_tdir ${_t} SOURCE_DIR)
+            set_tests_properties(${_t} DIRECTORY ${_tdir} PROPERTIES DISABLED TRUE)
+        endif()
+    endforeach()
+endif()
+
 if(EXISTS ${CMAKE_SOURCE_DIR}/../autonomous-trust/conformance)
     add_subdirectory(conformance)
 endif()

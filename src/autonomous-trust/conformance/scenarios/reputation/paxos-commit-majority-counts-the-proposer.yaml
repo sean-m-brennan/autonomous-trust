@@ -23,10 +23,7 @@ participants:
     role: acceptor
 
 fixtures:
-  requests:
-    bob:
-      - [1000, 1]
-  my_requests:
+  proposals:
     alice:
       - id1: 1000
         id2: 1

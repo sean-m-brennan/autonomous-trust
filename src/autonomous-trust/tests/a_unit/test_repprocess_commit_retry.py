@@ -13,18 +13,19 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""OUR half of a task is followed until it is in the chain (ISSUES §2.24).
+"""OUR half of a task is followed until it is in the chain or the pool
+(ISSUES §2.24).
 
-A granted round leaves my_requests when its transaction goes out, so if the
-acceptors never commit it the half is gone; a round nobody answers gets no
-nack, so the nack retry never fires. Partition cohort part-3490610 lost island
-B's app reaction the first way. What outlives the retries is parked until the
-chain grows from a peer (§2.60). Mirrors C test/rep_commit_retry_test.c.
+A half whose co-signing round is lost on the way is otherwise gone: partition
+cohort part-3490610 lost island B's app reaction that way. What outlives the
+retries is parked until the chain grows from a peer (§2.60). Mirrors C
+test/rep_commit_retry_test.c.
 """
 import queue
 from uuid import uuid4
 
-from autonomous_trust.core.reputation.reputation import TransactionScore
+from autonomous_trust.core.reputation.reputation import (
+    Transaction, TransactionScore, placement_entry)
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
 from autonomous_trust.core.network.message import Message
 from autonomous_trust.core.system import CfgIds, now
@@ -37,11 +38,11 @@ def _later(n):
     return now().timestamp() + 60.0 * n
 
 
-def _requests(q):
-    """Drain the network queue; count the Paxos requests it carried."""
+def _proposals(q):
+    """Drain the network queue; count the halves it proposed."""
     n = 0
     while not q.empty():
-        if q.get_nowait().function == ReputationProtocol.request:
+        if q.get_nowait().function == ReputationProtocol.transaction:
             n += 1
     return n
 
@@ -54,75 +55,39 @@ def _cohort():
     return rp, {CfgIds.network: net_q}, net_q
 
 
-def _grant_all(rp, queues):
-    """Grant our most recent round from every peer, as handle_request does."""
-    idx = next(reversed(rp.my_requests))
-    id1, id2 = idx
-    for peer in rp.protocol.peers.all:
-        ack = ((id1, id2, rp.identity.uuid), (None, len(rp.history)), None)
-        msg = Message(CfgIds.reputation, ReputationProtocol.grant,
-                      to_yaml_string(ack), from_whom=peer)
-        msg.verified = True
-        rp.handle_grant(queues, msg)
-    return idx
-
-
-def _accept_all(rp, queues, idx):
-    id1, id2 = idx
-    for peer in rp.protocol.peers.all:
-        msg = Message(CfgIds.reputation, ReputationProtocol.accepted,
-                      to_yaml_string((id1, id2, rp.identity.uuid)),
-                      from_whom=peer)
-        msg.verified = True
-        rp.handle_accepted(queues, msg)
+def _committed(rp, task):
+    """Our half of ``task`` reached the pool, as a certified commit puts it
+    there. (Mock peers cannot sign, so the certificate is not built here; the
+    co-signing round is pinned by the conformance corpus.)"""
+    rp.history.record_half(task, rp.identity.uuid, 0.9)
 
 
 class TestUncommittedHalvesAreReProposed:
-    def test_a_granted_round_that_never_commits_is_re_proposed(self):
+    def test_a_half_that_never_commits_is_re_proposed(self):
         """THE REGRESSION (part-3490610)."""
         rp, queues, net_q = _cohort()
         task = uuid4()
         rp._start_paxos(queues, TransactionScore(task, 0.9))
-        _grant_all(rp, queues)
-        assert not rp.my_requests, 'precondition: the transaction went out'
+        assert _proposals(net_q) == 1, 'precondition: the transaction went out'
         assert str(task) in rp.awaiting_commit
-        _requests(net_q)
 
         assert rp._retry_uncommitted_halves(queues, now().timestamp()) == 0
         assert rp._retry_uncommitted_halves(queues, _later(1)) == 1
-        assert _requests(net_q) == 1
+        assert _proposals(net_q) == 1
 
-        idx = _grant_all(rp, queues)
-        _accept_all(rp, queues, idx)
-        assert str(task) not in rp.awaiting_commit
+        _committed(rp, task)
         assert rp._retry_uncommitted_halves(queues, _later(2)) == 0
+        assert str(task) not in rp.awaiting_commit
 
     def test_a_committed_half_is_left_alone(self):
         rp, queues, net_q = _cohort()
         task = uuid4()
         rp._start_paxos(queues, TransactionScore(task, 0.9))
-        idx = _grant_all(rp, queues)
-        _accept_all(rp, queues, idx)
-        assert str(task) not in rp.awaiting_commit
-        _requests(net_q)
+        _committed(rp, task)
+        _proposals(net_q)
         assert rp._retry_uncommitted_halves(queues, _later(1)) == 0
-        assert _requests(net_q) == 0
-
-    def test_an_unanswered_round_is_re_proposed_and_its_ballot_retired(self):
-        rp, queues, net_q = _cohort()
-        task = uuid4()
-        rp._start_paxos(queues, TransactionScore(task, 0.9))
-        # A ballot is minted from the clock's millisecond and the chain length,
-        # so a re-proposal inside the same millisecond would reuse the key and
-        # overwrite the stale round, hiding whether it was retired. In a live
-        # run the first round is seconds older: say so.
-        (old_idx, tc), = rp.my_requests.items()
-        del rp.my_requests[old_idx]
-        rp.my_requests[(old_idx[0] - 30000, old_idx[1])] = tc
-        assert rp._retry_uncommitted_halves(queues, _later(1)) == 1
-        live = [tc for tc in rp.my_requests.values()
-                if tc.score.task_id == task]
-        assert len(live) == 1, 'the stale round was left beside the new one'
+        assert _proposals(net_q) == 0
+        assert str(task) not in rp.awaiting_commit
 
     def test_an_exhausted_half_is_parked_not_dropped(self):
         """Five re-proposals, then PARKED (§2.60), not dropped."""
@@ -139,7 +104,9 @@ class TestUncommittedHalvesAreReProposed:
         rp, queues, net_q = _cohort()
         task = uuid4()
         rp._start_paxos(queues, TransactionScore(task, 0.9))
-        rp.history.update(task, rp.identity.uuid, 0.9)
+        alice = rp.protocol.peers.all[0]
+        rp.history.apply_placed(0, [placement_entry(Transaction(
+            task, rp.identity.uuid, 0.9, alice.uuid, 0.8))])
         assert rp._retry_uncommitted_halves(queues, _later(1)) == 0
         assert str(task) not in rp.awaiting_commit
 
@@ -152,20 +119,19 @@ def _park(rp, queues, net_q):
     for i in range(1, 7):
         rp._retry_uncommitted_halves(queues, _later(i))
     assert rp.parked_count() == 1
-    _requests(net_q)
+    _proposals(net_q)
     return task
 
 
 def _catch_up(rp, queues, n):
-    """alice sends a chain of ``n`` unrelated alice/bob entries, as the
-    majority island's does at the heal."""
-    from autonomous_trust.core.reputation.reputation import Transaction
+    """The majority island's chain reaches us at the heal: ``n`` unrelated
+    alice/bob entries are placed on ours, and the chain growing from a peer
+    wakes what is parked, as _reconcile_into does on EXTENDED."""
     alice, bob = rp.protocol.peers.all[:2]
-    chain = [Transaction(uuid4(), alice.uuid, 0.8, bob.uuid, 0.7, index=i + 1)
-             for i in range(n)]
-    rp.handle_update(queues, Message(
-        CfgIds.reputation, ReputationProtocol.update,
-        to_yaml_string(chain), from_whom=alice))
+    rp.history.apply_placed(rp.history.next_index, [
+        placement_entry(Transaction(uuid4(), alice.uuid, 0.8, bob.uuid, 0.7))
+        for _ in range(n)])
+    rp._wake_parked(alice.nickname)
 
 
 class TestParkedHalves:
@@ -219,7 +185,7 @@ class TestParkedHalves:
         assert str(task) not in rp.awaiting_commit
 
         task = _park(rp, queues, net_q)
-        rp.history.update(task, rp.identity.uuid, 0.9)
+        _committed(rp, task)
         assert rp._retry_uncommitted_halves(queues, _later(8)) == 0
         assert str(task) not in rp.awaiting_commit
 
@@ -239,20 +205,21 @@ class TestParkedHalves:
 
     def test_a_peer_heard_on_a_retired_ballot_still_counts(self):
         """THE REGRESSION (part-2136648): reach is any frame from the peer,
-        not an answer to one of the half's own rounds. A grant for a ballot
-        the retry already retired lands nowhere; alice is merely heard."""
+        not an answer to one of the half's own rounds. An acceptance for a
+        ballot the retry already replaced lands nowhere; alice is merely
+        heard."""
         rp, queues, net_q = _cohort()
         task = uuid4()
         rp._start_paxos(queues, TransactionScore(task, 0.9))
-        stale = next(reversed(rp.my_requests))
+        stale = next(reversed(rp.proposals))
         for i in range(1, 6):
             rp._retry_uncommitted_halves(queues, _later(i))
         alice = rp.protocol.peers.all[0]
-        ack = ((stale[0], stale[1], rp.identity.uuid),
-               (None, len(rp.history)), None)
-        rp.handle_grant(queues, Message(CfgIds.reputation,
-                                        ReputationProtocol.grant,
-                                        to_yaml_string(ack), from_whom=alice))
+        msg = Message(CfgIds.reputation, ReputationProtocol.accepted,
+                      to_yaml_string((stale[0] - 1, stale[1],
+                                      rp.identity.uuid)), from_whom=alice)
+        msg.verified = True
+        rp.handle_accepted(queues, msg)
         rp.note_heard(alice, _later(6))
         rp._retry_uncommitted_halves(queues, _later(6))
         assert rp.parked_count() == 0
@@ -302,10 +269,10 @@ class TestProbeBackpressure:
         task = uuid4()
         rp._start_paxos(queues, TransactionScore(task, 0.9))  # the app half
         assert not self._probe(rp, queues)
-        _requests(net_q)
+        _proposals(net_q)
         assert rp._retry_uncommitted_halves(queues, _later(1)) == 1
-        idx = _grant_all(rp, queues)
-        _accept_all(rp, queues, idx)
+        _committed(rp, task)
+        assert rp._retry_uncommitted_halves(queues, _later(1)) == 0
         assert str(task) not in rp.awaiting_commit
         assert rp._retry_uncommitted_halves(queues, _later(2)) == 1
         assert self._probe(rp, queues)

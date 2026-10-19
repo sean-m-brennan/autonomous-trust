@@ -202,6 +202,21 @@ DEFINE_TEST(test_a_round_already_in_the_chain_is_forgotten)
     _end();
 }
 
+/* Likewise a round whose entry is already in the pool, certified elsewhere
+ * and waiting to be placed. Mirrors Python
+ * test_a_round_already_in_the_chain_is_forgotten. */
+DEFINE_TEST(test_a_round_already_in_the_pool_is_forgotten)
+{
+    _begin_with_a_lost_propose();
+    ck_assert_ret_ok(reputation_install_pooled_attested(g_ver->uuid, 0.3, "probe",
+                                                        g_subj->uuid, DIGEST));
+    ck_assert_int_eq((int)_retry_pending_attestations(g_proc, _later(1)), 0);
+    ck_assert_int_eq((int)g_proposes, 0);
+    ck_assert_int_eq((int)reputation_attest_pending_count(), 0);
+    ck_assert_int_eq((int)reputation_attest_cosig_count(), 0);
+    _end();
+}
+
 /* @p signer's attest_sign for the verifier's round about @p subject (digest
  * DIGEST, score 0.3, channel "probe"), dispatched to the verifier. */
 static void _sign_from(identity_t *signer, identity_t *subject)
@@ -289,5 +304,6 @@ RUN_TESTS(RepAttestRetry,
           test_a_lost_propose_is_sent_again_after_the_interval,
           test_reproposals_are_bounded_then_the_round_is_abandoned,
           test_a_round_already_in_the_chain_is_forgotten,
+          test_a_round_already_in_the_pool_is_forgotten,
           test_a_round_that_reaches_its_quorum_forgets_its_signatures,
           test_retiring_one_round_keeps_another_rounds_signatures)

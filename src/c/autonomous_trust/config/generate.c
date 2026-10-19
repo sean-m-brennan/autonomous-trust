@@ -25,7 +25,11 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <unistd.h>
+#ifndef SIOCGIFHWADDR
+#include <net/if_dl.h>  /* Darwin/BSD: the MAC is the interface's AF_LINK entry */
+#endif
 
 #include <jansson.h>
 #include <uuid/uuid.h>
@@ -254,7 +258,25 @@ static int discover_network_for(net_iface_t *iface, const char *preferred_ip)
         found_ip4 = true;
     }
 
-    /* Get MAC address via ioctl */
+    /* Get MAC address: an ioctl on Linux; the BSDs have no SIOCGIFHWADDR and
+     * list it in getifaddrs as the interface's AF_LINK address instead. */
+#ifndef SIOCGIFHWADDR
+    for (struct ifaddrs *ifa = ifaddr; found_ip4 && ifa != NULL; ifa = ifa->ifa_next)
+    {
+        if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_LINK
+            || strcmp(ifa->ifa_name, iface->if_name) != 0)
+            continue;
+        const struct sockaddr_dl *sdl = (const struct sockaddr_dl *)ifa->ifa_addr;
+        if (sdl->sdl_alen == 6)
+        {
+            const unsigned char *mac = (const unsigned char *)LLADDR(sdl);
+            snprintf(iface->mac_addr, MAC_ADDR_LEN + 1,
+                     "%02x:%02x:%02x:%02x:%02x:%02x",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        }
+        break;
+    }
+#else
     if (found_ip4)
     {
         int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -273,6 +295,7 @@ static int discover_network_for(net_iface_t *iface, const char *preferred_ip)
             close(sock);
         }
     }
+#endif
 
     freeifaddrs(ifaddr);
 

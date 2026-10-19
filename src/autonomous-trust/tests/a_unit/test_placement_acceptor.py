@@ -50,15 +50,13 @@ def four(tmp_path, monkeypatch):
             _ident('obs', 4))
 
 
-def _placing(me, everyone, on=True):
+def _placing(me, everyone):
     """`me` in a group of `everyone`, its roster in force (an anchor: these
     cases are about placing entries, not founding the group)."""
-    rp, q = _node(me, _roster(me, everyone), required=False)
-    rp.protocol.group.ordered_placement = on
+    rp, q = _node(me, _roster(me, everyone))
     peers = rp.protocol.peers.all
     rp.protocol.peers.find_top_n = lambda n: list(peers)[:n]
-    if on:
-        rp.history.roster_anchor = _roster_of(everyone)
+    rp.history.roster_anchor = _roster_of(everyone)
     return rp, q
 
 
@@ -163,10 +161,8 @@ class TestPromise:
                                         prop))
         assert _sent(q) == []
 
-    def test_unverified_or_unplaced_groups_get_no_answer(self, four):
+    def test_an_unverified_request_gets_no_answer(self, four):
         prop, acc = four[0], four[1]
-        rp, q = _placing(acc, four, on=False)
-        assert _ask(rp, q, prop) == []
         rp, q = _placing(acc, four)
         m = _msg(ReputationProtocol.place_request,
                  {'group': '', 'k': 0, 'head': '',
@@ -280,6 +276,38 @@ class TestLearn:
         assert rp.history.pooled(e.task_id) is None
         assert str(e.task_id) not in rp.awaiting_commit
         assert rp.history.placed_end == 1
+
+    def test_a_placed_attestation_is_logged_and_brings_a_checkpoint_forward(
+            self, four):
+        # Placement completes an attested entry, so it does what a commit
+        # does in a chain that does not place: the line cohorts watch for
+        # (Stele rt-3700990 waited on it), and a checkpoint soon.
+        from unittest.mock import MagicMock
+        from autonomous_trust.core.reputation.reputation import (AttestedScore,
+                                                                 attest_task_id)
+        prop, ver, subj, obs = four
+        rp, q = _placing(obs, four)
+        rp._next_checkpoint_at = float('inf')
+        rp.logger = MagicMock()
+        digest = 'ab' * 32
+        att = AttestedScore(verifier_uuid=str(ver.uuid), subject_uuid=str(subj.uuid),
+                            score=0.3, evidence_digest=digest)
+        sigs = {str(m.uuid): ReputationProcess._detached_sig(m, att.designation)
+                for m in (ver, prop, obs)}
+        tx = Transaction(attest_task_id(ver.uuid, subj.uuid, digest),
+                         p1_id=ver.uuid, p1_score=0.3, p1_channel='probe',
+                         attested=True, subject_id=subj.uuid,
+                         evidence_digest=digest, attest_sigs=sigs)
+        value = _value(placement_entry(tx))
+        _placed(rp, q, prop, value, _certify(value, 0, b'', four[:3]))
+        assert [t.task_id for t in rp.history] == [tx.task_id]
+        lines = [c.args[0] % c.args[1:] for c in rp.logger.info.call_args_list
+                 if c.args[0].startswith('Attested score committed')]
+        assert lines == ['Attested score committed: verifier=%s subject=%s '
+                         'score=0.30 channel=probe signers=3 (index 0)'
+                         % (str(ver.uuid)[:8], str(subj.uuid)[:8])]
+        assert rp._next_checkpoint_at <= __import__('time').time() + \
+            rp.ATTEST_CHECKPOINT_SEC + 1
 
     @pytest.mark.parametrize('spoil', ['sub-quorum', 'forged', 'other-head'])
     def test_an_uncertified_placement_is_refused(self, four, spoil):

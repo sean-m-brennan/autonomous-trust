@@ -49,6 +49,8 @@ from autonomous_trust.core._python.identity.encrypt import Encryptor
 from autonomous_trust.core.processes import ProcessTracker
 from autonomous_trust.core.system import CfgIds
 
+from tests.a_unit.test_placement_acceptor import _roster_of
+
 
 def _identity(tag: str, uuid=None) -> Identity:
     """A real identity with a per-tag signing key (see the note in
@@ -121,14 +123,20 @@ def _supported(n, score=TX_SCORE):
     return (n * score + k * neutral) / (n + k)
 
 
-def _build_evidence(proposer: Identity, cosigners, peer_uuids, count=3):
+def _build_evidence(proposer: Identity, cosigners, peer_uuids, count=3,
+                    founded_by=None):
     """A complete, honestly-signed evidence document: `count` committed
     bilateral txs between the proposer and each peer in turn, checkpointed
-    over the whole window and co-signed by `cosigners`.
+    over the whole window and co-signed by `cosigners`. With `founded_by`
+    (identities), the chain opens on that group's genesis roster, as every
+    chain does now that every group places its order; without one it is a
+    chain from before then, which a restart clears.
 
     Each peer therefore appears in ``count // len(peer_uuids)`` transactions,
     which is what bounds its restorable score."""
     history = TransactionHistory()
+    if founded_by:
+        history.apply_placed(0, [_roster_of(founded_by)])
     for i in range(count):
         tid = UUID(int=i + 1)
         peer = peer_uuids[i % len(peer_uuids)]
@@ -196,7 +204,8 @@ class TestVerifiedWarmStart:
         peer_b = _identity('peer-b')
         # 40 txs alternating between the two peers -> 20 each.
         _, doc = _build_evidence(me, [me, peer_a, peer_b],
-                                 [peer_a.uuid, peer_b.uuid], count=40)
+                                 [peer_a.uuid, peer_b.uuid], count=40,
+                                 founded_by=[me, peer_a, peer_b])
         supported = _supported(20)
         assert supported > 0.8  # the scores below are inside what 20 txs bear
         _write(cfg_root, doc)
@@ -208,8 +217,8 @@ class TestVerifiedWarmStart:
         assert rp.reputations.current[_uu(peer_b.uuid)] == pytest.approx(0.75)
         assert rp._trust_tier(rp.reputations.current[_uu(peer_a.uuid)]) == 3
         # ...and the attested history itself is adopted, with the checkpoint
-        # that attests it.
-        assert len(rp.history) == 40
+        # that attests it: the genesis roster and the 40 txs.
+        assert len(rp.history) == 41
         assert rp.history.window_root() == doc['checkpoint']['root'].encode()
         assert rp._checkpoint is not None
         assert rp._checkpoint.epoch == 4
@@ -790,6 +799,7 @@ class TestEvidencePersistence:
         me = _identity('me')
         peer = _identity('peer-a')
         rp = _make_rep_process(identity=me, peers=[peer])
+        rp.history.apply_placed(0, [_roster_of([me, peer])])
         for i in range(20):
             tid = UUID(int=i + 1)
             rp.history.update(tid, me.uuid, TX_SCORE)
@@ -807,7 +817,7 @@ class TestEvidencePersistence:
             identity=me, peers=[peer],
             reputations=Reputations({peer.uuid: 0.75}))
         assert restarted.reputations.current[_uu(peer.uuid)] == pytest.approx(0.75)
-        assert len(restarted.history) == 20
+        assert len(restarted.history) == 21
         assert restarted.history.window_root() == rp.history.window_root()
 
     def test_fuller_signature_set_upgrades_the_file(self, cfg_root):

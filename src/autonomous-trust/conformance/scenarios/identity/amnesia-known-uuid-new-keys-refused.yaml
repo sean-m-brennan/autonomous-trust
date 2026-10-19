@@ -1,0 +1,46 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: amnesia-known-uuid-new-keys-refused
+byte_pinning: false
+description: |
+    A request presents the UUID of a member of bg's group under
+    signing and encryption keys bg has never seen. Recognition requires the
+    recorded keys, so it is not readmitted. It is not proposed either: a known
+    UUID under new keys is refused outright and logged. C used to recognize a
+    member by UUID alone and encrypt the group key to whatever keys the
+    request carried.
+
+    See doc/architecture/identity-protocol.md, "Amnesia".
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: returning
+    role: new_node
+
+fixtures:
+  amnesia_member: true
+
+steps:
+  - id: 1
+    from: returning
+    to: broadcast
+    function: request_access
+    payload:
+      rekeyed: true
+    description: |
+        The member's UUID, with fresh keys.
+
+  - id: 2
+    from: bg
+    to: returning
+    function: full_history
+    in_response_to: 1
+    expect_none: true
+    description: |
+        No group key.
+
+expected_state:
+  bg:
+    propose_emitted: 0

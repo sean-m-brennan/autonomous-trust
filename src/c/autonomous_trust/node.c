@@ -24,13 +24,18 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/types.h>
+#ifndef _WIN32
 #include <sys/wait.h>
+#endif
+#include <pthread.h>
+#include <stdatomic.h>
 
 #include "node.h"
 #include "node_priv.h"
 #include "config/generate.h"
 #include "utilities/clock.h"
 #include "utilities/sighandler.h"
+#include "utilities/socket_helpers.h"  /* at_socket_close */
 #include "utilities/util.h"
 #include "processes/processes.h"   /* cadence */
 
@@ -119,7 +124,7 @@ int at_node_bind_inbound(at_node_t *node)
     const char *inbound = (node->config.q_in != NULL
                            && node->config.q_in[0] != '\0')
                               ? node->config.q_in : node->config.app_name;
-    if (messaging_init(inbound, &node->app_queue) != 0)
+    if (messaging_init_external(inbound, &node->app_queue) != 0)
     {
         log_exception(&node->log);
         log_error(&node->log,
@@ -129,7 +134,7 @@ int at_node_bind_inbound(at_node_t *node)
          * Closed here, not by messaging_qclose, which also unlinks the path —
          * on this path the name may well belong to whoever we lost the race to. */
         if (node->app_queue.fd >= 0)
-            close(node->app_queue.fd);
+            at_socket_close(node->app_queue.fd);
         node->app_queue.fd = -1;
         return -1;
     }
@@ -137,13 +142,55 @@ int at_node_bind_inbound(at_node_t *node)
     return 0;
 }
 
-int at_node_start(at_node_t *node)
+/* An in-process daemon (messaging_in_process()): run_autonomous_trust runs on
+ * this thread until shutdown instead of forking. One per process, since the
+ * stop flag it obeys (stop_process) is the process's. */
+static pthread_t g_daemon_thread;
+static atomic_bool g_daemon_running = false;
+
+static void *_daemon_thread_main(void *arg)
 {
-    /* Launch the AT daemon */
-    node->daemon_pid = run_autonomous_trust(
+    at_node_t *node = arg;
+    (void)run_autonomous_trust(
         (char *)node->config.q_out, (char *)node->config.q_in,
         node->config.capabilities, node->config.cap_len,
         node->config.log_level, (char *)node->config.log_file);
+    atomic_store(&g_daemon_running, false);
+    return NULL;
+}
+
+bool at_node_daemon_running(const at_node_t *node)
+{
+    if (node == NULL)
+        return false;
+    if (messaging_in_process())
+        return atomic_load(&g_daemon_running);
+#ifdef _WIN32
+    return false;
+#else
+    return kill(node->daemon_pid, 0) == 0;
+#endif
+}
+
+int at_node_start(at_node_t *node)
+{
+    /* Launch the AT daemon */
+    if (messaging_in_process())
+    {
+        atomic_store(&g_daemon_running, true);
+        if (pthread_create(&g_daemon_thread, NULL, _daemon_thread_main, node) != 0)
+        {
+            atomic_store(&g_daemon_running, false);
+            node->daemon_pid = -1;
+        }
+        else
+            node->daemon_pid = getpid();   /* the daemon is this process */
+    }
+    else
+        node->daemon_pid = run_autonomous_trust(
+            (char *)node->config.q_out, (char *)node->config.q_in,
+            node->config.capabilities, node->config.cap_len,
+            node->config.log_level, (char *)node->config.log_file);
 
     if (node->daemon_pid <= 0)
     {
@@ -192,23 +239,11 @@ int at_node_run(at_node_t *node, at_node_tick_fn tick, void *user_data)
         }
 
         /* Check daemon liveness */
-        if (node->daemon_alive)
+        if (node->daemon_alive && !at_node_daemon_running(node))
         {
-            int err = kill(node->daemon_pid, 0);
-            if (err == -1)
-            {
-                if (errno == ESRCH)
-                {
-                    log_info(&node->log, "AT daemon exited\n");
-                    stop_process = true;
-                    node->daemon_alive = false;
-                }
-                else
-                {
-                    SYS_EXCEPTION();
-                    log_exception(&node->log);
-                }
-            }
+            log_info(&node->log, "AT daemon exited\n");
+            stop_process = true;
+            node->daemon_alive = false;
         }
 
         usleep(cadence);
@@ -219,6 +254,31 @@ int at_node_run(at_node_t *node, at_node_tick_fn tick, void *user_data)
 
 void at_node_shutdown(at_node_t *node)
 {
+    if (node->daemon_alive && messaging_in_process())
+    {
+        /* The daemon loop watches the same flag a SIGINT would have set. */
+        stop_process = true;
+        const int step_ms = 50;
+        int waited_ms = 0;
+        while (atomic_load(&g_daemon_running) && waited_ms < AT_DAEMON_EXIT_TIMEOUT_MS)
+        {
+            usleep(step_ms * 1000);
+            waited_ms += step_ms;
+        }
+        if (atomic_load(&g_daemon_running))
+        {
+            log_error(&node->log, "AT daemon thread has not stopped %d ms after the stop; "
+                      "it ends with the process\n", AT_DAEMON_EXIT_TIMEOUT_MS);
+            (void)pthread_detach(g_daemon_thread);
+        }
+        else
+        {
+            (void)pthread_join(g_daemon_thread, NULL);
+            log_info(&node->log, "AT daemon stopped after %d ms\n", waited_ms);
+        }
+        node->daemon_alive = false;
+    }
+#ifndef _WIN32
     if (node->daemon_alive)
     {
         log_info(&node->log, "Sending SIGINT to AT daemon (PID %d)\n",
@@ -272,6 +332,7 @@ void at_node_shutdown(at_node_t *node)
         }
         node->daemon_alive = false;
     }
+#endif
     log_info(&node->log, "%s exiting\n", node->config.app_name);
 }
 

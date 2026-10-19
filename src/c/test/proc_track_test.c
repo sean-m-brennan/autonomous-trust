@@ -74,7 +74,7 @@ DEFINE_TEST(test_process_tracker_read_config)
 
     FILE *f = fopen(filename, "w");
     ck_assert_ptr_nonnull(f);
-    ck_assert_ret_nonzero(fputs(config, f));
+    ck_assert(fputs(config, f) >= 0);   /* non-negative is success (UCRT returns 0) */
     fclose(f);
 
     logger_t logger;

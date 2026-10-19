@@ -39,12 +39,3 @@ bool fleet_check_reputation_threshold(double peer_reputation, double min_thresho
 {
     return peer_reputation >= min_threshold;
 }
-
-bool fleet_should_accept_proposal(const update_proposal_t *prop,
-                                  const uint8_t *signer_pk,
-                                  double proposer_reputation)
-{
-    if (!fleet_validate_proposal(prop, signer_pk))
-        return false;
-    return fleet_check_reputation_threshold(proposer_reputation, prop->min_proposer_reputation);
-}

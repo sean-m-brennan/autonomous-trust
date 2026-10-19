@@ -14,14 +14,14 @@
  *   limitations under the License.
  *******************/
 
-/** @file A half in a group that places its order has no round of its own
- *  (doc/architecture/reputation.md, "Agreeing on an order").
+/** @file A half has no round of its own (doc/architecture/reputation.md,
+ *  "Agreeing on an order").
  *
- *  Where its entry lands is decided by placement, so the proposer skips `ask
- *  permission` and sends its `transaction` at once, naming the group and
- *  asking to be certified. An acceptor in such a group signs it without having
- *  granted it; one in a group that does not place its order still needs the
- *  grant, which is what orders that chain. Mirrors
+ *  Where its entry lands is decided by placement, so the proposer sends its
+ *  `transaction` at once, naming the group and asking to be certified, and an
+ *  acceptor signs it without a grant. A proposal that does neither is from a
+ *  build that still ran the half round, and so are the half round's own verbs
+ *  (retired 2026-10-16): nothing answers them. Mirrors
  *  tests/a_unit/test_placement_halves.py.
  */
 
@@ -50,9 +50,9 @@
 
 static char TX_FN[] = "transaction";
 
-/* What this node sent: how many of each, and the last transaction and
- * acceptance. */
-static int g_asks, g_txs, g_accepts;
+/* What this node sent: how many of each (g_sent: anything at all), and the
+ * last transaction and acceptance. */
+static int g_asks, g_txs, g_accepts, g_sent;
 static json_t *g_tx, *g_accepted;
 
 static int _capture_hook(const char *key, const message_type_t type,
@@ -64,7 +64,8 @@ static int _capture_hook(const char *key, const message_type_t type,
         return 0;
     const char *fn = msg->info.net_msg.function;
     json_t **slot = NULL;
-    if (strcmp(fn, "ask permission") == 0)
+    g_sent++;
+    if (strcmp(fn, "ask permission") == 0)   /* a retired verb */
         g_asks++;
     else if (strcmp(fn, "transaction") == 0)
     {
@@ -95,13 +96,12 @@ static identity_t *_mk_identity(const char *name, const char *addr)
 
 static identity_t *me, *p[3];
 
-/* This node, rostered with p[0..2], in a group that does or does not place
- * its order. */
-static process_t *_begin(bool placing)
+/* This node, rostered with p[0..2]. */
+static process_t *_begin(void)
 {
     reputation_reset_state(3);
     messaging_set_test_hook(_capture_hook);
-    g_asks = g_txs = g_accepts = 0;
+    g_asks = g_txs = g_accepts = g_sent = 0;
     g_tx = g_accepted = NULL;
     me = _mk_identity("me", "10.0.0.1");
     p[0] = _mk_identity("p0", "10.0.0.2");
@@ -112,8 +112,6 @@ static process_t *_begin(bool placing)
     pthread_rwlock_init(&proc->protocol.peers_rwlock, NULL);
     strncpy(proc->name, "reputation", PROC_NAME_LEN);
     proc->protocol.phase = 1;
-    proc->protocol.group.ordered_placement = placing;
-    proc->protocol.group.commit_certificates = true;
     uuid_generate(proc->protocol.group.uuid);
     config_t *id_cfg = calloc(1, sizeof(config_t));
     ck_assert_ptr_nonnull(id_cfg);
@@ -186,7 +184,7 @@ static void _propose(process_t *proc)
 
 DEFINE_TEST(test_a_placing_proposer_sends_its_half_without_asking)
 {
-    process_t *proc = _begin(true);
+    process_t *proc = _begin();
     _propose(proc);
     ck_assert_int_eq(g_asks, 0);
     ck_assert_int_eq(g_txs, 3);                  /* one to each member */
@@ -199,19 +197,9 @@ DEFINE_TEST(test_a_placing_proposer_sends_its_half_without_asking)
 }
 END_TEST_DEFINITION()
 
-DEFINE_TEST(test_a_proposer_whose_group_does_not_place_still_asks)
-{
-    process_t *proc = _begin(false);
-    _propose(proc);
-    ck_assert_int_eq(g_asks, 3);
-    ck_assert_int_eq(g_txs, 0);
-    _end();
-}
-END_TEST_DEFINITION()
-
 DEFINE_TEST(test_a_placing_acceptor_signs_a_half_it_never_granted)
 {
-    process_t *proc = _begin(true);
+    process_t *proc = _begin();
     _offer(proc, true, true);
     ck_assert_int_eq(g_accepts, 1);
     ck_assert_ptr_nonnull(g_accepted);
@@ -222,7 +210,7 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_unless_it_asks_to_be_certified_or_names_no_group)
 {
-    process_t *proc = _begin(true);
+    process_t *proc = _begin();
     _offer(proc, false, true);
     _offer(proc, true, false);
     ck_assert_int_eq(g_accepts, 0);
@@ -230,18 +218,39 @@ DEFINE_TEST(test_unless_it_asks_to_be_certified_or_names_no_group)
 }
 END_TEST_DEFINITION()
 
-DEFINE_TEST(test_where_order_is_not_placed_the_grant_is_still_needed)
+/* A node on a build from before every group placed its order asks for the
+ * floor: nothing answers it, whichever of the retired verbs it sends. */
+DEFINE_TEST(test_a_retired_verb_gets_no_answer)
 {
-    process_t *proc = _begin(false);
-    _offer(proc, true, true);
-    ck_assert_int_eq(g_accepts, 0);
+    process_t *proc = _begin();
+    static char retired[][24] = { "ask permission", "permission granted",
+                                  "try again", "out of date" };
+    char by[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(p[0]->uuid, by);
+    for (size_t i = 0; i < sizeof(retired) / sizeof(retired[0]); i++)
+    {
+        json_t *ask = json_pack("{s:I, s:I, s:s}", "id1", (json_int_t)1,
+                                "id2", (json_int_t)1, "peer_uuid", by);
+        public_identity_t *pub = NULL;
+        ck_assert_ret_ok(identity_publish(p[0], &pub));
+        generic_msg_t msg = {0};
+        msg.type = NET_MESSAGE;
+        strncpy(msg.info.net_msg.process, "reputation", PROC_NAME_LEN);
+        msg.info.net_msg.function = retired[i];
+        msg.info.net_msg.verified = true;
+        memcpy(&msg.info.net_msg.from_whom, pub, sizeof(public_identity_t));
+        ck_assert_ret_ok(net_msg_pack_json(&msg.info.net_msg, ask));
+        ck_assert(run_message_handlers(proc, NULL, NET_MESSAGE, &msg));
+        smrt_deref(pub);
+        json_decref(ask);
+    }
+    ck_assert_int_eq(g_sent, 0);
     _end();
 }
 END_TEST_DEFINITION()
 
 RUN_TESTS(RepPlaceHalves,
           test_a_placing_proposer_sends_its_half_without_asking,
-          test_a_proposer_whose_group_does_not_place_still_asks,
           test_a_placing_acceptor_signs_a_half_it_never_granted,
           test_unless_it_asks_to_be_certified_or_names_no_group,
-          test_where_order_is_not_placed_the_grant_is_still_needed)
+          test_a_retired_verb_gets_no_answer)

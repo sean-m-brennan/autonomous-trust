@@ -21,7 +21,6 @@ participants:
     role: member
 
 fixtures:
-  ordered_placement: true
   place_promised:
     bob: {n: 9, by: carol}
 

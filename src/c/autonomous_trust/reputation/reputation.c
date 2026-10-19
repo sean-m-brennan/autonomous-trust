@@ -22,6 +22,7 @@
 #include <ctype.h>
 #include <sodium.h>
 
+#include "utilities/portable.h"  /* uuid_generate_sha1 / st_mtim on Darwin */
 #include "reputation/reputation.h"
 #include "structures/map.h"
 #include "utilities/at_jansson.h"

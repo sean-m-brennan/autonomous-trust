@@ -39,7 +39,8 @@ from autonomous_trust.core.reputation.reputation import (
     AttestedScore, Checkpoint, SignedAttestation, Transaction,
     TransactionHistory, attest_task_id, consensus_score_from_window,
     SignedCheckpoint, attested_record, evidence_attest_certs,
-    evidence_from_dict, evidence_to_dict, load_anchor, verify_attested_record)
+    evidence_from_dict, evidence_to_dict, load_anchor, placement_entry,
+    verify_attested_record)
 from autonomous_trust.core.system import CfgIds
 from unittest.mock import MagicMock
 
@@ -141,7 +142,8 @@ class TestRound:
         propose = [m for m in _sent(vq)
                    if m.function == ReputationProtocol.attest_propose]
         assert len(propose) == 1
-        assert len(ver.history) == 0, 'nothing commits before the quorum'
+        assert ver.history.pooled_count() == 0, \
+            'nothing commits before the quorum'
 
         att = _att(v, s)
         obs.handle_attest_propose(oq, _msg(ReputationProtocol.attest_propose,
@@ -152,7 +154,8 @@ class TestRound:
 
         ver.handle_attest_sign(vq, _msg(ReputationProtocol.attest_sign,
                                         from_json_string_obj(signs[0].obj), o))
-        assert len(ver.history) == 1
+        # Certified: it waits in the pool to be placed.
+        assert ver.history.pooled_count() == 1
         finals = [m for m in _sent(vq)
                   if m.function == ReputationProtocol.attest_final]
         assert len(finals) == 1
@@ -162,10 +165,10 @@ class TestRound:
             else from_json_string_obj(finals[0].obj)
         subj.handle_attest_final(sq, _msg(ReputationProtocol.attest_final,
                                           signed, v))
-        assert len(subj.history) == 1
-        tx = list(subj.history)[0]
+        assert subj.history.pooled_count() == 1
+        tx = next(iter(subj.history._pool.values()))
         assert tx.attested and str(tx.subject_id) == str(s.uuid)
-        assert subj.history.attest_certs[tx.task_id]
+        assert tx.attest_sigs
 
     def test_a_member_declines_a_verifier_below_the_floor(self, trio):
         v, s, o = trio
@@ -238,22 +241,24 @@ class TestChain:
         assert not rp._chain_certified([changed], msg)
 
     def test_a_fork_cannot_take_a_certified_entry_away(self, trio):
+        """A certified placement that forks at our attested entry drops it
+        from the chain and puts it back in the pool, certificate and all, to
+        be placed again."""
         v, s, o = trio
         rp, _ = _node(o, [v, s])
         att = _att(v, s)
         sigs = {str(v.uuid): _sig(v, att), str(o.uuid): _sig(o, att)}
-        assert rp.history.append_attested(att.to_transaction(), sigs)
-        # A peer's longer chain that forks at index 0 and never saw it.
+        tx = att.to_transaction()
+        tx.attest_sigs = dict(sigs)
+        assert rp.history.apply_placed(0, [placement_entry(tx)]) == 'applied'
+        # A peer's certified chain that forks at index 0 and never saw it.
         peer = TransactionHistory()
-        for _ in range(2):
-            t = uuid4()
-            peer.update(t, v.uuid, 0.9)
-            peer.update(t, s.uuid, 0.9)
-        res = rp.history.reconcile(list(peer))
+        peer.apply_placed(0, [placement_entry(Transaction(
+            uuid4(), v.uuid, 0.9, s.uuid, 0.9)) for _ in range(2)])
+        res = rp.history.reconcile(list(peer), certified={0, 1})
         assert res.status == 'adopted'
         assert att.task_id not in rp.history._task_mapping
-        rp._reappend_attested(res)
-        assert att.task_id in rp.history._task_mapping
+        assert rp.history.pooled(att.task_id).attest_sigs == sigs
         assert rp.history.verify_links()
 
     def test_it_is_about_its_subject_and_not_its_verifier(self, trio):
@@ -475,6 +480,41 @@ class TestArchive:
             str(v.uuid): ReputationProcess._detached_sig(v, good.designation)}
         rp._archive_attested('')
         assert verify_attested_record(json.loads(path.read_text()))[0]
+
+    def test_the_group_size_is_the_one_the_certificate_was_made_in(
+            self, trio, tmp_path, monkeypatch):
+        """Stele red team rt-3765724, phase 7b: a member that joined late
+        archived history certified by a group of four with the group size it
+        saw itself, five, and its own records then failed their quorum. The
+        record carries the roster in force at the entry's index (AT §2.48).
+        Mirrors rep_archive_test.c."""
+        from nacl.encoding import HexEncoder
+        from autonomous_trust.core.config import Configuration
+        from autonomous_trust.core.reputation.reputation import (
+            roster_digest, roster_task_id)
+        monkeypatch.setattr(Configuration, 'get_cfg_dir',
+                            staticmethod(lambda: str(tmp_path)))
+        v, s, o = trio
+        x, late = _ident('x', 4), _ident('late', 5)
+        rp, _ = _node(o, [v, s, x, late])        # today: five members
+        members = [[str(i.uuid), i.signature.public.encode(
+            encoder=HexEncoder).decode()] for i in (v, s, o, x)]
+        d = roster_digest(members)
+        rp.history.roster_anchor = Transaction(
+            roster_task_id(None, 'genesis', None, d), roster_op='genesis',
+            roster_digest=d, roster_members=members)   # then: four
+        att = _att(v, s)
+        assert rp.history.append_attested(
+            att.to_transaction(), {str(v.uuid): _sig(v, att), str(o.uuid): _sig(o, att)})
+        window = rp.history._indexed_window()
+        ck = Checkpoint(proposer_uuid=o.uuid, root=rp.history.window_root(),
+                        epoch=1, first_index=window[0].index, count=len(window))
+        rp._store_checkpoint(ck, {str(m.uuid): ReputationProcess._detached_sig(
+            m, ck.designation) for m in (o, v, x)})
+        rec = json.loads((tmp_path / 'attested' / ('%s.json' % att.task_id))
+                         .read_text())
+        assert rec['group_size'] == 4
+        assert verify_attested_record(rec) == (True, [])
 
     def test_it_is_written_once_and_outlives_the_window(self, trio, tmp_path,
                                                          monkeypatch):
@@ -714,7 +754,7 @@ class TestReproposal:
                 if m.function == ReputationProtocol.attest_sign][0]
         ver.handle_attest_sign(vq, _msg(ReputationProtocol.attest_sign,
                                         from_json_string_obj(sign.obj), o))
-        assert len(ver.history) == 1
+        assert ver.history.pooled_count() == 1
         _sent(vq)
         assert ver._retry_pending_attestations(vq, _later(ver, 1)) == 0
         assert _proposes(vq) == []
@@ -723,7 +763,8 @@ class TestReproposal:
         v, s, o = trio
         ver, vq = self._proposed(trio)
         att = list(ver._attest_pending.values())[0]
-        # Certified elsewhere, and its final reached us first.
+        # Certified elsewhere, and its final reached us first: it waits in
+        # the pool.
         ver._commit_attestation(att, {str(v.uuid): _sig(v, att),
                                       str(o.uuid): _sig(o, att)})
         assert ver._retry_pending_attestations(vq, _later(ver, 1)) == 0

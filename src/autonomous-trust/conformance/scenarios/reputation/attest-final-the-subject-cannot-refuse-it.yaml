@@ -11,6 +11,9 @@ description: |
     quorum in carol's view too, so her chain holds the entry like everyone
     else's. The subject cannot block an attested score by declining to take it.
 
+    A committed attestation waits in the pool for its placement, as every
+    entry does now that every group places its order.
+
 participants:
   - id: alice
     role: verifier
@@ -32,4 +35,5 @@ steps:
 
 expected_state:
   carol:
-    committed_tx_count: 1
+    committed_tx_count: 0
+    pool_count: 1

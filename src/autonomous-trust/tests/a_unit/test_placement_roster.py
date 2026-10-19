@@ -206,7 +206,6 @@ class TestJudgedByRoster:
         ada, dee, amy, bob = (_ident('ada', 1), _ident('dee', 2),
                               _ident('amy', 3), _ident('bob', 4))
         rp, q = _node(ada, [dee, amy, bob])
-        rp.protocol.group.ordered_placement = True
         roster = _roster_of(roster_idents or [ada, dee, amy])
         assert rp.history.apply_placed(0, [roster]) == 'applied'
         t = uuid4()
@@ -246,7 +245,6 @@ class TestJudgedByRoster:
         rp, (ada, dee, amy, bob), entries, _desig = self._setup()
         gone = _ident('gone', 9)
         rp3, _q = _node(ada, [dee, amy])
-        rp3.protocol.group.ordered_placement = True
         rp3.history.apply_placed(0, [_roster_of([ada, dee, gone])])
         desig = place_designation(1, rp3.history.head_hash,
                                   place_value_digest(entries, 1))
@@ -270,7 +268,6 @@ class TestRosterValue:
         me = _ident('me', 1)
         others = [_ident('o%d' % i, i + 2) for i in range(peers)]
         rp, _q = _node(me, others)
-        rp.protocol.group.ordered_placement = True
         if roster:
             rp.history.apply_placed(0, [_roster_of([me] + others[:2])])
         return rp, me, others
@@ -372,7 +369,6 @@ class TestAnchor:
                                    p2_score=0.8), [a, b])
         _place(src, 2, _add_of(src, d), [a, b])
         rp, _q = _node(d, [a, b, c])
-        rp.protocol.group.ordered_placement = True
         return rp, src, (a, b, c, d)
 
     MSG = SimpleNamespace(from_whom=SimpleNamespace(nickname='a'))
@@ -407,7 +403,6 @@ class TestBeforeTheRoster:
     def _node(self, tmp_path):
         me, a, b = _ident('me', 1), _ident('a', 2), _ident('b', 3)
         rp, _q = _node(me, [a, b])
-        rp.protocol.group.ordered_placement = True
         rp._placement_path = lambda key: str(tmp_path / ('placement-%s' % (key or 'p')))
         rp._pool_path = lambda key: str(tmp_path / ('pool-%s' % (key or 'p')))
         return rp, (me, a, b)

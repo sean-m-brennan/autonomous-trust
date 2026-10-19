@@ -117,7 +117,10 @@ class IdentityHistory(StepDAG, VoterTracker):
     def timeout(self):
         return self._timeout
 
-    def insert_peer(self, who, level=None):
+    def insert_peer(self, who, level=None, promoted=False):
+        """Record an admitted peer. ``promoted`` is a peer already in the peer
+        list that the vote has just admitted (a first-contact contact): it is
+        recorded although ``Peers`` holds it."""
         if who.uuid is None or not who.nickname or who.signature is None:
             self.logger.warning('Rejecting peer with incomplete identity')
             return
@@ -125,7 +128,7 @@ class IdentityHistory(StepDAG, VoterTracker):
         if existing is not None:
             self.logger.warning('Peer %s already in history', who.nickname)
             return
-        if who not in self._peers.all:
+        if promoted or who not in self._peers.all:
             self._merkle.insert(IdentityObj(who, self._merkle.root_digest))
             self.add_step(LinkedStep(self._merkle.root_digest))
         self._peers.add(who, level)

@@ -1,0 +1,62 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: amnesia-moved-address-readmitted
+byte_pinning: false
+description: |
+    A member of bg's group, with the keys bg knows it by,
+    returns from a new address (a new DHCP lease, another network). Address
+    is not part of recognition, so it is readmitted without a vote, and bg's
+    group records the new address. Python used to compare the address too, so
+    a moved member missed the branch and was refused by duplicate detection.
+
+    See doc/architecture/identity-protocol.md, "Amnesia".
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: returning
+    role: new_node
+
+fixtures:
+  amnesia_member: true
+
+steps:
+  - id: 1
+    from: returning
+    to: broadcast
+    function: request_access
+    payload:
+      address: 10.0.77.9
+    description: |
+        The member re-announces from 10.0.77.9.
+
+  - id: 2
+    from: bg
+    to: broadcast
+    function: peer_accepted
+    in_response_to: 1
+    description: |
+        bg confirms it to the group.
+
+  - id: 3
+    from: bg
+    to: returning
+    function: access_granted
+    in_response_to: 1
+    description: |
+        bg's identity, in the open.
+
+  - id: 4
+    from: bg
+    to: returning
+    function: full_history
+    in_response_to: 1
+    description: |
+        The group key and history, encrypted to the keys bg knows it by.
+
+expected_state:
+  bg:
+    propose_emitted: 0
+    member_address:
+      returning: 10.0.77.9

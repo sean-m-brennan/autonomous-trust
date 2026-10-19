@@ -1336,9 +1336,9 @@ class TestProposerHistoryBilateral:
         stub._chain_for_group = lambda g: history
         stub._note_interaction = lambda *a, **k: None
         stub._fold_committed_tx = lambda *a, **k: None
-        # A group that does not declare commit certificates (the default).
-        stub._commit_certs_required = lambda g=None: False
-        stub._ordered_placement = lambda g=None: False
+        # A stand-in certificate passes: certificates are
+        # test_commit_certificates'.
+        stub._commit_cert_ok = lambda *a, **k: True
         stub._record_committed_half = lambda *a: \
             ReputationProcess._record_committed_half(stub, *a)
         stub.identity = SimpleNamespace(uuid=self_id)
@@ -1351,13 +1351,13 @@ class TestProposerHistoryBilateral:
         # §2.16, shape 2), so it comes from the proposer it names.
         msg = SimpleNamespace(
             function=ReputationProtocol.committed,
-            obj=to_json_string((task, peer_id, 0.7)),
+            obj=to_json_string((task, peer_id, 0.7, None, None, {'s': 'ab'})),
             verified=True, from_whom=SimpleNamespace(uuid=peer_id, nickname='p'),
         )
         ReputationProcess.handle_committed(stub, {}, msg)
 
-        # Acceptor wrote the proposer's entry.
-        tx = history[task]
+        # Acceptor pooled the proposer's half, to be placed.
+        tx = history.pooled(task)
         assert tx.p1_id == peer_id
         assert tx.p1_score == pytest.approx(0.7)
         assert tx.p2_id is None  # only the proposer's slot is filled
@@ -1366,19 +1366,19 @@ class TestProposerHistoryBilateral:
         # avoid double-write (handle_accepted already wrote it).
         msg_self = SimpleNamespace(
             function=ReputationProtocol.committed,
-            obj=to_json_string((task, self_id, 0.9)),
+            obj=to_json_string((task, self_id, 0.9, None, None, {'s': 'ab'})),
             verified=True, from_whom=SimpleNamespace(uuid=self_id, nickname='s'),
         )
         ReputationProcess.handle_committed(stub, {}, msg_self)
         # Re-fetch; p2 must still be empty.
-        tx = history[task]
+        tx = history.pooled(task)
         assert tx.p2_id is None
 
     def test_bilateral_via_two_commits(self):
-        """Putting the two halves together: a proposer's own
-        handle_accepted writes their entry; the peer's committed
-        broadcast then fills the second slot.  This is the path
-        CTFT relies on for non-default scoring."""
+        """Putting the two halves together in the pool: a proposer's own
+        handle_accepted pools its half; the peer's committed broadcast then
+        fills the second slot, and the entry is ready to be placed. This is
+        the path CTFT relies on for non-default scoring."""
         from autonomous_trust.core.reputation.protocol import (
             ReputationProtocol,
         )
@@ -1388,11 +1388,11 @@ class TestProposerHistoryBilateral:
         history = TransactionHistory()
         task = uuid4()
 
-        # 1. Self's handle_accepted reaches majority — writes
-        #    (task, self, 0.9) directly.  We simulate that with a
-        #    plain history.update.
-        history.update(task, self_id, 0.9)
-        assert {history[task].p1_id, history[task].p2_id} == {self_id, None}
+        # 1. Self's handle_accepted reaches majority -- pools
+        #    (task, self, 0.9).  We simulate that with record_half.
+        history.record_half(task, self_id, 0.9)
+        assert {history.pooled(task).p1_id,
+                history.pooled(task).p2_id} == {self_id, None}
 
         # 2. Peer's committed broadcast arrives.  Our handle_committed
         #    fills the second slot.
@@ -1402,8 +1402,7 @@ class TestProposerHistoryBilateral:
             _chain_for_group=lambda g: history,
             _note_interaction=lambda *a, **k: None,
             _fold_committed_tx=lambda *a, **k: None,
-            _commit_certs_required=lambda g=None: False,
-            _ordered_placement=lambda g=None: False,
+            _commit_cert_ok=lambda *a, **k: True,
             identity=SimpleNamespace(uuid=self_id),
             logger=SimpleNamespace(
                 warning=lambda *a, **k: None, debug=lambda *a, **k: None,
@@ -1413,12 +1412,12 @@ class TestProposerHistoryBilateral:
             ReputationProcess._record_committed_half(stub, *a)
         msg = SimpleNamespace(
             function=ReputationProtocol.committed,
-            obj=to_json_string((task, peer_id, 0.3)),
+            obj=to_json_string((task, peer_id, 0.3, None, None, {'s': 'ab'})),
             verified=True, from_whom=SimpleNamespace(uuid=peer_id, nickname='p'),
         )
         ReputationProcess.handle_committed(stub, {}, msg)
 
-        tx = history[task]
+        tx = history.pooled(task)
         assert {tx.p1_id, tx.p2_id} == {self_id, peer_id}
 
     def test_forward_transaction_does_not_write_history(self):

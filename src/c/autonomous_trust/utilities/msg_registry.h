@@ -95,6 +95,12 @@ typedef struct {
     /** True iff the main process forwards this type, when it drains it from
      *  its own queue, to the attached app's queue. */
     bool app_bound;
+    /** True iff the app's roster pull (AT_APP_ROSTER_REQUEST) re-emits the
+     *  current view of this type. Such an event is state: while no app is
+     *  attached it is counted and dropped, since the next roster pull brings
+     *  it back. Every other app-bound type is a one-time event and is held
+     *  until an app attaches (autonomous_trust.c). */
+    bool app_replayed;
 } at_msg_vtable_t;
 
 /**

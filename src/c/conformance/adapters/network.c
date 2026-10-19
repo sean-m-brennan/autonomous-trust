@@ -32,6 +32,7 @@
 #include "identity/identity_priv.h"
 #include "network/network.h"
 #include "network/net_message.h"
+#include "network/net_proc_priv.h"
 #ifdef AT_RENDEZVOUS_ENABLED   /* libat_rendezvous is built */
 #include "rendezvous/net_relay_rosters.h"
 #endif
@@ -2699,6 +2700,47 @@ static int run_gateway_boundary_verbs(const at_case_t *c,
     return 0;
 }
 
+/* What an inbound frame may carry, by its path (scenario `wire-verb-policy`,
+ * ISSUES §2.17): each fixture case asked of net_wire_verb_admitted. Mirrors
+ * Python _run_wire_verb_policy. */
+static int run_wire_verb_policy(const at_case_t *c, char *err, size_t err_len) {
+    json_t *cases = json_object_get(json_object_get(c->data, "fixtures"), "cases");
+    if (!json_is_array(cases) || json_array_size(cases) == 0) {
+        snprintf(err, err_len, "scenario: fixtures.cases missing or empty");
+        return -1;
+    }
+    static const struct { const char *name; net_route_path_t path; } paths[] = {
+        { "peer", NET_PATH_PEER },
+        { "stranger-plaintext", NET_PATH_STRANGER },
+        { "relayed-stranger", NET_PATH_RELAY_STRANGER },
+        { "broadcast", NET_PATH_BROADCAST },
+        { "group", NET_PATH_GROUP },
+    };
+    bool all = true;
+    size_t i;
+    json_t *one;
+    json_array_foreach(cases, i, one) {
+        const char *proc = json_string_value(json_object_get(one, "process"));
+        const char *fn = json_string_value(json_object_get(one, "function"));
+        const char *pname = json_string_value(json_object_get(one, "path"));
+        bool want = json_is_true(json_object_get(one, "admitted"));
+        int found = -1;
+        for (size_t k = 0; pname != NULL && k < sizeof(paths) / sizeof(paths[0]); k++)
+            if (strcmp(pname, paths[k].name) == 0)
+                found = (int)k;
+        if (found < 0) {
+            snprintf(err, err_len, "scenario: unknown path '%s'", pname ? pname : "");
+            return -1;
+        }
+        if (net_wire_verb_admitted(proc, fn, paths[found].path, NULL) != want) {
+            fprintf(stderr, "wire-verb-policy mismatch: %s.%s on %s\n",
+                    proc ? proc : "?", fn ? fn : "?", pname);
+            all = false;
+        }
+    }
+    return expect_flag(c, "node", "all_cases_match", all, err, err_len) != 0 ? -1 : 0;
+}
+
 /* The plaintext allowlist (scenario `unencrypted-verbs`).
  *
  * Pins the membership AND the size of the set a receiver accepts unencrypted
@@ -3266,6 +3308,9 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
     }
     if (strcmp(c->name, "gateway-boundary-verbs") == 0) {
         return run_gateway_boundary_verbs(c, err, err_len);
+    }
+    if (strcmp(c->name, "wire-verb-policy") == 0) {
+        return run_wire_verb_policy(c, err, err_len);
     }
     if (strcmp(c->name, "unencrypted-verbs") == 0) {
         return run_unencrypted_verbs(c, err, err_len);

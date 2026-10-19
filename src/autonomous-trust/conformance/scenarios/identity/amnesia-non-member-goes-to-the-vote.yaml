@@ -1,0 +1,43 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: amnesia-non-member-goes-to-the-vote
+byte_pinning: false
+description: |
+    Without an admission authority: a peer of bg that is not a
+    member of its group, presenting the keys bg knows it by, asks for access.
+    It is not readmitted on recognition: bg proposes it to the group, as it
+    would any newcomer. (Alone in its group, bg then admits it on its own
+    vote; what this pins is that the request reached the vote.)
+
+    See doc/architecture/identity-protocol.md, "Amnesia".
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: contact
+    role: new_node
+
+fixtures:
+  # In bg's peer list, not in its group address map.
+  amnesia_known: true
+
+steps:
+  - id: 1
+    from: contact
+    to: broadcast
+    function: request_access
+    description: |
+        The non-member peer asks for access.
+
+  - id: 2
+    from: bg
+    to: broadcast
+    function: propose_peer
+    in_response_to: 1
+    description: |
+        bg proposes it to the group: the vote path, not the amnesia branch.
+
+expected_state:
+  bg:
+    propose_emitted: 1

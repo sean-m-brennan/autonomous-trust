@@ -87,6 +87,7 @@ static int tcp_send_to(const uint8_t *msg, size_t msg_len,
     int sock = socket(ipv6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
     if (sock == -1)
         return SYS_EXCEPTION();
+    (void)at_socket_nosigpipe(sock);
 
     /* Connect FROM the address peers know us by, else they cannot attribute the
      * frame. stream=true so IP_BIND_ADDRESS_NO_PORT defers port selection to
@@ -101,7 +102,7 @@ static int tcp_send_to(const uint8_t *msg, size_t msg_len,
         addr.sin6_family = AF_INET6;
         addr.sin6_port = htons(port);
         if (inet_pton(AF_INET6, host, &addr.sin6_addr) <= 0) {
-            close(sock);
+            at_socket_close(sock);
             return EXCEPTION(EINVAL);
         }
         err = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
@@ -110,13 +111,13 @@ static int tcp_send_to(const uint8_t *msg, size_t msg_len,
         addr.sin_family = AF_INET;
         addr.sin_port = htons(port);
         if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) {
-            close(sock);
+            at_socket_close(sock);
             return EXCEPTION(EINVAL);
         }
         err = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
     }
     if (err != 0) {
-        close(sock);
+        at_socket_close(sock);
         return EXCEPTION(ENET_SEND);
     }
 
@@ -125,7 +126,7 @@ static int tcp_send_to(const uint8_t *msg, size_t msg_len,
      * side is 1 MB, well under UINT32_MAX, so the cast is safe. */
     uint32_t hdr_be = htonl((uint32_t)msg_len);
     if (send_all(sock, &hdr_be, sizeof(hdr_be)) != 0) {
-        close(sock);
+        at_socket_close(sock);
         return EXCEPTION(ENET_SEND);
     }
 
@@ -136,13 +137,13 @@ static int tcp_send_to(const uint8_t *msg, size_t msg_len,
             chunk = TCP_CHUNK_SIZE;
         ssize_t sent = at_send_eintr(sock, msg + total_sent, chunk, 0);
         if (sent <= 0) {
-            close(sock);
+            at_socket_close(sock);
             return EXCEPTION(ENET_SEND);
         }
         total_sent += (size_t)sent;
     }
 
-    close(sock);
+    at_socket_close(sock);
     log_debug(logger, "TCP sent %zu bytes to %s:%d\n", total_sent, host, port);
     return 0;
 }
@@ -215,7 +216,7 @@ static int tcp_read_frame(int sock, uint8_t **buf_out, size_t *buf_len)
 static void tcp_conn_drop(net_transport_ctx_t *ctx, int slot)
 {
     if (ctx->live_conns[slot].fd >= 0)
-        close(ctx->live_conns[slot].fd);
+        at_socket_close(ctx->live_conns[slot].fd);
     ctx->live_conns[slot].fd = -1;
 }
 
@@ -329,6 +330,7 @@ static int tcp_accept_new(net_transport_ctx_t *ctx, net_channel_t channel,
             return ENOMSG;
         return SYS_EXCEPTION();
     }
+    (void)at_socket_nosigpipe(client);
 
     /* Cap live connections, so a peer opening many cannot exhaust our
      * descriptors. Mirrors Python's max_conns drop in _accept_loop. */
@@ -343,7 +345,7 @@ static int tcp_accept_new(net_transport_ctx_t *ctx, net_channel_t channel,
         log_warn(ctx->logger,
                  "TCP: refusing connection from %s -- already holding %d "
                  "(AT_NET_MAX_CONNS)\n", from_addr, ctx->max_live_conns);
-        close(client);
+        at_socket_close(client);
         return ENOMSG;
     }
 
@@ -355,7 +357,7 @@ static int tcp_accept_new(net_transport_ctx_t *ctx, net_channel_t channel,
     if (err != 0) {
         if (err != ENOTCONN && err != ENOMSG)
             log_debug(ctx->logger, "TCP: first frame from %s failed\n", from_addr);
-        close(client);
+        at_socket_close(client);
         return ENOMSG;
     }
 
@@ -449,8 +451,8 @@ static int tcp_open_common(net_transport_ctx_t **out_ctx,
     return 0;
 
 fail:
-    if (ctx->recv_ptp > 0) close(ctx->recv_ptp);
-    if (ctx->recv_grp > 0) close(ctx->recv_grp);
+    if (ctx->recv_ptp > 0) at_socket_close(ctx->recv_ptp);
+    if (ctx->recv_grp > 0) at_socket_close(ctx->recv_grp);
     free(ctx);
     return -1;
 }
@@ -515,8 +517,8 @@ static void tcp_close(net_transport_ctx_t *ctx)
     if (ctx == NULL) return;
     for (int i = 0; i < TCP_MAX_LIVE_CONNS; i++)
         tcp_conn_drop(ctx, i);
-    if (ctx->recv_ptp > 0) close(ctx->recv_ptp);
-    if (ctx->recv_grp > 0) close(ctx->recv_grp);
+    if (ctx->recv_ptp > 0) at_socket_close(ctx->recv_ptp);
+    if (ctx->recv_grp > 0) at_socket_close(ctx->recv_grp);
     free(ctx);
 }
 

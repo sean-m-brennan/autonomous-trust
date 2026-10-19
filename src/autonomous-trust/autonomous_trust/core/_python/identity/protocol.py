@@ -245,6 +245,17 @@ CORE_UNENCRYPTED_VERBS = frozenset({
 })
 
 
+#: The identity verbs sent with no recipient and no group multicast, so they go
+#: out on the broadcast (stranger/multicast) channel and are let in there beside
+#: the plaintext verbs (..plaintext_verbs.is_broadcast, ISSUES §2.17). Mirrors
+#: C's ID_BROADCAST_ONLY_VERBS one-for-one.
+BROADCAST_ONLY_VERBS = frozenset({
+    IdentityProtocol.update,             # group_key_update
+    IdentityProtocol.confirm,            # peer_accepted
+    IdentityProtocol.propose,            # propose_peer
+})
+
+
 if __name__ == '__main__':
     import napkin
 

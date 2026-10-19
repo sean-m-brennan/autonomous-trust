@@ -209,7 +209,7 @@ message_type_t string_to_message_type(const char *str)
 int signal_to_proto(const signal_t *msg, void **data_ptr, size_t *data_len_ptr)
 {
     char data_str[1024];
-    sprintf(data_str, "%d-%s", msg->sig, msg->descr);
+    snprintf(data_str, sizeof(data_str), "%d-%s", msg->sig, msg->descr);
     *data_len_ptr = strlen(data_str) + 1;
     *data_ptr = malloc(*data_len_ptr);
     if (*data_ptr == NULL)
@@ -260,7 +260,10 @@ int net_msg_unpack_json(const net_msg_t *msg, json_t **json)
     /* JSON_DECODE_ANY mirrors the JSON_ENCODE_ANY in net_msg_pack_json so a
      * scalar-root payload (the partition_signal from_addr) round-trips.
      * Object/array payloads decode identically. */
-    *json = json_loads((const char *)msg->obj, JSON_DECODE_ANY, &error);
+    /* Bounded by len, never by a terminator: obj is a buffer plus a length,
+     * and a copy that kept only len bytes (identity's held updates did) made
+     * the parse run on into whatever followed it on the heap. */
+    *json = json_loadb((const char *)msg->obj, msg->len, JSON_DECODE_ANY, &error);
     if (*json == NULL)
         return -1;
     return 0;

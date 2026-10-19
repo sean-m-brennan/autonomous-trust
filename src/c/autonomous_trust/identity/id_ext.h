@@ -126,6 +126,13 @@ typedef struct {
      *  accept. Asked by REPUTATION about a co-signer it has never admitted, so
      *  @p proc is the reputation process. */
     bool (*credential_anchored)(const process_t *proc, const public_identity_t *carried);
+
+    /** Whether @p uuid_str (lower-case) is someone the user recorded as a
+     *  contact (first contact). Duplicate detection lets such a peer,
+     *  presenting the keys it is known by, be voted on like any newcomer, which
+     *  is the one route by which a contact joins the cohort. NULL is a node
+     *  with no contacts. */
+    bool (*is_contact)(const process_t *proc, const char *uuid_str);
 } identity_ext_t;
 
 /** Register @p ext (static storage). @return 0; -1 NULL/unnamed/duplicate;
@@ -170,6 +177,7 @@ bool identity_ext_join_refused(const process_t *proc, const public_identity_t *n
 bool identity_ext_gateway_refused(const process_t *proc, const char *uuid_str);
 bool identity_ext_operator_credential(const process_t *proc, const public_identity_t *claim);
 bool identity_ext_credential_anchored(const process_t *proc, const public_identity_t *carried);
+bool identity_ext_is_contact(const process_t *proc, const char *uuid_str);
 
 /** Register @p ext at load time. */
 #define IDENTITY_EXT_REGISTER(tag, ext)                                        \

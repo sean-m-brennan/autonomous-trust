@@ -1,0 +1,50 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-scope-entry-canonical-bytes
+byte_pinning: false
+description: |
+    A scoped attestation's scope is part of the entry's canonical bytes, after
+    the evidence digest, and both runtimes hash it identically
+    (doc/architecture/reputation.md, "Verifier-attested scores").
+
+    bob holds the entry attest-scope-final-commits certifies -- alice's 0.3
+    about carol on `probe`, evidence digest ab..ab, scope aa..aa -- written
+    through the chain's own writer (TransactionHistory.append_attested /
+    tx_history_append_attested). The step (`update needed`) leaves bob's chain
+    as it is, so the pin is the window root over that one entry. A divergence
+    in where or how the scope is serialized changes it on one side only.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+fixtures:
+  tx_history:
+    bob:
+      - attested: true
+        p1: alice
+        p1_score: 0.3
+        p1_channel: probe
+        subject: carol
+        evidence_digest: "abababababababababababababababababababababababababababababababab"
+        attest_scope: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: update needed
+    payload: {}
+    description: |
+        A request that leaves bob's chain as it is, so the assertion reads the
+        staged entry.
+
+expected_state:
+  bob:
+    committed_tx_count: 1
+    window_root: "b7b52ae98619b4b85be8c6cd5a2f59c07996f199d479c34a327149a6de23db69"

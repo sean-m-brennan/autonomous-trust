@@ -64,10 +64,13 @@ void handle_signal(int signum)
     {
     case SIGINT:
     case SIGTERM:
+#ifdef SIGQUIT
     case SIGQUIT:
+#endif
     case SIGABRT:
         stop_process = true;
         break;
+#ifdef SIGHUP   /* Windows has none of these three */
     case SIGHUP:
         reread_configs();
         break;
@@ -77,6 +80,7 @@ void handle_signal(int signum)
     case SIGUSR2:
         user2_handler();
         break;
+#endif
     case SIGILL:
     {
         const char *error = "Stack Overflow";
@@ -103,10 +107,19 @@ void handle_signal(int signum)
 int init_sig_handling(logger_t *logger)
 {
     _logger = logger;
+#ifdef _WIN32
+    /* No sigaction; the CRT's signal() delivers Ctrl-C (SIGINT) and Ctrl-Break
+     * as SIGBREAK. The real stop a Windows node gets is its supervisor closing
+     * its stdin (agorad). */
+    if (signal(SIGINT, handle_signal) == SIG_ERR || signal(SIGTERM, handle_signal) == SIG_ERR)
+        return -1;
+    return 0;
+#else
     struct sigaction sa = {0};
     sa.sa_handler = handle_signal;
     int err = sigaction(SIGINT, &sa, NULL);
     if (err == 0)
         err = sigaction(SIGTERM, &sa, NULL);
     return err;
+#endif
 }
