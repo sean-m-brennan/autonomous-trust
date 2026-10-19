@@ -289,56 +289,92 @@ infrastructure (OCSP, CRL endpoints). Without mitigation, every DDIL-admitted
 peer stays capped at `ddil_fallback_reputation_cap` indefinitely, preventing the
 network from reaching full trust depth.
 
-Delegated verification solves this by turning the AT group itself into a
-distributed Policy Decision Point. When any peer in the group successfully
-verifies a credential against ZTA infrastructure, it broadcasts the result via
-`ZTA_PROTO_VERIFICATION`. Peers that could not verify independently accept the
-delegated result, but only from peers they trust.
+Delegated verification turns the AT group itself into a distributed Policy
+Decision Point. A member whose own re-verification proves a peer's credential
+tells the rest of the group (`zta_verified`, a *vouch*). A member whose own
+check finds a credential revoked tells them too (`zta_revoked`, an *alert*).
+Both runtimes send and act on both (ISSUES §2.20). The decisions live in one
+pure module per runtime, `zta_delegation.{h,c}` and `zta/delegation.py`, and
+the conformance scenarios `identity/zta-delegation-vouch` and
+`identity/zta-delegation-alert` pin every verdict on both sides.
 
-**Not wired yet.** The receive side below is written, and the send side never
-reaches a peer. `_broadcast_verification` puts its message on the local network
-process's queue, and the network process does not forward it, so no peer ever
-receives a vouch. A DDIL-admitted peer stays capped until this node's own
-re-verification proves it. The same holds for revocation alerts (§9). This
-section describes the design.
+### Who hears a finding
 
-### How it works
+The checks below apply to both verbs, in this order.
+
+1. **The sender is a member of this node's group** (its group address map).
+   The sender is the one the transport names. A finding carries no
+   voucher field, so a payload cannot speak for someone else.
+2. **The finding is about the credential this node recorded** for that peer.
+   The credential hash must match the one on the peer's record here. A
+   finding about a peer this node holds no credential for is ignored.
+3. **The status fits the verb**: a vouch says `VERIFIED`, an alert says
+   `REVOKED`.
+
+### Vouches
+
+A vouch counts only for a peer this node is waiting on: its own last check
+could not answer (`UNAVAILABLE`/`DEFERRED`, the DDIL case). It counts only from
+a member at or above `delegated_verification_min_reputation`. When
+`delegated_verification_quorum` distinct members have vouched, the peer's
+standing becomes `proved` and its DDIL ceiling lifts. This happens once.
+Further vouches are `settled`.
 
 1. Peer A admits Peer B in DDIL mode (reputation capped at 0.5).
-2. Peer C has OCSP connectivity and verifies B's credential during periodic re-verification. C broadcasts a `ZTA_VERIFICATION_RESULT` message identifying B as verified, signed with C's identity.
-3. Peer A receives C's verification. If the vouch is from an admitted group member (guaranteed by the encrypted channel), A records it.
-4. When the number of distinct vouching peers reaches `delegated_verification_quorum`, A lifts B's DDIL reputation cap. B can now earn reputation above 0.5.
+2. Peer C reaches the OCSP responder and proves B's credential during its
+   re-verification sweep. C sends `zta_verified` about B to every other member.
+3. A checks that C is a member, that the hash is B's recorded credential, and
+   that C's reputation is at or above the bar.
+4. At quorum, A publishes `proved` for B, and B can earn reputation above 0.5.
+
+A node vouches only for a peer whose credential it proved. A credential that
+chains but is not bound under `binding_mode: prefer` stays `capped` here and is
+not vouched for.
+
+### Alerts
+
+An alert is a hint, never a verdict. On receipt, this node re-checks the
+peer's credential with its own verifier at once and acts on its own answer:
+
+- `VERIFIED`: the alert changes nothing.
+- `REVOKED` or `REJECTED`: the peer's standing becomes `failed` under the full
+  `revocation_reputation_penalty`. `EXPIRED` costs half the penalty.
+- No answer (DDIL): the alert is counted, from members at or above the
+  reputation bar. At `delegated_verification_quorum` distinct alerters, the
+  peer is bounded `capped` at `ddil_fallback_reputation_cap` until this node's
+  own check settles it.
+
+The re-check is not gated on the sender's reputation. It costs one verifier
+lookup, and the answer is this node's own. Nothing rate-limits it yet.
+
+This node's own answer, from an alert's re-check or from the sweep, clears
+whatever vouches and alerts were counted for that peer.
 
 ### Trust gating
 
-Delegated verification is not blind trust in relay. The
-`delegated_verification_min_reputation` threshold (default 0.7) controls the
-minimum reputation a vouching peer must have for its verification to be
-accepted. The ZTA process queries the local reputation process via IPC
-(`local_rep_query`/`local_rep_response`) and caches scores with a 10-minute TTL.
-Vouches that arrive before the reputation of the voucher is cached are held in a
-pending queue and evaluated when the reputation response arrives. Two moves are
-prevented.
+Delegated verification does not trust whoever relays a finding. The
+`delegated_verification_min_reputation` threshold (default 0.7) sets the
+reputation a member needs before its vouch or its alert counts. The node asks
+its own reputation process (`local_rep_query` / `local_rep_response`, local
+IPC) and caches the answer for 10 minutes. A finding that arrives before the
+sender's reputation is known is held (32 at most) and offered again when the
+answer comes. A `local_rep_response` that arrives off the wire is refused in
+both runtimes. Before this, a member could forge one and set its own score past
+the bar. The bar prevents two attacks:
 
-- An attacker joining in DDIL mode and vouching for a confederate (the attacker's own reputation is too low).
-- A recently compromised peer whose reputation is degrading from issuing trusted vouches.
+- An attacker admitted in DDIL mode vouching for a confederate (the attacker's own reputation is too low).
+- A recently compromised peer issuing findings while its reputation degrades.
 
 The `delegated_verification_quorum` (default 1) can be raised for
-higher-assurance environments. With quorum 3, three independent peers must each
-verify the credential before the cap lifts. This provides Byzantine fault
-tolerance, since a single compromised verifier cannot unilaterally lift caps.
+higher-assurance environments. With quorum 3, three independent members must
+each prove the credential before the cap lifts, so a single compromised
+verifier cannot lift caps on its own.
 
 ### Audit trail
 
-Every delegated vouch is recorded in the audit log:
-
-- The initial vouch receipt (action: `"delegated_vouch"`)
-- The cap-lift event when quorum is met (action: `"delegated_cap_lift"`)
-- The resolution of the original deferred audit entry
-
-This provides a complete chain: "Peer B was admitted at T with deferred
-verification; Peer C vouched at T+N1; Peer D vouched at T+N2; quorum met at
-T+N2; cap lifted."
+Findings from members are logged (INFO when counted or acted on, WARNING when
+ignored, with the reason). They are not written to the ZTA audit log
+(§10). This node's own deferred verifications and their resolution are.
 
 ### Configuration
 
@@ -368,7 +404,7 @@ that:
 1. **Periodically re-verifies** peer credentials against ZTA infrastructure at the configured interval.
 2. **Applies reputation penalties** for revoked or expired credentials.
 3. **Resolves deferred verifications** when infrastructure becomes available.
-4. **Is meant to broadcast revocation alerts** to the group via `ZTA_PROTO_REVOCATION_ALERT` messages. It does not yet: the alert stops at the local network process, and the revoking node only penalizes locally (§8).
+4. **Tells the group what it found** (§8): `zta_revoked` when its own check finds a credential revoked, `zta_verified` when it proves one, sent encrypted to every other member. It receives both and acts on them the same way.
 5. **Enforces reputation caps** on peers admitted without ZTA verification.
 
 When ZTA is disabled at runtime, the process exits immediately.
@@ -383,10 +419,13 @@ ZTA peers exchange three message types via the network layer:
 | `zta_verified` | `ZTA_PROTO_VERIFICATION` | Share a verification result with peers |
 | `zta_reverify` | `ZTA_PROTO_REVERIFY_REQ` | Request peers to re-verify a specific peer |
 
-These use the existing `net_msg_t` transport with the function field set to the
-protocol constant. That is the design. Today the three constants are defined
-and not used: nothing sends them to a peer and no handler is registered for
-them.
+The first two are built in both runtimes. Each is sent encrypted to each
+other member, addressed to process `zta_verify`, with the body
+`{"credential_hash": hex, "peer_uuid", "reason", "status"}`. Python has no
+`zta_verify` process. Its ZTA rides the identity process, and the ZTA
+extension declares the alias (`Extension.process_aliases`), so the Python
+network process delivers those frames to identity. `zta_reverify` is defined
+and still unused: nothing sends it and nothing handles it.
 
 ---
 
@@ -576,7 +615,7 @@ Python sweeps admitted peers on `reverify_interval_sec` inside IdentityProcess
 rather than in a process of its own, detecting post-admission revocation and
 lifting a DDIL cap once the infrastructure returns. See [ZTA Python
 Parity](zta-python-parity.md) for that implementation and for what remains
-C-only (the audit log and delegated verification).
+C-only (the audit log). Delegated verification and revocation alerts are in both runtimes (§8).
 
 **As of 2026-08-06 the credential→identity *binding* gate, named trust anchors,
 multi-credential admission, and derived gateway authority exist in BOTH

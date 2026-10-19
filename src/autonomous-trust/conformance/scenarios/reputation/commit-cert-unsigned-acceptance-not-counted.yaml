@@ -4,10 +4,12 @@ protocol: reputation
 name: commit-cert-unsigned-acceptance-not-counted
 byte_pinning: false
 description: |
-    Commit certificates (doc/architecture/reputation.md). alice's proposal does not ask
-    for certification, so bob's acceptance carries no signature. In a group that
-    declares certificates an unsigned acceptance does not count, and alice writes
-    nothing.
+    Commit certificates (doc/architecture/reputation.md). bob's acceptance of
+    alice's round carries no signature over her commit_designation. An unsigned
+    acceptance does not count, and alice writes nothing.
+
+    Step 2 is delivered as built, not as bob's reply to step 1 (which is
+    signed), so the acceptance alice handles is the unsigned one.
 
 participants:
   - id: alice
@@ -16,11 +18,7 @@ participants:
     role: acceptor
 
 fixtures:
-  commit_certificates: true
-  requests:
-    bob:
-      - [1000, 1]
-  my_requests:
+  proposals:
     alice:
       - id1: 1000
         id2: 1
@@ -43,7 +41,6 @@ steps:
     from: bob
     to: alice
     function: tx accepted
-    in_response_to: 1
     payload:
       id1: 1000
       id2: 1

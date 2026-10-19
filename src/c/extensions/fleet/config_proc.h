@@ -131,6 +131,9 @@ int config_restore_all(const char *cfg_dir, const char *data_dir);
 */
 int config_backup_delete(const char *data_dir);
 
+/** Register the config protocol handlers on @p proc. */
+int config_register_handlers(const process_t *proc);
+
 /*@
   requires \valid(proc);
   requires \valid_read(signal);

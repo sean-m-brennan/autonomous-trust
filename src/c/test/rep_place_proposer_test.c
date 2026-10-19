@@ -103,7 +103,6 @@ static process_t *_mk_process(identity_t *self, identity_t **peers, int n)
     pthread_rwlock_init(&proc->protocol.peers_rwlock, NULL);
     strncpy(proc->name, "reputation", PROC_NAME_LEN);
     proc->protocol.phase = 1;
-    proc->protocol.group.ordered_placement = true;
     config_t *id_cfg = calloc(1, sizeof(config_t));
     ck_assert_ptr_nonnull(id_cfg);
     id_cfg->name = "identity";
@@ -451,7 +450,6 @@ DEFINE_TEST(test_a_child_chain_round_goes_to_that_group_alone)
         uuid_unparse_lower(p[i]->uuid, u);
         ck_assert_ret_ok(group_add_address(&child, u, p[i]->address));
     }
-    child.ordered_placement = true;
     ck_assert_ret_ok(identity_add_child_group(proc, &child, NULL));
     char key[UUID_STRING_LEN + 1];
     uuid_unparse_lower(cg, key);
@@ -716,6 +714,82 @@ DEFINE_TEST(test_a_departed_members_signature_still_counts)
 }
 END_TEST_DEFINITION()
 
+/* Placement completes an attested entry, so it logs the line a commit logs
+ * in a chain that does not place; cohorts watch for it (Stele rt-3700990
+ * waited on it and failed). Mirrors test_placement_acceptor.py
+ * test_a_placed_attestation_is_logged_and_brings_a_checkpoint_forward. */
+DEFINE_TEST(test_a_placed_attestation_is_logged_as_committed)
+{
+    process_t *proc = _begin();
+    identity_t *roster[3] = { me, p[0], p[1] };
+    _seed_roster(roster, 3);
+    char log_path[128];
+    snprintf(log_path, sizeof(log_path), "%s/rep.log", g_dir);
+    logger_t lg;
+    ck_assert_int_eq(logger_init(&lg, INFO, log_path), 0);
+    proc->logger = &lg;
+
+    transaction_t e;
+    memset(&e, 0, sizeof(e));
+    e.index = -1;
+    e.attested = true;
+    e.p1_set = true;
+    uuid_copy(e.p1_uuid, p[0]->uuid);
+    uuid_copy(e.subject_uuid, p[2]->uuid);
+    e.p1_score = 0.3;
+    at_strlcpy(e.p1_channel, "probe", sizeof(e.p1_channel));
+    memset(e.evidence_digest, 'a', TX_ATTEST_DIGEST_HEX_LEN);
+    tx_attest_task_uuid(e.p1_uuid, e.subject_uuid, e.evidence_digest, e.task_uuid);
+    char head[TX_HASH_HEX_LEN + 1], digest[TX_HASH_HEX_LEN + 1];
+    reputation_get_head_hash(head);
+    place_value_digest(&e, 1, 1, digest);
+    uint8_t desig[PLACE_DESIG_MAX];
+    size_t dlen = place_designation(1, head, digest, desig, sizeof(desig));
+    json_t *sigs = json_object();
+    identity_t *signers[2] = { p[0], p[1] };
+    for (int i = 0; i < 2; i++)
+    {
+        char u[UUID_STRING_LEN + 1], sig[crypto_sign_BYTES * 2 + 1] = {0};
+        uuid_unparse_lower(signers[i]->uuid, u);
+        _hex_sig(signers[i], desig, dlen, sig);
+        json_object_set_new(sigs, u, json_string(sig));
+    }
+    char task[UUID_STRING_LEN + 1], ver[UUID_STRING_LEN + 1], subj[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(e.task_uuid, task);
+    uuid_unparse_lower(e.p1_uuid, ver);
+    uuid_unparse_lower(e.subject_uuid, subj);
+    /* The learner takes the attestation's own certificate on the placement's
+     * word, so placeholder signatures stand in for it here. */
+    json_t *value = json_pack("[{s:s, s:b, s:s, s:f, s:s, s:s, s:s, s:{s:s, s:s, s:s}}]",
+                              "task", task, "attested", 1, "p1", ver, "p1_score", 0.3,
+                              "p1_channel", "probe", "subject", subj,
+                              "evidence_digest", e.evidence_digest, "attest_sigs",
+                              "x", "00", "y", "01", "z", "02");
+    json_t *msg = json_pack("{s:s, s:i, s:o, s:o}", "group", "", "k", 1,
+                            "value", value, "sigs", sigs);
+    static char PLACED_FN[] = "placed";
+    _send(proc, p[0], PLACED_FN, msg);
+    json_decref(msg);
+    ck_assert_int_eq(reputation_get_committed_tx_count(), 2);
+
+    proc->logger = NULL;
+    if (lg.file != NULL)
+        fclose(lg.file);
+    FILE *f = fopen(log_path, "r");
+    ck_assert_ptr_nonnull(f);
+    char line[1024], want[256];
+    snprintf(want, sizeof(want), "Reputation: attested score committed: verifier=%.8s "
+             "subject=%.8s score=0.30 channel=probe signers=3 (index 1)", ver, subj);
+    int seen = 0;
+    while (fgets(line, sizeof(line), f) != NULL)
+        if (strstr(line, want) != NULL)
+            seen++;
+    fclose(f);
+    ck_assert_int_eq(seen, 1);
+    _end();
+}
+END_TEST_DEFINITION()
+
 /* --- Proposing who is in the group (doc/architecture/reputation.md). --- */
 
 static const char *_value_op(json_t *place)
@@ -959,6 +1033,7 @@ RUN_TESTS(RepPlaceProposer,
           test_a_majority_of_the_logged_roster_carries_a_placement,
           test_a_signer_outside_the_roster_is_not_counted,
           test_a_departed_members_signature_still_counts,
+          test_a_placed_attestation_is_logged_as_committed,
           test_the_leader_places_the_next_instance_without_asking,
           test_a_leader_that_promised_another_ballot_asks_again,
           test_an_acceptance_survives_a_second_and_a_restart,

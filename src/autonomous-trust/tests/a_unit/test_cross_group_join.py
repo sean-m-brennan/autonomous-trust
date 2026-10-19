@@ -381,6 +381,17 @@ class TestRotation:
         grp.rotate_key()
         assert grp.decrypt(blob, sender) == b'in flight'
 
+    def test_retired_key_decrypts_as_the_network_process_calls_it(self):
+        """The network process passes the group itself as the sender
+        (netprocess.py `sender_group.decrypt(raw_msg, sender_group)`). The
+        fallback used to pair the retired private with that group's CURRENT
+        public, so this exact call never opened a frame under a retired key."""
+        grp = _group('cohort')
+        sender = Group.from_canonical(grp.to_canonical())
+        blob = sender.encrypt(b'in flight', sender)
+        grp.rotate_key()
+        assert grp.decrypt(blob, grp) == b'in flight'
+
     def test_retired_key_stops_working_after_the_window(self):
         grp = _group('cohort')
         sender = Group.from_canonical(grp.to_canonical())

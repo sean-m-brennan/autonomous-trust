@@ -23,6 +23,9 @@
 #include <string.h>
 
 #include <sodium.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>  /* _NSGetExecutablePath: Darwin has no /proc */
+#endif
 
 #include "config/configuration.h"
 #include "package_hash.h"
@@ -65,7 +68,16 @@ static void _compute(void)
         && strchr(info.dli_fname, '/') != NULL)
         _hash_file(info.dli_fname);
     if (g_hash[0] == '\0')
+    {
+#ifdef __APPLE__
+        char exe[4096];
+        uint32_t exe_len = sizeof(exe);
+        if (_NSGetExecutablePath(exe, &exe_len) == 0)
+            _hash_file(exe);
+#else
         _hash_file("/proc/self/exe");
+#endif
+    }
 }
 
 const char *at_package_hash(void)

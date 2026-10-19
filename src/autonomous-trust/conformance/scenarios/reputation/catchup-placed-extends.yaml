@@ -25,7 +25,6 @@ participants:
     role: member
 
 fixtures:
-  ordered_placement: true
   local_chain:
     bob:
       - {task: a, p1: 0.7, p2: 0.5, batch: 1, placed_by: [alice, bob, carol]}

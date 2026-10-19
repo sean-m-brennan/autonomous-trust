@@ -27,7 +27,6 @@ participants:
     role: member
 
 fixtures:
-  ordered_placement: true
   local_chain:
     bob:
       - {task: x, p1: 0.2, p2: 0.2, certified_by: [alice, carol, dave]}

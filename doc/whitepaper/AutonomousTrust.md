@@ -292,15 +292,17 @@ recovery strategy.
 
 ### 5.3 Consensus and slashing
 
-Agreement on reputation runs as leaderless Byzantine Multi-Paxos, so there is no
+Agreement on reputation runs as Byzantine Multi-Paxos with no fixed
+coordinator: whoever placed the last entry leads the next, and every other
+member takes over in an order they all compute the same way, so there is no
 coordinator to capture, and none to lose.
 
 
-| Phase | Messages                                   | Purpose                                                                                      |
-| ----- | ------------------------------------------ | -------------------------------------------------------------------------------------------- |
-| 1     | `request` -> `grant` / `nack` / `backdate` | ask permission; proposal id is (timestamp, chain-index, peer) with a replay-idempotent guard |
-| 2     | `transaction` -> `accepted`                | on majority grant, propose the score; commit on majority accept                              |
-| 3     | `committed` (broadcast)                    | every peer writes the*same* bilateral entry                                                  |
+| Phase | Messages                                                         | Purpose                                                                                     |
+| ----- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| 1     | `transaction` -> `accepted`                                      | propose the score; each acceptor signs it, and a majority's signatures certify it          |
+| 2     | `committed` (broadcast)                                          | every peer pools the *same* certified half                                                  |
+| 3     | `place request` -> `place grant`, `place` -> `place accepted` -> `placed` | Paxos decides where each ready entry goes, and every peer writes the same chain             |
 
 A node that has fallen behind catches up by querying its top three most-trusted
 peers and majority-voting the result, which is then verifiable against the chain

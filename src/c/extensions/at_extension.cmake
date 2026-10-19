@@ -25,7 +25,7 @@
 #                     otherwise compile a second copy of the whole core into
 #                     it, with its own registries.
 #   at_<name>_static  STATIC (libat_<name>.a), for static consumers, which
-#                     link it with --whole-archive or call at_<name>_link().
+#                     link it whole (at_whole_archive) or call at_<name>_link().
 #
 # Both export src/c/extensions as a PUBLIC include dir, so a header is
 # included as "<name>/<header>.h" -- the spelling it had in the core.
@@ -36,7 +36,10 @@ set(AT_EXT_DIR ${CMAKE_CURRENT_LIST_DIR})
 function(at_extension_library name)
     cmake_parse_arguments(A "" "" "SOURCES;DEPENDS" ${ARGN})
     add_library(at_${name} SHARED ${A_SOURCES})
-    target_link_libraries(at_${name} PRIVATE $<TARGET_LINKER_FILE:autonomous_trust>)
+    # The core's own dependencies too: an extension calls sodium, jansson and
+    # uuid directly, and Apple's linker refuses a dylib with unresolved symbols.
+    target_link_libraries(at_${name} PRIVATE $<TARGET_LINKER_FILE:autonomous_trust>
+        ${DEPENDENCIES})
     add_dependencies(at_${name} autonomous_trust)
 
     add_library(at_${name}_static STATIC ${A_SOURCES})
@@ -81,8 +84,9 @@ function(at_extension_tests name)
         target_include_directories(${_t} PRIVATE ${AT_EXT_DIR}/../test ${AT_EXT_DIR} ${_root})
         # libsubunit when found: a static libcheck needs it as soon as a test
         # pulls in its logging (empty and skipped otherwise; see LIBSUBUNIT_LIBRARY).
+        at_whole_archive(_whole_items ${_whole})
         target_link_libraries(${_t} PRIVATE
-            -Wl,--whole-archive ${_whole} -Wl,--no-whole-archive ${AT_TEST_LIBS}
+            ${_whole_items} ${AT_TEST_LIBS}
             ${LIBSUBUNIT_LIBRARY})
         add_test(NAME ${_t} COMMAND $<TARGET_FILE:${_t}>)
     endforeach()

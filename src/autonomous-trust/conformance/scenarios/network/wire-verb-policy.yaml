@@ -1,0 +1,69 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: wire-verb-policy
+byte_pinning: false
+description: |
+    What an inbound wire frame may carry, by the path it came in on (ISSUES
+    §2.17). A handler's local-origin check reads the sender the envelope
+    claims, and on a stranger's paths a stranger chooses that claim, so the
+    refusal is made on the frame's NAMES before routing:
+
+    - never an `app_*` verb, on any path: those are the local app's commands,
+      and no node sends one to another;
+    - never a command to the network process except a remote `stats_req`
+      (an `exclude` from the wire would gate peers for us, and any other
+      function was re-sent stamped as ours);
+    - from a sender we do not hold (plaintext from an unknown address, or
+      relayed from an unknown uuid), only the plaintext verbs;
+    - on the broadcast channel, only the plaintext verbs and the identity
+      verbs sent with no recipient (group_key_update, peer_accepted,
+      propose_peer).
+
+    Each case is asked of the production policy (C net_wire_verb_admitted,
+    Python netprocess.wire_verb_admitted). Both directions are pinned, so a
+    rule loosened on one runtime only fails here.
+
+participants:
+  - id: node
+    role: receiver
+
+fixtures:
+  cases:
+    - {process: identity, function: app_block, path: peer, admitted: false}
+    - {process: identity, function: app_send_dm, path: group, admitted: false}
+    - {process: identity, function: app_publish_post, path: stranger-plaintext, admitted: false}
+    - {process: reputation, function: app_roster_request, path: broadcast, admitted: false}
+    - {process: identity, function: peer_dm, path: peer, admitted: true}
+    - {process: identity, function: peer_dm, path: group, admitted: true}
+    - {process: reputation, function: transaction, path: peer, admitted: true}
+    - {process: network, function: stats_req, path: peer, admitted: true}
+    - {process: network, function: exclude, path: peer, admitted: false}
+    - {process: network, function: readmit, path: group, admitted: false}
+    - {process: network, function: stats_resp, path: peer, admitted: false}
+    - {process: identity, function: access_granted, path: stranger-plaintext, admitted: true}
+    - {process: identity, function: subtree_roster_response, path: relayed-stranger, admitted: true}
+    - {process: identity, function: peer_dm, path: stranger-plaintext, admitted: false}
+    - {process: identity, function: full_history, path: relayed-stranger, admitted: false}
+    - {process: reputation, function: transaction, path: stranger-plaintext, admitted: false}
+    - {process: identity, function: group_key_update, path: stranger-plaintext, admitted: false}
+    - {process: identity, function: request_access, path: broadcast, admitted: true}
+    - {process: identity, function: group_partition_probe, path: broadcast, admitted: true}
+    - {process: identity, function: group_key_update, path: broadcast, admitted: true}
+    - {process: identity, function: peer_accepted, path: broadcast, admitted: true}
+    - {process: identity, function: propose_peer, path: broadcast, admitted: true}
+    - {process: identity, function: peer_dm, path: broadcast, admitted: false}
+    - {process: reputation, function: transaction, path: broadcast, admitted: false}
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: classify_wire_verbs
+    description: |
+        The adapter asks the production policy about every case and records
+        whether every answer matches.
+
+expected_state:
+  node:
+    all_cases_match: true

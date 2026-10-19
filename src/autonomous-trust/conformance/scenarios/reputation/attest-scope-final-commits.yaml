@@ -6,9 +6,12 @@ byte_pinning: false
 description: |
     A scoped attestation commits with its scope, and the scope is part of the
     committed fact: it is in the designation the quorum signed and in the
-    entry's canonical bytes, after the evidence digest. An unscoped entry's
-    bytes are unchanged (attest-final-commits-without-the-subject keeps its
-    pinned root).
+    entry's canonical bytes, after the evidence digest. The bytes are pinned
+    by attest-scope-entry-canonical-bytes, since a pooled entry is hashed only
+    when it is placed.
+
+    A committed attestation waits in the pool for its placement, as every
+    entry does now that every group places its order.
 
 participants:
   - id: alice
@@ -32,5 +35,5 @@ steps:
 
 expected_state:
   bob:
-    committed_tx_count: 1
-    window_root: "b7b52ae98619b4b85be8c6cd5a2f59c07996f199d479c34a327149a6de23db69"
+    committed_tx_count: 0
+    pool_count: 1

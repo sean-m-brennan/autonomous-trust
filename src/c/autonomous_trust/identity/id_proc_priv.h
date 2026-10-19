@@ -177,6 +177,31 @@ void identity_retry_sibling_handoffs(process_t *proc);
  *  phase 3; returns how many were replayed. */
 size_t identity_replay_held_group_updates(process_t *proc, directory_t *queues);
 
+/** How many request_access frames identity holds while it is not yet in
+ *  phase 3, one per requester (a later one replaces it); past
+ *  it the oldest is dropped. */
+#define ID_HELD_ACCESS_REQUESTS 16
+
+/** Replay, in arrival order, the access requests held because they arrived
+ *  before phase 3, and forget them. identity_run calls it the moment it enters
+ *  phase 3, after the held group updates; returns how many were replayed. */
+size_t identity_replay_held_access_requests(process_t *proc, directory_t *queues);
+
+/** Test seam: the private copy a held message is kept as (false: out of
+ *  memory). Release @p copy with messaging_recv_release. */
+bool identity_copy_held_message(const generic_msg_t *msg, generic_msg_t *copy);
+
+/** How many groups other than ours identity remembers having told about ours
+ *  (identity_tell_bridged_group); past it the oldest is forgotten. */
+#define ID_TOLD_BRIDGED_MAX 16
+
+/** We were admitted into @p foreign_group (a group's JSON) as well as ours:
+ *  send our current group's full_history to each of its members we hold as a
+ *  peer and that is not in our group, once per foreign group. Returns how many
+ *  were sent. Called after choose_group adopts, and on a foreign full_history
+ *  in phase 3; exposed for unit tests. */
+size_t identity_tell_bridged_group(process_t *proc, const json_t *foreign_group);
+
 /** Test seam: how many sibling hand-offs are waiting to be retried. */
 size_t identity_pending_sibling_handoffs(void);
 

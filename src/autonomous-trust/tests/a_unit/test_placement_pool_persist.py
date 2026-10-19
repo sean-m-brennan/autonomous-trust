@@ -142,12 +142,6 @@ class TestRestart:
         rp._persist_pools()
         assert os.path.exists(rp._pool_path(''))
 
-    def test_a_chain_that_does_not_place_writes_nothing(self, four):
-        rp, q = _placing(four[0], four, on=False)
-        rp.history.record_half(T1, four[3].uuid, 0.4)
-        rp._persist_pools()
-        assert not os.path.exists(rp._pool_path(''))
-
     def test_an_unreadable_pool_starts_empty(self, four):
         rp, q = _placing(four[0], four)
         with open(rp._pool_path(''), 'w') as f:

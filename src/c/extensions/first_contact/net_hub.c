@@ -358,7 +358,7 @@ static bool _take_token_locked(net_hub_t *hub, const char *uuid)
 }
 
 typedef struct {
-    long expiry;
+    int64_t expiry;
     char uuid[UUID_STR_LEN + 1];
     char key[65];
     json_t *wire;

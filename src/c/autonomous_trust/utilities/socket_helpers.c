@@ -17,6 +17,8 @@
 #include "socket_helpers.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <string.h>
 #include <sys/time.h>
 
@@ -106,4 +108,47 @@ int at_set_sndtimeo(int sock, int timeout_ms, logger_t *logger)
 {
     return set_timeo(sock, SOL_SOCKET, SO_SNDTIMEO, timeout_ms,
                      "SO_SNDTIMEO", logger);
+}
+
+int at_socket_nosigpipe(int sock)
+{
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    return setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#else
+    (void)sock;
+    return 0;
+#endif
+}
+
+int at_socket_close(int sock)
+{
+#ifdef _WIN32
+    return closesocket((SOCKET)sock) == 0 ? 0 : -1;
+#else
+    return close(sock);
+#endif
+}
+
+int at_socket_set_nonblock(int sock)
+{
+#ifdef _WIN32
+    u_long on = 1;
+    return ioctlsocket((SOCKET)sock, FIONBIO, &on) == 0 ? 0 : -1;
+#else
+    int fl = fcntl(sock, F_GETFL, 0);
+    if (fl < 0)
+        return -1;
+    return fcntl(sock, F_SETFL, fl | O_NONBLOCK);
+#endif
+}
+
+int at_socket_listener_opts(int sock)
+{
+    int one = 1;
+#ifdef _WIN32
+    return setsockopt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, &one, sizeof(one));
+#else
+    return setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#endif
 }

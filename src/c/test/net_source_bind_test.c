@@ -103,7 +103,9 @@ static int bound_port(int sock)
     struct sockaddr_in got = {0};
     socklen_t len = sizeof(got);
     if (getsockname(sock, (struct sockaddr *)&got, &len) != 0)
-        return -1;
+        /* Windows refuses getsockname on an unbound socket (EINVAL) where
+         * POSIX reports port 0; either way it is unbound. */
+        return errno == EINVAL ? 0 : -1;
     return ntohs(got.sin_port);
 }
 

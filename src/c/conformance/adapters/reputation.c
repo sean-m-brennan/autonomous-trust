@@ -18,8 +18,8 @@
  *
  *  Drives `kind: scenario` for `protocol: reputation`. Each scenario
  *  step's dispatch resets the file-scope rep_state, re-installs the
- *  TARGET participant's fixtures (history_len, last_id, my_requests,
- *  pre-granted requests), then runs the handler. This works around C's
+ *  TARGET participant's fixtures (history_len, proposals, roster, ...),
+ *  then runs the handler. This works around C's
  *  shared rep_state design: only one participant's handler runs per
  *  step, so the shared state only needs to be correct for that
  *  participant at that moment.
@@ -29,6 +29,7 @@
  *  byte-for-byte (rep:<id> for participants, tx:<slug> for tasks).
  */
 
+#include "utilities/portable.h"  /* uuid_generate_sha1 / st_mtim on Darwin */
 #include "reputation.h"
 
 #include <stdio.h>
@@ -87,13 +88,6 @@ typedef struct {
     char checkpoint_root[TX_HASH_HEX_LEN + 1];
     /* Checkpoint proposals parked for a later co-sign (ISSUES §2.29). */
     int cosigns_parked;
-    int request_count;
-    int64_t last_id;
-    /* This node's own rounds under way at the end of the step (task, score):
-     * what an adoption re-proposed (Agora Phase 4 DDIL). */
-    int    n_proposed;
-    uuid_t proposed_tasks[SCE_MAX_PARTICIPANTS * 8];
-    double proposed_scores[SCE_MAX_PARTICIPANTS * 8];
     rp_peer_rep_t peer_reps[SCE_MAX_PARTICIPANTS];
     /* Verifiable warm start (doc/architecture/reputation.md). The evidence document is the one
      * artifact BOTH runtimes read, so its shape is worth pinning here; the
@@ -179,7 +173,7 @@ static void _uuid5(const char *prefix, const char *name, uuid_t out)
 
 /* Resolve a generic_msg_t.to_whom uuid back to a participant id, or
  * "broadcast" when zeroed (the C handler family stamps zero on
- * group-bound messages — handle_nack's retry, etc.). */
+ * group-bound messages). */
 static bool _is_zero_uuid(const uuid_t u)
 {
     for (size_t i = 0; i < sizeof(uuid_t); i++)
@@ -321,8 +315,8 @@ static void _free_participant_impl(rp_impl_t *impl)
 }
 
 /* Pre-populate every participant's protocol.peers list with every other
- * participant — handle_grant iterates protocol.peers when broadcasting
- * the resulting transaction. */
+ * participant — _propose_half iterates protocol.peers when sending the
+ * transaction. */
 static void _link_peer_lists(sce_run_ctx_t *ctx)
 {
     for (size_t i = 0; i < ctx->participant_count; i++)
@@ -597,7 +591,10 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
      * case stages them. */
     reputation_set_attest_conflicts("{\"teams\": []}");
 
-    if (g_fixtures == NULL || target_id == NULL) return;
+    /* A case with no fixtures still gets the defaults below (the placement
+     * directory, a roster of every participant): json_object_get on a NULL
+     * g_fixtures reads every fixture as absent. */
+    if (target_id == NULL) return;
 
     /* attest_conflicts: [[<pid>, ...], ...] -- the teams whose members do not
      * witness for each other (ISSUES §2.54). Scenario-level: every node holds
@@ -638,15 +635,6 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
             reputation_set_chain_len((int)json_integer_value(n_j));
     }
 
-    /* last_id: { "<pid>": N, ... } */
-    json_t *li = json_object_get(g_fixtures, "last_id");
-    if (json_is_object(li))
-    {
-        json_t *id_j = json_object_get(li, target_id);
-        if (json_is_integer(id_j))
-            reputation_set_last_id((int64_t)json_integer_value(id_j));
-    }
-
     /* num_updates: { "<pid>": N } — lower the catch-up quorum so a single
      * `latest update` step fires the chain merge (Phase 1). */
     json_t *nu = json_object_get(g_fixtures, "num_updates");
@@ -670,39 +658,22 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
     else
         unsetenv("AT_SLASH_ENABLED");
 
-    /* commit_certificates: true -- the cohort's group declares commit
-     * certificates (doc/architecture/reputation.md). Group-carried, so it is
-     * set on the target's group on every install, and cleared when absent.
-     * Mirrors the Python adapter setting it on the shared Group. */
+    /* Every group places its order. Placement state lives in a directory of
+     * its own, emptied before every step: rep_state is reset per step, and a
+     * promise persisted by one step must not come back in the next except
+     * through a fixture. */
     {
-        sce_participant_t *tp = sce_find_participant(ctx, target_id);
-        rp_impl_t *ti = tp ? (rp_impl_t *)tp->impl : NULL;
-        if (ti != NULL && ti->proc != NULL)
-            ti->proc->protocol.group.commit_certificates =
-                json_is_true(json_object_get(g_fixtures, "commit_certificates"));
-        /* ordered_placement: true -- the group places its order. Placement
-         * state then lives in a directory of its own, emptied before every
-         * step: rep_state is reset per step, and a promise persisted by one
-         * step must not come back in the next except through a fixture. */
-        bool placing = json_is_true(json_object_get(g_fixtures, "ordered_placement"));
-        if (ti != NULL && ti->proc != NULL)
-            ti->proc->protocol.group.ordered_placement = placing;
         static char place_dir[256];
-        if (placing)
+        if (place_dir[0] == '\0')
         {
-            if (place_dir[0] == '\0')
-            {
-                snprintf(place_dir, sizeof(place_dir), "/tmp/at-conf-place-XXXXXX");
-                if (mkdtemp(place_dir) == NULL)
-                    place_dir[0] = '\0';
-            }
-            char path[320];
-            snprintf(path, sizeof(path), "%s/reputation-placement.cfg.json", place_dir);
-            unlink(path);
-            reputation_set_placement_dir(place_dir);
+            snprintf(place_dir, sizeof(place_dir), "/tmp/at-conf-place-XXXXXX");
+            if (mkdtemp(place_dir) == NULL)
+                place_dir[0] = '\0';
         }
-        else
-            reputation_set_placement_dir(NULL);
+        char path[320];
+        snprintf(path, sizeof(path), "%s/reputation-placement.cfg.json", place_dir);
+        unlink(path);
+        reputation_set_placement_dir(place_dir[0] != '\0' ? place_dir : NULL);
     }
 
     /* place_promised: { "<pid>": {n, by: "<pid>"} } -- the ballot a node has
@@ -725,8 +696,7 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
      * the Python adapter. */
     json_t *rl = json_object_get(json_object_get(g_fixtures, "roster"), target_id);
     json_t *everyone = NULL;
-    if (json_object_get(g_fixtures, "roster") == NULL
-        && json_is_true(json_object_get(g_fixtures, "ordered_placement")))
+    if (json_object_get(g_fixtures, "roster") == NULL)
     {
         /* Every participant, unless `roster` names one per participant ({}
          * for none, an unfounded chain). Mirrors the Python adapter. */
@@ -757,59 +727,26 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
     }
     json_decref(everyone);
 
-    /* requests: { "<pid>": [[id1, id2], ...] } — pre-stage granted Paxos
-     * rounds (so handle_transaction's paxos_has_granted_id check passes). */
-    json_t *reqs = json_object_get(g_fixtures, "requests");
-    if (json_is_object(reqs))
+    /* proposals: { "<pid>": [{id1, id2, task_id, score, channel?}, ...] } --
+     * pre-stage the proposer's outstanding rounds, as _forward_transaction
+     * leaves them for handle_accepted. Mirrors the Python adapter. */
+    json_t *props = json_object_get(json_object_get(g_fixtures, "proposals"),
+                                    target_id);
+    if (json_is_array(props))
     {
-        json_t *pair_arr = json_object_get(reqs, target_id);
-        if (json_is_array(pair_arr))
+        for (size_t i = 0; i < json_array_size(props); i++)
         {
-            for (size_t i = 0; i < json_array_size(pair_arr); i++)
-            {
-                json_t *pair = json_array_get(pair_arr, i);
-                if (!json_is_array(pair) || json_array_size(pair) < 2) continue;
-                int64_t r_id1 = json_integer_value(json_array_get(pair, 0));
-                int64_t r_id2 = json_integer_value(json_array_get(pair, 1));
-                reputation_install_accepted(r_id1, r_id2);
-            }
-        }
-    }
-
-    /* my_requests: { "<pid>": [{id1, id2, task_id, score}, ...] } —
-     * pre-stage outstanding paxos rounds for proposers. */
-    json_t *myr = json_object_get(g_fixtures, "my_requests");
-    if (json_is_object(myr))
-    {
-        json_t *entries = json_object_get(myr, target_id);
-        if (json_is_array(entries))
-        {
-            const uuid_t *self_uuid = _uuid_of(ctx, target_id);
-            for (size_t i = 0; i < json_array_size(entries); i++)
-            {
-                json_t *e = json_array_get(entries, i);
-                if (!json_is_object(e)) continue;
-                int64_t e_id1 = json_integer_value(json_object_get(e, "id1"));
-                int64_t e_id2 = json_integer_value(json_object_get(e, "id2"));
-                double  score = 1.0;
-                json_t *s_j = json_object_get(e, "score");
-                if (json_is_real(s_j))    score = json_real_value(s_j);
-                else if (json_is_integer(s_j)) score = (double)json_integer_value(s_j);
-
-                const char *slug = "default";
-                json_t *t_j = json_object_get(e, "task_id");
-                if (json_is_string(t_j)) slug = json_string_value(t_j);
-                uuid_t task_uuid;
-                _uuid5("tx:", slug, task_uuid);
-
-                /* my_requests is keyed by proposer uuid in C; install
-                 * with self-as-proposer so handle_grant looks us up via
-                 * the grant's peer_uuid field, which we also stamp as
-                 * self. */
-                if (self_uuid)
-                    reputation_install_my_request(e_id1, e_id2, *self_uuid,
-                                                   score, task_uuid);
-            }
+            json_t *e = json_array_get(props, i);
+            if (!json_is_object(e)) continue;
+            int64_t e_id1 = json_integer_value(json_object_get(e, "id1"));
+            int64_t e_id2 = json_integer_value(json_object_get(e, "id2"));
+            json_t *s_j = json_object_get(e, "score");
+            double score = json_is_number(s_j) ? json_number_value(s_j) : 1.0;
+            const char *slug = json_string_value(json_object_get(e, "task_id"));
+            uuid_t task_uuid;
+            _uuid5("tx:", slug != NULL ? slug : "default", task_uuid);
+            reputation_install_proposal(e_id1, e_id2, score, task_uuid,
+                                        json_string_value(json_object_get(e, "channel")));
         }
     }
 
@@ -863,19 +800,20 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
                 const uuid_t *p1_uuid = _uuid_of(ctx, p1_id);
                 const uuid_t *p2_uuid = _uuid_of(ctx, p2_id);
                 if (p1_uuid && p2_uuid)
-                    reputation_install_tx_pair(task_uuid,
-                                               *p1_uuid, p1_score,
-                                               *p2_uuid, p2_score);
+                    reputation_install_tx_pair_tagged(task_uuid,
+                        *p1_uuid, p1_score,
+                        json_string_value(json_object_get(e, "p1_channel")),
+                        *p2_uuid, p2_score,
+                        json_string_value(json_object_get(e, "p2_channel")));
                 else if (p1_uuid && p2_id == NULL)
-                    /* One side only, counterparty slot left open: lets a
-                     * single step drive the arrival that COMPLETES the entry,
-                     * which is the only way to assert on the committed window
-                     * in a harness that resets state between steps. */
-                    reputation_install_tx_single(task_uuid, *p1_uuid, p1_score);
-                /* A staged pair is untagged on both sides. A scenario that
-                 * needs a channel on a committed entry drives the
-                 * `tx committed` path, which carries one -- the seeding hook
-                 * deliberately has no channel argument (R+D.md §12.8). */
+                    /* One side only: a half waits in the primary chain's
+                     * pool for its placement. Mirrors the Python adapter's
+                     * history.record_half. */
+                    (void)reputation_record_half(task_uuid, *p1_uuid, p1_score,
+                        json_string_value(json_object_get(e, "p1_channel")),
+                        NULL);
+                /* A staged pair carries each half's channel when the
+                 * fixture names one (R+D.md §12.8). */
             }
         }
     }
@@ -1068,6 +1006,30 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
                             ((rp_impl_t *)self_p->impl)->proc, &st);
                 }
             }
+        }
+    }
+
+    /* tenure: { "<pid>": {min_sec: N, "<other_pid>": seconds_ago, ...} } —
+     * the tenure gate's minimum and when the target first held each member
+     * (doc/architecture/reputation.md, "Tenure"). Installed directly, like
+     * peer_standing: the clock is started by the rescore sweep, which this
+     * harness does not run. Mirrors the Python adapter's preset_tenure. */
+    json_t *tn = json_object_get(g_fixtures, "tenure");
+    json_t *tn_mine = json_is_object(tn) ? json_object_get(tn, target_id) : NULL;
+    if (json_is_object(tn_mine))
+    {
+        json_t *min_j = json_object_get(tn_mine, "min_sec");
+        reputation_set_min_tenure(json_is_number(min_j) ? json_number_value(min_j) : 0.0);
+        const char *other_id;
+        json_t *ago;
+        json_object_foreach(tn_mine, other_id, ago)
+        {
+            if (strcmp(other_id, "min_sec") == 0 || !json_is_number(ago))
+                continue;
+            const uuid_t *u = _uuid_of(ctx, other_id);
+            if (u != NULL)
+                reputation_set_member_since(*u, NULL,
+                                            (double)time(NULL) - json_number_value(ago));
         }
     }
 
@@ -1507,42 +1469,61 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     }
 
     json_t *body = NULL;
-    if (strcmp(function, REP_PROTO_REQUEST) == 0
-        || strcmp(function, REP_PROTO_NACK) == 0
-        || strcmp(function, REP_PROTO_BACKDATE) == 0
-        || strcmp(function, REP_PROTO_ACCEPTED) == 0)
+    if (strcmp(function, REP_PROTO_RETIRED_REQUEST) == 0
+        || strcmp(function, REP_PROTO_RETIRED_GRANT) == 0
+        || strcmp(function, REP_PROTO_RETIRED_NACK) == 0
+        || strcmp(function, REP_PROTO_RETIRED_BACKDATE) == 0)
+    {
+        /* A verb of the retired half round, from a node on an older build:
+         * the step's payload goes on the wire as given. Mirrors the Python
+         * adapter. */
+        body = payload != NULL ? json_deep_copy(payload) : json_object();
+    }
+    else if (strcmp(function, REP_PROTO_ACCEPTED) == 0)
     {
         body = json_object();
         json_object_set_new(body, "id1", json_integer(id1));
         json_object_set_new(body, "id2", json_integer(id2));
         json_object_set_new(body, "peer_uuid", json_string(proposer_str));
-        /* The fork probe's head (ISSUES §2.51): a literal, or "own" for the
-         * acceptor's own head (the global chain, one per binary here). */
-        const char *head = (strcmp(function, REP_PROTO_REQUEST) == 0 && payload)
-            ? json_string_value(json_object_get(payload, "head")) : NULL;
-        char own[TX_HASH_HEX_LEN + 1];
-        if (head != NULL && strcmp(head, "own") == 0)
-        {
-            (void)reputation_head_hash(own, sizeof(own));
-            head = own;
-        }
-        if (head != NULL)
-            json_object_set_new(body, "head", json_string(head));
-        /* signed: true -- an acceptance in a group that declares commit
-         * certificates carries the acceptor's real signature over the half's
-         * commit_designation (doc/architecture/reputation.md, "Commit certificates"), as handle_transaction
-         * writes it. This engine REBUILDS a propagated message from the step
-         * rather than re-delivering it, so the step states task_id and score
-         * and the signature is made here by the sender's key. Gated on the
-         * key, so every other acceptance keeps its historical shape. */
+        /* An acceptance carries the acceptor's real signature over the
+         * half's commit_designation (doc/architecture/reputation.md, "Commit
+         * certificates"), as handle_transaction writes it. This engine
+         * REBUILDS a propagated message from the step rather than
+         * re-delivering it, so the step states task_id and score and the
+         * signature is made here by the sender's key: on `signed: true`, or
+         * on a response step, where Python re-delivers the acceptor's real
+         * (signed) message. Mirrors the Python adapter. */
         if (strcmp(function, REP_PROTO_ACCEPTED) == 0 && payload != NULL
-            && json_is_true(json_object_get(payload, "signed"))
+            && (json_is_true(json_object_get(payload, "signed"))
+                || (ctx->responding
+                    && !json_is_false(json_object_get(payload, "signed"))))
             && proposer_uuid != NULL)
         {
             const char *slug = json_string_value(json_object_get(payload, "task_id"));
             json_t *s_j = json_object_get(payload, "score");
-            double sc = json_is_number(s_j) ? json_number_value(s_j) : 1.0;
             const char *chan = json_string_value(json_object_get(payload, "channel"));
+            if (slug == NULL)
+            {
+                /* Not stated: the round's own half, from the proposer's
+                 * `proposals` fixture at this (id1, id2). Mirrors the Python
+                 * adapter. */
+                json_t *props = json_object_get(
+                    json_object_get(g_fixtures, "proposals"), proposer_id);
+                size_t pi;
+                json_t *pe;
+                json_array_foreach(props, pi, pe)
+                {
+                    if (json_integer_value(json_object_get(pe, "id1")) == id1
+                        && json_integer_value(json_object_get(pe, "id2")) == id2)
+                    {
+                        slug = json_string_value(json_object_get(pe, "task_id"));
+                        s_j = json_object_get(pe, "score");
+                        chan = json_string_value(json_object_get(pe, "channel"));
+                        break;
+                    }
+                }
+            }
+            double sc = json_is_number(s_j) ? json_number_value(s_j) : 1.0;
             if (slug != NULL)
             {
                 uuid_t task_uuid;
@@ -1558,15 +1539,6 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                     json_object_set_new(body, "sig", json_string(sig_hex));
             }
         }
-    }
-    else if (strcmp(function, REP_PROTO_GRANT) == 0)
-    {
-        body = json_object();
-        json_object_set_new(body, "id1", json_integer(id1));
-        json_object_set_new(body, "id2", json_integer(id2));
-        json_object_set_new(body, "peer_uuid", json_string(proposer_str));
-        json_object_set_new(body, "last_id", json_integer(0));
-        json_object_set_new(body, "chain_len", json_integer(0));
     }
     else if (strcmp(function, REP_PROTO_TX) == 0)
     {
@@ -1598,12 +1570,13 @@ static int _build_inbound(sce_run_ctx_t *ctx,
          * "task outcome" -- so every pre-channel scenario keeps its meaning. */
         if (channel)
             json_object_set_new(body, "channel", json_string(channel));
-        /* A proposer in a declaring group asks for certification. */
-        if (payload && json_is_true(json_object_get(payload, "certify")))
+        /* A proposal asks to be certified and names its group ("" is the
+         * primary), as every proposer's does now. `certify: false` or
+         * `placing: false` leaves one off, to stand for a half-round build's
+         * proposal. Mirrors the Python adapter. */
+        if (!(payload && json_is_false(json_object_get(payload, "certify"))))
             json_object_set_new(body, "certify", json_true());
-        /* A proposer in a group that places its order names the group ("" is
-         * the primary), and sends without a grant. */
-        if (payload && json_is_true(json_object_get(payload, "placing")))
+        if (!(payload && json_is_false(json_object_get(payload, "placing"))))
             json_object_set_new(body, "group", json_string(""));
         if (task_slug)
         {
@@ -2257,6 +2230,12 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     out->info.net_msg.function = (char *)function;
     out->info.net_msg.encrypt = false;
     memcpy(&out->info.net_msg.from_whom, sender_impl->pub, sizeof(public_identity_t));
+    /* An app verb comes from this node's own app, which leaves from_whom
+     * zeroed, unless the step says it came off the wire (`from_wire: true`),
+     * which production refuses (ISSUES §2.17). Mirrors the Python adapter. */
+    if (strncmp(function, "app_", 4) == 0
+        && !json_is_true(json_object_get(payload, "from_wire")))
+        memset(&out->info.net_msg.from_whom, 0, sizeof(public_identity_t));
     if (recipient_impl)
         memcpy(&out->info.net_msg.to_whom, recipient_impl->pub, sizeof(public_identity_t));
 
@@ -2308,11 +2287,6 @@ static int _dispatch(sce_run_ctx_t *ctx,
         s->pool_task_n = reputation_get_pool_tasks(s->pool_tasks, 64);
         s->place_have = reputation_get_place_promise(&s->place_n, s->place_by);
         s->cosigns_parked = (int)reputation_parked_cosign_count();
-        s->request_count = reputation_get_request_count();
-        s->n_proposed = reputation_get_my_request_tasks(
-            s->proposed_tasks, s->proposed_scores,
-            (int)(sizeof(s->proposed_tasks) / sizeof(s->proposed_tasks[0])));
-        s->last_id       = reputation_get_last_id();
         /* Record this dispatcher's view of every other participant's
          * reputation, so `expected_state[pid].reputation_of[other]`
          * can be checked after the next step resets rep_state. */
@@ -2705,56 +2679,6 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                     }
                 }
             }
-            else if (strcmp(key, "proposed_tasks") == 0)
-            {
-                /* { "<task slug>": score } — exactly this node's own rounds
-                 * under way, by task, with the score each carries. */
-                if (!json_is_object(val))
-                {
-                    snprintf(ctx->err, sizeof(ctx->err),
-                             "%s: proposed_tasks must be an object", pid);
-                    return -1;
-                }
-                int got = snap->n_proposed < 0 ? 0 : snap->n_proposed;
-                if ((size_t)got != json_object_size(val))
-                {
-                    snprintf(ctx->err, sizeof(ctx->err),
-                             "%s: proposed_tasks has %d round(s), expected %zu",
-                             pid, got, json_object_size(val));
-                    return -1;
-                }
-                const char *slug;
-                json_t *want_v;
-                json_object_foreach(val, slug, want_v)
-                {
-                    uuid_t tk;
-                    _uuid5("chain:", slug, tk);
-                    int hit = -1;
-                    for (int k = 0; k < got; k++)
-                        if (uuid_compare(snap->proposed_tasks[k], tk) == 0)
-                            hit = k;
-                    double want = json_number_value(want_v);
-                    if (hit < 0 || fabs(snap->proposed_scores[hit] - want) > 1e-9)
-                    {
-                        snprintf(ctx->err, sizeof(ctx->err),
-                                 "%s: proposed_tasks[%s] %s (expected score %.4f)",
-                                 pid, slug, hit < 0 ? "missing" : "has the wrong score",
-                                 want);
-                        return -1;
-                    }
-                }
-            }
-            else if (strcmp(key, "requests_count") == 0)
-            {
-                int want = (int)json_integer_value(val);
-                if (snap->request_count != want)
-                {
-                    snprintf(ctx->err, sizeof(ctx->err),
-                             "%s: requests_count=%d, expected %d",
-                             pid, snap->request_count, want);
-                    return -1;
-                }
-            }
             else if (strcmp(key, "attest_signs_sent") == 0)
             {
                 int want = (int)json_integer_value(val);
@@ -2833,25 +2757,6 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                                  pid, want_pid);
                         return -1;
                     }
-                }
-            }
-            else if (strcmp(key, "last_id_set") == 0)
-            {
-                /* Python's check is `self.process.last_id is not None`;
-                 * the C side uses int64_t initialized to 0 and only
-                 * advances on a granted ballot (paxos.c:123). > 0
-                 * therefore means "set". Scenarios pin ballot ids > 0
-                 * so this maps cleanly to Python's None semantics. */
-                bool want = json_is_true(val);
-                bool got = (snap->last_id > 0);
-                if (got != want)
-                {
-                    snprintf(ctx->err, sizeof(ctx->err),
-                             "%s: last_id_set=%s (value=%lld), expected %s",
-                             pid, got ? "true" : "false",
-                             (long long)snap->last_id,
-                             want ? "true" : "false");
-                    return -1;
                 }
             }
             else if (strcmp(key, "reputation_of") == 0)

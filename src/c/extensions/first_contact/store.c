@@ -21,6 +21,7 @@
  *  the DEFINE_CONFIGURATION table) and never auto-pruned, like the reputation
  *  store. */
 
+#include "utilities/portable.h"  /* at_tmp_path */
 #include "first_contact/contacts.h"
 #include "first_contact/device.h"
 #include "first_contact/directory.h"
@@ -527,7 +528,10 @@ int contacts_save(const contacts_t *store, const char *data_dir)
      * rename(2) is atomic within a filesystem, and the temp sits beside the
      * target so they are always on the same one. */
     char tmp[4096 + 16];
-    snprintf(tmp, sizeof(tmp), "%s.tmp%d", path, (int)getpid());
+    if (at_tmp_path(tmp, sizeof(tmp), path) != 0) {
+        json_decref(root);
+        return -1;
+    }
     int rc = json_dump_file(root, tmp, JSON_INDENT(2) | JSON_SORT_KEYS);
     json_decref(root);
     if (rc != 0) {

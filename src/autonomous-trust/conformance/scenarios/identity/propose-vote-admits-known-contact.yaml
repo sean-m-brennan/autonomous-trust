@@ -1,0 +1,48 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: propose-vote-admits-known-contact
+byte_pinning: false
+description: |
+    A contact joins the cohort through the
+    vote. The topology is propose-vote-sybil-uuid's, where the newcomer
+    already sits in bob's peer list under its own UUID and keys, plus one
+    thing: first contact recorded the newcomer as a contact. Duplicate
+    detection exempts a recorded contact presenting the keys it is known by,
+    so bob votes (votes_emitted == 1), where the same collision without the
+    contact record still suppresses the vote.
+
+    Only a recorded contact is exempt. Any other peer that is not a member
+    still collides, which is what propose-vote-sybil-uuid keeps pinning.
+
+    See doc/architecture/identity-protocol.md, "Amnesia".
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  amnesia_known: true
+  first_contact:
+    enabled: true
+  contacts:
+    newcomer: {}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: propose_peer
+    payload:
+      candidate: newcomer
+    description: |
+        alice proposes newcomer to bob. bob holds it as a recorded contact, not
+        a member, so the collision is not a sybil and bob votes.
+
+expected_state:
+  bob:
+    votes_emitted: 1

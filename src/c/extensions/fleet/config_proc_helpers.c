@@ -161,6 +161,13 @@ static size_t build_config_signable(const config_proposal_t *prop, uint8_t *buf,
     memcpy(buf + offset, prop->version, vlen);
     offset += vlen;
 
+    /* Who proposed and which proposal (see update_proposal.c build_signable). */
+    if (offset + 2 * sizeof(uuid_t) > buflen) return 0;
+    memcpy(buf + offset, prop->proposer_uuid, sizeof(uuid_t));
+    offset += sizeof(uuid_t);
+    memcpy(buf + offset, prop->proposal_uuid, sizeof(uuid_t));
+    offset += sizeof(uuid_t);
+
     return offset;
 }
 

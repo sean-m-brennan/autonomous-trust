@@ -51,7 +51,8 @@ DEFINE_TEST(test_messaging_init_and_close)
     queue_t q;
     memset(&q, 0, sizeof(q));
     ck_assert_ret_ok(messaging_init("test_queue", &q));
-    ck_assert(q.fd > 0);
+    /* An in-process queue (Windows; AT_IN_PROCESS) has no descriptor. */
+    ck_assert(messaging_in_process() ? q.fd == -1 : q.fd > 0);
     ck_assert_str_eq(q.key, "test_queue");
 
     messaging_qclose(&q);

@@ -33,6 +33,7 @@ at_extension_library(zta
         zta_policy.c
         zta_audit.c
         zta_process.c
+        zta_delegation.c
         zta_binding.c
         zta_identity.c
         zta_msg_types.c

@@ -18,11 +18,12 @@
 
 Drives `kind: scenario` for `protocol: reputation`. Builds real
 ReputationProcess instances and turns on synchronous_dispatch so the
-threaded paths (handle_grant -> _paxos_timeout, handle_nack -> _try_again,
-handle_reputation_request -> _compute_reputation) execute inline.
+threaded paths (handle_reputation_request -> _compute_reputation) execute
+inline.
 
-Phase F covers the leaderless Byzantine multi-Paxos request/grant/transaction
-flow plus the chain-length backdate and stale-id nack branches.
+Every group places its order (doc/architecture/reputation.md, "Agreeing on an
+order"): a half is co-signed (transaction / tx accepted / tx committed) and
+placement decides where it goes in the chain.
 """
 
 from __future__ import annotations
@@ -184,10 +185,13 @@ class _Participant:
                         f'expected {expected}'
                     )
             elif key in ('halves_held', 'certified_halves'):
-                # Ordinary halves held (pending or committed), and how many
-                # carry a commit certificate (doc/architecture/reputation.md, "Commit certificates").
+                # Ordinary halves held (in the chain or waiting in the pool),
+                # and how many carry a commit certificate
+                # (doc/architecture/reputation.md, "Commit certificates").
                 held = certified = 0
-                for tx in self.process.history._task_mapping.values():
+                hist = self.process.history
+                for tx in (list(hist._task_mapping.values())
+                           + list(hist._pool.values())):
                     if tx.attested:
                         continue
                     for scorer in (tx.p1_id, tx.p2_id):
@@ -345,12 +349,6 @@ class _Participant:
                             f'{self.id}.evidence_ceiling_of[{other_pid}]='
                             f'{got:.4f}, expected {float(want):.4f}'
                         )
-            elif key == 'last_id_set':
-                actual = self.process.last_id is not None
-                if actual != bool(expected):
-                    raise AssertionError(
-                        f'{self.id}: last_id_set={actual}, expected {expected}'
-                    )
             elif key == 'slashes_proposed':
                 # How many slash proposals this participant ORIGINATED
                 # (R+D.md §12.8). Its reason for existing is the zero case:
@@ -398,28 +396,6 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: app_roster={actual}, '
                         f'expected {sorted(expected)}'
-                    )
-            elif key == 'proposed_tasks':
-                # { "<task slug>": score } -- exactly this node's own rounds
-                # under way, by task, with the score each carries (the
-                # re-proposal an adoption makes, Agora Phase 4 DDIL).
-                got = {}
-                for tc in self.process.my_requests.values():
-                    ts = getattr(tc, 'score', None)
-                    if ts is not None:
-                        got[str(ts.task_id)] = float(ts.score)
-                want = {str(uuid5(_NS, f'chain:{slug}')): float(v)
-                        for slug, v in expected.items()}
-                if set(got) != set(want) or any(
-                        abs(got[k] - want[k]) > 1e-9 for k in want):
-                    raise AssertionError(
-                        f'{self.id}: proposed_tasks={got}, expected {want} '
-                        f'(from {expected})')
-            elif key == 'requests_count':
-                actual = len(self.process.requests)
-                if actual != expected:
-                    raise AssertionError(
-                        f'{self.id}: requests_count={actual}, expected {expected}'
                     )
             elif key == 'reputation_of':
                 # `expected` is { "<other_pid>": float } — compare
@@ -646,15 +622,13 @@ class ReputationAdapter:
     def _build_participants(self, case: Case) -> dict[str, ParticipantHandle]:
         spec_participants = case.data['participants']
         fixtures = case.data.get('fixtures', {}) or {}
-        # Preset state for handlers that gate on history length / last_id /
-        # requests list — see scenario YAML keys for documentation.
+        # Preset state for handlers that gate on history length -- see
+        # scenario YAML keys for documentation.
         preset_history_len: dict[str, int] = fixtures.get('history_len', {}) or {}
-        preset_last_id: dict[str, int] = fixtures.get('last_id', {}) or {}
-        preset_requests: dict[str, list[list[int]]] = fixtures.get('requests', {}) or {}
-        # my_requests pre-stages a proposer's outstanding paxos rounds. Each
-        # entry: {id1, id2, task_id, score}. Required by handle_nack
-        # / handle_grant to recognize the round and look up the score.
-        preset_my_requests: dict[str, list[dict[str, Any]]] = fixtures.get('my_requests', {}) or {}
+        # proposals pre-stages a proposer's outstanding rounds. Each entry:
+        # {id1, id2, task_id, score, channel?}. handle_accepted looks the
+        # round's score up by (id1, id2). Mirrors the C adapter.
+        preset_proposals: dict[str, list[dict[str, Any]]] = fixtures.get('proposals', {}) or {}
         # tx_history pre-stages bilateral Transactions in self.process.history.
         # { pid -> [{task_id, p1, p1_score, p2, p2_score}, ... ] }. p1/p2
         # reference other participant ids; the adapter resolves them to
@@ -689,6 +663,12 @@ class ReputationAdapter:
         # A LIST lets two authorities speak about the same peer, which is the
         # only way to pin the minimum-over-sources reduction.
         preset_peer_standing: dict[str, dict[str, Any]] = fixtures.get('peer_standing', {}) or {}
+        # tenure pre-sets the tenure gate (doc/architecture/reputation.md,
+        # "Tenure"): { pid -> {min_sec: N, <other_pid>: seconds_ago, ...} },
+        # the minimum and when this participant first held each member.
+        # Installed directly, like peer_standing: the clock is started by the
+        # rescore sweep, which this harness does not run.
+        preset_tenure: dict[str, dict[str, Any]] = fixtures.get('tenure', {}) or {}
         # checkpoint pre-seeds a finalized Phase 2 checkpoint root.
         # { pid -> {root: <hex>, epoch: int} }. Lets a single-step scenario
         # verify an evidence-bearing slash against a checkpoint (Phase 3); the
@@ -736,28 +716,20 @@ class ReputationAdapter:
                       'rep-grp', Encryptor.generate(), False)
         for spec in spec_participants[1:]:
             group.add_address(identities[spec['id']].uuid, identities[spec['id']].address)
-        # commit_certificates: true -- the cohort's group declares commit
-        # certificates (doc/architecture/reputation.md). Group-carried, so it is
-        # set on the one Group every participant shares. Mirrors the C adapter.
-        group._commit_certificates = fixtures.get('commit_certificates') is True
-        # ordered_placement: true -- the group places its order
-        # (doc/architecture/reputation.md, "Agreeing on an order"). Placement
-        # state then lives in a directory per participant, fresh per case:
-        # every participant shares this process and its config directory.
-        group._ordered_placement = fixtures.get('ordered_placement') is True
-        place_root = (tempfile.mkdtemp(prefix='at-conf-place-')
-                      if group._ordered_placement else None)
+        # Every group places its order (doc/architecture/reputation.md,
+        # "Agreeing on an order"). Placement state lives in a directory per
+        # participant, fresh per case: every participant shares this process
+        # and its config directory.
+        place_root = tempfile.mkdtemp(prefix='at-conf-place-')
         preset_place_promised = fixtures.get('place_promised', {}) or {}
-        # A placing group's roster in force before the scenario starts: every
-        # participant, unless `roster` names one per participant ({} for none,
-        # an unfounded chain). Mirrors the C adapter.
+        # The roster in force before the scenario starts: every participant,
+        # unless `roster` names one per participant ({} for none, an unfounded
+        # chain). Mirrors the C adapter.
         if 'roster' in fixtures:
             preset_roster = fixtures.get('roster') or {}
-        elif fixtures.get('ordered_placement') is True:
+        else:
             everyone = [p['id'] for p in spec_participants]
             preset_roster = {p['id']: everyone for p in spec_participants}
-        else:
-            preset_roster = {}
         self._fixture_roster = preset_roster
 
         handles: dict[str, ParticipantHandle] = {}
@@ -773,13 +745,12 @@ class ReputationAdapter:
                 peers.add(other_id)
 
             participant = self._build_one(pid, role, identity, peers, group)
-            if place_root is not None:
-                where = os.path.join(place_root, pid)
-                os.makedirs(where, exist_ok=True)
-                participant.process._placement_path = (
-                    lambda key, where=where: os.path.join(
-                        where, 'reputation-placement' + ('-' + key if key else '')
-                        + Configuration.file_ext))
+            where = os.path.join(place_root, pid)
+            os.makedirs(where, exist_ok=True)
+            participant.process._placement_path = (
+                lambda key, where=where: os.path.join(
+                    where, 'reputation-placement' + ('-' + key if key else '')
+                    + Configuration.file_ext))
             if pid in preset_roster:
                 # roster: {pid: [member pids]} -- the roster in force on pid's
                 # primary chain before the scenario starts, each member with
@@ -815,9 +786,6 @@ class ReputationAdapter:
                 participant.process.history._chain.append(tx)
                 participant.process.history._task_mapping[tx.task_id] = tx
 
-            if pid in preset_last_id:
-                participant.process.last_id = preset_last_id[pid]
-
             if pid in preset_num_updates:
                 participant.process.num_updates = int(preset_num_updates[pid])
             # Instance attribute, shadowing the class-level default that reads
@@ -835,26 +803,16 @@ class ReputationAdapter:
                     first_index=int(spec_ck.get('first_index', 0)),
                     count=int(spec_ck.get('count', 0)))
 
-            for r in preset_requests.get(pid, []):
-                # Each preset request entry is [id1, id2] — pre-stage the
-                # acceptor's `requests` list so handle_transaction's check
-                # `if idx not in self.requests` passes.
-                participant.process.requests.append(tuple(r))
-
-            for entry in preset_my_requests.get(pid, []):
-                from autonomous_trust.core.reputation.repprocess import TxCount
+            for entry in preset_proposals.get(pid, []):
                 idx = (int(entry['id1']), int(entry['id2']))
                 score = TransactionScore(
                     task_id=str(uuid5(_NS, f'tx:{entry.get("task_id", "default")}')),
                     score=float(entry.get('score', 1.0)),
-                    # Absent -> TX_CHANNEL_TASK_OUTCOME, so every existing
-                    # scenario keeps its meaning unchanged (R+D.md §12.8).
+                    # Absent -> TX_CHANNEL_TASK_OUTCOME (R+D.md §12.8).
                     channel=entry.get('channel'),
                 )
-                participant.process.my_requests[idx] = TxCount(score, 0)
-                # Also stage the proposals dict so handle_grant /
-                # handle_accepted can look up the score by idx.
                 participant.process.proposals[idx] = score
+                participant.process.round_group[idx] = str(group.uuid)
 
             # tx_history: each entry installs a bilateral Transaction via
             # two history.update calls (matching how handle_committed
@@ -906,17 +864,21 @@ class ReputationAdapter:
                 if slug is None or p1_id not in identities:
                     continue
                 task_uuid = uuid5(_NS, f'tx:{slug}')
+                if p2_id is None:
+                    # One side only, waiting in the pool for its counterpart,
+                    # as a committed half does (mirrors C's
+                    # reputation_install_tx_single): lets a single step drive
+                    # the arrival that completes the entry, since the C
+                    # harness resets state between steps.
+                    participant.process.history.record_half(
+                        task_uuid, identities[p1_id].uuid,
+                        float(entry.get('p1_score', 0.0)),
+                        entry.get('p1_channel'))
+                    continue
                 participant.process.history.update(
                     task_uuid, identities[p1_id].uuid,
                     float(entry.get('p1_score', 0.0)),
                     entry.get('p1_channel'))
-                if p2_id is None:
-                    # One side only, counterparty slot left open (mirrors C's
-                    # reputation_install_tx_single): lets a single step drive
-                    # the arrival that COMPLETES the entry, which is the only
-                    # way to assert on the committed window in the C harness,
-                    # since it resets state between steps.
-                    continue
                 if p2_id not in identities:
                     continue
                 participant.process.history.update(
@@ -962,6 +924,17 @@ class ReputationAdapter:
             participant.process.set_attest_conflicts({'teams': [
                 [str(uuid5(_NS, f'rep:{m}')) for m in team]
                 for team in preset_attest_conflicts]})
+            tenure = preset_tenure.get(pid) or {}
+            if tenure:
+                import time as _time
+                proc = participant.process
+                proc._tenure_min_override = float(tenure.get('min_sec', 0))
+                proc._tenure_seeded = True
+                for other_pid, ago in tenure.items():
+                    if other_pid == 'min_sec' or other_pid not in identities:
+                        continue
+                    proc._member_since[str(identities[other_pid].uuid)] = (
+                        None, _time.time() - float(ago))
             if preset_peer_standing.get(pid):
                 # ACT on them, not merely record them: the C adapter's
                 # reputation_apply_peer_standing does the unwind at install time,
@@ -1305,26 +1278,11 @@ class ReputationAdapter:
         elif function == ReputationProtocol.rep_resolved:
             obj = to_json_string(self._resolved_answer(participants,
                                                        from_id, to_id, payload))
-        elif function == ReputationProtocol.request:
-            tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
-            # The fork probe's head (ISSUES §2.51): a literal, or "own" for
-            # the acceptor's own head. Mirrors the C adapter.
-            head = payload.get('head')
-            if head == 'own':
-                head = participants[to_id].impl.process._our_head()
-            if head:
-                tup = tup + (head,)
-            obj = to_json_string(tup)
-        elif function == ReputationProtocol.grant:
-            id_tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
-            last_id = payload.get('last_id')
-            last_idx = int(payload.get('last_idx', 0))
-            last_val = payload.get('last_val')
-            ack = (id_tup, (last_id, last_idx), last_val)
-            obj = to_json_string(ack)
-        elif function in (ReputationProtocol.nack, ReputationProtocol.backdate):
-            tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
-            obj = to_json_string(tup)
+        elif function in ReputationProtocol.retired:
+            # A verb of the retired half round, as a build that still runs it
+            # sends one: [id1, id2, proposer]. Mirrors the C adapter.
+            obj = to_json_string((int(payload.get('id1', 1)),
+                                  int(payload.get('id2', 1)), proposer_uuid))
         elif function == ReputationProtocol.transaction:
             id_tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
             score = TransactionScore(
@@ -1336,13 +1294,13 @@ class ReputationAdapter:
                 # keeps the pre-channel behavior.
                 channel=payload.get('channel'),
             )
+            # A proposer asks for certification and names its group ('' is
+            # the primary). `certify: false` or `placing: false` builds the
+            # proposal a half-round build sent, which is dropped.
             tup = (id_tup, score)
-            if payload.get('certify') is True:
-                # A proposer in a declaring group asks for certification.
+            if payload.get('certify', True) is True:
                 tup = tup + (True,)
-            if payload.get('placing') is True:
-                # A proposer in a group that places its order names the group
-                # ('' is the primary), and sends without a grant.
+            if payload.get('placing', True) is True:
                 if len(tup) < 3:
                     tup = tup + (False,)
                 tup = tup + ('',)
@@ -1604,6 +1562,11 @@ class ReputationAdapter:
         else:
             raise AssertionError(f'unsupported reputation function {function!r}')
 
+        # An app verb comes from this node's own app, with no sender, unless
+        # the step says it came off the wire (`from_wire: true`), which
+        # production refuses (ISSUES §2.17). Mirrors the C adapter.
+        if function.startswith('app_') and not payload.get('from_wire'):
+            sender_identity = None
         msg = Message(
             CfgIds.reputation, function, obj,
             from_whom=sender_identity,

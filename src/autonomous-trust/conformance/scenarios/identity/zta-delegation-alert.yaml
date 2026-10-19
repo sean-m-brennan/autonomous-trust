@@ -1,0 +1,88 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: zta-delegation-alert
+byte_pinning: false
+description: |
+    A member's `zta_revoked` (ISSUES §2.20) is a hint, never a verdict. The
+    member, credential and status checks are the vouch's. Then this node
+    re-checks the peer's credential with its own verifier at once and acts
+    on its OWN answer: VERIFIED ignores the alert, REVOKED/REJECTED publish
+    `failed` under the full revocation penalty, EXPIRED under half. The
+    re-check is not gated on the sender's reputation (it costs a lookup, and
+    the answer is ours). Only when this node cannot answer (DDIL) are alerts
+    counted, from members at or above the bar, and a quorum of distinct
+    alerters bounds the peer `capped` at ddil_fallback_reputation_cap until
+    this node's own check settles it.
+
+fixtures:
+  zta_delegation:
+    # delegated_verification_min_reputation / _quorum,
+    # ddil_fallback_reputation_cap, revocation_reputation_penalty
+    policy: {min_reputation: 0.7, quorum: 2, ddil_cap: 0.5, revocation_penalty: 0.8}
+    # A, B, C, D are members; X is not.
+    members: ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444"]
+    # The credential hash this node recorded for each peer; N has none.
+    records:
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa": "1111111111111111111111111111111111111111111111111111111111111111"
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb": "2222222222222222222222222222222222222222222222222222222222222222"
+      "cccccccc-cccc-4ccc-8ccc-cccccccccccc": "3333333333333333333333333333333333333333333333333333333333333333"
+      "dddddddd-dddd-4ddd-8ddd-dddddddddddd": "4444444444444444444444444444444444444444444444444444444444444444"
+    # A sender with no entry has no answer yet (pending); C is under the bar.
+    reputations: {"11111111-1111-4111-8111-111111111111": 0.9, "22222222-2222-4222-8222-222222222222": 0.8, "33333333-3333-4333-8333-333333333333": 0.3, "55555555-5555-4555-8555-555555555555": 0.95}
+    # This node's own answer for each peer when an alert makes it re-check;
+    # P has none (the verifier is unreachable: UNAVAILABLE).
+    own_checks: {"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb": REVOKED, "cccccccc-cccc-4ccc-8ccc-cccccccccccc": VERIFIED, "dddddddd-dddd-4ddd-8ddd-dddddddddddd": EXPIRED}
+    events:
+      - {kind: alert, from: "55555555-5555-4555-8555-555555555555", peer: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", hash: "2222222222222222222222222222222222222222222222222222222222222222", status: REVOKED, verdict: not_member}
+      - {kind: alert, from: "11111111-1111-4111-8111-111111111111", peer: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", hash: "2222222222222222222222222222222222222222222222222222222222222222", status: VERIFIED, verdict: wrong_status}
+      - {kind: alert, from: "11111111-1111-4111-8111-111111111111", peer: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", hash: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", status: REVOKED, verdict: hash_mismatch}
+      - {kind: alert, from: "11111111-1111-4111-8111-111111111111", peer: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", hash: "2222222222222222222222222222222222222222222222222222222222222222", status: REVOKED, verdict: no_record}
+      - {kind: alert, from: "11111111-1111-4111-8111-111111111111", peer: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", hash: "3333333333333333333333333333333333333333333333333333333333333333", status: REVOKED, verdict: own_verified}
+      - kind: alert
+        from: "33333333-3333-4333-8333-333333333333"
+        peer: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        hash: "2222222222222222222222222222222222222222222222222222222222222222"
+        status: REVOKED
+        verdict: own_failed
+        standings: [{peer: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", standing: failed, ceiling: 0.2}]
+      - kind: alert
+        from: "11111111-1111-4111-8111-111111111111"
+        peer: "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        hash: "4444444444444444444444444444444444444444444444444444444444444444"
+        status: REVOKED
+        verdict: own_failed
+        standings: [{peer: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", standing: failed, ceiling: 0.6}]
+      - {kind: alert, from: "11111111-1111-4111-8111-111111111111", peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", hash: "1111111111111111111111111111111111111111111111111111111111111111", status: REVOKED, verdict: counted}
+      - {kind: alert, from: "33333333-3333-4333-8333-333333333333", peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", hash: "1111111111111111111111111111111111111111111111111111111111111111", status: REVOKED, verdict: below_bar}
+      - {kind: alert, from: "44444444-4444-4444-8444-444444444444", peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", hash: "1111111111111111111111111111111111111111111111111111111111111111", status: REVOKED, verdict: pending}
+      - {kind: alert, from: "11111111-1111-4111-8111-111111111111", peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", hash: "1111111111111111111111111111111111111111111111111111111111111111", status: REVOKED, verdict: duplicate}
+      - kind: alert
+        from: "22222222-2222-4222-8222-222222222222"
+        peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        hash: "1111111111111111111111111111111111111111111111111111111111111111"
+        status: REVOKED
+        verdict: quorum
+        standings: [{peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", standing: capped, ceiling: 0.5}]
+      - {reputation: {"44444444-4444-4444-8444-444444444444": 0.75}}
+      - {kind: alert, from: "44444444-4444-4444-8444-444444444444", peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", hash: "1111111111111111111111111111111111111111111111111111111111111111", status: REVOKED, verdict: settled}
+      - {own_result: VERIFIED, peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+      - {kind: alert, from: "11111111-1111-4111-8111-111111111111", peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", hash: "1111111111111111111111111111111111111111111111111111111111111111", status: REVOKED, verdict: counted}
+
+participants:
+  - id: node
+    role: receiver
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: zta_delegation_events
+    description: |
+        The adapter offers every event to the production decisions
+        (C zta_delegation.c, Python zta/delegation.py) and records whether
+        every verdict and every standing published matches the table.
+
+expected_state:
+  node:
+    all_cases_match: true

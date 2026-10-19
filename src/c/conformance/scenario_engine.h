@@ -86,6 +86,11 @@ typedef struct sce_run_ctx {
     /* Wide enough for the longest diagnostic _drive_assertion builds: the
      * expected from->to:function triple plus a 256-byte list of what the
      * parent step's outbox actually held. */
+    /* True while a response step (`in_response_to`) is rebuilt for delivery:
+     * the Python engine re-delivers the captured message there, so an
+     * adapter rebuilding it may need to make what the real handler made
+     * (an acceptor's signature, say). */
+    bool responding;
     char err[512];
 } sce_run_ctx_t;
 

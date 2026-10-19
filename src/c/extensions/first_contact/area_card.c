@@ -111,7 +111,7 @@ int at_area_card_verify(const at_dir_signed_t *card, double now)
 }
 
 int at_area_card_create(const identity_t *self, const char *area, const char *bucket,
-                        const char *name, int64_t seq, long expiry, double now,
+                        const char *name, int64_t seq, int64_t expiry, double now,
                         at_dir_signed_t *out)
 {
     char a[AT_AREA_MAX + 1], bk[AT_AREA_BUCKET_MAX + 1];
@@ -123,7 +123,7 @@ int at_area_card_create(const identity_t *self, const char *area, const char *bu
         || strncmp(bk, a, strlen(a)) != 0 || !at_area_valid_name(name))
         return AT_DIR_MALFORMED;
     if (expiry == 0)
-        expiry = (long)now + AT_AREA_DEFAULT_TTL_SECONDS;
+        expiry = (int64_t)now + AT_AREA_DEFAULT_TTL_SECONDS;
     char uu[UUID_STRING_LEN + 1];
     uuid_unparse_lower(self->uuid, uu);
     /* identity_t embeds public_identity_t at offset 0; the address is left

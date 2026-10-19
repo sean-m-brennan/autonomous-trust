@@ -61,13 +61,12 @@ static const char T2[] = "00000000-0000-4000-8000-000000000002";
 static const char A[] = "aaaaaaaa-0000-4000-8000-000000000001";
 static const char B[] = "bbbbbbbb-0000-4000-8000-000000000002";
 
-static process_t *_mk_process(bool placing)
+static process_t *_mk_process(void)
 {
     process_t *proc = smrt_create(sizeof(process_t));
     ck_assert_ptr_nonnull(proc);
     pthread_rwlock_init(&proc->protocol.peers_rwlock, NULL);
     strncpy(proc->name, "reputation", PROC_NAME_LEN);
-    proc->protocol.group.ordered_placement = placing;
     return proc;
 }
 
@@ -141,7 +140,7 @@ DEFINE_TEST(test_the_pool_survives_a_restart)
     ck_assert(mkdtemp(dir) != NULL);
     reputation_set_placement_dir(dir);
     reputation_reset_state(1);
-    process_t *proc = _mk_process(true);
+    process_t *proc = _mk_process();
     reputation_restore_pool(proc);
     _half(T1, A, 0.75);
     _half(T2, A, 0.25);
@@ -167,7 +166,7 @@ DEFINE_TEST(test_an_unchanged_pool_is_not_rewritten)
     ck_assert(mkdtemp(dir) != NULL);
     reputation_set_placement_dir(dir);
     reputation_reset_state(1);
-    process_t *proc = _mk_process(true);
+    process_t *proc = _mk_process();
     char path[128];
     struct stat sb;
     _pool_path(dir, path, sizeof(path));
@@ -189,24 +188,6 @@ DEFINE_TEST(test_an_unchanged_pool_is_not_rewritten)
 }
 END_TEST_DEFINITION()
 
-DEFINE_TEST(test_a_chain_that_does_not_place_writes_nothing)
-{
-    char dir[] = "/tmp/at-pool-test-XXXXXX";
-    ck_assert(mkdtemp(dir) != NULL);
-    reputation_set_placement_dir(dir);
-    reputation_reset_state(1);
-    process_t *proc = _mk_process(false);
-    _half(T1, A, 0.75);
-    reputation_persist_pools(proc);
-    char path[128];
-    struct stat sb;
-    _pool_path(dir, path, sizeof(path));
-    ck_assert(stat(path, &sb) != 0);
-    rmdir(dir);
-    reputation_set_placement_dir(NULL);
-}
-END_TEST_DEFINITION()
-
 DEFINE_TEST(test_an_unreadable_pool_starts_empty)
 {
     char dir[] = "/tmp/at-pool-test-XXXXXX";
@@ -219,7 +200,7 @@ DEFINE_TEST(test_an_unreadable_pool_starts_empty)
     fclose(f);
     reputation_set_placement_dir(dir);
     reputation_reset_state(1);
-    reputation_restore_pool(_mk_process(true));
+    reputation_restore_pool(_mk_process());
     uuid_t got[4];
     ck_assert_int_eq(reputation_get_pool_tasks(got, 4), 0);
     unlink(path);
@@ -233,5 +214,4 @@ RUN_TESTS(RepPlacePoolPersist,
           test_what_was_placed_meanwhile_stays_out,
           test_the_pool_survives_a_restart,
           test_an_unchanged_pool_is_not_rewritten,
-          test_a_chain_that_does_not_place_writes_nothing,
           test_an_unreadable_pool_starts_empty)

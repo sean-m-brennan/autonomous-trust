@@ -188,7 +188,12 @@ int all_config_files(char dir[], array_t *paths)
         struct dirent *de = readdir(d);
         if (de == NULL)
             break;
+#ifdef DT_REG
         if (de->d_type == DT_REG || de->d_type == DT_UNKNOWN)
+#else
+        /* No d_type (Windows): the extension test below is the filter. */
+        if (true)
+#endif
         {
             char *dot = strchr(de->d_name, '.');
             /* Accept all three legacy/current extensions regardless of

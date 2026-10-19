@@ -49,6 +49,7 @@
 #include "autonomous_trust/node_priv.h"
 #include "config/configuration.h"
 #include "utilities/message.h"
+#include "utilities/send_retry.h"
 #include "autonomous_trust/at_route_priv.h"   /* at_route_internal_msgs forward */
 
 /****************************
@@ -651,6 +652,104 @@ DEFINE_TEST(test_every_app_event_type_forwards_to_the_app_queue)
 }
 END_TEST_DEFINITION()
 
+/* No app attached (cohort runs logged about a thousand ENOENT drops each, between
+ * short-lived drivers): a one-time event waits for the app, in order; a state
+ * event the roster pull re-emits is counted and dropped, not held. */
+/* One datagram from @p q within about a second, or fail rather than hang. */
+static void _recv_soon(queue_t *q, generic_msg_t *got)
+{
+    for (int i = 0; i < 100; i++) {
+        if (messaging_recv_on(q, got, NULL, false) == 0)
+            return;
+        usleep(10000);
+    }
+    _test_count++;
+    _ck_fail("nothing reached the app queue");
+}
+
+static void _route_one(generic_msg_t *msg, const char *q_out, int want_sent)
+{
+    array_t unhandled;
+    ck_assert_ret_ok(array_init(&unhandled));
+    ck_assert_ret_ok(at_route_queue_msg(&unhandled, msg));
+    ck_assert_int_eq(at_route_internal_msgs(&unhandled, q_out, NULL), want_sent);
+    array_free(&unhandled);
+}
+
+DEFINE_TEST(test_one_time_events_wait_for_the_app_and_state_events_do_not)
+{
+    queue_dir_setup();
+    at_app_hold_reset();
+    queue_t sender_q;
+    ck_assert_ret_ok(messaging_init("_hold_sender_q", &sender_q));
+    messaging_assign(&sender_q);
+    ck_assert(!messaging_bound("_hold_app_q"));
+    ck_assert(at_app_event_replayed(PEER_OBSERVED));
+    ck_assert(!at_app_event_replayed(TRANSACTION_SCORE));
+
+    generic_msg_t one[3] = {{0}}, state = {0};
+    for (int i = 0; i < 3; i++) {
+        one[i].type = TRANSACTION_SCORE;
+        one[i].size = message_size(TRANSACTION_SCORE);
+        one[i].info.tx_score.score = 0.1 * (i + 1);
+        _route_one(&one[i], "_hold_app_q", 0);
+    }
+    state.type = PEER_OBSERVED;
+    state.size = message_size(PEER_OBSERVED);
+    _route_one(&state, "_hold_app_q", 0);
+    ck_assert_int_eq((int)at_app_held_count(), 3);
+
+    /* The app binds: the next pass hands it the three, in order, and only them. */
+    queue_t app_q;
+    ck_assert_ret_ok(messaging_init("_hold_app_q", &app_q));
+    array_t empty;
+    ck_assert_ret_ok(array_init(&empty));
+    ck_assert_int_eq(at_route_internal_msgs(&empty, "_hold_app_q", NULL), 0);
+    array_free(&empty);
+    ck_assert_int_eq((int)at_app_held_count(), 0);
+    for (int i = 0; i < 3; i++) {
+        generic_msg_t got = {0};
+        _recv_soon(&app_q, &got);
+        ck_assert_int_eq((int)got.type, TRANSACTION_SCORE);
+        ck_assert(got.info.tx_score.score > 0.1 * (i + 1) - 1e-9
+                  && got.info.tx_score.score < 0.1 * (i + 1) + 1e-9);
+    }
+    generic_msg_t none = {0};
+    ck_assert(messaging_recv_on(&app_q, &none, NULL, false) != 0);
+
+    /* Attached, an event goes straight through. */
+    _route_one(&one[0], "_hold_app_q", 1);
+    generic_msg_t got = {0};
+    _recv_soon(&app_q, &got);
+
+    /* The app goes away: held again. */
+    messaging_qclose(&app_q);
+    _route_one(&one[1], "_hold_app_q", 0);
+    ck_assert_int_eq((int)at_app_held_count(), 1);
+
+    /* Bounded: past AT_APP_HELD_MAX the oldest goes, so the first the app
+     * gets is the sixth of AT_APP_HELD_MAX + 5 (the one held above went too). */
+    at_app_hold_reset();
+    generic_msg_t many = one[0];
+    for (int i = 0; i < AT_APP_HELD_MAX + 5; i++) {
+        many.info.tx_score.score = (double)i;
+        _route_one(&many, "_hold_app_q", 0);
+    }
+    ck_assert_int_eq((int)at_app_held_count(), AT_APP_HELD_MAX);
+    ck_assert_ret_ok(messaging_init("_hold_app_q", &app_q));
+    (void)at_app_flush_held("_hold_app_q", NULL);
+    generic_msg_t first = {0};
+    _recv_soon(&app_q, &first);
+    ck_assert(first.info.tx_score.score > 4.5 && first.info.tx_score.score < 5.5);
+    messaging_qclose(&app_q);
+    at_send_retry_reset();   /* the app queue's depth sent the rest to it */
+
+    at_app_hold_reset();
+    messaging_assign(NULL);
+    messaging_qclose(&sender_q);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(App_Node,
           test_the_config_survives_an_init_that_aliases_it,
           test_an_empty_config_still_gets_the_documented_defaults,
@@ -668,4 +767,5 @@ RUN_TESTS(App_Node,
           test_wait_ready_does_not_wait_out_the_timeout_for_nothing,
           test_a_roster_pull_says_not_ready_rather_than_just_failing,
           test_every_app_verb_is_allowlisted_for_routing,
-          test_every_app_event_type_forwards_to_the_app_queue)
+          test_every_app_event_type_forwards_to_the_app_queue,
+          test_one_time_events_wait_for_the_app_and_state_events_do_not)

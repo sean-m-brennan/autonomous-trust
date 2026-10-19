@@ -14,6 +14,9 @@ description: |
     himself, against his own roster, and appends the entry: one committed entry,
     whose hash both runtimes agree on (the pinned window root).
 
+    A committed attestation waits in the pool for its placement, as every
+    entry does now that every group places its order.
+
 participants:
   - id: alice
     role: verifier
@@ -35,5 +38,5 @@ steps:
 
 expected_state:
   bob:
-    committed_tx_count: 1
-    window_root: "bbb38ed9d7e1a1a70cf4fd74184ac4339d4120415581828516beaf99ddac162d"
+    committed_tx_count: 0
+    pool_count: 1

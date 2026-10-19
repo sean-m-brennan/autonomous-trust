@@ -1,0 +1,70 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: zta-delegation-vouch
+byte_pinning: false
+description: |
+    A member's `zta_verified` (ISSUES §2.20). It is heard only for a peer
+    this node is waiting on (its own last check could not answer), only from
+    a member (the transport's sender, never a payload claim), only about the
+    credential this node recorded for that peer, and only from a member at or
+    above delegated_verification_min_reputation. A sender whose reputation is
+    not known yet is held (pending), not refused. A quorum of distinct
+    vouchers lifts the peer to `proved`, once; this node's own answer
+    settles the peer and clears what was counted.
+
+fixtures:
+  zta_delegation:
+    # delegated_verification_min_reputation / _quorum,
+    # ddil_fallback_reputation_cap, revocation_reputation_penalty
+    policy: {min_reputation: 0.7, quorum: 2, ddil_cap: 0.5, revocation_penalty: 0.8}
+    # A, B, C, D are members; X is not.
+    members: ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444"]
+    # The credential hash this node recorded for each peer; N has none.
+    records:
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa": "1111111111111111111111111111111111111111111111111111111111111111"
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb": "2222222222222222222222222222222222222222222222222222222222222222"
+      "cccccccc-cccc-4ccc-8ccc-cccccccccccc": "3333333333333333333333333333333333333333333333333333333333333333"
+      "dddddddd-dddd-4ddd-8ddd-dddddddddddd": "4444444444444444444444444444444444444444444444444444444444444444"
+    # A sender with no entry has no answer yet (pending); C is under the bar.
+    reputations: {"11111111-1111-4111-8111-111111111111": 0.9, "22222222-2222-4222-8222-222222222222": 0.8, "33333333-3333-4333-8333-333333333333": 0.3, "55555555-5555-4555-8555-555555555555": 0.95}
+    events:
+      - {kind: vouch, from: "11111111-1111-4111-8111-111111111111", peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", hash: "1111111111111111111111111111111111111111111111111111111111111111", status: VERIFIED, verdict: not_unverified}
+      - {own_result: UNAVAILABLE, peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+      - {kind: vouch, from: "55555555-5555-4555-8555-555555555555", peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", hash: "1111111111111111111111111111111111111111111111111111111111111111", status: VERIFIED, verdict: not_member}
+      - {kind: vouch, from: "11111111-1111-4111-8111-111111111111", peer: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", hash: "1111111111111111111111111111111111111111111111111111111111111111", status: VERIFIED, verdict: no_record}
+      - {kind: vouch, from: "11111111-1111-4111-8111-111111111111", peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", hash: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", status: VERIFIED, verdict: hash_mismatch}
+      - {kind: vouch, from: "11111111-1111-4111-8111-111111111111", peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", hash: "1111111111111111111111111111111111111111111111111111111111111111", status: REVOKED, verdict: wrong_status}
+      - {kind: vouch, from: "33333333-3333-4333-8333-333333333333", peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", hash: "1111111111111111111111111111111111111111111111111111111111111111", status: VERIFIED, verdict: below_bar}
+      - {kind: vouch, from: "44444444-4444-4444-8444-444444444444", peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", hash: "1111111111111111111111111111111111111111111111111111111111111111", status: VERIFIED, verdict: pending}
+      - {kind: vouch, from: "11111111-1111-4111-8111-111111111111", peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", hash: "1111111111111111111111111111111111111111111111111111111111111111", status: VERIFIED, verdict: counted}
+      - {kind: vouch, from: "11111111-1111-4111-8111-111111111111", peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", hash: "1111111111111111111111111111111111111111111111111111111111111111", status: VERIFIED, verdict: duplicate}
+      - {reputation: {"44444444-4444-4444-8444-444444444444": 0.75}}
+      - kind: vouch
+        from: "44444444-4444-4444-8444-444444444444"
+        peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        hash: "1111111111111111111111111111111111111111111111111111111111111111"
+        status: VERIFIED
+        verdict: quorum
+        standings: [{peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", standing: proved, ceiling: null}]
+      - {kind: vouch, from: "22222222-2222-4222-8222-222222222222", peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", hash: "1111111111111111111111111111111111111111111111111111111111111111", status: VERIFIED, verdict: settled}
+      - {own_result: VERIFIED, peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+      - {kind: vouch, from: "22222222-2222-4222-8222-222222222222", peer: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", hash: "1111111111111111111111111111111111111111111111111111111111111111", status: VERIFIED, verdict: not_unverified}
+
+participants:
+  - id: node
+    role: receiver
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: zta_delegation_events
+    description: |
+        The adapter offers every event to the production decisions
+        (C zta_delegation.c, Python zta/delegation.py) and records whether
+        every verdict and every standing published matches the table.
+
+expected_state:
+  node:
+    all_cases_match: true

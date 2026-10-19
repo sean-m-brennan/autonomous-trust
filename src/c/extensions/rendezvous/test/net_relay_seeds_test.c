@@ -85,7 +85,7 @@ static char *_edits(const unsigned char *seed, const char *add, const char *remo
     return _signed(seed, AT_RELAY_SEEDS_LOCAL_DOMAIN, body);
 }
 
-static void _write(const char *dir, const char *name, const char *text)
+static void _write_file(const char *dir, const char *name, const char *text)
 {
     char path[512];
     snprintf(path, sizeof(path), "%s/%s/%s", g_root, dir, name);
@@ -98,14 +98,14 @@ static void _write(const char *dir, const char *name, const char *text)
 static void _ship(int seq, const char *relays_json)
 {
     char *t = _list(g_release_seed, seq, relays_json);
-    _write("etc/at", AT_RELAY_SEEDS_FILE, t);
+    _write_file("etc/at", AT_RELAY_SEEDS_FILE, t);
     free(t);
 }
 
 static void _local(const unsigned char *seed, const char *add, const char *remove)
 {
     char *t = _edits(seed, add, remove);
-    _write("var/at", AT_RELAY_SEEDS_LOCAL_FILE, t);
+    _write_file("var/at", AT_RELAY_SEEDS_LOCAL_FILE, t);
     free(t);
 }
 
@@ -135,7 +135,7 @@ static void _fresh_root(void)
     sodium_bin2hex(seed_hex, sizeof(seed_hex), g_node_seed, sizeof(g_node_seed));
     snprintf(ident, sizeof(ident),
              "{\"typename\":\"identity\",\"signature\":{\"hex_seed\":\"%s\"}}", seed_hex);
-    _write("etc/at", "identity.cfg.json", ident);
+    _write_file("etc/at", "identity.cfg.json", ident);
 }
 
 static size_t _own(net_relay_ep_t *eps)
@@ -323,7 +323,7 @@ DEFINE_TEST(test_an_explicit_path_overrides_the_cfg_dir)
     _fresh_root();
     net_relay_ep_t eps[AT_RELAY_MAX];
     char *t = _list(g_release_seed, 1, "[\"relay://203.0.113.12:1\"]");
-    _write("", "elsewhere.json", t);
+    _write_file("", "elsewhere.json", t);
     free(t);
     char path[512];
     snprintf(path, sizeof(path), "%s//elsewhere.json", g_root);

@@ -90,6 +90,9 @@ static identity_t *_mk_identity(const char *name, const char *addr)
     return ident;
 }
 
+/* The identity process the last _admit ran (its kept frames are its own). */
+static process_t *g_admit_proc = NULL;
+
 static process_t *_mk_process(identity_t *self)
 {
     process_t *proc = smrt_create(sizeof(process_t));
@@ -156,6 +159,7 @@ static void _admit(size_t refuse_each)
     identity_t *me = _mk_identity("amy", "10.0.0.2");
     identity_t *joiner = _mk_identity("bob", "10.0.0.3");
     process_t *proc = _mk_process(me);
+    g_admit_proc = proc;   /* the owner of what it kept, for a later drain */
     directory_t *queues = _mk_queues();
     public_identity_t *pub = _publish(joiner);
     /* A lone node's own vote is the majority once the grace period is up. */
@@ -202,7 +206,9 @@ DEFINE_TEST(test_a_wedged_queue_keeps_both_for_the_tick)
     ck_assert(at_send_retry_pending("network") >= 2);
     g_refuse_each = 0;                      /* the queue drains */
     messaging_set_test_hook(_capture_hook); /* _admit removed it */
-    at_send_retry_drain(NULL, "network", (double)time(NULL));
+    /* As the identity process's own tick would: a kept frame is its sender's
+     * to retry (in-process every subsystem shares the list). */
+    at_send_retry_drain(g_admit_proc, "network", (double)time(NULL));
     messaging_set_test_hook(NULL);
     ck_assert_uint_eq(g_granted, 1);
     ck_assert_uint_eq(g_history, 1);

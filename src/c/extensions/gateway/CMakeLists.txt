@@ -42,7 +42,8 @@ add_library(at_gateway SHARED ${at_gateway_src})
 # Link the core .so by file, not by target: the core's target_sources(...
 # PUBLIC ${libsrc}) would otherwise compile a second copy of the whole core
 # into libat_gateway, with its own process tables and filter chain.
-target_link_libraries(at_gateway PRIVATE $<TARGET_LINKER_FILE:autonomous_trust>)
+target_link_libraries(at_gateway PRIVATE $<TARGET_LINKER_FILE:autonomous_trust>
+    ${DEPENDENCIES})
 add_dependencies(at_gateway autonomous_trust)
 
 add_library(at_gateway_static STATIC ${at_gateway_src})
@@ -68,9 +69,8 @@ install(TARGETS at_gateway at_gateway_static
 # cross_cluster where they need them) on their network_config_t and install
 # the filter through the extension (test/gateway_test.h), as a node would.
 if(LIBCHECK_LIBRARY)
-    set(AT_GATEWAY_TEST_LIBS
-        -Wl,--whole-archive at_gateway_static -Wl,--no-whole-archive
-        ${AT_TEST_LIBS})
+    at_whole_archive(_gateway_whole at_gateway_static)
+    set(AT_GATEWAY_TEST_LIBS ${_gateway_whole} ${AT_TEST_LIBS})
 
     function(add_gateway_test name)
         add_executable(${name} test/${name}.c)

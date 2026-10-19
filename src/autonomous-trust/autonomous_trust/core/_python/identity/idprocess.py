@@ -261,6 +261,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # flow. Cleared once the merge is in flight to prevent loops.
         self.self_bootstrapped = False
         self.merging = False
+        # Groups other than ours that admitted us, whose members we have
+        # already sent our history to (_tell_bridged_group). Once per group, so
+        # two members of different groups cannot bounce histories forever.
+        # Bounded like C's ID_TOLD_BRIDGED_MAX.
+        self._told_bridged: list[str] = []
         self.peer_potentials = {}
         # Gateway multi-group state — see doc/architecture/gateway-reputation-tree.md.
         # child_groups:   group-uuid-str -> Group (with key) we gateway parent_gateway:
@@ -1760,6 +1765,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self._record_group(queues)
                     self._populate_peers_from_history(
                         queues, list(unioned_peers.values()))
+                    # Every other group that admitted us: tell its members
+                    # ours exists.
+                    for hist_tpl in list(self.histories):
+                        self._tell_bridged_group(queues, hist_tpl[0])
                     existing = hist
                     diff: list[LinkedStep] = self._history.catch_up(existing)
                     msg_str = to_json_string(diff)  # to self.handle_history_diff()
@@ -2029,10 +2038,78 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         except Exception as err:
             self.report_exception(err, 'vote_collection')
 
+    def _history_payload(self) -> str:
+        """The full_history a welcomer hands a joiner: (group, steps, peer
+        identities). Twin of C _history_payload."""
+        peers_payload = [public_identity_to_canonical(p) for p in self.peers.all]
+        # Group slot travels as the DRY canonical flat dict (shared byte-shape
+        # with C's group_to_json) so a C peer can parse it and recover the
+        # shared private key; Python peers reconstruct via Group.from_canonical
+        # in receive_history/_merge_to_mesh/choose_group. See
+        # [[project_group_key_sync]].
+        return to_json_string((self.group.to_canonical(), self._history.recite(),
+                               peers_payload))
+
+    def _tell_bridged_group(self, queues, foreign_group) -> int:
+        """We were admitted into ``foreign_group`` (a history's group slot,
+        canonical dict or Group) as well as into the group we hold, so its
+        members and ours have never met: two founders that bootstrapped apart,
+        bridged only by us. Nothing else would ever tell them. Send our current
+        group's history to every member of the other group we hold as a peer; a
+        founder that self-bootstrapped merges through receive_history ->
+        _merge_to_mesh, and the merge's tiebreak settles which group both keep.
+        Once per foreign group. Returns how many histories were queued. Twin of
+        C _tell_bridged_group."""
+        if isinstance(foreign_group, dict):
+            guuid = foreign_group.get('uuid')
+            members = foreign_group.get('address_map') or {}
+        else:
+            guuid = getattr(foreign_group, 'uuid', None)
+            members = getattr(foreign_group, '_address_map', None) or {}
+        if guuid is None or self.group is None:
+            return 0
+        guuid = str(guuid).lower()
+        ours = str(self.group.uuid).lower()
+        if guuid == ours:
+            return 0
+        with self.lock:
+            if guuid in self._told_bridged:
+                return 0
+            self._told_bridged.append(guuid)
+            del self._told_bridged[:-16]
+        our_members = {str(u).lower() for u in self.group._address_map}
+        to = []
+        for member in members:
+            if str(member).lower() in our_members:
+                continue
+            peer = self.peers.find_by_uuid(member) if self.peers else None
+            if peer is not None:
+                to.append(peer)
+        if not to:
+            self.logger.info('Admitted by group %s as well as ours (%s), but we '
+                             'hold none of its members as peers', guuid, ours)
+            return 0
+        msg_str = self._history_payload()
+        sent = 0
+        for peer in to:
+            self.logger.info('Admitted by group %s as well as ours (%s): sending '
+                             'our history to its member %s', guuid, ours, peer.nickname)
+            try:
+                queues[CfgIds.network].put(
+                    Message(self.name, IdentityProtocol.history, msg_str, to_whom=peer),
+                    block=True, timeout=self.q_cadence)
+                sent += 1
+            except Full:
+                self.logger.error('_tell_bridged_group: Network queue full')
+        return sent
+
     def _peer_accepted(self, queues, blob: IdentityObj, amnesia=False):
         if self.group is None:  # too early
             return
         self.logger.debug('Process accepted peer: %s (%s)', blob.identity.nickname, amnesia)
+        # A contact the vote admitted was in the peer list before it was a member.
+        promoted = (not amnesia
+                    and self.peers.find_by_uuid(blob.identity.uuid) is not None)
 
         # inform existing group members about the new peer;  to self.handle_confirm_peer()
         # New-peer identity rides as the DRY canonical public-identity payload
@@ -2102,16 +2179,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 blob.identity.nickname)
         else:
             self._rotate_group_key(queues)
-        peers_payload = [public_identity_to_canonical(p) for p in self.peers.all]
-        # Group slot travels as the DRY canonical flat dict (shared byte-shape
-        # with C's group_to_json) so a C peer can parse it and recover the
-        # shared private key; Python peers reconstruct via Group.from_canonical
-        # in receive_history/_merge_to_mesh/choose_group. See
-        # [[project_group_key_sync]].
-        msg_str = to_json_string((self.group.to_canonical(), self._history.recite(),
-                                  peers_payload))
+        msg_str = self._history_payload()
         message = Message(self.name, IdentityProtocol.history, msg_str, to_whom=blob.identity)
-        self.logger.debug('Send full history (+%d peer identities)', len(peers_payload))
+        self.logger.debug('Send full history (+%d peer identities)', len(self.peers.all))
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
 
         if not amnesia:  # otherwise, already in listings
@@ -2121,7 +2191,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                          peer_uuid=str(blob.identity.uuid),
                          peer_addr=getattr(blob.identity, 'address', None),
                          source='peer_accepted')
-            self._add_peer(queues, blob.identity, amnesia)
+            self._add_peer(queues, blob.identity, amnesia, promoted=promoted)
 
     @staticmethod
     def _mark_operator_bound(new_id, value):
@@ -2187,8 +2257,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         """
         if self.phase != 3:
             if message.function == IdentityProtocol.announce:
-                # Nobody resends a request_access, so say that this one is lost.
-                self.logger.info('Dropping access request from %s: identity phase %s, not 3',
+                # A requester with a peer never resends, so the request is
+                # held: unhandled, process() keeps it in self.messages and
+                # offers it again every pass until phase 3. C holds it the same
+                # way (identity_replay_held_access_requests).
+                self.logger.info('Holding access request from %s until phase 3 (identity phase %s)',
                                  getattr(message.from_whom, 'nickname', '?'), self.phase)
             return False
         if message.function == IdentityProtocol.announce:
@@ -2239,9 +2312,25 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                                       why)
                     return True
                 id_obj = IdentityObj(new_id, new_id.uuid)
+                # Recognizing a returning node (doc/architecture/identity-protocol.md,
+                # "Amnesia"). A known uuid must present the keys it is known by;
+                # address and nickname may change. Only a MEMBER of our group is
+                # readmitted without a vote: anything else in the peer list -- a
+                # first-contact direct peer, a provisional admission -- takes the
+                # ordinary path below, vote and admission gate included, because
+                # readmission hands over the group key.
                 existing = self.peers.find_by_uuid(new_id.uuid)
-                if new_id == existing:  # don't care if it's a different address
+                if existing is not None and not self._same_keys(new_id, existing):
+                    self.logger.warning(
+                        'Access request from %s refused: uuid %s is known under '
+                        'different keys', new_id.nickname, str(new_id.uuid)[:8])
+                    _probes.counter('id.join', 'known_uuid_new_keys', 'refused')
+                    return True
+                if existing is not None and self._group_already_member(new_id):
                     self.logger.debug('Amnesiac peer: %s', new_id.nickname)
+                    if (existing.address != new_id.address
+                            or existing.nickname != new_id.nickname):
+                        self._readdress_member(queues, existing, new_id)
                     # Late-arrival cap recovery: if this peer was added
                     # to self.peers via a confirm broadcast that arrived
                     # before its announce (no_prior_potential path), its
@@ -2309,6 +2398,33 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 self.logger.error('welcoming_committee: Network queue full')
             return True
         return False
+
+    @staticmethod
+    def _same_keys(one, other) -> bool:
+        """Whether two identities are the same keyholder: uuid, signing key and
+        encryption key. Address and nickname are deliberately not compared,
+        since a node that moved networks is still itself. Mirrors C
+        _same_keys."""
+        return (other is not None and str(one.uuid) == str(other.uuid)
+                and one.signature == other.signature
+                and one.encryptor == other.encryptor)
+
+    def _readdress_member(self, queues, existing, new_id):
+        """A returning member came back from a new address (or under a new
+        nickname): replace the record and the group address map's entry, and
+        tell the group, so its traffic is attributed to it again."""
+        self.logger.info('Member %s returned from %s (was %s)', new_id.nickname,
+                         new_id.address, existing.address)
+        self.peers.remove(existing)
+        self.peers.add(new_id, self.peers.mid_level)
+        self._record_peers(queues)
+        self._confirm_group_membership(queues, new_id)
+
+    def _is_contact(self, peer_uuid) -> bool:
+        """Whether ``peer_uuid`` is a contact the user recorded (first
+        contact). Without that extension nobody is."""
+        return any(hook.is_contact(self, str(peer_uuid)) for hook in identity_hooks(self)
+                   if hook.is_contact is not None)
 
     def _group_already_member(self, peer) -> bool:
         """True when ``peer`` is ALREADY a member of our group, i.e. its uuid is
@@ -2518,7 +2634,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # paths that already merge histories without merging keys).
         self._update_group(queues, self.group, level)
 
-    def _add_peer(self, queues, identity, amnesia=False, confirmed=True):
+    def _add_peer(self, queues, identity, amnesia=False, confirmed=True, promoted=False):
         # The `amnesia` parameter is currently a structural placeholder.
         # All callers either pass the default (`False`) or are guarded
         # by `if not amnesia` above. The actual amnesia recovery flow
@@ -2540,7 +2656,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         level = self.peers.mid_level
         if confirmed:
             self._confirm_group_membership(queues, identity, level)
-        self._history.insert_peer(identity, level)
+        self._history.insert_peer(identity, level, promoted=promoted)
         with self.lock:
             has_potential = identity.uuid in self.peer_potentials
             capabilities = self.peer_potentials.get(identity.uuid) if has_potential else None
@@ -2563,7 +2679,16 @@ class IdentityProcess(Process, metaclass=ProcMeta,
 
     def _process_id(self, blob):
         try:
+            # A recorded contact asking to join is already in the peer list, so
+            # it would collide with itself. It is exempt only as the keyholder it
+            # is known as, and only while not yet a member: the vote is the one
+            # route by which a contact joins (amnesia readmission is for members).
+            candidate = blob.identity
+            contact = (not self._group_already_member(candidate)
+                       and self._is_contact(candidate.uuid))
             for peer in self.peers.all:
+                if contact and self._same_keys(candidate, peer):
+                    continue
                 if blob.identity.uuid == peer.uuid or \
                         blob.identity.signature == peer.signature or \
                         blob.identity.encryptor == peer.encryptor:

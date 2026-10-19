@@ -35,7 +35,7 @@ class Group(InitializableConfig):
 
     def __init__(self, _uuid, _address_map, _nickname, _encryptor, _public_only=True,
                  _created=0.0, _key_epoch=0, _previous_keys=None, _wire_format=None,
-                 _commit_certificates=False, _ordered_placement=False):
+                 _commit_certificates=None, _ordered_placement=None):
         super().__init__(identity_pb2.Group)
         self._uuid = str(_uuid)
         self._address_map = _address_map
@@ -100,21 +100,11 @@ class Group(InitializableConfig):
             # reading would cost more than it protects. Same discipline as
             # zta_policy.binding_mode falling back to `require`.
             self._wire_format = NetWireFormat.json
-        # Whether this group's members REQUIRE a quorum certificate on an
-        # ordinary reputation commit (doc/architecture/reputation.md, "Commit
-        # certificates"). Group-carried for the reason wire_format is: a
-        # receiver that requires one refuses commits a receiver that does not
-        # would write, so two members that disagreed would fork their chains.
-        # A joiner adopts its group's value; AT_COMMIT_CERTIFICATES only stamps
-        # a group this node mints. Absent -> False, which is every group minted
-        # before this existed.
-        self._commit_certificates = bool(_commit_certificates)
-        # Whether Paxos decides this group's chain order (doc/architecture/
-        # reputation.md, "Agreeing on an order"). Group-carried for the same
-        # reason: a cohort that half placed and half appended on arrival would
-        # fork. A joiner adopts it; AT_ORDERED_PLACEMENT only stamps a group
-        # this node mints. Absent -> False.
-        self._ordered_placement = bool(_ordered_placement)
+        # `_commit_certificates` and `_ordered_placement` are retired
+        # (2026-10-16): every group places its order and certifies its commits
+        # (doc/architecture/reputation.md, "Agreeing on an order"). The
+        # parameters stay only so a config written before then still loads
+        # through `config_json_decoder`; their values are ignored.
 
     def to_dict(self):
         # `_previous_keys` is process-local grace-window state, not part of the
@@ -128,10 +118,6 @@ class Group(InitializableConfig):
         # runtimes' persisted groups the same shape.
         d = super().to_dict()
         d.pop('_previous_keys', None)
-        # Absent when off, so every group that does not declare it keeps the
-        # shape it had before the field existed.
-        if not d.get('_ordered_placement'):
-            d.pop('_ordered_placement', None)
         return d
 
     def __eq__(self, other):
@@ -164,21 +150,6 @@ class Group(InitializableConfig):
         existed has no attribute at all, and every such group is JSON."""
         return getattr(self, '_wire_format', NetWireFormat.json)
 
-    @property
-    def commit_certificates(self) -> bool:
-        """Do this group's members require a quorum certificate on every
-        ordinary reputation commit? ``getattr`` with a default for the same
-        reason as :attr:`wire_format`: a group decoded from a config written
-        before the field existed has no attribute, and every such group does
-        not."""
-        return bool(getattr(self, '_commit_certificates', False))
-
-    @property
-    def ordered_placement(self) -> bool:
-        """Does Paxos decide this group's chain order? ``getattr`` with a
-        default, as for :attr:`commit_certificates`."""
-        return bool(getattr(self, '_ordered_placement', False))
-
     #: How long a superseded key still decrypts, and how many are kept. A
     #: rotation propagates as fast as one message to each member, so this is
     #: generous; it bounds the window in which a key that was deliberately
@@ -199,18 +170,24 @@ class Group(InitializableConfig):
         Requires ownership of the current private key -- a public-only view of
         somebody else's group has no standing to rotate it, and silently
         minting a key here would fork the cohort into two that cannot hear
-        each other."""
+        each other.
+
+        The new key is minted before the current one is retired, so a mint
+        that raises leaves the group as it was. Retiring first would leave a
+        live key that is also in its own retired list, refusing every update
+        that carries it. Mirrors C group_rotate_key."""
         if not self.owns_private_key:
             raise RuntimeError(
                 'Cannot rotate the key of a group whose private key we do not '
                 'hold (%s)' % self.nickname)
+        minted = Encryptor.generate()
         stamp = time.time() if now_ts is None else float(now_ts)
         prev = getattr(self, '_previous_keys', None)
         if prev is None:
             prev = self._previous_keys = []
         prev.insert(0, (self._encryptor, stamp))
         del prev[self.PREVIOUS_KEY_MAX:]
-        self._encryptor = Encryptor.generate()
+        self._encryptor = minted
         self._public_only = False
         self._key_epoch = self.key_epoch + 1
         return self._key_epoch
@@ -394,11 +371,6 @@ class Group(InitializableConfig):
         # new group, which is precisely the split a group-carried format exists
         # to prevent.
         self._wire_format = other.wire_format
-        # Likewise the commit-certificate declaration: it is a property of the
-        # cohort, and an absorbed node that kept its own would refuse (or
-        # accept) commits the rest of its new group does not.
-        self._commit_certificates = other.commit_certificates
-        self._ordered_placement = other.ordered_placement
 
     def encrypt(self, msg, whom, nonce=None):
         """
@@ -434,13 +406,20 @@ class Group(InitializableConfig):
             # frames. Bounded by age so a retired key stops working soon after
             # it is retired -- an unbounded fallback would make rotation
             # decorative.
+            #
+            # Each retired key is tried as the pair it was, its own private
+            # with its own public, which is how a group frame is sealed (the
+            # shared key to itself). The network process passes the group as
+            # `whom`, so pairing with whom's public meant the CURRENT public,
+            # and no frame sealed under a retired key ever opened. Mirrors C
+            # group_decrypt.
             stamp = time.time()
             for old_key, retired_at in list(getattr(self, '_previous_keys', [])):
                 if stamp - retired_at > self.PREVIOUS_KEY_GRACE:
                     continue
                 try:
                     return Box(old_key.private,
-                               whom.encryptor.public).decrypt(msg, nonce)
+                               old_key.public).decrypt(msg, nonce)
                 except CryptoError:
                     continue
             raise
@@ -450,9 +429,7 @@ class Group(InitializableConfig):
         # GROUP, not of holding its private key, and a member handed a
         # public-only view still has to know which envelope the cohort speaks.
         return Group(self.uuid, self.addresses, self.nickname, Encryptor(self.encryptor.publish(), True), True,
-                     _wire_format=self.wire_format,
-                     _commit_certificates=self.commit_certificates,
-                     _ordered_placement=self.ordered_placement)
+                     _wire_format=self.wire_format)
 
     def sync_to_message(self):
         self.message.uuid = str(self._uuid).encode('utf-8')
@@ -470,13 +447,6 @@ class Group(InitializableConfig):
         self.message.wire_format = (identity_pb2.NET_WIRE_PROTO
                                     if self.wire_format == NetWireFormat.proto
                                     else identity_pb2.NET_WIRE_JSON)
-        # False is the proto3 default, so a group that does not declare it
-        # encodes to the bytes it did before this field existed. Guarded for
-        # generated code that predates the field.
-        if 'commit_certificates' in self.message.DESCRIPTOR.fields_by_name:
-            self.message.commit_certificates = self.commit_certificates
-        if 'ordered_placement' in self.message.DESCRIPTOR.fields_by_name:
-            self.message.ordered_placement = self.ordered_placement
         self._encryptor.sync_to_message()
         self.message.encryptor.CopyFrom(self._encryptor.message)
 
@@ -494,10 +464,6 @@ class Group(InitializableConfig):
         self._wire_format = (NetWireFormat.proto
                              if self.message.wire_format == identity_pb2.NET_WIRE_PROTO
                              else NetWireFormat.json)
-        self._commit_certificates = bool(
-            getattr(self.message, 'commit_certificates', False))
-        self._ordered_placement = bool(
-            getattr(self.message, 'ordered_placement', False))
         self._nickname = ''
         self._public_only = True
         # Reconstruct nested Encryptor
@@ -542,14 +508,6 @@ class Group(InitializableConfig):
             # the same message, from the member that admitted us.
             'wire_format': self.wire_format,
         }
-        # Commit-certificate declaration: emitted ONLY when set, so a group that
-        # does not declare it keeps the bytes it had before the field existed
-        # (every byte-pinned group form in the corpus). Absent reads as False.
-        if self.commit_certificates:
-            out['commit_certificates'] = True
-        # Likewise the ordered-placement declaration.
-        if self.ordered_placement:
-            out['ordered_placement'] = True
         return out
 
     @staticmethod
@@ -569,9 +527,7 @@ class Group(InitializableConfig):
                      _key_epoch=int(d.get('key_epoch', 0) or 0),
                      # Absent -> json (the constructor's default), which is both
                      # what an older peer means and the safe reading (doc/architecture/network-wire-format.md).
-                     _wire_format=d.get('wire_format'),
-                     _commit_certificates=d.get('commit_certificates') is True,
-                     _ordered_placement=d.get('ordered_placement') is True)
+                     _wire_format=d.get('wire_format'))
 
     @staticmethod
     def initialize(address_map, our_nickname):
@@ -579,9 +535,7 @@ class Group(InitializableConfig):
         # Stamp a real creation epoch (doc/architecture/identity-protocol.md) so a group minted here carries a
         # comparable age for the merge tiebreaker. now() is the NTP-adjusted
         # clock (autonomous_trust.core.system.now).
-        from ..system import (now, resolve_net_wire_mode,
-                              resolve_commit_certificates,
-                              resolve_ordered_placement)
+        from ..system import now, resolve_net_wire_mode
         created = now().timestamp()
         # AT_NET_WIRE_MODE applies HERE and only here: this is the one moment a
         # node decides a format rather than adopting one. Every other group this
@@ -589,13 +543,9 @@ class Group(InitializableConfig):
         # (doc/architecture/network-wire-format.md), so an operator stands up a proto cohort by setting the knob on
         # whichever node forms the group.
         wire_format, _src = resolve_net_wire_mode()
-        # The commit-certificate and ordered-placement declarations likewise:
-        # decided here, adopted everywhere else.
         return Group(uuid_mod.uuid4(), address_map, our_nickname,
                      Encryptor.generate(), False, _created=created,
-                     _wire_format=wire_format,
-                     _commit_certificates=resolve_commit_certificates(),
-                     _ordered_placement=resolve_ordered_placement())
+                     _wire_format=wire_format)
 
 
 class ChildGroupSet(object):

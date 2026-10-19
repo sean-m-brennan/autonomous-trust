@@ -39,6 +39,8 @@
 #include "utilities/msg_types_priv.h"
 #include "utilities/util.h"
 #include "network/net_message.h"
+#include "identity/identity.h"
+#include "identity/identity_priv.h"   /* identity_t's keys */
 
 
 /* Frama-C: skipped — [solver-timeout] artifact_store + logging preconditions */
@@ -112,7 +114,7 @@ int fleet_store_artifact(const char *file_path, const char *version,
 int fleet_propose_update(const uint8_t *artifact_hash, const char *version,
                          const char *target_arch,
                          const uint8_t *signing_pk, const uint8_t *signing_sk,
-                         logger_t *logger)
+                         const uuid_t signer_uuid, logger_t *logger)
 {
     update_proposal_t prop;
     memset(&prop, 0, sizeof(prop));
@@ -122,7 +124,9 @@ int fleet_propose_update(const uint8_t *artifact_hash, const char *version,
     prop.min_proposer_reputation = 0.0;
     uuid_generate(prop.proposal_uuid);
 
-    memcpy(prop.signer_uuid, prop.proposal_uuid, sizeof(uuid_t));
+    /* The signer is this node: every receiver checks the signature under the
+     * key it holds for that member. */
+    uuid_copy(prop.signer_uuid, signer_uuid);
     if (update_proposal_sign(&prop, signing_sk) != 0)
     {
         if (logger)
@@ -165,4 +169,34 @@ int fleet_propose_update(const uint8_t *artifact_hash, const char *version,
     if (logger)
         log_info(logger, "fleet_propose_update: proposal submitted\n");
     return 0;
+}
+
+int fleet_propose_update_as_node(const uint8_t *artifact_hash, const char *version,
+                                 const char *target_arch, logger_t *logger)
+{
+    /* The node's identity, from its configuration: the proposal must be
+     * signed by the key the other members hold for it. */
+    char dir[CFG_PATH_LEN + 1] = {0};
+    char fname[CFG_NAME_SIZE + 16];
+    char path[CFG_PATH_LEN + CFG_NAME_SIZE + 18];
+    snprintf(fname, sizeof(fname), "identity%s",
+             at_serialize_mode_file_ext(at_serialize_mode_current()));
+    if (get_cfg_dir(dir, sizeof(dir)) < 0 || path_join(path, sizeof(path), dir, fname) < 0)
+        return -1;
+    uuid_t placeholder;
+    uuid_generate(placeholder);
+    identity_t *self = NULL;
+    if (identity_create(&placeholder, "0.0.0.0", "node", "node", &self) != 0 || self == NULL)
+        return -1;
+    if (read_config_file(path, self) != 0) {
+        if (logger)
+            log_error(logger, "fleet_propose_update_as_node: cannot read %s\n", path);
+        smrt_deref(self);
+        return -1;
+    }
+    int rc = fleet_propose_update(artifact_hash, version, target_arch, self->signature.public,
+                                  self->signature.private, self->uuid, logger);
+    sodium_memzero(self->signature.private, sizeof(self->signature.private));
+    smrt_deref(self);
+    return rc;
 }

@@ -39,6 +39,8 @@ extern char FLEET_PROTO_VOTE_NACK[];
 extern char FLEET_PROTO_ACCEPTED[];
 extern char FLEET_PROTO_REJECTED[];
 
+/** The bar a proposer's reputation must reach when `fleet.cfg.json` sets none
+ *  (fleet_gate.h). */
 #define FLEET_DEFAULT_MIN_REPUTATION 0.7
 
 /**
@@ -67,24 +69,6 @@ bool fleet_validate_proposal(const update_proposal_t *prop, const uint8_t *signe
   ensures \result == (peer_reputation >= min_threshold);
 */
 bool fleet_check_reputation_threshold(double peer_reputation, double min_threshold);
-
-/**
- * fleet_should_accept_proposal - combined validation + reputation gate.
- * @prop:               the proposal to validate
- * @signer_pk:          public key of the proposer
- * @proposer_reputation: the proposer's current reputation score
- * Returns true only if the signature is valid AND reputation meets the
- * threshold embedded in the proposal (prop->min_proposer_reputation).
- */
-/*@
-  requires \valid(prop);
-  requires \valid_read(signer_pk + (0 .. crypto_sign_PUBLICKEYBYTES - 1));
-  assigns \nothing;
-  ensures \result == \true || \result == \false;
-*/
-bool fleet_should_accept_proposal(const update_proposal_t *prop,
-                                  const uint8_t *signer_pk,
-                                  double proposer_reputation);
 
 /**
  * fleet_store_artifact - read a file, hash it, and store it in the
@@ -131,13 +115,20 @@ int fleet_store_artifact(const char *file_path, const char *version,
   requires target_arch != \null && \valid_read(target_arch);
   requires \valid_read(signing_pk + (0 .. crypto_sign_PUBLICKEYBYTES - 1));
   requires \valid_read(signing_sk + (0 .. crypto_sign_SECRETKEYBYTES - 1));
+  requires \valid_read(signer_uuid + (0 .. 15));
   assigns \nothing;
   ensures \result == 0 || \result == -1;
 */
 int fleet_propose_update(const uint8_t *artifact_hash, const char *version,
                          const char *target_arch,
                          const uint8_t *signing_pk, const uint8_t *signing_sk,
-                         logger_t *logger);
+                         const uuid_t signer_uuid, logger_t *logger);
+
+/** fleet_propose_update() signed as this node: its identity's key and uuid,
+ *  read from the configuration directory. Only an operator-bound member's
+ *  proposal is accepted (fleet_gate.h). */
+int fleet_propose_update_as_node(const uint8_t *artifact_hash, const char *version,
+                                 const char *target_arch, logger_t *logger);
 
 /*@
   requires \valid(proc);
@@ -149,6 +140,9 @@ int fleet_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t 
 
 /** The app_fleet_propose handler (the fleet process registers it). Tests
  *  drive it directly. Always returns true: a refusal is logged, not raised. */
+/** Register the fleet protocol handlers on @p proc. */
+int fleet_register_handlers(const process_t *proc);
+
 bool fleet_handle_app_propose(const process_t *proc, directory_t *queues, generic_msg_t *msg);
 
 /** The pending proposal @p proposal_uuid (lower-case uuid string) into

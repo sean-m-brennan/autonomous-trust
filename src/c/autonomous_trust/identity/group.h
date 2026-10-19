@@ -79,22 +79,6 @@ typedef struct
      * consumer built against the older header misreads only this one rather
      * than everything after it. */
     net_wire_format_t wire_format;
-    /* Whether this group's members REQUIRE a quorum certificate on every
-     * ordinary reputation commit (doc/architecture/reputation.md, "Commit
-     * certificates"). Group-carried for the reason wire_format is: members
-     * that disagreed would write different commits and fork their chains.
-     * Rides group_to_json as "commit_certificates" (emitted only when true)
-     * and identity.proto Group.commit_certificates. false == group_init's
-     * zeroed struct == every group predating the field. Mirrors Python
-     * Group.commit_certificates. Last, for the reason wire_format is. */
-    bool commit_certificates;
-    /* Whether Paxos decides this group's chain order (doc/architecture/
-     * reputation.md, "Agreeing on an order"). Group-carried for the reason
-     * commit_certificates is: a cohort that half placed and half appended as
-     * entries completed would fork. Rides group_to_json as
-     * "ordered_placement" (emitted only when true) and identity.proto
-     * Group.ordered_placement. Mirrors Python Group.ordered_placement. */
-    bool ordered_placement;
 } group_t;
 
 /**
@@ -236,26 +220,6 @@ const char *group_rotation_refusal(const group_t *group, const group_t *other);
  * @param address Peer address; NULL or empty yields NET_WIRE_JSON.
  * @return The format to encode in.
  */
-/**
- * @brief Whether a group this node MINTS requires commit certificates:
- *        AT_COMMIT_CERTIFICATES, default off.
- *
- * Stamps a new group and nothing else; an existing group's members read the
- * declaration off the group. "1", "true", "yes" and "on" (trimmed, any case)
- * turn it on; anything else, or unset, leaves it off. Mirrors Python
- * resolve_commit_certificates.
- */
-bool group_commit_certificates_resolve(void);
-
-/**
- * @brief Whether Paxos decides the chain order of a group this node MINTS:
- *        AT_ORDERED_PLACEMENT, default ON since 2026-10-13. "0", "false", "no"
- *        or "off" (trimmed, any case) turns it off; anything else, or unset,
- *        leaves it on. Stamps a new group and nothing else. Mirrors Python
- *        resolve_ordered_placement.
- */
-bool group_ordered_placement_resolve(void);
-
 net_wire_format_t group_wire_format_for_address(const group_t *group,
                                                 const char *address);
 

@@ -43,6 +43,12 @@
 
 #include "logger.h"
 
+/* Darwin has no MSG_NOSIGNAL: a socket opts out of SIGPIPE once, with
+ * SO_NOSIGPIPE (@ref at_socket_nosigpipe), and the per-send flag is a no-op. */
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 /**
  * @brief send(2) with transparent EINTR retry.
  * @return Bytes sent, or -1 with @c errno set on non-EINTR error.
@@ -108,6 +114,39 @@ int at_set_sndtimeo(int sock, int timeout_ms, logger_t *logger);
  *         set on non-EINTR error.
  */
 int at_poll_eintr(struct pollfd *fds, nfds_t nfds, int timeout_ms);
+
+/**
+ * @brief Keep a write to a reset stream socket from raising SIGPIPE.
+ *
+ * Sets @c SO_NOSIGPIPE where the platform has it (Darwin, the BSDs), whose
+ * sends cannot carry MSG_NOSIGNAL; elsewhere a no-op, since MSG_NOSIGNAL is
+ * the per-send equivalent there. Call it on every connected or accepted
+ * stream socket.
+ *
+ * @return 0 on success or when there is nothing to set, -1 with @c errno set.
+ */
+int at_socket_nosigpipe(int sock);
+
+/**
+ * @brief Close a socket: close(2) on POSIX, closesocket on Windows, where a
+ *        socket is not a file descriptor and close() would leak it.
+ */
+int at_socket_close(int sock);
+
+/**
+ * @brief Put a socket in non-blocking mode (O_NONBLOCK; FIONBIO on Windows).
+ * @return 0 on success, -1 with @c errno set.
+ */
+int at_socket_set_nonblock(int sock);
+
+/**
+ * @brief Ready a listening socket to bind: SO_REUSEADDR on POSIX, so a restart
+ *        can bind while old connections sit in TIME_WAIT; SO_EXCLUSIVEADDRUSE on
+ *        Windows, where SO_REUSEADDR would instead let another socket bind the
+ *        same port and take this server's connections.
+ * @return 0 on success, -1 with @c errno set.
+ */
+int at_socket_listener_opts(int sock);
 
 /** @} */ /* end of internal_utilities */
 

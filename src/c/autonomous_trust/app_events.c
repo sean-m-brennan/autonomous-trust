@@ -53,7 +53,7 @@ at_app_events_t *at_app_events_open(const char *q_in)
     at_app_events_t *h = calloc(1, sizeof(*h));
     if (h == NULL)
         return NULL;
-    if (messaging_init(q_in, &h->queue) != 0)
+    if (messaging_init_external(q_in, &h->queue) != 0)
     {
         free(h);
         return NULL;

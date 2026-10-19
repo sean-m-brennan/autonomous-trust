@@ -25,6 +25,7 @@ The core reaches all of it through ``IdentityHooks`` (``_at_extension.py``)
 and names none of it. Mirrors the C twin, libat_zta's zta_identity.c, and
 doc/architecture/zta-integration.md.
 """
+import functools
 import hashlib
 import time
 
@@ -34,11 +35,13 @@ from autonomous_trust.core.identity.peer_standing import (
 from autonomous_trust.core.identity.zta_fields import ZTA_CRED_MAX
 from autonomous_trust.core.system import now
 
+from . import delegation
+
 from .operator_binding import verify_operator_binding
 from .zta_binding import identity_is_bound
 from .zta_policy import (ZtaPolicy, ZtaPolicyError, BINDING_MODE_PREFER,
                          BINDING_MODE_REQUIRE)
-from .zta_verifier import ZtaStatus
+from .zta_verifier import ZtaStatus, ZTA_HASH_LEN
 
 #: How often the identity loop asks whether the policy's re-verification
 #: interval has elapsed. The sweep itself runs on the policy's own, much longer,
@@ -73,6 +76,12 @@ def init_state(proc) -> None:
     proc._last_zta_reverify = None
     proc._last_zta_reverify_check = None
     proc._operator_verified = set()   # uuids whose operator credential verified
+    # What members told us about peers (delegation.py), the senders' reputations
+    # as the reputation process last answered (uuid -> (score, when)), and the
+    # findings waiting on one of those answers.
+    proc._zta_deleg = delegation.ZtaDelegation()
+    proc._zta_rep_cache = {}
+    proc._zta_pending_findings = []
 
 
 def publish_zta_standing(proc, queues, peer_uuid, status, ceiling=None,
@@ -682,7 +691,10 @@ def periodic_zta_reverify(proc, queues):
                      if str(p.uuid) != self_uuid]
         checked = failed = resolved = 0
         for peer in peers:
-            outcome = zta_reverify_one(proc, peer, anchors, policy)
+            found, outcome = zta_reverify_status(proc, peer, anchors, policy)
+            if found is not None:
+                # Settles, or marks as waiting, what members told us (delegation.py).
+                proc._zta_deleg.own_result(str(peer.uuid).lower(), found)
             if outcome is None:
                 continue        # no credential, or the verifier could not answer
             checked += 1
@@ -704,6 +716,14 @@ def periodic_zta_reverify(proc, queues):
                     getattr(peer, 'nickname', '?'))
             publish_zta_standing(proc, queues, peer.uuid, status, ceiling,
                                        verified_at, reason)
+            # Tell the group: a vouch lets a member that cannot reach the
+            # verifier lift its cap; an alert makes each member re-check.
+            if found is ZtaStatus.REVOKED:
+                send_zta_finding(proc, queues, peer, delegation.ZTA_PROTO_REVOCATION_ALERT,
+                                 found, 'credential revoked')
+            elif status == STANDING_PROVED:
+                send_zta_finding(proc, queues, peer, delegation.ZTA_PROTO_VERIFICATION,
+                                 found, 're-verified')
         if checked:
             _probes.counter('id.zta', 'reverified', str(checked))
         if failed:
@@ -726,9 +746,18 @@ def zta_reverify_one(proc, peer, anchors, policy):
     the peer). Publishing a standing in either case would overwrite a
     verdict with the absence of one.
     """
+    return zta_reverify_status(proc, peer, anchors, policy)[1]
+
+
+def zta_reverify_status(proc, peer, anchors, policy):
+    """``(status, outcome)``: the verifier's answer for ``peer`` as a ZtaStatus
+    (None when it carries no credential; DEFERRED when nobody could answer),
+    and the standing tuple zta_reverify_one returns. The status is what
+    delegation needs (delegation.py): which finding to tell the group, and
+    whether this node is one still waiting on an answer."""
     creds = zta_credentials(proc, peer)
     if not creds:
-        return None
+        return None, None
     mode = policy.binding_mode
     san_template = getattr(policy, 'san_uri_template', '') or ''
     worst = None       # an affirmative failure, if any anchor reported one
@@ -773,27 +802,266 @@ def zta_reverify_one(proc, peer, anchors, policy):
             # Exactly the standing admission gave it: chained, unbound,
             # capped. Re-reporting it keeps a cap that the sweep would
             # otherwise silently lift on its first pass.
-            return (STANDING_CAPPED, policy.ddil_fallback_reputation_cap,
-                    None, 'unbound credential (binding_mode %s)' % mode)
+            return ZtaStatus.VERIFIED, (
+                STANDING_CAPPED, policy.ddil_fallback_reputation_cap,
+                None, 'unbound credential (binding_mode %s)' % mode)
         # Any-of: one credential still chaining, unrevoked and bound is
         # enough, exactly as at admission.
-        return (STANDING_PROVED, None, time.time(),
-                're-verified against %s' % matched[0][0])
+        return ZtaStatus.VERIFIED, (STANDING_PROVED, None, time.time(),
+                                    're-verified against %s' % matched[0][0])
     if worst is None and unbound:
-        return (STANDING_FAILED,
+        return ZtaStatus.REJECTED, (STANDING_FAILED,
                 min(1.0, max(0.0, 1.0 - policy.revocation_reputation_penalty
                              * 0.5)), None,
                 'no bound credential under binding_mode %s' % mode)
     if worst is None:
-        return None    # nobody could answer — DDIL, not a verdict
+        return ZtaStatus.DEFERRED, None   # nobody could answer — DDIL, not a verdict
     penalty = policy.revocation_reputation_penalty
     if worst.status is ZtaStatus.EXPIRED:
         # Lapsed, not lying. Mirrors the C twin's half-weight penalty for
         # EXPIRED in _reverify_peers.
         penalty *= 0.5
     ceiling = min(1.0, max(0.0, 1.0 - penalty))
-    return (STANDING_FAILED, ceiling, None,
-            '%s: %s' % (worst.status.value, worst.reason))
+    return worst.status, (STANDING_FAILED, ceiling, None,
+                          '%s: %s' % (worst.status.value, worst.reason))
+
+
+# -- delegated verification and revocation alerts (delegation.py) ---------------
+#: How long a sender's reputation, as the reputation process answered it, is
+#: used before it is asked again. Mirrors C's REP_CACHE_TTL_SEC.
+ZTA_REP_CACHE_TTL_SEC = 600.0
+#: Findings held for a reputation answer. Mirrors C's MAX_PENDING_FINDINGS.
+ZTA_MAX_PENDING_FINDINGS = 32
+#: The reputation process's local query and its reply (C REP_PROTO_LOCAL_*).
+REP_LOCAL_QUERY = 'local_rep_query'
+REP_LOCAL_RESPONSE = 'local_rep_response'
+
+
+def _members(proc) -> set:
+    group = getattr(proc, 'group', None)
+    amap = getattr(group, '_address_map', None) or {}
+    return {str(u).lower() for u in amap}
+
+
+def _peer_by_uuid(proc, uuid_str):
+    with proc.lock:
+        for peer in (proc.peers.all if proc.peers is not None else []):
+            if str(peer.uuid).lower() == uuid_str:
+                return peer
+    return None
+
+
+def _cached_reputation(proc, uuid_str):
+    entry = proc._zta_rep_cache.get(uuid_str)
+    if entry is None:
+        return None
+    score, when = entry
+    if time.time() - when > ZTA_REP_CACHE_TTL_SEC:
+        del proc._zta_rep_cache[uuid_str]
+        return None
+    return score
+
+
+def _request_reputation(proc, queues, uuid_str):
+    from autonomous_trust.core.config import to_json_string
+    from autonomous_trust.core.network import Message
+    from autonomous_trust.core.system import CfgIds
+    try:
+        queues[CfgIds.reputation].put(
+            Message(CfgIds.reputation, REP_LOCAL_QUERY,
+                    to_json_string({'peer_uuid': uuid_str,
+                                    'return_process': proc.name})),
+            block=True, timeout=proc.q_cadence)
+    except Exception as err:
+        proc.logger.warning('ZTA: could not ask reputation about %s: %s',
+                            uuid_str[:8], err)
+
+
+def _own_status(proc, peer_uuid) -> ZtaStatus:
+    """This node's own answer for one peer's credential, asked now: the check
+    the sweep runs. Anything that cannot answer is UNAVAILABLE."""
+    peer = _peer_by_uuid(proc, peer_uuid)
+    if peer is None:
+        return ZtaStatus.UNAVAILABLE
+    try:
+        found, _ = zta_reverify_status(proc, peer, zta_anchor_verifiers(proc),
+                                       zta_policy(proc))
+    except Exception as err:
+        proc.logger.warning('ZTA: re-check of %s failed: %s', peer_uuid[:8], err)
+        return ZtaStatus.UNAVAILABLE
+    found = found or ZtaStatus.UNAVAILABLE
+    proc.logger.info('ZTA: re-checked %s on an alert: %s', peer_uuid, found.value)
+    return found
+
+
+def zta_delegation_context(proc, queues) -> delegation.DelegationContext:
+    """The decisions' view of this identity process (C: zta_process.c _ctx)."""
+    policy = zta_policy(proc)
+
+    def recorded_hash(peer_uuid):
+        peer = _peer_by_uuid(proc, peer_uuid)
+        cred_hash = bytes(getattr(peer, 'zta_credential_hash', b'') or b'') if peer else b''
+        return cred_hash if any(cred_hash) else None
+
+    def reputation(uuid_str):
+        score = _cached_reputation(proc, uuid_str)
+        if score is None:
+            _request_reputation(proc, queues, uuid_str)
+        return score
+
+    def standing(peer_uuid, status, ceiling, reason):
+        publish_zta_standing(proc, queues, peer_uuid, status, ceiling,
+                             time.time() if status == STANDING_PROVED else None,
+                             reason)
+
+    return delegation.DelegationContext(
+        is_member=lambda uuid_str: uuid_str in _members(proc),
+        recorded_hash=recorded_hash, reputation=reputation,
+        own_check=lambda peer_uuid: _own_status(proc, peer_uuid),
+        standing=standing,
+        min_reputation=policy.delegated_verification_min_reputation,
+        quorum=policy.delegated_verification_quorum,
+        ddil_cap=policy.ddil_fallback_reputation_cap,
+        revocation_penalty=policy.revocation_reputation_penalty)
+
+
+def send_zta_finding(proc, queues, peer, verb, status, reason) -> int:
+    """Tell every other member of our group what our own check found; returns
+    how many were sent. Wire form, both verbs: {"credential_hash": hex,
+    "peer_uuid", "reason", "status": "VERIFIED"|"REVOKED"}, to process
+    ``zta_verify`` (C's process; ours is identity, through the extension's
+    process alias). The sender is the transport's, never a payload field.
+    Mirrors C's _send_finding."""
+    from autonomous_trust.core.config import to_json_string
+    from autonomous_trust.core.network import Message
+    from autonomous_trust.core.system import CfgIds
+    peer_uuid = str(peer.uuid).lower()
+    cred_hash = bytes(getattr(peer, 'zta_credential_hash', b'') or b'')
+    body = to_json_string({'credential_hash': cred_hash.hex(), 'peer_uuid': peer_uuid,
+                           'reason': reason or '', 'status': status.value})
+    members = _members(proc)
+    self_uuid = str(proc.identity.uuid).lower()
+    with proc.lock:
+        targets = [p for p in (proc.peers.all if proc.peers is not None else [])
+                   if str(p.uuid).lower() in members
+                   and str(p.uuid).lower() not in (self_uuid, peer_uuid)]
+    sent = 0
+    for member in targets:
+        try:
+            queues[CfgIds.network].put(
+                Message(delegation.ZTA_PROCESS, verb, body, member,
+                        from_whom=proc.identity, encrypt=True,
+                        return_to=delegation.ZTA_PROCESS),
+                block=True, timeout=proc.q_cadence)
+            sent += 1
+        except Exception as err:
+            proc.logger.warning('ZTA: could not send %s to %s: %s', verb,
+                                str(member.uuid)[:8], err)
+    proc.logger.debug('ZTA: sent %s for %s to %d member(s)', verb, peer_uuid, sent)
+    return sent
+
+
+def _decide(proc, queues, kind, sender, peer_uuid, cred_hash, status) -> str:
+    """One member's finding, decided and logged (C: _decide)."""
+    verdict = proc._zta_deleg.event(zta_delegation_context(proc, queues), kind,
+                                    sender, peer_uuid, cred_hash, status)
+    what = 'vouch' if kind == delegation.VOUCH else 'revocation alert'
+    if verdict == delegation.PENDING:
+        held = (kind, sender, peer_uuid, cred_hash, status)
+        if any(h[:3] == held[:3] for h in proc._zta_pending_findings):
+            pass    # already held
+        elif len(proc._zta_pending_findings) >= ZTA_MAX_PENDING_FINDINGS:
+            proc.logger.warning('ZTA: pending finding queue full, dropping one from %s',
+                                sender)
+        else:
+            proc._zta_pending_findings.append(held)
+        proc.logger.debug('ZTA: %s from %s for %s held: reputation not known yet',
+                          what, sender, peer_uuid)
+    elif verdict in (delegation.COUNTED, delegation.QUORUM, delegation.OWN_FAILED,
+                     delegation.OWN_VERIFIED):
+        proc.logger.info('ZTA: %s from %s for %s: %s', what, sender, peer_uuid, verdict)
+    else:
+        proc.logger.warning('ZTA: %s from %s for %s ignored: %s', what, sender,
+                            peer_uuid, verdict)
+    return verdict
+
+
+def handle_zta_finding(proc, queues, message, kind) -> bool:
+    """A member's ``zta_verified`` / ``zta_revoked`` (C: _handle_finding)."""
+    from uuid import UUID
+    from autonomous_trust.core.config import from_json_string
+    if not zta_policy(proc).enabled:
+        return True
+    sender = getattr(message.from_whom, 'uuid', None) if message.from_whom else None
+    if sender is None:
+        proc.logger.warning('ZTA: %s with no sender refused', message.function)
+        return True
+    sender = str(sender).lower()
+    try:
+        body = message.obj
+        if isinstance(body, (str, bytes)):
+            body = from_json_string(body)
+        peer_uuid = str(UUID(body['peer_uuid'])).lower()
+        cred_hash = bytes.fromhex(body['credential_hash'])
+        status_s = body['status']
+        if len(cred_hash) != ZTA_HASH_LEN or not isinstance(status_s, str):
+            raise ValueError('bad hash or status')
+    except Exception:
+        proc.logger.warning('ZTA: %s from %s: malformed', message.function, sender)
+        return True
+    # Anything else is neither finding (C maps it to REJECTED too).
+    status = {'VERIFIED': ZtaStatus.VERIFIED,
+              'REVOKED': ZtaStatus.REVOKED}.get(status_s, ZtaStatus.REJECTED)
+    _decide(proc, queues, kind, sender, peer_uuid, cred_hash, status)
+    return True
+
+
+def handle_rep_response(proc, queues, message) -> bool:
+    """The reputation process's answer to _request_reputation: cache it and
+    offer the held findings again (C: _handle_rep_response). Refused off the
+    wire: a member forging one would set its own score past the bar."""
+    from autonomous_trust.core.app_verbs import is_local_app_verb, refuse_remote_app_verb
+    from autonomous_trust.core.config import from_json_string
+    if not is_local_app_verb(proc, message):
+        return refuse_remote_app_verb(proc, message, message.function)
+    try:
+        body = message.obj
+        if isinstance(body, (str, bytes)):
+            body = from_json_string(body)
+        uuid_str = str(body['peer_uuid']).lower()
+        # A peer the reputation process does not know scores 0.0: under the bar.
+        score = float(body.get('score', 0.0)) if body.get('found') else 0.0
+    except Exception:
+        proc.logger.error('ZTA: failed to unpack rep response')
+        return True
+    proc._zta_rep_cache[uuid_str] = (score, time.time())
+    held, proc._zta_pending_findings = proc._zta_pending_findings, []
+    for finding in held:
+        if _cached_reputation(proc, finding[1]) is None:
+            proc._zta_pending_findings.append(finding)
+        else:
+            _decide(proc, queues, *finding)
+    return True
+
+
+def _handle_vouch(proc, queues, message) -> bool:
+    return handle_zta_finding(proc, queues, message, delegation.VOUCH)
+
+
+def _handle_alert(proc, queues, message) -> bool:
+    return handle_zta_finding(proc, queues, message, delegation.ALERT)
+
+
+def register_delegation_handlers(proc) -> None:
+    """On the identity process: the two findings and the reputation answer.
+    partial, not lambdas: multiproc mode pickles the process."""
+    proto = proc.protocol
+    proto.register_handler(delegation.ZTA_PROTO_VERIFICATION,
+                           functools.partial(_handle_vouch, proc))
+    proto.register_handler(delegation.ZTA_PROTO_REVOCATION_ALERT,
+                           functools.partial(_handle_alert, proc))
+    proto.register_handler(REP_LOCAL_RESPONSE,
+                           functools.partial(handle_rep_response, proc))
 
 
 # -- the identity hooks (_at_extension.py) ---------------------------------------

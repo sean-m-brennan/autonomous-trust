@@ -31,6 +31,7 @@
 #include <jansson.h>
 #include <sodium.h>
 
+#include "utilities/portable.h"  /* uuid_generate_sha1 / st_mtim on Darwin */
 #include "processes/processes.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
@@ -122,7 +123,7 @@ bool at_first_contact_enabled(void)
 
 typedef struct {
     char nonce[AT_CONTACT_NONCE_MAX + 1];
-    long expiry;                 /* epoch seconds; 0 = never expires */
+    int64_t expiry;                 /* epoch seconds; 0 = never expires */
 } fc_spent_t;
 
 static struct {
@@ -222,7 +223,7 @@ static int _fc_path(char *out, size_t out_len)
 }
 
 /* Caller holds fc_state.lock. */
-static int _fc_append_locked(const char *nonce, long expiry)
+static int _fc_append_locked(const char *nonce, int64_t expiry)
 {
     if (fc_state.count == fc_state.cap) {
         size_t cap = fc_state.cap == 0 ? 8 : fc_state.cap * 2;
@@ -272,7 +273,7 @@ static void _fc_load_locked(const logger_t *logger)
     json_object_foreach(nonces, key, val) {
         if (key == NULL || key[0] == '\0')
             continue;
-        long expiry = json_is_integer(val) ? (long)json_integer_value(val) : 0;
+        int64_t expiry = json_is_integer(val) ? (int64_t)json_integer_value(val) : 0;
         (void)_fc_append_locked(key, expiry);
     }
     json_decref(root);
@@ -316,7 +317,10 @@ static void _fc_save_locked(const logger_t *logger)
     /* Atomic: dump to a temp sibling, rename over the target. Same discipline
      * as contacts_save and Python's atomic_write. */
     char tmp[sizeof(path) + 16];
-    snprintf(tmp, sizeof(tmp), "%s.tmp%d", path, (int)getpid());
+    if (at_tmp_path(tmp, sizeof(tmp), path) != 0) {
+        json_decref(root);
+        return;
+    }
     int rc = json_dump_file(root, tmp, JSON_INDENT(2) | JSON_SORT_KEYS);
     json_decref(root);
     if (rc != 0 || rename(tmp, path) != 0) {
@@ -499,7 +503,7 @@ static void _fc_minted_ref(const char *nonce, char *ref_out, size_t ref_len)
  * send is not an error: nothing may be listening (tests, a node with no app). */
 static void _fc_emit(const process_t *proc, int32_t kind, const char *ref,
                      const public_identity_t *peer, at_fc_reason_t reason,
-                     at_fc_role_t role, long expiry, const char *blob)
+                     at_fc_role_t role, int64_t expiry, const char *blob)
 {
     generic_msg_t msg = {0};
     msg.type = FIRST_CONTACT_EVENT;
@@ -523,7 +527,7 @@ static void _fc_emit(const process_t *proc, int32_t kind, const char *ref,
 
 /* Record a spent nonce (pruning expired records first) and persist. Mirrors
  * Python SpentNonces.add. */
-static void _fc_spend(const logger_t *logger, const char *nonce, long expiry,
+static void _fc_spend(const logger_t *logger, const char *nonce, int64_t expiry,
                       double now)
 {
     pthread_mutex_lock(&fc_state.lock);
@@ -839,10 +843,31 @@ static void _fc_periodic(const process_t *proc)
     (void)at_area_contact_refresh(proc);
 }
 
+/* Whether the user recorded @p uuid_str as a contact, verified or not: such a
+ * peer may ask to join our cohort through the vote (identity's duplicate
+ * detection asks). Only while first contact is enabled. Mirrors Python
+ * first_contact._is_contact. */
+static bool _fc_is_contact(const process_t *proc, const char *uuid_str)
+{
+    (void)proc;
+    if (uuid_str == NULL || !at_first_contact_enabled())
+        return false;
+    char dir[CFG_PATH_LEN + 1] = {0};
+    if (get_data_dir(dir, sizeof(dir)) <= 0)
+        return false;
+    contacts_t store;
+    contacts_init(&store);
+    (void)contacts_load(dir, &store);
+    bool known = contacts_get(&store, uuid_str) != NULL;
+    contacts_free(&store);
+    return known;
+}
+
 static const identity_ext_t first_contact_identity_ext = {
     .name = "first_contact",
     .run_start = _fc_run_start,
     .periodic_resync = _fc_periodic,
+    .is_contact = _fc_is_contact,
 };
 IDENTITY_EXT_REGISTER(first_contact, &first_contact_identity_ext)
 
@@ -1221,7 +1246,7 @@ bool handle_first_contact_hello(const process_t *proc, directory_t *queues,
      * garbage, and reporting it would let anyone on the LAN flood the app. */
     const char *nonce = json_string_value(json_object_get(inv.body, "nonce"));
     json_t *exp = json_object_get(inv.body, "expiry");
-    long expiry = json_is_integer(exp) ? (long)json_integer_value(exp) : 0;
+    int64_t expiry = json_is_integer(exp) ? (int64_t)json_integer_value(exp) : 0;
     if (nonce == NULL)
         nonce = "";
     char ref[AT_FC_REF_LEN];
@@ -1630,12 +1655,13 @@ static const char *_fc_app_ref(const json_t *req)
 }
 
 /* A number the way Python's int() takes it: integers, and reals truncated. */
-static bool _fc_json_long(const json_t *v, long *out)
+static bool _fc_json_long(const json_t *v, int64_t *out)
 {
     if (!json_is_number(v))
         return false;
-    *out = json_is_integer(v) ? (long)json_integer_value(v)
-                              : (long)json_real_value(v);
+    /* int64_t: an expiry in epoch seconds outgrows a 32-bit long (Windows). */
+    *out = json_is_integer(v) ? (int64_t)json_integer_value(v)
+                              : (int64_t)json_real_value(v);
     return true;
 }
 
@@ -1679,12 +1705,12 @@ bool handle_first_contact_app_invite(const process_t *proc, directory_t *queues,
 
     /* Expiry: an absolute `expiry` wins, then `ttl_seconds` (0 = never), then
      * the default week -- Python create_invitation's precedence exactly. */
-    long now = (long)time(NULL);
-    long expiry = now + AT_FC_DEFAULT_TTL_SECONDS;
+    int64_t now = (int64_t)time(NULL);
+    int64_t expiry = now + AT_FC_DEFAULT_TTL_SECONDS;
     bool ok = true;
     json_t *jexp = req != NULL ? json_object_get(req, "expiry") : NULL;
     json_t *jttl = req != NULL ? json_object_get(req, "ttl_seconds") : NULL;
-    long v = 0;
+    int64_t v = 0;
     if (jexp != NULL) {
         ok = _fc_json_long(jexp, &v);
         expiry = v;
@@ -2339,8 +2365,8 @@ static fc_contact_t _fc_contact_status(const char *key)
 
     pthread_mutex_lock(&fc_records.lock);
     bool stale = !fc_records.loaded || strcmp(fc_records.path, path) != 0
-        || (present && (st.st_mtim.tv_sec != fc_records.mtime.tv_sec
-                        || st.st_mtim.tv_nsec != fc_records.mtime.tv_nsec))
+        || (present && (at_file_mtim(path, &st).tv_sec != fc_records.mtime.tv_sec
+                        || at_file_mtim(path, &st).tv_nsec != fc_records.mtime.tv_nsec))
         || (!present && fc_records.count > 0);
     if (stale) {
         free(fc_records.uuids);
@@ -2351,7 +2377,7 @@ static fc_contact_t _fc_contact_status(const char *key)
         at_strlcpy(fc_records.path, path, sizeof(fc_records.path));
         memset(&fc_records.mtime, 0, sizeof(fc_records.mtime));
         if (present) {
-            fc_records.mtime = st.st_mtim;
+            fc_records.mtime = at_file_mtim(path, &st);
             contacts_t store;
             contacts_init(&store);
             (void)contacts_load(dir, &store);

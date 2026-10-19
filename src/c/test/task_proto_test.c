@@ -108,7 +108,7 @@ DEFINE_TEST(test_paxos_payload_roundtrip)
 {
     ck_assert(sodium_init() >= 0);
 
-    /* Build a Paxos Phase 1a request payload (as handle_request/grant use) */
+    /* Build a Paxos round payload (as the reputation handlers use) */
     json_t *payload = json_object();
     json_object_set_new(payload, "id1", json_real(3.14159));
     json_object_set_new(payload, "id2", json_integer(42));
