@@ -109,6 +109,11 @@ COMPROMISE_MODE="abrupt"
 # generate_compose.py so the seeded identity format matches the runtime.
 C_MICRODRONES="${AT_C_MICRODRONES:-}"
 
+# Minikube VM size. The defaults (2 CPUs, 6 GB) OOM under dod-mission's
+# ~20 peer pods plus the in-VM image builds.
+MINIKUBE_CPUS="${AT_MINIKUBE_CPUS:-8}"
+MINIKUBE_MEMORY_MB="${AT_MINIKUBE_MEMORY_MB:-16384}"
+
 # Probes shared volume defaults to ON for multi-agency compose.
 export AT_PROBES="${AT_PROBES:-1}"
 
@@ -609,8 +614,22 @@ ensure_minikube_running() {
         exit 1
     fi
     if ! minikube status &>/dev/null; then
-        log "Starting Minikube..."
-        minikube start
+        log "Starting Minikube (${MINIKUBE_CPUS} CPUs, ${MINIKUBE_MEMORY_MB} MB)..."
+        minikube start --cpus="$MINIKUBE_CPUS" --memory="${MINIKUBE_MEMORY_MB}mb"
+    fi
+    # An existing VM keeps the size it was created with; `minikube start`
+    # flags cannot grow it. The pods carry no resource requests, so an
+    # undersized VM admits them all, exhausts RAM, and the apiserver stops
+    # answering (livez / log-stream TLS handshake timeouts).
+    local have_mb
+    have_mb=$(minikube profile list -o json 2>/dev/null | python3 -c '
+import json, sys
+for p in json.load(sys.stdin).get("valid", []):
+    if p["Name"] == "minikube":
+        print(p["Config"]["Memory"])' 2>/dev/null || true)
+    if [[ -n "$have_mb" && "$have_mb" -lt "$MINIKUBE_MEMORY_MB" ]]; then
+        warn "Minikube VM has ${have_mb} MB; this demo needs ~${MINIKUBE_MEMORY_MB} MB."
+        warn "Recreate it: minikube delete && rerun (or set AT_MINIKUBE_MEMORY_MB)."
     fi
 }
 

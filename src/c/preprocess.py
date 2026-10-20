@@ -64,7 +64,7 @@ def preprocess(target_filepath: str, output_file: str, directory: str, rel_path:
     ignore_list = []
 
     definition = ''
-    with open(target_filepath, 'r') as f:
+    with open(target_filepath, 'r', encoding='utf-8') as f:
         lines = f.readlines()
         def_lines = []
         for idx, line in enumerate(list(lines)):
@@ -119,7 +119,7 @@ def preprocess(target_filepath: str, output_file: str, directory: str, rel_path:
                 if path in os.path.join(root, filename):
                     ignore = True
             if (filename.endswith('.c') or filename.endswith('.h')) and not ignore:
-                with open(os.path.join(root, filename), 'r') as f:
+                with open(os.path.join(root, filename), 'r', encoding='utf-8') as f:
                     contents = _strip_c_comments(f.read())
                     if delimiter in contents:
                         index = contents.find(delimiter)
@@ -157,7 +157,7 @@ def preprocess(target_filepath: str, output_file: str, directory: str, rel_path:
     # (an over-count once crashed every error-logging test with SIGSEGV).
     # Catch it here as a clear build error. Unsized arrays (`[]`) auto-grow and
     # are skipped.
-    with open(target_filepath, 'r') as _tf:
+    with open(target_filepath, 'r', encoding='utf-8') as _tf:
         _tmpl = _strip_c_comments(_tf.read())
     _arr = re.search(r'\[\s*([A-Za-z_][A-Za-z0-9_]*|\d+)?\s*\]\s*=\s*\{(.*?)\}\s*;',
                      _tmpl, re.DOTALL)
@@ -181,8 +181,8 @@ def preprocess(target_filepath: str, output_file: str, directory: str, rel_path:
                          _dim, _cap, target_filepath), file=sys.stderr)
                 sys.exit(1)
 
-    with open(output_file, 'w') as o_file:
-        with open(target_filepath, 'r') as i_file:
+    with open(output_file, 'w', encoding='utf-8') as o_file:
+        with open(target_filepath, 'r', encoding='utf-8') as i_file:
             in_includes = False
             post_list = False
             for line in i_file.readlines():
