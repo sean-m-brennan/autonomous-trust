@@ -178,8 +178,8 @@ typedef struct net_transport_s {
      * @brief Optional: true iff this transport was opened in gateway mode
      *        and should forward frames whose envelope dst is not local.
      *
-     * Only consulted by net_proc.c when the build has AT_NET_ENVELOPE
-     * enabled. A NULL function pointer means the transport does not
+     * Only consulted by libat_gateway, when the network config turns
+     * `envelope` on. A NULL function pointer means the transport does not
      * support forwarding (always treated as false). Currently implemented
      * only by the hybrid transport, which reads its hybrid_config_t's
      * is_gateway bit.
@@ -211,8 +211,9 @@ typedef struct net_transport_s {
      *        inner leg.
      *
      * Meaningful only for multi-leg transports (currently just hybrid).
-     * NULL for single-leg transports. Used by AT_NET_GROUP_FORWARD, where
-     * a gateway must route a GROUP-addressed envelope to the configured
+     * NULL for single-leg transports. Used by the gateway's group forward
+     * (network config `group_forward`, libat_gateway), where a gateway must
+     * route a GROUP-addressed envelope to the configured
      * upstream leg rather than fanning out.
      *
      * @p leg_index is opaque to the caller; it is the value stored in the

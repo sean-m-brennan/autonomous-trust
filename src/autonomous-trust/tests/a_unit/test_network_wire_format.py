@@ -175,8 +175,8 @@ def test_unknown_format_is_refused(signer):
 # The group carries the choice
 # --------------------------------------------------------------------------
 
-def _group(fmt=None):
-    return Group('3f2504e0-4f89-11d3-9a0c-0305e82c3301', {'u': '10.0.0.1'}, '',
+def _group(fmt=None, uuid='3f2504e0-4f89-11d3-9a0c-0305e82c3301'):
+    return Group(uuid, {'u': '10.0.0.1'}, '',
                  Encryptor.generate(), False, _wire_format=fmt)
 
 
@@ -229,9 +229,32 @@ def test_merge_adopts_the_surviving_groups_format():
     talking in its old format inside its new group -- exactly the split a
     group-carried format exists to prevent."""
     ours = _group(NetWireFormat.json)
-    theirs = _group(NetWireFormat.proto)
+    theirs = _group(NetWireFormat.proto, uuid='4f2504e0-4f89-11d3-9a0c-0305e82c3302')
     ours.adopt_membership(theirs)
     assert ours.wire_format == NetWireFormat.proto
+
+
+def test_same_group_update_keeps_our_format():
+    """A group's format never changes in place: the update announcing a
+    change would reach members in the format they cannot read yet."""
+    ours = _group(NetWireFormat.json)
+    theirs = _group(NetWireFormat.proto)
+    ours.adopt_membership(theirs)
+    assert ours.wire_format == NetWireFormat.json
+
+
+def test_proto_group_refuses_a_formatless_group():
+    """An absent or unknown format reads as JSON, which a proto group must
+    not take; a JSON group, or none, reads it as before."""
+    canon = _group(NetWireFormat.json).to_canonical()
+    del canon['wire_format']
+    proto, json_ = _group(NetWireFormat.proto), _group(NetWireFormat.json)
+    assert Group.refuses_formatless(proto, canon)
+    assert Group.refuses_formatless(proto, dict(canon, wire_format='protoo'))
+    assert not Group.refuses_formatless(proto, dict(canon, wire_format='json'))
+    assert not Group.refuses_formatless(proto, dict(canon, wire_format='proto'))
+    assert not Group.refuses_formatless(json_, canon)
+    assert not Group.refuses_formatless(None, canon)
 
 
 def test_minted_group_takes_the_env_knob(monkeypatch):

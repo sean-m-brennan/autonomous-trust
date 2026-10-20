@@ -23,6 +23,7 @@
 
 #include "algorithms/algorithms.h"
 #include "identity/identity.h"
+#include "identity/group.h"
 
 
 #ifndef __FRAMAC__
@@ -70,6 +71,23 @@ void public_identity_derive_petname(const char *nickname, char *out,
 int group_to_json(const void *data_struct, json_t **obj_ptr);
 
 int group_from_json(const json_t *obj, void *data_struct);
+
+/**
+ * @brief Whether a node holding @p mine must refuse the canonical group
+ *        @p theirs rather than read it.
+ *
+ * True when @p mine speaks proto and @p theirs does not name a format this
+ * build knows ("json" or "proto"). An absent wire_format reads as JSON, which
+ * is right in a JSON cohort; in a proto cohort it makes a member that took the
+ * group speak JSON to peers that refuse it, and nothing surfaces it
+ * (doc/architecture/network-wire-format.md). Mirrors Python
+ * Group.refuses_formatless.
+ *
+ * @param mine   Our group; NULL never refuses.
+ * @param theirs The peer's group in canonical JSON form; NULL never refuses.
+ * @return true to refuse.
+ */
+bool group_refuses_formatless(const group_t *mine, const json_t *theirs);
 
 /*@
   requires len > 0;

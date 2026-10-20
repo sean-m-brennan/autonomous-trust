@@ -2168,6 +2168,10 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_t *gj = NULL;
         if (group_to_json(&sender_impl->proc->protocol.group, &gj) == 0
             && gj != NULL) {
+            /* `omit_wire_format`: the group as a peer that lost the field (or
+             * predates it) sends it. Mirrors the Python adapter. */
+            if (json_is_true(json_object_get(payload, "omit_wire_format")))
+                json_object_del(gj, "wire_format");
             net_msg_pack_json(&out->info.net_msg, gj);
             json_decref(gj);
         }

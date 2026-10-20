@@ -2212,7 +2212,12 @@ class IdentityAdapter:
             # exercises is the cross-runtime one. handle_group_update parses it
             # via Group.from_canonical. See [[project_group_key_sync]].
             target_group = sender.process.group
-            obj = to_json_string(target_group.to_canonical()) if target_group else ''
+            canonical = target_group.to_canonical() if target_group else None
+            if canonical is not None and payload.get('omit_wire_format'):
+                # The group as a peer that lost the field (or predates it)
+                # sends it. Mirrors the C adapter.
+                canonical.pop('wire_format', None)
+            obj = to_json_string(canonical) if canonical is not None else ''
         elif function == IdentityProtocol.hierarchy_req:
             # A late joiner asking the group to state their positions
             # (protocol step 7). The handler answers from its own claim and

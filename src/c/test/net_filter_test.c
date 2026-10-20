@@ -29,6 +29,8 @@
 #include "network/network.h"
 #include "network/net_filter.h"
 
+extern void net_knobs_resolve_reset(void);  /* test seam, not in network.h */
+
 /* Network filter chain (network/net_filter.h). Two test filters: each
  * records its inbound call, strips / prepends a one-byte tag, and can be
  * told what verdict to return. */
@@ -224,6 +226,20 @@ DEFINE_TEST(test_filter_config_gate)
     ck_assert_int_eq(net_filters_check_config(&cfg, NULL), 0);
     cfg.group_forward = cfg.cross_cluster = true;
     ck_assert_int_eq(net_filters_check_config(&cfg, NULL), 0);
+
+    /* A forwarding node mints only JSON groups, so it refuses to start when
+     * it would mint a proto one. */
+    setenv("AT_NET_WIRE_MODE", "proto", 1);
+    net_knobs_resolve_reset();
+    ck_assert_int_eq(net_filters_check_config(&cfg, NULL), -1);
+    cfg.group_forward = false;
+    ck_assert_int_eq(net_filters_check_config(&cfg, NULL), 0);
+    cfg.group_forward = true;
+    setenv("AT_NET_WIRE_MODE", "json", 1);
+    net_knobs_resolve_reset();
+    ck_assert_int_eq(net_filters_check_config(&cfg, NULL), 0);
+    unsetenv("AT_NET_WIRE_MODE");
+    net_knobs_resolve_reset();
     net_filters_reset();
 }
 END_TEST_DEFINITION()

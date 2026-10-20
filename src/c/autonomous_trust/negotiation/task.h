@@ -42,8 +42,8 @@ typedef struct {
     bool flexible;
     /** How many participants the requestor expects to hear back from. C twin
      *  of Python @c TaskInfo.size, carried on the wire and back on the reply.
-     *  No completion rule reads it: Python forwards every result (all but
-     *  the first @c score_only) and C counts the peers it invited. 0 (the
+     *  No completion rule reads it: both runtimes forward the first result,
+     *  score every one, and count the peers they invited. 0 (the
      *  memset default) and 1 both mean single-participant; every
      *  C-originated task is one. */
     int size;

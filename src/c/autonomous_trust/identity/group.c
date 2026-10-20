@@ -331,6 +331,17 @@ net_wire_format_t group_wire_format_for_address(const group_t *group,
     return member ? group->wire_format : NET_WIRE_JSON;
 }
 
+bool group_refuses_formatless(const group_t *mine, const json_t *theirs)
+{
+    if (mine == NULL || theirs == NULL || mine->wire_format != NET_WIRE_PROTO)
+        return false;
+    const char *wf = json_string_value(json_object_get(theirs, "wire_format"));
+    if (wf == NULL)
+        return true;
+    return strcmp(wf, net_wire_format_name(NET_WIRE_JSON)) != 0
+           && strcmp(wf, net_wire_format_name(NET_WIRE_PROTO)) != 0;
+}
+
 int group_to_json(const void *data_struct, json_t **obj_ptr)
 {
     const group_t *ident = data_struct;
