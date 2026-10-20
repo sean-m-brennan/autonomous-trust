@@ -4194,7 +4194,8 @@ static bool handle_rep_response(const process_t *proc, directory_t *queues, gene
 /****************************
  * Handler: handle_local_rep_query (local IPC reputation query)
  * Another local process (e.g. ZTA) asks for a peer's reputation score.
- * Responds via local IPC to the requesting process.
+ * Responds via local IPC to the requesting process. Refused off the wire:
+ * the reply is pushed to whichever process the payload names.
  ****************************/
 
 /*@
@@ -4206,6 +4207,10 @@ static bool handle_rep_response(const process_t *proc, directory_t *queues, gene
 static bool handle_local_rep_query(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
+
+    if (!identity_is_local_app_verb(proc, nmsg))
+        return identity_refuse_remote_app_verb(proc, nmsg,
+                                               REP_PROTO_LOCAL_QUERY);
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
@@ -4226,6 +4231,12 @@ static bool handle_local_rep_query(const process_t *proc, directory_t *queues, g
 
     const char *peer_uuid_str = json_string_value(j_peer_uuid);
     const char *return_proc   = json_string_value(j_return_proc);
+    if (peer_uuid_str == NULL || return_proc == NULL)
+    {
+        json_decref(payload);
+        log_error(proc->logger, "Reputation: handle_local_rep_query: missing JSON fields\n");
+        return false;
+    }
 
     uuid_t peer_uuid;
     double score = 0.0;
@@ -4252,11 +4263,16 @@ static bool handle_local_rep_query(const process_t *proc, directory_t *queues, g
     json_object_set_new(resp_json, "score", json_real(score));
     json_object_set_new(resp_json, "found", json_boolean(found));
 
+    /* return_proc lives in payload: copy it before payload is released. */
+    char return_buf[PROC_NAME_LEN + 1];
+    at_strlcpy(return_buf, return_proc, sizeof return_buf);
+    return_proc = return_buf;
     json_decref(payload);
 
     generic_msg_t resp = {0};
     resp.type = NET_MESSAGE;
-    strncpy(resp.info.net_msg.process, return_proc, PROC_NAME_LEN);
+    at_strlcpy(resp.info.net_msg.process, return_proc,
+               sizeof resp.info.net_msg.process);
     resp.info.net_msg.function = REP_PROTO_LOCAL_RESP;
     net_msg_pack_json(&resp.info.net_msg, resp_json);
     json_decref(resp_json);

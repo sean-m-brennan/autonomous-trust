@@ -650,9 +650,9 @@ static void _task_info_into_json(const process_t *proc, const task_t *task,
         json_object_set_new(j, "requestor", req);
     /* How many participants the requestor expects. Carried through rather
      * than assumed to be 1, so the requestor's value survives the round
-     * trip. Neither runtime's completion rule reads it today: a Python
-     * requestor forwards every result and marks all but the first
-     * `score_only`, and a C requestor counts the peers it invited. A task
+     * trip. Neither runtime's completion rule reads it today: both forward
+     * the first result to the app, score every one, and keep the task until
+     * every peer they invited has answered. A task
      * that arrived without one counts as single-participant, which is what
      * every C-originated task is. */
     json_object_set_new(j, "size", json_integer(task->size > 0 ? task->size : 1));
@@ -2525,12 +2525,16 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
                                  negotiation_competence_weight(
                                      tracker->capability_name, subject));
 
-                /* Forward to the main process once every invitee has
-                 * answered, as before. */
-                if (collected >= tracker->expected)
+                /* The first answer goes to the main process, so the app
+                 * sees one answer per task and one slow or silent invitee
+                 * cannot hold it back; every later one is scored only. The
+                 * tracker lives until every invitee has answered (or the
+                 * task is cancelled). Mirrors Python handle_results, which
+                 * marks the later ones score_only. */
+                if (collected == 1)
                 {
                     log_info(proc->logger,
-                             "Negotiation: task %s complete — forwarding results\n",
+                             "Negotiation: task %s first result — forwarding\n",
                              task_uuid_str);
 
                     /* Build TASK_RESULT message to the main (requestor) process */
@@ -2544,7 +2548,11 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
                     result_msg.info.task_result.result_len  = result_len;
 
                     _neg_send(proc, AT_MAIN_QUEUE, &result_msg, "a task result");
-
+                }
+                if (collected >= tracker->expected)
+                {
+                    log_info(proc->logger,
+                             "Negotiation: task %s complete\n", task_uuid_str);
                     /* Clean up tracker entry. The map's value only borrows
                      * the tracker, which _announce_task_locked calloc'd. */
                     map_remove(&neg_state.my_tasks, task_uuid_str);

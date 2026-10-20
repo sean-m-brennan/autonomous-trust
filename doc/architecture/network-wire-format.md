@@ -79,6 +79,26 @@ On a merge, the surviving group's format comes along with its uuid and address
 map (`adopt_membership` / C `handle_group_update`). The merge winner is already
 decided by size → age → uuid, so the format needs no tiebreaker of its own.
 
+**A group's format never changes in place.** An update for the group a node
+already holds (same uuid) brings membership and keys, never a format: the
+node keeps its own. The update announcing a change would reach the members in
+the format they cannot yet read, and the cohort would split with nothing to
+bring it back. A format change takes a new group. Pinned by
+`identity/group-update-same-uuid-keeps-format`.
+
+**A proto group refuses a group that names no format.** An absent (or
+unrecognized) `wire_format` reads as JSON, which is right in a JSON cohort and
+for every group from a peer that predates the field. In a proto cohort it is
+wrong in a way nothing surfaces: a member that took such a group would speak
+JSON to peers that refuse it, and silence is not scored. So a node whose own
+group is proto refuses the group instead: in a group update, a solicited join
+answer, and the merge out of a self-bootstrap (whose peers still count). A
+node holding a JSON group, or none, reads it as JSON as before. The rule is
+`Group.refuses_formatless` / C `group_refuses_formatless`, counted as
+`id.group/formatless_refused`. Pinned by
+`identity/group-update-formatless-refused-by-proto` and its control
+`identity/group-update-formatless-read-as-json`.
+
 ### Selection, both directions
 
 | Traffic | Format |
@@ -233,7 +253,14 @@ plaintext, because it hands over the group key.
 
 ### The one configuration that can violate G
 
-Tracked as `ISSUES.md` §2.12, which carries the four candidate resolutions.
+Decided 2026-10-20 (the user's call, `ISSUES.md` §2.12 shape 4): forwarding is
+allowed only in a JSON deployment. A node with `group_forward` on never mints
+a proto group: `net_filters_check_config` refuses to start it when
+`AT_NET_WIRE_MODE` resolves to `proto`, the only input to the format of a group
+it mints. That keeps a forwarded frame's format knowable without a lookup,
+since it can only be JSON, but only while the cohorts on both legs are JSON
+too. The forwarding node cannot check that: it holds none of the groups it
+forwards for. The operator has to keep those cohorts JSON.
 
 `group_forward` (a network-config switch of libat_gateway, **off** unless the
 node's network config sets it alongside `"envelope": true`) lets a gateway relay

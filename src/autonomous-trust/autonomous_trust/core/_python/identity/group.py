@@ -352,6 +352,7 @@ class Group(InitializableConfig):
         correct, and it mirrors C's ``handle_group_update`` which copies only
         uuid/address/address_map and keeps its own encryptor
         (id_proc.c:2113-2134). See [[dod-microdrone-targets-live-vs-playback]]."""
+        same_group = str(other.uuid) == str(self._uuid)
         self._uuid = str(other.uuid)
         self._address_map = (dict(other._address_map)
                              if isinstance(other._address_map, dict)
@@ -370,7 +371,14 @@ class Group(InitializableConfig):
         # line an absorbed node would keep talking in its old format inside its
         # new group, which is precisely the split a group-carried format exists
         # to prevent.
-        self._wire_format = other.wire_format
+        #
+        # Never for the SAME group: a group's format does not change in place,
+        # and a format change needs a new group. The update announcing one
+        # would reach the members in the format they cannot read yet, so the
+        # cohort would split with no way back (user's call 2026-10-20).
+        # Mirrors C handle_group_update.
+        if not same_group:
+            self._wire_format = other.wire_format
 
     def encrypt(self, msg, whom, nonce=None):
         """
@@ -528,6 +536,25 @@ class Group(InitializableConfig):
                      # Absent -> json (the constructor's default), which is both
                      # what an older peer means and the safe reading (doc/architecture/network-wire-format.md).
                      _wire_format=d.get('wire_format'))
+
+    @staticmethod
+    def refuses_formatless(mine, theirs) -> bool:
+        """True when a node holding *mine* must not read the canonical group
+        dict *theirs*, because *mine* speaks proto and *theirs* does not name
+        a format it knows (doc/architecture/network-wire-format.md).
+
+        An absent ``wire_format`` reads as JSON, which is right for a JSON
+        cohort and for every group from a peer that predates the field. In a
+        proto cohort it is wrong in a way nothing surfaces: a member that took
+        such a group would speak JSON to peers that refuse it, and silence is
+        not scored. So a proto node refuses the group instead of reading it
+        (user's call 2026-10-20). C twin: ``group_refuses_formatless``.
+        """
+        if mine is None or getattr(mine, 'wire_format', None) != NetWireFormat.proto:
+            return False
+        if not isinstance(theirs, dict):
+            return False
+        return theirs.get('wire_format') not in (NetWireFormat.json, NetWireFormat.proto)
 
     @staticmethod
     def initialize(address_map, our_nickname):
