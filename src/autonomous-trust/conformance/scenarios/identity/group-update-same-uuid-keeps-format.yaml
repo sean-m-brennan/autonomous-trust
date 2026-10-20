@@ -1,0 +1,53 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-update-same-uuid-keeps-format
+byte_pinning: false
+description: |
+    A group's envelope format does not change in place
+    (doc/architecture/network-wire-format.md). A membership update for OUR
+    OWN group grows the membership and leaves the format alone, even when the
+    sender's copy names another one: the update announcing a change would
+    reach the members in the format they cannot read yet, so the cohort would
+    split with no way back. A format change needs a new group.
+
+    Before 2026-10-20 both runtimes copied the format along with the
+    membership.
+
+    Topology: peer_a and peer_b hold the SAME group G (uuid 0a..). peer_a's
+    copy is json with one member and owns the key. peer_b's copy is proto
+    with three members and public-only, so the update takes the
+    adopt-membership, keep-our-key path.
+
+participants:
+  - id: peer_a
+    role: group_member
+  - id: peer_b
+    role: group_member
+
+fixtures:
+  groups:
+    peer_a:
+      uuid: "0a000000-0000-4000-8000-00000000000a"
+      size: 1
+      wire_format: json
+    peer_b:
+      uuid: "0a000000-0000-4000-8000-00000000000a"
+      size: 3
+      public_only: true
+      wire_format: proto
+
+steps:
+  - id: 1
+    from: peer_b
+    to: peer_a
+    function: group_key_update
+    payload: {}
+    description: |
+        peer_b sends G with a larger membership and another format. peer_a
+        takes the membership and keeps its format.
+
+expected_state:
+  peer_a:
+    group_size: 3
+    group_wire_format: json

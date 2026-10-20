@@ -1865,6 +1865,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             if not pending:
                 return False
             raw = hist_tpl[0]
+            if Group.refuses_formatless(self.group, raw):
+                self.logger.warning('Join answer names no format and our group '
+                                    'speaks proto; ignoring')
+                return False
             group = Group.from_canonical(raw) if isinstance(raw, dict) else raw
             key = str(getattr(group, 'uuid', '') or '')
             if key not in pending:
@@ -1910,6 +1914,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     peer_idents = None
                 # Group rides the wire as the DRY canonical flat dict (see
                 # _merge_to_mesh); reconstruct it, tolerating a legacy object.
+                formatless = Group.refuses_formatless(self.group, group)
                 if isinstance(group, dict):
                     group = Group.from_canonical(group)
                 if peer_idents:
@@ -1923,6 +1928,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                         if uuid is not None:
                             unioned_peers.setdefault(str(uuid), ident)
                 if not steps:
+                    continue
+                if formatless:
+                    # Its peers still count; its group is not ours to take.
+                    self.logger.warning('Skipping a history whose group names no '
+                                        'format: our group speaks proto')
                     continue
                 if accepted == (None, None) or len(steps) > len(accepted[1]):  # noqa
                     accepted = group, steps
@@ -3923,6 +3933,12 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 # from_json_string reconstructs directly via __type__). Mirrors
                 # the full_history reconstruction. See [[project_group_key_sync]].
                 decoded = from_json_string(group)
+                if Group.refuses_formatless(self.group, decoded):
+                    self.logger.warning(
+                        'Refusing group update from %s: our group speaks proto and '
+                        'theirs names no format', getattr(message.from_whom, 'nickname', '?'))
+                    _probes.counter('id.group', 'formatless_refused')
+                    return True
                 group = (Group.from_canonical(decoded)
                          if isinstance(decoded, dict) else decoded)
             mine, theirs = self.group, group
@@ -4044,6 +4060,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     # Normal adopt: `theirs` carries the shared private key, or
                     # we hold no key to lose — take it wholesale.
                     self.logger.debug('Replace %s group with %s group', mine.nickname, theirs.nickname)
+                    if mine.uuid == theirs.uuid:
+                        # A group's format does not change in place; see
+                        # Group.adopt_membership.
+                        theirs._wire_format = mine.wire_format
                     self.group = theirs
                 elif mine.uuid == theirs.uuid:
                     # `theirs` is PUBLIC-ONLY but has a larger membership for OUR

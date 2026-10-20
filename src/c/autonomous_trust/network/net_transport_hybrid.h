@@ -112,11 +112,11 @@ typedef struct hybrid_inner_s {
  *      net_transport_hybrid.c) allocates this struct and populates
  *      from JSON; net_proc.c finds it in proc->configs["hybrid"]
  *      and points transport_specific at it. */
-/** Group-routing entry for AT_NET_GROUP_FORWARD (at-over-dtn stage F).
+/** Group-routing entry for the gateway's group forward (at-over-dtn stage F).
  *  A gateway receiving a GROUP-addressed envelope whose dst_uuid matches
  *  @c group_uuid re-emits the frame via @c leg_index. Stored inline in
- *  hybrid_config_t regardless of build flags so the JSON schema is stable;
- *  the code paths that consume them are gated on AT_NET_GROUP_FORWARD. */
+ *  hybrid_config_t whatever the network config says, so the JSON schema is
+ *  stable; libat_gateway consumes them only when `group_forward` is on. */
 typedef struct group_route_s {
     uint8_t group_uuid[16]; /**< Destination group UUID (raw, not hyphenated). */
     size_t  leg_index;      /**< Index into hybrid_config_t::inners. */
@@ -128,14 +128,13 @@ typedef struct hybrid_config_s {
 
     /** True iff this node is a gateway — i.e., when it receives a frame
      *  whose envelope dst is not local, it should forward to the other
-     *  inner transport instead of dropping. Consumed only when the build
-     *  was configured with AT_NET_ENVELOPE; otherwise forwarding code is
-     *  absent and this field is ignored. */
+     *  inner transport instead of dropping. Consumed only by libat_gateway
+     *  when the network config turns `envelope` on; ignored otherwise. */
     bool is_gateway;
 
-    /** Group UUID -> inner-leg routing table. Populated for gateways when
-     *  AT_NET_GROUP_FORWARD=ON; ignored otherwise. Always present in the
-     *  struct so JSON schema is stable across build variants. */
+    /** Group UUID -> inner-leg routing table. Used by gateways whose
+     *  network config turns `group_forward` on; ignored otherwise. Always
+     *  present in the struct so the JSON schema is stable. */
     group_route_t group_routes[HYBRID_MAX_GROUP_ROUTES];
     size_t n_group_routes;
 } hybrid_config_t;
@@ -147,8 +146,7 @@ typedef struct hybrid_config_s {
  *  @p cfg is NULL.
  *
  *  This helper is compiled unconditionally so tests can exercise route
- *  resolution without needing the AT_NET_GROUP_FORWARD code path active
- *  in net_proc.c. */
+ *  resolution without a gateway running `group_forward`. */
 int hybrid_group_route_lookup(const hybrid_config_t *cfg,
                               const uint8_t *dst_uuid,
                               size_t *out_leg_index);

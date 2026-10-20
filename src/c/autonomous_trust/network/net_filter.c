@@ -135,6 +135,18 @@ int net_filters_check_config(const network_config_t *cfg, logger_t *logger)
                   cfg->group_forward ? "group_forward" : "cross_cluster");
         return -1;
     }
+    /* A forwarded group frame is from a group this node cannot place, so its
+     * format cannot be looked up; that holds only while every cohort is JSON
+     * (doc/architecture/network-wire-format.md, "The one configuration that
+     * can violate G"). So a node with group_forward on never mints a proto
+     * group, and AT_NET_WIRE_MODE is read only for the group a node mints. */
+    if (cfg->group_forward && net_wire_mode_resolve(NULL, logger) == NET_WIRE_PROTO) {
+        log_error(logger, "Network: group_forward is on and AT_NET_WIRE_MODE=proto;"
+                          " a forwarding node may only mint a JSON group. Unset"
+                          " AT_NET_WIRE_MODE or turn group_forward off; refusing"
+                          " to start\n");
+        return -1;
+    }
     if (cfg->envelope && !net_filter_installed(NET_FILTER_ENVELOPE)) {
         log_error(logger, "Network: the network config asks for the routing envelope,"
                           " but libat_gateway is not loaded; refusing to start rather"

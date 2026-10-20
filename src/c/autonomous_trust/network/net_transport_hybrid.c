@@ -716,8 +716,9 @@ int hybrid_from_json(const json_t *obj, void *data_struct)
     if (jgw != NULL)
         cfg->is_gateway = json_boolean_value(jgw);
 
-    /* Optional group-UUID routing table (AT_NET_GROUP_FORWARD). Read even
-     * when the feature is compiled out — keeps config schema stable. Entries
+    /* Optional group-UUID routing table (the gateway's group forward). Read
+     * even when `group_forward` is off, which keeps the config schema stable.
+     * Entries
      * with an unparseable UUID or out-of-range leg_index are rejected. */
     const json_t *jroutes = json_object_get(obj, "group_routes");
     if (json_is_array(jroutes)) {

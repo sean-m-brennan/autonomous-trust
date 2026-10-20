@@ -2993,6 +2993,13 @@ static int _merge_to_mesh(process_t *proc, directory_t *queues)
             continue;
 
         json_t *g_json = json_array_get(root, 0);
+        if (group_refuses_formatless(&proc->protocol.group, g_json)) {
+            /* Its peers still count; its group is not ours to take. Mirrors
+             * Python _merge_to_mesh. */
+            log_warn(proc->logger, "Identity: skipping a history whose group "
+                     "names no format: our group speaks proto\n");
+            continue;
+        }
         if (g_json && json_is_object(g_json)) {
             group_t parsed = {0};
             if (group_from_json(g_json, &parsed) == 0) {
@@ -3177,6 +3184,11 @@ static bool _adopt_solicited_group(process_t *proc, const json_t *payload)
     pthread_mutex_unlock(&id_state.lock);
     if (!solicited)
         return false;
+    if (group_refuses_formatless(&proc->protocol.group, gj)) {
+        log_warn(proc->logger, "Identity: join answer names no format and our "
+                 "group speaks proto; ignoring\n");
+        return false;
+    }
 
     group_t *g = calloc(1, sizeof(group_t));
     if (g == NULL)
@@ -4325,6 +4337,19 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
         return true; /* malformed payload — discard, do not echo */
 
+    /* A proto group never reads a group that names no format: it would read
+     * as JSON (doc/architecture/network-wire-format.md). Mirrors Python
+     * handle_group_update. */
+    if (group_refuses_formatless(&proc->protocol.group, payload))
+    {
+        log_warn(proc->logger,
+                 "Identity: refusing group update from %s: our group speaks "
+                 "proto and theirs names no format\n", nmsg->from_whom.nickname);
+        probes_counter("id.group", "formatless_refused", NULL);
+        json_decref(payload);
+        return true;
+    }
+
     /* Incoming group uuid + address_map size. */
     json_t *j_uuid = json_object_get(payload, "uuid");
     const char *theirs_uuid_str = j_uuid ? json_string_value(j_uuid) : NULL;
@@ -4620,9 +4645,13 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
          * doc/architecture/network-wire-format.md): an absorbed node that kept
          * its own would speak a format its new group may not read. Absent or
          * unrecognized reads as json, as group_from_json reads it.
+         * Never for the SAME group: a format does not change in place, since
+         * the update announcing it would reach members in the format they
+         * cannot read yet; a format change needs a new group.
          * Mirrors Python Group.adopt_membership. */
-        ((process_t *)proc)->protocol.group.wire_format = net_wire_format_from_name(
-            json_string_value(json_object_get(payload, "wire_format")));
+        if (!same_group)
+            ((process_t *)proc)->protocol.group.wire_format = net_wire_format_from_name(
+                json_string_value(json_object_get(payload, "wire_format")));
         /* Replace address_map: free any existing entries, then ingest theirs
          * by walking the JSON object so we never need map_priv.h here. */
         if (((process_t *)proc)->protocol.group.address_map.items != NULL)

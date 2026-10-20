@@ -1,0 +1,48 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-update-formatless-refused-by-proto
+byte_pinning: false
+description: |
+    A node whose group speaks proto refuses a group that names no format
+    (doc/architecture/network-wire-format.md). An absent wire_format reads
+    as JSON, which is right in a JSON cohort; in a proto cohort it would make
+    the node speak JSON to peers that refuse it, and silence is not scored,
+    so nothing would surface it. The user's call (2026-10-20).
+
+    Topology: peer_a holds group G (uuid 0a..), proto, size 1. peer_b holds
+    a DIFFERENT, larger group H (uuid 0b..) and owns its key, so without the
+    rule peer_a would adopt H outright. peer_b's update leaves the field out.
+    The control is group-update-formatless-read-as-json.
+
+participants:
+  - id: peer_a
+    role: group_member
+  - id: peer_b
+    role: group_member
+
+fixtures:
+  groups:
+    peer_a:
+      uuid: "0a000000-0000-4000-8000-00000000000a"
+      size: 1
+      wire_format: proto
+    peer_b:
+      uuid: "0b000000-0000-4000-8000-00000000000b"
+      size: 3
+      wire_format: json
+
+steps:
+  - id: 1
+    from: peer_b
+    to: peer_a
+    function: group_key_update
+    payload:
+      omit_wire_format: true
+    description: |
+        peer_b sends H without a format. peer_a refuses it and keeps G.
+
+expected_state:
+  peer_a:
+    group_size: 1
+    group_wire_format: proto

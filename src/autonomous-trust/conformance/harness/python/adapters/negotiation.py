@@ -193,6 +193,26 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: results_scored for {slug!r} = {got}, '
                         f'expected {want}')
+            elif key == 'results_forwarded':
+                # {task: <slug>, executors: [<pid>, ...]}: the results handed
+                # on toward the app, in order, by executor (ISSUES §2.8: the
+                # first reply only). Python hands every result to main and
+                # marks all but the first `score_only`, which automate.py does
+                # not forward; C sends main only the first.
+                slug = expected.get('task')
+                want = list(expected.get('executors') or [])
+                task_uuid = uuid5(_NS, f'task:{slug}')
+                by_uuid = {str(i.uuid): pid
+                           for pid, i in _PARTICIPANT_IDENTITIES.items()}
+                sink = self.queues[CfgIds.main]._sink
+                got = [by_uuid.get(str(getattr(r, 'executor_uuid', None)), '?')
+                       for r in sink
+                       if str(getattr(r, 'uuid', '')) == str(task_uuid)
+                       and not getattr(r, 'score_only', False)]
+                if got != want:
+                    raise AssertionError(
+                        f'{self.id}: results_forwarded for {slug!r} = {got}, '
+                        f'expected {want}')
             else:
                 raise AssertionError(f'{self.id}: unsupported expected_state key {key!r}')
 
