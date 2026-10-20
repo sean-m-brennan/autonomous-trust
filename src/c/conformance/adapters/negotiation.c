@@ -114,6 +114,11 @@ static const char *_resolve_to_id(const generic_msg_t *msg)
 #define NEG_SCORES_MAX 32
 static struct { uuid_t task; uuid_t subject; } g_scores[NEG_SCORES_MAX];
 static size_t g_n_scores;
+/* The task results the requestor forwarded to its main process (the app's
+ * hop): (task uuid, executor). `results_forwarded` asserts them. Python's
+ * adapter reads the results handed to main without `score_only`. */
+static struct { uuid_t task; uuid_t executor; } g_forwards[NEG_SCORES_MAX];
+static size_t g_n_forwards;
 
 static int _send_hook(const char *key,
                       const message_type_t type,
@@ -128,6 +133,13 @@ static int _send_hook(const char *key,
         uuid_copy(g_scores[g_n_scores].task, msg->info.tx_score.task_uuid);
         uuid_copy(g_scores[g_n_scores].subject, msg->info.tx_score.peer_uuid);
         g_n_scores++;
+    }
+    if (type == TASK_RESULT && g_n_forwards < NEG_SCORES_MAX)
+    {
+        uuid_copy(g_forwards[g_n_forwards].task, msg->info.task_result.task_uuid);
+        uuid_copy(g_forwards[g_n_forwards].executor,
+                  msg->info.task_result.requestor_uuid);
+        g_n_forwards++;
     }
     const char *to_id = _resolve_to_id(msg);
     const char *function = (type == NET_MESSAGE && msg->info.net_msg.function != NULL)
@@ -898,6 +910,46 @@ static int _negotiation_check_expected_state(sce_run_ctx_t *ctx)
                         return -1;
                     }
                 }
+            } else if (strcmp(key, "results_forwarded") == 0) {
+                /* {task: <slug>, executors: [<pid>, ...]}: the results handed
+                 * on toward the app, in order, by executor (ISSUES §2.8: the
+                 * first reply only). */
+                const char *slug = json_string_value(json_object_get(val, "task"));
+                json_t *ex = json_object_get(val, "executors");
+                if (slug == NULL || !json_is_array(ex)) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: results_forwarded expects {task, executors}", pid);
+                    return -1;
+                }
+                uuid_t task_uuid;
+                _uuid5("task:", slug, task_uuid);
+                size_t n = 0;
+                for (size_t k = 0; k < g_n_forwards; k++)
+                    if (uuid_compare(g_forwards[k].task, task_uuid) == 0)
+                        n++;
+                if (n != json_array_size(ex)) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: results_forwarded for %s: %zu result(s), expected %zu",
+                             pid, slug, n, json_array_size(ex));
+                    return -1;
+                }
+                size_t i, k = 0;
+                json_t *who;
+                json_array_foreach(ex, i, who) {
+                    while (k < g_n_forwards
+                           && uuid_compare(g_forwards[k].task, task_uuid) != 0)
+                        k++;
+                    uuid_t ex_uuid;
+                    _uuid5("neg:", json_string_value(who), ex_uuid);
+                    if (k >= g_n_forwards
+                        || uuid_compare(g_forwards[k].executor, ex_uuid) != 0) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: results_forwarded for %s: entry %zu is not "
+                                 "from %s", pid, slug, i, json_string_value(who));
+                        return -1;
+                    }
+                    k++;
+                }
             } else if (strcmp(key, "flood_count") == 0) {
                 /* {task: <slug>, count: <int>} — derive uuid from slug
                  * (same _uuid5 used elsewhere), read the per-task flood
@@ -1077,6 +1129,7 @@ void at_negotiation_run(const at_case_t *c, at_case_result_t *out)
      * has_my_task:false are not polluted by prior scenarios. */
     negotiation_reset_state();
     g_n_scores = 0;
+    g_n_forwards = 0;
 
     json_t *parts = json_object_get(c->data, "participants");
     if (!json_is_array(parts))

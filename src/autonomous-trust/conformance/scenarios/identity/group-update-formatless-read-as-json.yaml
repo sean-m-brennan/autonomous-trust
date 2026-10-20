@@ -1,0 +1,42 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-update-formatless-read-as-json
+byte_pinning: false
+description: |
+    The control for group-update-formatless-refused-by-proto: the same
+    update reaches a node whose group speaks JSON, which reads the absent
+    format as JSON, as it reads every group from a peer that predates the
+    field (doc/architecture/network-wire-format.md), and adopts H.
+
+participants:
+  - id: peer_a
+    role: group_member
+  - id: peer_b
+    role: group_member
+
+fixtures:
+  groups:
+    peer_a:
+      uuid: "0a000000-0000-4000-8000-00000000000a"
+      size: 1
+      wire_format: json
+    peer_b:
+      uuid: "0b000000-0000-4000-8000-00000000000b"
+      size: 3
+      wire_format: json
+
+steps:
+  - id: 1
+    from: peer_b
+    to: peer_a
+    function: group_key_update
+    payload:
+      omit_wire_format: true
+    description: |
+        peer_b sends H without a format. peer_a adopts it as JSON.
+
+expected_state:
+  peer_a:
+    group_size: 3
+    group_wire_format: json

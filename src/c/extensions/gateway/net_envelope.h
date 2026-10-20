@@ -46,8 +46,9 @@
  * NET_ENV_MAX_HOPS, the frame is dropped rather than forwarded. This
  * bounds loops if operators misconfigure a gateway mesh.
  *
- * Gated by the AT_NET_ENVELOPE CMake option. When OFF (default), net_proc
- * sends and receives frames without this header, matching pre-2b behavior.
+ * Used only when the network config turns `envelope` on (default off), and
+ * only with libat_gateway built. Otherwise net_proc sends and receives frames
+ * without this header, matching pre-2b behavior.
  */
 
 #include <stdbool.h>

@@ -56,6 +56,9 @@
 static json_t *g_last_body = NULL;
 static char    g_last_process[PROC_NAME_LEN + 1];
 static int     g_resp_count = 0;
+/* local_rep_response replies, and the process the last one went to. */
+static int     g_local_count = 0;
+static char    g_local_process[PROC_NAME_LEN + 1];
 
 static int _capture_hook(const char *key, const message_type_t type,
                          generic_msg_t *msg, bool blocking)
@@ -63,6 +66,12 @@ static int _capture_hook(const char *key, const message_type_t type,
     (void)key; (void)blocking;
     if (type != NET_MESSAGE || msg->info.net_msg.function == NULL)
         return 0;
+    if (strcmp(msg->info.net_msg.function, REP_PROTO_LOCAL_RESP) == 0) {
+        g_local_count++;
+        strncpy(g_local_process, msg->info.net_msg.process, PROC_NAME_LEN);
+        g_local_process[PROC_NAME_LEN] = '\0';
+        return 0;
+    }
     if (strcmp(msg->info.net_msg.function, REP_PROTO_REP_RESP) != 0)
         return 0;
     g_resp_count++;
@@ -116,20 +125,24 @@ static void _uuid_str(const uuid_t u, char *out)
     uuid_unparse_lower(u, out);
 }
 
+/* A NULL sender is a local process: it leaves from_whom zeroed. */
 static void _dispatch(process_t *proc, identity_t *sender, char *function,
                       json_t *payload)
 {
     public_identity_t *pub = NULL;
-    ck_assert_ret_ok(identity_publish(sender, &pub));
+    if (sender != NULL)
+        ck_assert_ret_ok(identity_publish(sender, &pub));
     generic_msg_t msg = {0};
     msg.type = NET_MESSAGE;
     strncpy(msg.info.net_msg.process, "reputation", PROC_NAME_LEN);
     msg.info.net_msg.function = function;
     msg.info.net_msg.verified = true;
-    memcpy(&msg.info.net_msg.from_whom, pub, sizeof(public_identity_t));
+    if (pub != NULL)
+        memcpy(&msg.info.net_msg.from_whom, pub, sizeof(public_identity_t));
     ck_assert_ret_ok(net_msg_pack_json(&msg.info.net_msg, payload));
     run_message_handlers(proc, NULL, NET_MESSAGE, &msg);
-    smrt_deref(pub);
+    if (pub != NULL)
+        smrt_deref(pub);
 }
 
 static void _begin(int num_peers)
@@ -137,6 +150,8 @@ static void _begin(int num_peers)
     reputation_reset_state(num_peers);
     g_resp_count = 0;
     g_last_process[0] = '\0';
+    g_local_count = 0;
+    g_local_process[0] = '\0';
     if (g_last_body != NULL) {
         json_decref(g_last_body);
         g_last_body = NULL;
@@ -372,6 +387,74 @@ DEFINE_TEST(test_absent_requesting_process_still_addresses_something)
     ck_assert_str_eq(g_last_process, "reputation");
     _end();
 }
+
+/* ------------------------------------------------------------------ */
+/* Local reputation query (ZTA asks for one peer's score)               */
+/* ------------------------------------------------------------------ */
+
+static json_t *_local_query(const char *peer_u, const char *return_proc)
+{
+    json_t *p = json_object();
+    json_object_set_new(p, "peer_uuid", json_string(peer_u));
+    json_object_set_new(p, "return_process", json_string(return_proc));
+    return p;
+}
+
+DEFINE_TEST(test_local_rep_query_is_answered_to_the_named_process)
+{
+    _begin(2);
+    identity_t *me = _mk_identity("bob", "10.0.0.2");
+    identity_t *subject = _mk_identity("charlie", "10.0.0.3");
+    process_t *proc = _mk_process(me);
+
+    char subject_u[UUID_STRING_LEN + 1];
+    _uuid_str(subject->uuid, subject_u);
+
+    json_t *p = _local_query(subject_u, "zta");
+    _dispatch(proc, NULL, REP_PROTO_LOCAL_QUERY, p);
+    json_decref(p);
+
+    ck_assert_int_eq(g_local_count, 1);
+    ck_assert_str_eq(g_local_process, "zta");
+    _end();
+}
+
+DEFINE_TEST(test_local_rep_query_off_the_wire_is_refused)
+{
+    /* The reply goes to whichever process the payload names, so a peer's
+     * query would push a local_rep_response into any queue it chose. */
+    _begin(2);
+    identity_t *me = _mk_identity("bob", "10.0.0.2");
+    identity_t *peer = _mk_identity("alice", "10.0.0.1");
+    identity_t *subject = _mk_identity("charlie", "10.0.0.3");
+    process_t *proc = _mk_process(me);
+
+    char subject_u[UUID_STRING_LEN + 1];
+    _uuid_str(subject->uuid, subject_u);
+
+    json_t *p = _local_query(subject_u, "zta");
+    _dispatch(proc, peer, REP_PROTO_LOCAL_QUERY, p);
+    json_decref(p);
+
+    ck_assert_int_eq(g_local_count, 0);
+    _end();
+}
+
+DEFINE_TEST(test_local_rep_query_without_strings_answers_nothing)
+{
+    _begin(2);
+    identity_t *me = _mk_identity("bob", "10.0.0.2");
+    process_t *proc = _mk_process(me);
+
+    json_t *p = json_object();
+    json_object_set_new(p, "peer_uuid", json_integer(7));
+    json_object_set_new(p, "return_process", json_integer(7));
+    _dispatch(proc, NULL, REP_PROTO_LOCAL_QUERY, p);
+    json_decref(p);
+
+    ck_assert_int_eq(g_local_count, 0);
+    _end();
+}
 END_TEST_DEFINITION()
 
 RUN_TESTS(RepRespShape,
@@ -381,4 +464,7 @@ RUN_TESTS(RepRespShape,
           test_batch_reply_skips_the_responder_itself,
           test_batch_reply_collapses_a_repeated_subject,
           test_batch_with_only_our_own_uuid_answers_nothing,
-          test_absent_requesting_process_still_addresses_something)
+          test_absent_requesting_process_still_addresses_something,
+          test_local_rep_query_is_answered_to_the_named_process,
+          test_local_rep_query_off_the_wire_is_refused,
+          test_local_rep_query_without_strings_answers_nothing)

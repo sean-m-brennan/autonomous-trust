@@ -153,8 +153,9 @@ void net_filters_after_deliver(const net_thread_ctx_t *ctx, net_channel_t ch,
 /**
  * @brief Refuse a network config the installed filters cannot honour: the
  * envelope asked for but no @ref NET_FILTER_ENVELOPE filter installed (its
- * library is absent), or group_forward / cross_cluster without the
- * envelope. Logs an ERROR naming the problem. @return 0 or -1.
+ * library is absent), group_forward / cross_cluster without the envelope,
+ * or group_forward with AT_NET_WIRE_MODE=proto (a forwarding node mints only
+ * JSON groups). Logs an ERROR naming the problem. @return 0 or -1.
  */
 int net_filters_check_config(const network_config_t *cfg, logger_t *logger);
 
