@@ -46,6 +46,7 @@
 #include "adapters/physics.h"
 #include "physics/physics.h"
 #include "reputation/tx_channel.h"
+#include "utilities/compiler.h"   /* AT_PRINTF_FORMAT */
 
 /* Verdict -> the name the scenario spells, and the (score, channel) it must
  * carry. Asserting all three catches a runtime that returned the right number
@@ -122,7 +123,7 @@ static bool _result_text(json_t *result, char *buf, size_t len)
 }
 
 static bool _fail(at_case_result_t *out, const char *fmt, ...)
-    __attribute__((format(printf, 2, 3)));
+    __attribute__((format(AT_PRINTF_FORMAT, 2, 3)));
 
 static bool _fail(at_case_result_t *out, const char *fmt, ...)
 {

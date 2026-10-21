@@ -42,7 +42,7 @@
 #define AT_PHYS_MAX_DIAGNOSES 256
 
 static void _err(char *buf, size_t len, const char *fmt, ...)
-    __attribute__((format(printf, 3, 4)));
+    __attribute__((format(AT_PRINTF_FORMAT, 3, 4)));
 
 static void _err(char *buf, size_t len, const char *fmt, ...)
 {
@@ -970,7 +970,7 @@ static bool _parse_claim(const char *result_str, claim_t *out)
 static at_physics_verdict_t _refuted(double *score_out, char *reason_out,
                                      size_t reason_len, const char *reason,
                                      const char *fmt, ...)
-    __attribute__((format(printf, 5, 6)));
+    __attribute__((format(AT_PRINTF_FORMAT, 5, 6)));
 
 static at_physics_verdict_t _refuted(double *score_out, char *reason_out,
                                      size_t reason_len, const char *reason,
