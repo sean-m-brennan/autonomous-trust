@@ -1219,6 +1219,7 @@ typedef struct {
     map_t   sigs_final;    /* voter uuid-str -> string_data(hex sig) */
     int64_t own_epoch;     /* monotonic epoch for rounds WE originate */
     int     last_head;     /* -1 == this chain has never been checkpointed */
+    json_t *forks;         /* equivocation records (R+D.md §14.1), or NULL */
 } rep_chain_ckpt_t;
 
 /* The slot for a chain key, created on first use. Caller holds the lock. */
@@ -3099,8 +3100,12 @@ static bool handle_committed(const process_t *proc, directory_t *queues, generic
  * the result. The segment's placement certificates decide (tx_history_reconcile_placed). @p finality applies our
  * finalized checkpoint (primary chain, quorum-of-one path). Mirrors Python
  * _reconcile_into. Caller holds no lock. */
+static void _record_catchup_equivocation(const process_t *proc, const char *key,
+                                         json_t *arr, int f, const uuid_t *sender);
+static void _load_fork_records(const char *key, const json_t *doc);
+
 static void _reconcile_into(const process_t *proc, const char *key, json_t *arr,
-                            const char *who, bool finality)
+                            const char *who, const uuid_t *sender, bool finality)
 {
     const char *group = key[0] != '\0' ? key : NULL;
     static const int none[1] = { 0 };
@@ -3152,10 +3157,13 @@ static void _reconcile_into(const process_t *proc, const char *key, json_t *arr,
                  "finalized checkpoint (ends %d); keeping ours\n",
                  who, res.fork, final_end);
     else if (res.status == TX_RECONCILE_EQUIVOCATION)
+    {
         log_error(proc->logger,
                   "Reputation: chain from %s holds a certified placement at "
                   "index %d that differs from ours: two quorums signed two "
                   "values there; keeping ours\n", who, res.fork);
+        _record_catchup_equivocation(proc, key, arr, res.fork, sender);
+    }
     else
         log_debug(proc->logger, "Reputation: chain update from %s: status %d\n",
                   who, (int)res.status);
@@ -3485,7 +3493,8 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
             _chain_key(proc, group, key, sizeof(key));
         if (key[0] != '\0' && json_is_array(arr)
             && _chain_json_certified(proc, arr, key))
-            _reconcile_into(proc, key, arr, nmsg->from_whom.nickname, false);
+            _reconcile_into(proc, key, arr, nmsg->from_whom.nickname,
+                            &nmsg->from_whom.uuid, false);
         json_decref(chain_json);
         return true;
     }
@@ -3514,7 +3523,8 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
     {
         pthread_mutex_unlock(&rep_state.lock);
         if (json_is_array(chain_json))
-            _reconcile_into(proc, "", chain_json, nmsg->from_whom.nickname, true);
+            _reconcile_into(proc, "", chain_json, nmsg->from_whom.nickname,
+                            &nmsg->from_whom.uuid, true);
         json_decref(chain_json);
         return true;
     }
@@ -3602,7 +3612,7 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
     pthread_mutex_unlock(&rep_state.lock);
     if (majority != NULL)
     {
-        _reconcile_into(proc, "", majority, "the majority chain", false);
+        _reconcile_into(proc, "", majority, "the majority chain", NULL, false);
         json_decref(majority);
     }
     return true;
@@ -8474,6 +8484,25 @@ static void _current_checkpoint_locked(const char *chain_key,
  * Failure is logged and swallowed. The evidence is an optimization of trust —
  * its absence costs a warm start its elevated tiers and nothing else — so it
  * must never be able to take down the reputation process. */
+/* The evidence document for chain @p chain_key: its window, its finalized
+ * checkpoint and, only when there are any, its equivocation records, so a node
+ * that never saw one writes the document it always did. Mirrors Python
+ * evidence_to_dict. Caller holds rep_state.lock. */
+static int _evidence_doc_locked(const char *chain_key, json_t **out)
+{
+    rep_checkpoint_t ckpt;
+    if (rep_checkpoint_init(&ckpt) != 0)
+        return -1;
+    _current_checkpoint_locked(chain_key, &ckpt);
+    int err = reputation_evidence_to_json(_chain_for_key_locked(chain_key),
+                                          &ckpt, out);
+    rep_checkpoint_free(&ckpt);
+    rep_chain_ckpt_t *slot = err == 0 ? _ckpt_slot_locked(chain_key) : NULL;
+    if (*out != NULL && slot != NULL && json_array_size(slot->forks) > 0)
+        json_object_set_new(*out, "forks", json_deep_copy(slot->forks));
+    return err;
+}
+
 static void _persist_history(const process_t *proc, const char *chain_key)
 {
     char path[CFG_PATH_LEN + 64] = {0};
@@ -8483,16 +8512,10 @@ static void _persist_history(const process_t *proc, const char *chain_key)
                  "Reputation: cannot build evidence path; not persisting\n");
         return;
     }
-    rep_checkpoint_t ckpt;
-    if (rep_checkpoint_init(&ckpt) != 0)
-        return;
     json_t *doc = NULL;
     pthread_mutex_lock(&rep_state.lock);
-    _current_checkpoint_locked(chain_key, &ckpt);
-    int err = reputation_evidence_to_json(_chain_for_key_locked(chain_key),
-                                          &ckpt, &doc);
+    int err = _evidence_doc_locked(chain_key, &doc);
     pthread_mutex_unlock(&rep_state.lock);
-    rep_checkpoint_free(&ckpt);
     if (err != 0 || doc == NULL)
     {
         log_warn(proc->logger, "Reputation: could not build evidence doc\n");
@@ -9581,6 +9604,9 @@ static bool _rebuild_one_chain(const process_t *proc, const char *chain_key,
          * unattested, so they are clamped. */
         return false;
     }
+    /* The equivocation records are this node's own, whatever becomes of the
+     * chain beside them, so they come back first. */
+    _load_fork_records(chain_key, doc);
 
     tx_history_t *loaded = NULL;
     rep_checkpoint_t ckpt;
@@ -11855,6 +11881,286 @@ static bool _placement_certified_seg(const process_t *proc, const char *key,
     return ok;
 }
 
+/* --- equivocation (R+D.md §14.1) --------------------------------------------
+ *
+ * Two certificates for different values at one index mean two quorums of the
+ * roster signed both, and the members in both signed twice. We keep ours
+ * either way. The record holds both certificates, so this node can prove it
+ * later; it is never sent and never scored (the user's calls, 2026-10-21, D3 B
+ * and D4 B). Mirrors the Python PlacementMixin. */
+#define REP_FORKS_MAX 32
+
+static int _str_cmp(const void *a, const void *b)
+{
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* One side of an equivocation: the placement at @p k after the entry whose
+ * hash is @p prev, its value digest, its signatures, and who among them
+ * verifies against the roster in force for @p k (our live view while the
+ * chain holds none). A new object, or NULL. Takes no lock on entry. */
+static json_t *_fork_cert(const process_t *proc, const char *key, int k,
+                          const transaction_t *entries, int m, json_t *sigs,
+                          const char *prev)
+{
+    char digest[TX_HASH_HEX_LEN + 1];
+    place_value_digest(entries, m, k, digest);
+    uint8_t desig[PLACE_DESIG_MAX];
+    size_t dlen = place_designation(k, prev, digest, desig, sizeof(desig));
+    if (digest[0] == '\0' || dlen == 0 || !json_is_object(sigs))
+        return NULL;
+    json_t *roster = _roster_at(key, k);
+    json_t *lower = json_object();
+    const char *names[256];
+    size_t n_names = 0;
+    const char *voter;
+    json_t *sig;
+    json_object_foreach(sigs, voter, sig)
+    {
+        char u[UUID_STRING_LEN + 1];
+        at_strlcpy(u, voter, sizeof(u));
+        for (char *c = u; *c; c++)
+            if (*c >= 'A' && *c <= 'Z')
+                *c = (char)(*c - 'A' + 'a');
+        if (json_is_string(sig))
+            json_object_set(lower, u, sig);
+        json_t *one = json_pack("{s:O}", voter, sig);
+        size_t ok = one == NULL ? 0
+            : roster != NULL ? _verified_cosigners_in(proc, roster, one, desig, dlen)
+                             : _verified_cosigners(proc, one, desig, dlen);
+        json_decref(one);
+        if (ok == 1 && n_names < sizeof(names) / sizeof(names[0]))
+            names[n_names++] = voter;
+    }
+    json_decref(roster);
+    char (*keys)[UUID_STRING_LEN + 1] = calloc(n_names > 0 ? n_names : 1,
+                                                sizeof(*keys));
+    const char **order = calloc(n_names > 0 ? n_names : 1, sizeof(*order));
+    json_t *signers = json_array();
+    for (size_t i = 0; keys != NULL && order != NULL && i < n_names; i++)
+    {
+        at_strlcpy(keys[i], names[i], sizeof(keys[i]));
+        for (char *c = keys[i]; *c; c++)
+            if (*c >= 'A' && *c <= 'Z')
+                *c = (char)(*c - 'A' + 'a');
+        order[i] = keys[i];
+    }
+    if (keys != NULL && order != NULL)
+    {
+        qsort(order, n_names, sizeof(*order), _str_cmp);
+        for (size_t i = 0; i < n_names; i++)
+            json_array_append_new(signers, json_string(order[i]));
+    }
+    free(order);
+    free(keys);
+    return json_pack("{s:i, s:s, s:s, s:o, s:o}", "k", k, "prev",
+                     prev != NULL ? prev : "", "digest", digest,
+                     "sigs", lower, "signers", signers);
+}
+
+/* Our own certificate for the placement holding index @p f, or NULL when it
+ * is not resident in full. Mirrors Python _own_fork_cert. */
+static json_t *_own_fork_cert(const process_t *proc, const char *key, int f)
+{
+    tx_place_batch_t *b = calloc(1, sizeof(*b));
+    if (b == NULL)
+        return NULL;
+    json_t *sigs = NULL;
+    pthread_mutex_lock(&rep_state.lock);
+    int rc = tx_history_own_place_batch(_chain_for_key_locked(key), f, b, &sigs);
+    pthread_mutex_unlock(&rep_state.lock);
+    json_t *out = rc == 0 && b->n > 0
+        ? _fork_cert(proc, key, b->k, b->entries, b->n, sigs, b->entries[0].prev_hash)
+        : NULL;
+    json_decref(sigs);
+    free(b);
+    return out;
+}
+
+/* Keep one equivocation record for chain @p key and persist it. Takes
+ * ownership of @p ours and @p theirs. */
+static void _note_equivocation(const process_t *proc, const char *key, int f,
+                               const char *source, const uuid_t *sender,
+                               json_t *ours, json_t *theirs)
+{
+    const char *od = json_string_value(json_object_get(ours, "digest"));
+    const char *td = json_string_value(json_object_get(theirs, "digest"));
+    if (od == NULL || td == NULL || strcmp(od, td) == 0)
+    {
+        json_decref(ours);
+        json_decref(theirs);
+        return;
+    }
+    json_t *both = json_array();
+    size_t i, j;
+    json_t *a, *b;
+    json_array_foreach(json_object_get(ours, "signers"), i, a)
+        json_array_foreach(json_object_get(theirs, "signers"), j, b)
+            if (json_equal(a, b))
+                json_array_append(both, a);
+    char from[UUID_STRING_LEN + 1] = {0};
+    if (sender != NULL)
+        uuid_unparse_lower(*sender, from);
+    pthread_mutex_lock(&rep_state.lock);
+    rep_chain_ckpt_t *slot = _ckpt_slot_locked(key);
+    bool fresh = slot != NULL;
+    if (slot != NULL && slot->forks == NULL)
+        slot->forks = json_array();
+    json_array_foreach(slot != NULL ? slot->forks : NULL, i, a)
+    {
+        const char *ro = json_string_value(json_object_get(json_object_get(a, "ours"), "digest"));
+        const char *rt = json_string_value(json_object_get(json_object_get(a, "theirs"), "digest"));
+        if (json_integer_value(json_object_get(a, "index")) == f && ro != NULL
+            && rt != NULL && strcmp(ro, od) == 0 && strcmp(rt, td) == 0)
+            fresh = false;
+    }
+    size_t n_both = json_array_size(both);
+    if (fresh)
+    {
+        json_t *rec = json_pack("{s:i, s:s, s:o, s:I, s:O, s:O, s:O}",
+                                "index", f, "source", source,
+                                "from", sender != NULL ? json_string(from) : json_null(),
+                                "at", (json_int_t)time(NULL),
+                                "ours", ours, "theirs", theirs, "both", both);
+        if (rec != NULL)
+            json_array_append_new(slot->forks, rec);
+        while (json_array_size(slot->forks) > REP_FORKS_MAX)
+            json_array_remove(slot->forks, 0);
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    json_decref(both);
+    json_decref(ours);
+    json_decref(theirs);
+    if (!fresh)
+        return;
+    log_error(proc->logger,
+              "Reputation: equivocation recorded on chain %s at index %d (%s): "
+              "%zu member(s) signed both values\n",
+              key[0] != '\0' ? key : "primary", f, source, n_both);
+    _persist_history(proc, key);
+}
+
+/* Catch-up returned EQUIVOCATION at @p f: record our certificate and the
+ * segment's. Mirrors Python _record_catchup_equivocation. */
+static void _record_catchup_equivocation(const process_t *proc, const char *key,
+                                         json_t *arr, int f, const uuid_t *sender)
+{
+    tx_place_batch_t *batches = NULL;
+    int nb = 0;
+    json_t *theirs = NULL;
+    pthread_mutex_lock(&rep_state.lock);
+    int rc = tx_history_place_batches(_chain_for_key_locked(key), arr, &batches, &nb);
+    pthread_mutex_unlock(&rep_state.lock);
+    for (int i = 0; rc == 0 && i < nb && theirs == NULL; i++)
+        if (batches[i].n > 0 && batches[i].k <= f && f < batches[i].k + batches[i].n)
+            theirs = _fork_cert(proc, key, batches[i].k, batches[i].entries,
+                                batches[i].n, (json_t *)batches[i].sigs,
+                                batches[i].entries[0].prev_hash);
+    free(batches);
+    _note_equivocation(proc, key, f, "catchup", sender,
+                       _own_fork_cert(proc, key, f), theirs);
+}
+
+/* A `placed` for an index we already hold. The same value is a late
+ * duplicate. A different value whose certificate verifies after our own entry
+ * at k-1 is an equivocation, recorded at the first index where the two differ.
+ * Mirrors Python _check_placed_equivocation. */
+static void _check_placed_equivocation(const process_t *proc, const char *key,
+                                       int k, json_t *value, json_t *sigs,
+                                       const uuid_t *sender)
+{
+    transaction_t *theirs = calloc(PLACE_BATCH_MAX, sizeof(transaction_t));
+    transaction_t *ours = calloc(PLACE_BATCH_MAX, sizeof(transaction_t));
+    int m = theirs != NULL && ours != NULL ? _place_value_from_json(value, theirs) : -1;
+    char prev[TX_HASH_HEX_LEN + 1] = {0};
+    bool held = m > 0;
+    pthread_mutex_lock(&rep_state.lock);
+    const tx_history_t *chain = _chain_for_key_locked(key);
+    for (int i = 0; held && i < m; i++)
+    {
+        const transaction_t *t = tx_history_committed_at(chain, k + i);
+        if (t == NULL)
+            held = false;
+        else
+            ours[i] = *t;
+    }
+    if (held && k > 0)
+    {
+        const transaction_t *before = tx_history_committed_at(chain, k - 1);
+        if (before == NULL)
+            held = false;
+        else
+            transaction_entry_hash(before, prev);
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    char od[TX_HASH_HEX_LEN + 1], td[TX_HASH_HEX_LEN + 1];
+    if (held)
+    {
+        place_value_digest(ours, m, k, od);
+        place_value_digest(theirs, m, k, td);
+        held = strcmp(od, td) != 0
+            && _placement_certified(proc, theirs, m, k, prev, sigs,
+                                    key[0] != '\0' ? key : NULL);
+    }
+    if (held)
+    {
+        int f = k;
+        for (int i = 0; i < m; i++)
+        {
+            place_value_digest(&ours[i], 1, k + i, od);
+            place_value_digest(&theirs[i], 1, k + i, td);
+            if (strcmp(od, td) != 0)
+            {
+                f = k + i;
+                break;
+            }
+        }
+        _note_equivocation(proc, key, f, "placed", sender,
+                           _own_fork_cert(proc, key, f),
+                           _fork_cert(proc, key, k, theirs, m, sigs, prev));
+    }
+    free(theirs);
+    free(ours);
+}
+
+/* Take back the records an evidence document holds for chain @p key. */
+static void _load_fork_records(const char *key, const json_t *doc)
+{
+    json_t *raw = json_object_get((json_t *)doc, "forks");
+    if (!json_is_array(raw))
+        return;
+    json_t *keep = json_array();
+    size_t i;
+    json_t *r;
+    json_array_foreach(raw, i, r)
+        if (json_is_integer(json_object_get(r, "index"))
+            && json_is_object(json_object_get(r, "ours"))
+            && json_is_object(json_object_get(r, "theirs")))
+            json_array_append(keep, r);
+    while (json_array_size(keep) > REP_FORKS_MAX)
+        json_array_remove(keep, 0);
+    pthread_mutex_lock(&rep_state.lock);
+    rep_chain_ckpt_t *slot = _ckpt_slot_locked(key);
+    if (slot != NULL)
+    {
+        json_decref(slot->forks);
+        slot->forks = keep;
+        keep = NULL;
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    json_decref(keep);
+}
+
+json_t *reputation_fork_records(const char *key)
+{
+    pthread_mutex_lock(&rep_state.lock);
+    rep_chain_ckpt_t *slot = _ckpt_slot_locked(key != NULL ? key : "");
+    json_t *out = slot != NULL && slot->forks != NULL
+        ? json_deep_copy(slot->forks) : json_array();
+    pthread_mutex_unlock(&rep_state.lock);
+    return out;
+}
+
 /* Verify and write one decided placement at the chain's next index. */
 static bool _apply_placement(const process_t *proc, const char *key, int k,
                              json_t *value, json_t *sigs, const char *group)
@@ -12022,6 +12328,8 @@ static bool handle_placed(const process_t *proc, directory_t *queues,
         json_decref(payload);
         return true;
     }
+    if (k < next)
+        _check_placed_equivocation(proc, key, k, value, sigs, &nmsg->from_whom.uuid);
     if (k < next || !_apply_placement(proc, key, k, value, sigs, chain_group))
     {
         json_decref(payload);
@@ -13176,6 +13484,7 @@ void reputation_reset_state(int num_peers)
             if (data_object_ptr(sv, &sp) == 0 && sp != NULL)
             {
                 map_free(&((rep_chain_ckpt_t *)sp)->sigs_final);
+                json_decref(((rep_chain_ckpt_t *)sp)->forks);
                 free(sp);
             }
         }
@@ -13660,16 +13969,12 @@ int reputation_get_evidence_doc(json_t **out)
     if (out == NULL) return -1;
     *out = NULL;
     if (!rep_state.initialized) return -1;
-    rep_checkpoint_t ckpt;
-    if (rep_checkpoint_init(&ckpt) != 0) return -1;
     pthread_mutex_lock(&rep_state.lock);
     /* The PRIMARY chain's document — what the corpus pins. A gateway's child
      * chains each have their own file; those are exercised by the unit tests
      * rather than the scenario snapshot. */
-    _current_checkpoint_locked("", &ckpt);
-    int err = reputation_evidence_to_json(&rep_state.history, &ckpt, out);
+    int err = _evidence_doc_locked("", out);
     pthread_mutex_unlock(&rep_state.lock);
-    rep_checkpoint_free(&ckpt);
     return err;
 }
 

@@ -97,6 +97,7 @@ typedef struct {
     char evidence_schema[8];
     int  evidence_chain_len;
     char evidence_checkpoint_root[TX_HASH_HEX_LEN + 1];
+    int  evidence_forks;   /* equivocation records the document carries */
     rp_peer_rep_t evidence_ceilings[SCE_MAX_PARTICIPANTS];
     /* Slash proposals this participant ORIGINATED, cumulative over the whole
      * scenario (R+D.md §12.8). Unlike every other field here this is a TALLY
@@ -131,6 +132,12 @@ typedef struct {
     bool    place_have;
     int64_t place_n;
     uuid_t  place_by;
+    /* Equivocation records on the primary chain (R+D.md §14.1): how many, and
+     * the newest one's fork index and the members who signed both values. */
+    int     fork_n;
+    int     fork_index;
+    char    fork_both[SCE_MAX_PARTICIPANTS][UUID_STRING_LEN + 1];
+    int     fork_both_n;
 } rp_snap_t;
 static rp_snap_t g_snaps[SCE_MAX_PARTICIPANTS];
 
@@ -2314,6 +2321,22 @@ static int _dispatch(sce_run_ctx_t *ctx,
         s->pool_task_n = reputation_get_pool_tasks(s->pool_tasks, 64);
         s->place_have = reputation_get_place_promise(&s->place_n, s->place_by);
         s->cosigns_parked = (int)reputation_parked_cosign_count();
+        json_t *forks = reputation_fork_records("");
+        s->fork_n = (int)json_array_size(forks);
+        s->fork_index = -1;
+        s->fork_both_n = 0;
+        json_t *newest = s->fork_n > 0 ? json_array_get(forks, (size_t)s->fork_n - 1) : NULL;
+        if (newest != NULL)
+        {
+            s->fork_index = (int)json_integer_value(json_object_get(newest, "index"));
+            size_t bi;
+            json_t *bv;
+            json_array_foreach(json_object_get(newest, "both"), bi, bv)
+                if (json_is_string(bv) && s->fork_both_n < SCE_MAX_PARTICIPANTS)
+                    snprintf(s->fork_both[s->fork_both_n++], UUID_STRING_LEN + 1,
+                             "%s", json_string_value(bv));
+        }
+        json_decref(forks);
         /* Record this dispatcher's view of every other participant's
          * reputation, so `expected_state[pid].reputation_of[other]`
          * can be checked after the next step resets rep_state. */
@@ -2354,6 +2377,8 @@ static int _dispatch(sce_run_ctx_t *ctx,
                          schema);
             s->evidence_chain_len =
                 (int)json_array_size(json_object_get(doc, "chain"));
+            s->evidence_forks =
+                (int)json_array_size(json_object_get(doc, "forks"));
             json_t *ck = json_object_get(doc, "checkpoint");
             const char *ck_root = json_is_object(ck)
                 ? json_string_value(json_object_get(ck, "root")) : NULL;
@@ -2545,6 +2570,45 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                     return -1;
                 }
             }
+            else if (strcmp(key, "equivocations") == 0)
+            {
+                /* {count, index, both: [pid, ...]}: how many equivocation
+                 * records the primary chain holds, and the newest one's fork
+                 * index and the members who signed both values (R+D.md
+                 * §14.1). Mirrors the Python adapter. */
+                json_t *jc = json_object_get(val, "count");
+                json_t *ji = json_object_get(val, "index");
+                json_t *jb = json_object_get(val, "both");
+                bool ok = json_is_integer(jc) && snap->fork_n == (int)json_integer_value(jc)
+                    && (ji == NULL || (json_is_integer(ji)
+                                       && snap->fork_index == (int)json_integer_value(ji)))
+                    && (jb == NULL || (json_is_array(jb)
+                                       && (int)json_array_size(jb) == snap->fork_both_n));
+                size_t wi;
+                json_t *wv;
+                json_array_foreach(jb, wi, wv)
+                {
+                    sce_participant_t *wp = json_is_string(wv)
+                        ? sce_find_participant(ctx, json_string_value(wv)) : NULL;
+                    char wu[UUID_STRING_LEN + 1] = {0};
+                    if (wp != NULL)
+                        uuid_unparse_lower(((rp_impl_t *)wp->impl)->pub->uuid, wu);
+                    bool found = false;
+                    for (int ri = 0; ri < snap->fork_both_n; ri++)
+                        found = found || strcmp(snap->fork_both[ri], wu) == 0;
+                    ok = ok && found;
+                }
+                if (!ok)
+                {
+                    char *want = json_dumps(val, JSON_COMPACT);
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: equivocations count=%d index=%d both=%d, "
+                             "expected %s", pid, snap->fork_n, snap->fork_index,
+                             snap->fork_both_n, want != NULL ? want : "?");
+                    free(want);
+                    return -1;
+                }
+            }
             else if (strcmp(key, "checkpoint_cosigns_parked") == 0)
             {
                 /* A proposal this node could not co-sign on arrival, kept for
@@ -2651,6 +2715,16 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                              "%s: evidence_doc.chain_len=%d, expected %d",
                              pid, snap->evidence_chain_len,
                              (int)json_integer_value(w_len));
+                    return -1;
+                }
+                json_t *w_forks = json_object_get(val, "forks");
+                if (json_is_integer(w_forks)
+                    && snap->evidence_forks != (int)json_integer_value(w_forks))
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: evidence_doc.forks=%d, expected %d",
+                             pid, snap->evidence_forks,
+                             (int)json_integer_value(w_forks));
                     return -1;
                 }
                 json_t *w_root = json_object_get(val, "checkpoint_root");

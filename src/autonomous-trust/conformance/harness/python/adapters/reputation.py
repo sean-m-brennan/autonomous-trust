@@ -161,6 +161,27 @@ class _Participant:
                 if actual != want:
                     raise AssertionError(f'{self.id}: {key} differ '
                                          f'({len(actual)} held)')
+            elif key == 'equivocations':
+                # {count, index, both: [pid, ...]}: how many equivocation
+                # records the primary chain holds, and the newest one's fork
+                # index and the members who signed both values (R+D.md §14.1).
+                # Mirrors the C adapter.
+                held = self.process._fork_records('')
+                newest = held[-1] if held else {}
+                uuid_of = {str(p.identity.uuid).lower(): pid
+                           for pid, p in participants.items()}
+                actual = {'count': len(held)}
+                if 'index' in expected:
+                    actual['index'] = newest.get('index')
+                if 'both' in expected:
+                    actual['both'] = sorted(uuid_of.get(u, u)
+                                            for u in newest.get('both', ()))
+                want = dict(expected)
+                if 'both' in want:
+                    want['both'] = sorted(want['both'])
+                if actual != want:
+                    raise AssertionError(f'{self.id}: equivocations={actual}, '
+                                         f'expected {want}')
             elif key == 'place_promised':
                 # {n, by: <pid>}, or null for no promise.
                 have = self.process._place_state('')['promised']
@@ -256,10 +277,13 @@ class _Participant:
                         checkpoint=ckpt,
                         sigs=dict(getattr(self.process,
                                           '_checkpoint_sigs_final', {})))
-                doc = evidence_to_dict(self.process.history, signed)
+                doc = evidence_to_dict(self.process.history, signed,
+                                       forks=self.process._fork_records(''))
                 actual = {
                     'schema': doc['schema'],
                     'chain_len': len(doc['chain']),
+                    # Equivocation records the document carries (R+D.md §14.1).
+                    'forks': len(doc.get('forks') or ()),
                     'checkpoint_root': ((doc['checkpoint'] or {}).get('root')
                                         or ''),
                 }
