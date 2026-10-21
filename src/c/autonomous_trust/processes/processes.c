@@ -431,6 +431,47 @@ int process_apply_handler_config(const process_t *proc)
     return 0;
 }
 
+static bool _uuid_in_map(map_t *map, const char *uuid_str)
+{
+    data_t *value = NULL;
+    return map != NULL && map->items != NULL && map_size(map) > 0
+        && map_get(map, (map_key_t)uuid_str, &value) == 0;
+}
+
+/* Whether a peer counts in consensus: it is in the address map of this node's
+ * group or of a child group it gateways. A first-contact direct peer is a peer
+ * but a member of neither, so it never sizes a quorum, signs into one, or
+ * enters a logged roster (R+D.md §13.5 D2). Before this node holds a group
+ * with a member map, every peer counts, as before. Caller holds the peers read
+ * lock. Mirrors Python ReputationProcess._roster_peers. */
+bool processes_peer_is_member(const process_t *proc, const public_identity_t *peer)
+{
+    if (proc == NULL || peer == NULL)
+        return false;
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer->uuid, key);
+    map_t *own = (map_t *)&proc->protocol.group.address_map;
+    bool any = own->items != NULL && map_size(own) > 0;
+    bool found = _uuid_in_map(own, key);
+    if (!found && proc->protocol.child_groups != NULL)
+    {
+        map_key_t ck = NULL;
+        data_t *cv = NULL;
+        map_entries_for_each(proc->protocol.child_groups, ck, cv)
+        {
+            void *gp = NULL;
+            if (!found && data_object_ptr(cv, &gp) == 0 && gp != NULL)
+            {
+                map_t *m = &((group_t *)gp)->address_map;
+                any = any || (m->items != NULL && map_size(m) > 0);
+                found = _uuid_in_map(m, key);
+            }
+        }
+        map_end_for_each
+    }
+    return found || !any;
+}
+
 bool processes_remove_peer(process_t *proc, const unsigned char *uuid)
 {
     if (proc == NULL || uuid == NULL)

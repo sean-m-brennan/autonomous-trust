@@ -1454,13 +1454,20 @@ class IdentityAdapter:
             None,
         )
         existing_pids = [s['id'] for s in spec_participants if s['id'] != newcomer_pid]
+        # `direct_peers`: {pid: [pid, ...]} -- first-contact direct peers, in
+        # the peer lists and NOT in the group (R+D.md §13.5 D2). The group is
+        # shared, so a listed peer is left out of it for everyone; the first
+        # existing participant must not be one. Mirrors the C adapter.
+        direct_fix = (case.data.get('fixtures') or {}).get('direct_peers') or {}
+        direct = {str(d) for ds in direct_fix.values() for d in (ds or ())}
         group: Group | None = None
         if existing_pids and not distinct_groups:
             seed = identities[existing_pids[0]]
             group = Group(seed.uuid, {seed.uuid: seed.address}, 'conformance-grp',
                           Encryptor.generate(), False)
             for pid in existing_pids[1:]:
-                group.add_address(identities[pid].uuid, identities[pid].address)
+                if pid not in direct:
+                    group.add_address(identities[pid].uuid, identities[pid].address)
 
         # Pre-populate each existing participant's Peers with all OTHER
         # existing participants so the canonical scenario doesn't need an

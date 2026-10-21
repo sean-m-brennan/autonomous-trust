@@ -1,0 +1,45 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: direct-peer-cosignature-not-counted
+byte_pinning: false
+description: |
+    A direct peer's signature is not a vote. It holds no group key and never
+    passed the cohort's own admission, so a co-signature from it counts toward
+    no quorum, however it reaches a round (R+D.md §13.5 D2).
+
+    bob's members are alice, carol and dave; eve is his direct peer. Three of
+    four finalize a checkpoint. alice, bob and eve signed: eve's signature is
+    dropped, two is short, and bob stores nothing. Before, eve both raised the
+    bar and helped clear it.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: member
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+  - id: eve
+    role: member
+
+fixtures:
+  direct_peers: [eve]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: checkpoint final
+    payload:
+      root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+      epoch: 7
+      first_index: 0
+      count: 3
+      cosigners: [alice, bob, eve]
+
+expected_state:
+  bob:
+    checkpoint_root: ""

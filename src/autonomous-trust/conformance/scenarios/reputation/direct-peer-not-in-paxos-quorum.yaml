@@ -1,0 +1,56 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: direct-peer-not-in-paxos-quorum
+byte_pinning: false
+description: |
+    The commit-certificate bar is sized from the members alone (R+D.md §13.5
+    D2). bob's members are alice, carol and dave, so his quorum is more than
+    3 // 2: two signatures over alice's commit_designation, never counting
+    alice's own. eve and frank are his direct peers. Counting them, the bar
+    was more than 5 // 2, and two signatures were refused.
+
+    carol and dave signed, and bob writes the certified half. The chain is
+    unfounded (`roster: {}`), so bob judges the certificate against his live
+    view of the group, where the direct peers would sit, rather than against
+    a logged roster that never listed them.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: proposer
+  - id: dave
+    role: member
+  - id: eve
+    role: member
+  - id: frank
+    role: member
+
+fixtures:
+  direct_peers: [eve, frank]
+  roster: {}
+  tx_history:
+    bob:
+      - task_id: t-1
+        p1: carol
+        p1_score: 0.9
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: tx committed
+    payload:
+      task_id: t-1
+      score: 0.8
+      cosigners: [carol, dave]
+
+expected_state:
+  bob:
+    committed_tx_count: 0
+    pool_count: 1
+    halves_held: 2
+    certified_halves: 1

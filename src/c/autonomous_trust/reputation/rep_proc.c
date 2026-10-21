@@ -1077,12 +1077,24 @@ static bool _peer_in_group(const process_t *proc, const public_identity_t *peer,
     return found;
 }
 
+/* How many peers processes_peer_is_member counts. Caller holds the peers read lock. */
+static size_t _member_count(const process_t *proc)
+{
+    if (proc == NULL)
+        return 0;
+    size_t count = 0;
+    for (size_t i = 0; i < proc->protocol.num_peers; i++)
+        if (processes_peer_is_member(proc, &proc->protocol.peers[i]))
+            count++;
+    return count;
+}
+
 static size_t _members_of_group(const process_t *proc, const char *group_uuid)
 {
     if (proc == NULL || group_uuid == NULL || group_uuid[0] == '\0')
-        return proc == NULL ? 0 : proc->protocol.num_peers;
+        return _member_count(proc);
     if (_child_group_locked(proc, group_uuid) == NULL)
-        return proc->protocol.num_peers;
+        return _member_count(proc);
     size_t count = 0;
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
         if (_peer_in_group(proc, &proc->protocol.peers[i], group_uuid))
@@ -1090,10 +1102,10 @@ static size_t _members_of_group(const process_t *proc, const char *group_uuid)
     return count;
 }
 
-/* num_peers / 2, the bar slashing and the co-signature quorum test clear with
+/* members / 2, the bar slashing and the co-signature quorum test clear with
  * `>`; Paxos rounds use _round_quorum_for_group. A non-gateway (no child
- * groups) always uses the historical num_peers/2, so leaf quorum math is
- * unchanged. Mirrors Python _quorum_for_group. */
+ * groups) uses its members (_member_count) / 2. Mirrors Python
+ * _quorum_for_group. */
 static size_t _quorum_for_group(const process_t *proc, const char *group_uuid)
 {
     if (proc == NULL)
@@ -1101,7 +1113,7 @@ static size_t _quorum_for_group(const process_t *proc, const char *group_uuid)
     if (proc->protocol.child_groups == NULL
         || map_size(proc->protocol.child_groups) == 0
         || group_uuid == NULL || group_uuid[0] == '\0')
-        return proc->protocol.num_peers / 2;
+        return _member_count(proc) / 2;
     return _members_of_group(proc, group_uuid) / 2;
 }
 
@@ -1129,7 +1141,7 @@ static size_t _ckpt_roster_for_group(const process_t *proc, const char *group_uu
     return (proc->protocol.child_groups == NULL
             || map_size(proc->protocol.child_groups) == 0
             || group_uuid == NULL || group_uuid[0] == '\0')
-        ? proc->protocol.num_peers
+        ? _member_count(proc)
         : _members_of_group(proc, group_uuid);
 }
 
@@ -4427,8 +4439,11 @@ static size_t _members_reachable_locked(const process_t *proc, double present,
     double since = present - REP_REACH_WINDOW_TIMEOUTS * REP_COMMIT_TIMEOUT;
     size_t reached = 1;
     peers_read_lock(proc);
-    size_t n = proc->protocol.num_peers;
-    for (size_t i = 0; i < n; i++) {
+    size_t n = 0;
+    for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+        if (!processes_peer_is_member(proc, &proc->protocol.peers[i]))
+            continue;
+        n++;
         char peer_str[UUID_STRING_LEN + 1];
         uuid_unparse_lower(proc->protocol.peers[i].uuid, peer_str);
         data_t *at = NULL;
@@ -4941,7 +4956,8 @@ static bool _cosigner_pubkey(const process_t *proc, const char *voter_str,
     {
         char peer_str[UUID_STRING_LEN + 1];
         uuid_unparse_lower(proc->protocol.peers[i].uuid, peer_str);
-        if (strncmp(peer_str, voter_str, sizeof(peer_str)) == 0)
+        if (strncmp(peer_str, voter_str, sizeof(peer_str)) == 0
+            && processes_peer_is_member(proc, &proc->protocol.peers[i]))
         {
             memcpy(out, proc->protocol.peers[i].signature.public,
                    crypto_sign_PUBLICKEYBYTES);
@@ -5489,7 +5505,7 @@ static size_t _attest_designation(const rep_attest_t *a, uint8_t *out, size_t ca
     return tag_len + (size_t)n;
 }
 
-/* Self, or a peer on our roster. */
+/* Self, or a peer on our roster (processes_peer_is_member). */
 static bool _is_member(const process_t *proc, const char *uuid_str)
 {
     if (proc == NULL || uuid_str == NULL)
@@ -5508,7 +5524,8 @@ static bool _is_member(const process_t *proc, const char *uuid_str)
     {
         char p[UUID_STRING_LEN + 1];
         uuid_unparse_lower(proc->protocol.peers[i].uuid, p);
-        found = strcmp(p, uuid_str) == 0;
+        found = strcmp(p, uuid_str) == 0
+            && processes_peer_is_member(proc, &proc->protocol.peers[i]);
     }
     peers_read_unlock(proc);
     return found;
@@ -5784,7 +5801,7 @@ static bool _attest_quorum_met(const process_t *proc, const rep_attest_t *a,
         return count > others / 2;
     }
     peers_read_lock(proc);
-    members = proc->protocol.num_peers + 1;
+    members = _member_count(proc) + 1;
     peers_read_unlock(proc);
     mates = _conflicted_members(proc, a->subject, NULL);
     others = members - (_is_member(proc, a->subject) ? 1 : 0);
@@ -6687,7 +6704,7 @@ static bool handle_slash_sign(const process_t *proc, directory_t *queues, generi
     json_t *sigs = _cosigs_json_locked(&rep_state.slash_sigs, key, &count);
     pthread_mutex_unlock(&rep_state.lock);
     peers_read_lock(proc);
-    size_t quorum = proc->protocol.num_peers / 2;
+    size_t quorum = _member_count(proc) / 2;
     peers_read_unlock(proc);
     bool finalize = count > quorum;
 
@@ -7564,7 +7581,8 @@ static json_t *_resolve_signers(const process_t *proc, map_t *sigs)
         {
             char uuid_str[UUID_STRING_LEN + 1];
             uuid_unparse_lower(proc->protocol.peers[i].uuid, uuid_str);
-            if (strcmp(uuid_str, voter) == 0)
+            if (strcmp(uuid_str, voter) == 0
+                && processes_peer_is_member(proc, &proc->protocol.peers[i]))
             {
                 match = &proc->protocol.peers[i];
                 break;
@@ -7775,7 +7793,8 @@ static bool _resolve_trust_signer(const process_t *proc, const char *voter,
     {
         char uuid_str[UUID_STRING_LEN + 1];
         uuid_unparse_lower(proc->protocol.peers[i].uuid, uuid_str);
-        if (strcmp(uuid_str, voter) == 0)
+        if (strcmp(uuid_str, voter) == 0
+            && processes_peer_is_member(proc, &proc->protocol.peers[i]))
         {
             peers_read_unlock(proc);
             return true;
@@ -8676,7 +8695,7 @@ static void _archive_attested(const process_t *proc, const char *chain_key)
     bool primary = (chain_key == NULL || chain_key[0] == '\0');
     peers_read_lock(proc);
     size_t roster = _ckpt_roster_for_group(proc, primary ? NULL : chain_key);
-    size_t members = proc->protocol.num_peers + 1;
+    size_t members = _member_count(proc) + 1;
     peers_read_unlock(proc);
 
     rep_archive_item_t items[MAX_CHAIN_LEN];
@@ -8890,12 +8909,15 @@ static void _persist_roster(const process_t *proc, const char *chain_key)
             json_object_set_new(doc, "self", json_string(ids[n]));
             n++;
         }
-        for (size_t i = 0; i < proc->protocol.num_peers && n < cap; i++, n++)
+        for (size_t i = 0; i < proc->protocol.num_peers && n < cap; i++)
         {
+            if (!processes_peer_is_member(proc, &proc->protocol.peers[i]))
+                continue;
             uuid_unparse_lower(proc->protocol.peers[i].uuid, ids[n]);
             sodium_bin2hex(keys[n], sizeof(keys[n]),
                            proc->protocol.peers[i].signature.public,
                            crypto_sign_PUBLICKEYBYTES);
+            n++;
         }
     }
     peers_read_unlock(proc);
@@ -10197,12 +10219,9 @@ size_t _hand_off_pending_halves(const process_t *proc, double present,
     if (proc->protocol.num_peers > 0)
     {
         peers = calloc(proc->protocol.num_peers, sizeof(public_identity_t));
-        if (peers != NULL)
-        {
-            n_peers = proc->protocol.num_peers;
-            memcpy(peers, proc->protocol.peers,
-                   n_peers * sizeof(public_identity_t));
-        }
+        for (size_t i = 0; peers != NULL && i < proc->protocol.num_peers; i++)
+            if (processes_peer_is_member(proc, &proc->protocol.peers[i]))
+                peers[n_peers++] = proc->protocol.peers[i];
     }
     peers_read_unlock(proc);
 
@@ -11420,7 +11439,7 @@ static bool _place_peer_in_chain(const process_t *proc,
                                  const public_identity_t *peer, const char *key)
 {
     if (key == NULL || key[0] == '\0' || _child_group_locked(proc, key) == NULL)
-        return true;
+        return processes_peer_is_member(proc, peer);
     return _peer_in_group(proc, peer, key);
 }
 

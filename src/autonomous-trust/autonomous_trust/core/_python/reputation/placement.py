@@ -665,7 +665,7 @@ class PlacementMixin:
             if roster is not None:
                 return [u for u, _key in roster.roster_members or ()]
         grp = self._group_by_uuid(key) if key else None
-        peers = self._members_of_group(grp) if key else list(self.peers.all)
+        peers = self._members_of_group(grp) if key else self._roster_peers()
         return [str(self.identity.uuid).lower()] + [str(p.uuid).lower() for p in peers]
 
     # --- who is in the group (doc/architecture/reputation.md) ---------------
@@ -683,7 +683,7 @@ class PlacementMixin:
         signing key, as a roster member list (sorted)."""
         from nacl.encoding import HexEncoder
         grp = self._group_by_uuid(key) if key else None
-        peers = self._members_of_group(grp) if key else list(self.peers.all)
+        peers = self._members_of_group(grp) if key else self._roster_peers()
         out = []
         for ident in [self.identity] + list(peers):
             try:

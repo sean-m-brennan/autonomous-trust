@@ -306,6 +306,8 @@ static void _free_participant_impl(rp_impl_t *impl)
     if (impl->proc != NULL)
     {
         if (impl->proc->protocol.handlers != NULL) map_free(impl->proc->protocol.handlers);
+        if (impl->proc->protocol.group.address_map.items != NULL)
+            map_free(&impl->proc->protocol.group.address_map);
         pthread_rwlock_destroy(&impl->proc->protocol.peers_rwlock);
         smrt_deref(impl->proc);
     }
@@ -314,20 +316,43 @@ static void _free_participant_impl(rp_impl_t *impl)
     free(impl);
 }
 
+/* Whether @p pid is one of the fixture's `direct_peers`: a first-contact
+ * direct peer, in every peer list and in no group (R+D.md §13.5 D2). */
+static bool _is_direct_peer(const char *pid)
+{
+    json_t *dp = json_object_get(g_fixtures, "direct_peers");
+    size_t i;
+    json_t *v;
+    json_array_foreach(dp, i, v)
+        if (json_is_string(v) && pid != NULL && strcmp(json_string_value(v), pid) == 0)
+            return true;
+    return false;
+}
+
 /* Pre-populate every participant's protocol.peers list with every other
  * participant — _propose_half iterates protocol.peers when sending the
- * transaction. */
+ * transaction — and its group's address map with every participant but the
+ * `direct_peers`. Mirrors the Python adapter's shared group. */
 static void _link_peer_lists(sce_run_ctx_t *ctx)
 {
     for (size_t i = 0; i < ctx->participant_count; i++)
     {
         rp_impl_t *impl_i = (rp_impl_t *)ctx->participants[i].impl;
         if (impl_i == NULL || impl_i->proc == NULL) continue;
+        group_t *grp = &impl_i->proc->protocol.group;
+        if (grp->address_map.items == NULL)
+            map_init(&grp->address_map);
         for (size_t j = 0; j < ctx->participant_count; j++)
         {
-            if (i == j) continue;
             rp_impl_t *impl_j = (rp_impl_t *)ctx->participants[j].impl;
             if (impl_j == NULL || impl_j->pub == NULL) continue;
+            if (!_is_direct_peer(ctx->participants[j].id))
+            {
+                char u[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(impl_j->pub->uuid, u);
+                group_add_address(grp, u, impl_j->pub->address);
+            }
+            if (i == j) continue;
             if (impl_i->proc->protocol.num_peers >= DEFAULT_MAX_PEERS) break;
             memcpy(&impl_i->proc->protocol.peers[impl_i->proc->protocol.num_peers],
                    impl_j->pub, sizeof(public_identity_t));
@@ -698,11 +723,13 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
     json_t *everyone = NULL;
     if (json_object_get(g_fixtures, "roster") == NULL)
     {
-        /* Every participant, unless `roster` names one per participant ({}
-         * for none, an unfounded chain). Mirrors the Python adapter. */
+        /* Every participant but the `direct_peers`, unless `roster` names one
+         * per participant ({} for none, an unfounded chain). Mirrors the
+         * Python adapter. */
         everyone = json_array();
         for (size_t pi = 0; pi < ctx->participant_count; pi++)
-            json_array_append_new(everyone, json_string(ctx->participants[pi].id));
+            if (!_is_direct_peer(ctx->participants[pi].id))
+                json_array_append_new(everyone, json_string(ctx->participants[pi].id));
         rl = everyone;
     }
     if (json_is_array(rl))
