@@ -1,14 +1,17 @@
-[< Process Architecture](process-architecture.md)
+*Previous: [Node lifecycle](node-lifecycle.md)*
 
 # Networking
 
-The network layer handles all wire communication between nodes. It provides three logical channels with different security properties, runs receiver threads for concurrent I/O, and routes messages between the network and internal process queues.
+The network layer carries every piece of wire communication between nodes. It
+supplies three logical channels with different security properties, runs
+receiver threads for concurrent I/O, and routes messages between the wire and
+the internal process queues.
 
 > This describes the Python `NetworkProcess`. The C implementation
 > (`src/c/autonomous_trust/network/`) implements the **same wire protocol**, and
 > C and Python nodes interoperate on the same network: provided both sides use
 > the DRY canonical JSON wire form for identity/group payloads (see
-> [Native / FFI Dual Implementation](native-ffi-dual-implementation.md) §6).
+> [Native / FFI dual implementation](native-ffi-dual-implementation.md) §6).
 
 ## Communication channels
 
@@ -32,10 +35,10 @@ The `UDPNetworkProcess` binds three UDP sockets:
 
 N is resolved once per node, from three layers in order:
 
-1. the provisioned config's `port` (a config always wins),
-2. the `AT_COMM_PORT` environment variable (operator override, applied only
-   where the config is silent),
-3. the compile-time default, 27787.
+1. The provisioned config's `port` (a config always wins),
+2. The `AT_COMM_PORT` environment variable (operator override, applied only
+ where the config is silent),
+3. The compile-time default, 27787.
 
 C: `net_port_resolve()` (`network/network.h`), logged at startup with the layer
 that supplied it. Python: `system.resolve_comm_port()`. Both refuse a value that
@@ -48,26 +51,42 @@ The config generator records `port` only when the operator asked for one, so a
 provisioned root does not pin every node to one port.
 
 **Two nodes on one host** therefore need only different `AT_COMM_PORT` values,
-or different addresses. Same base *and* same address is a silent failure, not a
-loud one: `SO_REUSEADDR` is set on every bind, so both succeed and the last
-binder receives everything (see `ISSUES.md`).
+or different addresses. Same base *and* same address now fails loudly: the
+second node's peer recv socket gets `EADDRINUSE` at open, and the error names
+the likely cause and the knob to move rather than reporting a bare "Address
+already in use".
+
+That is a per-socket property, not a global one. `SO_REUSEADDR` is set only
+where several listeners on one addr:port is the intent, the broadcast/multicast
+recv socket, and the TCP listeners, where the option grants a bind over
+`TIME_WAIT` but never over a live `LISTEN`. The UDP **unicast** recv sockets
+(peer, group) omit it in both runtimes, because with the option on both sockets
+Linux permits a duplicate bind and delivers every datagram to the last binder,
+leaving the first node deaf with nothing logged.
 
 Python derives two further ports from the same base: `ping_at_rcv` = N+2 and
-`ping_at_snd` = N+3. C has no counterpart: it implements neither.
+`ping_at_snd` = N+3. C has no counterpart: it implements neither. Both PingAT
+sockets bind a specific address, the client derives one from the route to its
+target when the caller supplies none, so co-located nodes separated only by
+address do not receive each other's replies, and never bind the wildcard.
 
 **PingAT is not ICMP.** It asks whether an *AT peer* is present and answering on
-AT's own ports via a cooperating responder (`PingATServer`); `ping(8)` asks
+the ports AT itself uses, via a cooperating responder (`PingATServer`); `ping(8)` asks
 whether a *host* is reachable. A host can answer ICMP with no AT process running
 at all, and an AT node can be present while ICMP is filtered, so the two answer
 different questions. The name says which one this is. PingAT is
 non-load-bearing: a missed reply costs a latency sample and changes no AT
-behaviour.
+behavior.
 
 There is no NTP port. AT carries no NTP implementation on either side; a stock
-daemon on the host disciplines the clock and AT only reads what it achieved
-(see [Node Lifecycle](node-lifecycle.md#clock-discipline)).
+daemon on the host disciplines the clock and AT only reads what it achieved (see
+[Node lifecycle](node-lifecycle.md#clock-discipline)).
 
-The `TCPNetworkProcess` extends this by replacing peer and group UDP with TCP (using `listen`/`accept`), while keeping UDP for broadcast/multicast. TCP uses `[length]\|[data]` framing for reliable delivery. By default it opens one connection per message; it can optionally reuse one connection per peer for many messages, described in [TCP Connection Pooling](network-connection-pooling.md).
+The `TCPNetworkProcess` extends this by replacing peer and group UDP with TCP
+(using `listen`/`accept`), while keeping UDP for broadcast/multicast. TCP uses
+`[length]\|[data]` framing for reliable delivery. By default it opens one
+connection per message; it can optionally reuse one connection per peer for many
+messages, described in [TCP connection pooling](network-connection-pooling.md).
 
 ## Wire message format
 
@@ -77,11 +96,12 @@ Messages are serialized as pipe-delimited strings:
 process|function|data
 ```
 
-- **process**: Target subsystem name (e.g., `identity`, `negotiation`, `reputation`)
-- **function**: Protocol message type (e.g., `request_access`, `invitation`, `ask permission`)
-- **data**: JSON-serialized payload (Configuration objects auto-deserialize if they contain `__type__`)
+- **process.** Target subsystem name (e.g., `identity`, `negotiation`, `reputation`)
+- **function.** Protocol message type (e.g., `request_access`, `invitation`, `transaction`)
+- **data.** JSON-serialized payload (Configuration objects auto-deserialize if they contain `__type__`)
 
-For encrypted channels, the entire serialized string is encrypted before transmission.
+For encrypted channels, the entire serialized string is encrypted before
+transmission.
 
 ## Receiver threads
 
@@ -92,13 +112,16 @@ For encrypted channels, the entire serialized string is encrypted before transmi
 | **peer_receiver** | `peer_receiver()` | Peer socket | Appends `(raw_msg, from_addr)` to `peer_messages` |
 | **group_receiver** | `group_receiver()` | Group socket | Appends to `group_messages` |
 | **unknown_receiver** | `unknown_receiver()` | Broadcast socket | Appends to `unknown_messages` |
-| **mystery_handler** | `mystery_handler()` |, | Retries encrypted messages from unknown peers |
+| **mystery_handler** | `mystery_handler()` | n/a | Retries encrypted messages from unknown peers |
 
-The mystery handler exists because during bootstrapping, encrypted messages may arrive before the sender's identity is known. It holds these messages and retries decryption periodically (up to 30 seconds) as peers are discovered.
+The mystery handler exists because during bootstrapping, encrypted messages may
+arrive before the sending identity is known. It holds these messages and retries
+decryption periodically (up to 30 seconds) as peers are discovered.
 
 ## Send-side message routing
 
-When a process places a `Message` on the network queue, `NetworkProcess` routes it based on `message.to_whom`:
+When a process places a `Message` on the network queue, `NetworkProcess` routes
+it based on `message.to_whom`:
 
 ```mermaid
 flowchart TD
@@ -158,7 +181,8 @@ flowchart TD
 
 ## Queue dispatch
 
-After decryption, `_msg_to_queue()` parses the wire format and routes the resulting `Message` to the correct process queue:
+After decryption, `_msg_to_queue()` parses the wire format and routes the
+resulting `Message` to the correct process queue:
 
 1. Parse `raw_msg` into `Message(process, function, data)`
 2. Look up `message.process` in the subsystem list
@@ -168,6 +192,46 @@ If the process name is not recognized, the message is logged and dropped.
 
 ## Pest tracking
 
-Peers that send invalid encrypted messages (returning `None` from decryption but with a known address) are tracked in a `pests` dict. After exceeding `annoy_limit` (5) failed messages, the peer is demoted in the hierarchy.
+Peers that send invalid encrypted messages (returning `None` from decryption but
+with a known address) are tracked in a `pests` dict. After exceeding
+`annoy_limit` (5) failed messages, the peer is demoted in the hierarchy.
 
-[Identity Protocol >](identity-protocol.md)
+**Network tunables.** Three operational knobs resolve from an environment
+override, else the compile-time default, identically in both runtimes. They
+carry no config layer, unlike the base port, these are per-node tuning rather
+than provisioned identity, so `network.cfg.json` does not mention them. A value
+that is unparseable or out of range is refused with a warning and the default
+kept, and startup logs each knob with the layer that supplied it, so an ignored
+override is distinguishable from an applied one.
+
+| Knob | Env var | Default | Range |
+|------|---------|---------|-------|
+| duplicate-broadcast threshold | `AT_NET_ANNOY_LIMIT` | 5 | [1, 10000] |
+| receive-poll timeout | `AT_NET_RECV_POLL_MS` | 100 ms | [1, 60000] |
+| mystery-message max age | `AT_MYSTERY_MAX_AGE_SEC` | 30 s | [1, 86400] |
+
+The poll timeout is stated in milliseconds because that is the unit the two
+sides can share exactly as an integer; Python's socket layer wants seconds and
+divides at the point of use. The mystery bound is wall-clock **age** on both
+sides: Python counted retries until 2026-08-10, which only approximated a
+duration and drifted with load, while C's retry is event-driven and could never
+have counted time at all. The `network/tunables-resolution` conformance case
+holds the two implementations to the same table.
+
+One further knob resolves the same way but is narrower than the three above, and
+the narrowness is the design:
+
+| Knob | Env var | Default | Values |
+|------|---------|---------|--------|
+| envelope encoding for a group this node **mints** | `AT_NET_WIRE_MODE` | `json` | `json` \| `proto` |
+
+It does **not** decide what goes on the wire for an existing group — that is
+carried by the group itself, so a cohort cannot end up half in one format and a
+joiner adopts its group's choice at admission. Setting it therefore only matters
+on whichever node forms a group. See
+[Network wire format](network-wire-format.md), pinned by
+`network/wire-mode-resolution`.
+
+---
+
+*Next: [Connection pooling](network-connection-pooling.md)*

@@ -1,0 +1,41 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-propose-teammate-declined
+byte_pinning: false
+description: |
+    A teammate of the subject does not co-sign an attestation about it
+    (ISSUES §2.54).
+
+    bob and carol act for one team: an application put them in the same team
+    of the conflict set, from a team roster both consented to. A teammate's
+    signature would not count toward the quorum, so bob says so rather than
+    send one. This is what makes a team's own nodes unable to carry, or to
+    starve, an attestation about one of them.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+fixtures:
+  attest_conflicts:
+    - [bob, carol]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest propose
+    payload:
+      subject: carol
+      score: 0.3
+      channel: probe
+    description: an admissible attestation, sent to the subject's teammate.
+
+expected_state:
+  bob:
+    attest_signs_sent: 0

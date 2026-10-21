@@ -1,0 +1,46 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-final-teammate-signatures-not-counted
+byte_pinning: false
+description: |
+    Teammates' signatures do not make a quorum about their own team (ISSUES
+    §2.54).
+
+    The same five members. alice's finalizer carries her own signature and
+    those of carol's teammates dan and erin: three of four non-subjects, which
+    would commit without the conflict set. With it, the teammates do not count,
+    and once any is left out two signatures are the least that can certify. One
+    remains, and bob refuses the entry. A team cannot vouch its own release
+    through an accommodating verifier.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+  - id: dan
+    role: member
+  - id: erin
+    role: member
+
+fixtures:
+  attest_conflicts:
+    - [carol, dan, erin]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest final
+    payload:
+      subject: carol
+      score: 0.8
+      cosigners: [alice, dan, erin]
+    description: the verifier and the subject's teammates.
+
+expected_state:
+  bob:
+    committed_tx_count: 0

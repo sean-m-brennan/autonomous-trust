@@ -393,6 +393,12 @@ for i in $(seq 1 "$NODE_COUNT"); do
     $ssh_cmd "test -f /opt/autonomous-trust/lib/libautonomous_trust.so" 2>/dev/null && rc=0 || rc=$?
     check "$node_name: libautonomous_trust.so present" $rc
 
+    # Check 2b: the five verification layers ship beside it
+    for layer in physics calibration certificates prequential replication; do
+        $ssh_cmd "test -f /opt/autonomous-trust/lib/libat_$layer.so" 2>/dev/null && rc=0 || rc=$?
+        check "$node_name: libat_$layer.so present" $rc
+    done
+
     # Check 3: systemd service is active
     $ssh_cmd "systemctl is-active autonomous-trust" &>/dev/null && rc=0 || rc=$?
     check "$node_name: systemd service active" $rc

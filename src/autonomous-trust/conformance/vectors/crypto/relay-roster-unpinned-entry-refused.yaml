@@ -1,0 +1,15 @@
+schema_version: "1"
+kind: crypto_vector
+protocol: network
+name: relay-roster-unpinned-entry-refused
+description: |
+    A validly signed roster with one entry that carries no <uuid>:<fp>@ pin: a
+    community vouches for relays by key, so the whole roster is refused.
+    FIRST_CONTACT_PLAN §4.2 / §4.5 (community relay rosters).
+primitive: relay_roster_verify
+input:
+  roster: "{\"body\":\"{\\\"v\\\":1,\\\"typename\\\":\\\"at-relay-roster\\\",\\\"issuer\\\":\\\"48075a597e721a156e2e0799de5cc0c5324dc6e7eaf1cdd46250868ec53215dd\\\",\\\"seq\\\":1,\\\"relays\\\":[\\\"relay://00000000-0000-4000-8000-000000000001:abababababababababababababababab@198.51.100.1:27790\\\",\\\"relay://203.0.113.9:27790\\\"]}\",\"sig\":\"288a492aa0fbdab36a813715069401a7bef64bb84ef4f84f645750bf9c6695eff081b7aacd58cf64d063fa8ccd5105557721d0b8bfb4efab74db51a498b53903\"}"
+  issuers:
+    - "48075a597e721a156e2e0799de5cc0c5324dc6e7eaf1cdd46250868ec53215dd"
+expected:
+  valid: false

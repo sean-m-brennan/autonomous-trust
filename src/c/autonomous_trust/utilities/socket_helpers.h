@@ -36,11 +36,18 @@
  *     accepted; in that case the warning is suppressed.
  */
 
+#include <poll.h>
 #include <stddef.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 
 #include "logger.h"
+
+/* Darwin has no MSG_NOSIGNAL: a socket opts out of SIGPIPE once, with
+ * SO_NOSIGPIPE (@ref at_socket_nosigpipe), and the per-send flag is a no-op. */
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 
 /**
  * @brief send(2) with transparent EINTR retry.
@@ -90,6 +97,56 @@ int at_set_rcvtimeo(int sock, int timeout_ms, logger_t *logger);
  * @return 0 on success, -1 with @c errno set on failure.
  */
 int at_set_sndtimeo(int sock, int timeout_ms, logger_t *logger);
+
+/**
+ * @brief poll(2) with transparent EINTR retry.
+ *
+ * The timeout is NOT recomputed across a retry: a signal-interrupted poll
+ * restarts with the full timeout, so the worst case is (signals + 1) ×
+ * @p timeout_ms. Callers here poll with either 0 or the receive-poll
+ * tunable, both short, and none of them use poll as a clock.
+ *
+ * @param fds         Descriptor set, as poll(2).
+ * @param nfds        Number of entries in @p fds.
+ * @param timeout_ms  Milliseconds to wait; 0 returns immediately, negative
+ *                    blocks indefinitely (as poll(2)).
+ * @return Number of ready descriptors (0 on timeout), or -1 with @c errno
+ *         set on non-EINTR error.
+ */
+int at_poll_eintr(struct pollfd *fds, nfds_t nfds, int timeout_ms);
+
+/**
+ * @brief Keep a write to a reset stream socket from raising SIGPIPE.
+ *
+ * Sets @c SO_NOSIGPIPE where the platform has it (Darwin, the BSDs), whose
+ * sends cannot carry MSG_NOSIGNAL; elsewhere a no-op, since MSG_NOSIGNAL is
+ * the per-send equivalent there. Call it on every connected or accepted
+ * stream socket.
+ *
+ * @return 0 on success or when there is nothing to set, -1 with @c errno set.
+ */
+int at_socket_nosigpipe(int sock);
+
+/**
+ * @brief Close a socket: close(2) on POSIX, closesocket on Windows, where a
+ *        socket is not a file descriptor and close() would leak it.
+ */
+int at_socket_close(int sock);
+
+/**
+ * @brief Put a socket in non-blocking mode (O_NONBLOCK; FIONBIO on Windows).
+ * @return 0 on success, -1 with @c errno set.
+ */
+int at_socket_set_nonblock(int sock);
+
+/**
+ * @brief Ready a listening socket to bind: SO_REUSEADDR on POSIX, so a restart
+ *        can bind while old connections sit in TIME_WAIT; SO_EXCLUSIVEADDRUSE on
+ *        Windows, where SO_REUSEADDR would instead let another socket bind the
+ *        same port and take this server's connections.
+ * @return 0 on success, -1 with @c errno set.
+ */
+int at_socket_listener_opts(int sock);
 
 /** @} */ /* end of internal_utilities */
 

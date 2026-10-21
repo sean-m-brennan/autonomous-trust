@@ -19,10 +19,14 @@
 #include <stdlib.h>
 #include <math.h>
 #include <errno.h>
+#include <ctype.h>
 #include <sodium.h>
 
+#include "utilities/portable.h"  /* uuid_generate_sha1 / st_mtim on Darwin */
 #include "reputation/reputation.h"
 #include "structures/map.h"
+#include "utilities/at_jansson.h"
+#include "utilities/util.h"          /* at_strlcpy */
 #include "structures/data.h"
 #include "identity/identity.h"
 
@@ -53,8 +57,26 @@ int transaction_canonical_bytes(const transaction_t *tx, char *out, size_t outsz
      * UUIDs lowercase-hyphenated (or "null"), floats "%.17g" (or "null"),
      * index decimal (or "null" when pending / -1). The task_uuid is always
      * present. p1/p2 follow their *_set flags; a pending (index < 0) tx
-     * serializes index as "null" to match Python's None. */
-    char buf[UUID_STRING_LEN * 3 + 128];
+     * serializes index as "null" to match Python's None.
+     *
+     * |p1_channel|p2_channel is APPENDED only when at least one side carries
+     * a channel other than the default (R+D.md §12.8). The condition is what
+     * makes covering the channel a non-migration rather than a chain break:
+     *
+     *  - The same fact still hashes the same. Absent and an explicit
+     *    "task_outcome" are the same claim, and both omit the block, so two
+     *    nodes cannot disagree about an entry's hash because one of them
+     *    received the default spelled out.
+     *  - Every entry committed before this field keeps its hash. Entry hashes
+     *    chain (prev_hash) and roll up into the window root that checkpoints
+     *    are quorum-signed over, so appending unconditionally would
+     *    invalidate every stored chain, every finalized checkpoint and every
+     *    byte-pinned corpus vector at once.
+     *  - The tampering that matters is still caught. STRIPPING a refutation
+     *    drops the block and changes the bytes, so the link and the window
+     *    root stop verifying; ADDING "task_outcome" to an untagged entry is a
+     *    no-op because it asserts nothing. */
+    char buf[TX_CANON_MAX];
     int n = 0;
     char tstr[UUID_STRING_LEN + 1];
     uuid_unparse_lower(tx->task_uuid, tstr);
@@ -73,6 +95,36 @@ int transaction_canonical_bytes(const transaction_t *tx, char *out, size_t outsz
         n += snprintf(buf + n, sizeof(buf) - n, "null");
     else
         n += snprintf(buf + n, sizeof(buf) - n, "%d", tx->index);
+    const char *c1 = tx_channel_or_default(tx->p1_channel);
+    const char *c2 = tx_channel_or_default(tx->p2_channel);
+    if (tx->attested || strcmp(c1, TX_CHANNEL_DEFAULT) != 0
+        || strcmp(c2, TX_CHANNEL_DEFAULT) != 0)
+        n += snprintf(buf + n, sizeof(buf) - n, "|%s|%s", c1, c2);
+    if (tx->attested)
+    {
+        /* A final block names whom the entry is about and what it rests on
+         * (doc/architecture/reputation.md, "Verifier-attested scores"). No
+         * ordinary entry has p2 unset at commit time, so this form cannot
+         * collide with one, and no ordinary entry's bytes change. */
+        char sstr[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(tx->subject_uuid, sstr);
+        n += snprintf(buf + n, sizeof(buf) - n, "|attested|%s|%s", sstr,
+                      tx->evidence_digest[0] != '\0' ? tx->evidence_digest : "null");
+        /* The scope, only when set: an unscoped entry's bytes are unchanged. */
+        if (tx->attest_scope[0] != '\0')
+            n += snprintf(buf + n, sizeof(buf) - n, "|%s", tx->attest_scope);
+    }
+    if (tx->roster)
+    {
+        /* A roster entry: no scorer, no channel, so its block follows the six
+         * common fields. No other entry has "roster" there ("roster" is not a
+         * channel), and no existing entry's bytes change. */
+        char who[UUID_STRING_LEN + 1] = "null";
+        if (!uuid_is_null(tx->roster_uuid))
+            uuid_unparse_lower(tx->roster_uuid, who);
+        n += snprintf(buf + n, sizeof(buf) - n, "|roster|%s|%s|%s", tx->roster_op,
+                      who, tx->roster_digest[0] != '\0' ? tx->roster_digest : "null");
+    }
     if (n < 0 || (size_t)n >= sizeof(buf) || (size_t)n >= outsz)
         return -1;
     memcpy(out, buf, (size_t)n + 1);
@@ -85,7 +137,7 @@ void transaction_entry_hash(const transaction_t *tx, char out[TX_HASH_HEX_LEN + 
      * Python MerkleTree.get_hash(canonical + prev_hash): 32-byte digest,
      * lowercase hex. prev_hash is appended as its raw ASCII hex bytes (the
      * same concatenation Python performs on the b'' / 64-hex-byte value). */
-    char canon[UUID_STRING_LEN * 3 + 128];
+    char canon[TX_CANON_MAX];
     int clen = transaction_canonical_bytes(tx, canon, sizeof(canon));
     if (clen < 0)
     {
@@ -99,6 +151,264 @@ void transaction_entry_hash(const transaction_t *tx, char out[TX_HASH_HEX_LEN + 
     unsigned char digest[32];
     crypto_generichash(digest, sizeof(digest), in, (size_t)clen + plen, NULL, 0);
     sodium_bin2hex(out, TX_HASH_HEX_LEN + 1, digest, sizeof(digest));
+}
+
+bool transaction_score_about(const transaction_t *tx, const uuid_t peer_uuid,
+                             double *score, uuid_t author)
+{
+    if (tx == NULL || !tx_is_committed(tx) || tx->roster)
+        return false;
+    const uuid_t *from = NULL;
+    double s = 0.0;
+    if (tx->attested)
+    {
+        /* About its subject only; the verifier is the author and gains
+         * nothing from it. */
+        if (uuid_compare(tx->subject_uuid, peer_uuid) != 0)
+            return false;
+        from = &tx->p1_uuid;
+        s = tx->p1_score;
+    }
+    else if (uuid_compare(tx->p1_uuid, peer_uuid) == 0)
+    {
+        from = &tx->p2_uuid;
+        s = tx->p2_score;
+    }
+    else if (uuid_compare(tx->p2_uuid, peer_uuid) == 0)
+    {
+        from = &tx->p1_uuid;
+        s = tx->p1_score;
+    }
+    else
+        return false;
+    if (score != NULL)
+        *score = s;
+    if (author != NULL)
+        uuid_copy(author, *from);
+    return true;
+}
+
+/* uuid5(NAMESPACE_URL, "urn:autonomous-trust:attested-score"), mirrored by
+ * Python ATTEST_NS. */
+static const uuid_t AT_ATTEST_NS = {
+    0xf0, 0xf4, 0xb5, 0xb1, 0x52, 0x47, 0x55, 0xca,
+    0x9d, 0x1e, 0xb1, 0x32, 0xdc, 0x93, 0x54, 0xfc };
+
+void tx_attest_task_uuid(const uuid_t verifier, const uuid_t subject,
+                         const char *evidence_digest, uuid_t out)
+{
+    char v[UUID_STRING_LEN + 1], s[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(verifier, v);
+    uuid_unparse_lower(subject, s);
+    char name[2 * UUID_STRING_LEN + TX_ATTEST_DIGEST_HEX_LEN + 8];
+    int n = snprintf(name, sizeof(name), "%s|%s|%s", v, s,
+                     evidence_digest != NULL ? evidence_digest : "");
+    if (n < 0 || (size_t)n >= sizeof(name))
+        n = (int)strnlen(name, sizeof(name) - 1);
+    uuid_generate_sha1(out, AT_ATTEST_NS, name, (size_t)n);
+}
+
+/* uuid5(NAMESPACE_URL, "urn:autonomous-trust:roster"), mirrored by Python
+ * ROSTER_NS. */
+static const uuid_t AT_ROSTER_NS = {
+    0x26, 0xdd, 0x83, 0x63, 0x9e, 0x20, 0x5e, 0x9e,
+    0x96, 0x27, 0x13, 0x31, 0x44, 0xc1, 0x0c, 0xcc };
+
+bool tx_roster_op_valid(const char *op)
+{
+    return op != NULL && (strcmp(op, "genesis") == 0 || strcmp(op, "add") == 0
+                          || strcmp(op, "restate") == 0);
+}
+
+void tx_roster_task_uuid(const uuid_t prev, const char *op, const uuid_t member,
+                         const char *digest, uuid_t out)
+{
+    char p[UUID_STRING_LEN + 1] = "null", m[UUID_STRING_LEN + 1] = "null";
+    if (prev != NULL)
+        uuid_unparse_lower(prev, p);
+    if (member != NULL)
+        uuid_unparse_lower(member, m);
+    char name[2 * UUID_STRING_LEN + TX_ROSTER_OP_LEN + TX_HASH_HEX_LEN + 8];
+    int n = snprintf(name, sizeof(name), "%s|%s|%s|%s", p, op != NULL ? op : "",
+                     m, digest != NULL ? digest : "");
+    if (n < 0 || (size_t)n >= sizeof(name))
+        n = (int)strnlen(name, sizeof(name) - 1);
+    uuid_generate_sha1(out, AT_ROSTER_NS, name, (size_t)n);
+}
+
+static int _roster_pair_cmp(const void *a, const void *b)
+{
+    const char *ua = json_string_value(json_array_get(*(json_t *const *)a, 0));
+    const char *ub = json_string_value(json_array_get(*(json_t *const *)b, 0));
+    return strcmp(ua, ub);
+}
+
+int roster_digest(const json_t *members, char out[TX_HASH_HEX_LEN + 1],
+                  json_t **norm_out)
+{
+    if (norm_out != NULL)
+        *norm_out = NULL;
+    size_t n = json_array_size(members);
+    if (!json_is_array(members) || n == 0 || n > 4096)
+        return -1;
+    json_t **pairs = calloc(n, sizeof(json_t *));
+    if (pairs == NULL)
+        return -1;
+    int rc = 0;
+    for (size_t i = 0; i < n && rc == 0; i++)
+    {
+        json_t *m = json_array_get(members, i);
+        const char *u = json_string_value(json_array_get(m, 0));
+        const char *k = json_string_value(json_array_get(m, 1));
+        uuid_t parsed;
+        if (!json_is_array(m) || u == NULL || k == NULL || uuid_parse(u, parsed) != 0
+            || strlen(k) != 64)
+        {
+            rc = -1;
+            break;
+        }
+        char ul[UUID_STRING_LEN + 1], kl[65];
+        uuid_unparse_lower(parsed, ul);
+        for (int j = 0; j < 64; j++)
+        {
+            char c = (char)tolower((unsigned char)k[j]);
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+                rc = -1;
+            kl[j] = c;
+        }
+        kl[64] = '\0';
+        pairs[i] = json_pack("[s, s]", ul, kl);
+        if (pairs[i] == NULL)
+            rc = -1;
+    }
+    if (rc == 0)
+    {
+        qsort(pairs, n, sizeof(json_t *), _roster_pair_cmp);
+        for (size_t i = 1; i < n && rc == 0; i++)
+            if (_roster_pair_cmp(&pairs[i - 1], &pairs[i]) == 0)
+                rc = -1;                      /* a member repeated */
+    }
+    size_t cap = 16 + n * (UUID_STRING_LEN + 66);
+    char *lines = rc == 0 ? malloc(cap) : NULL;
+    if (rc == 0 && lines == NULL)
+        rc = -1;
+    if (rc == 0)
+    {
+        size_t len = 0;
+        memcpy(lines, "AT-ROSTER\0", 10);
+        len = 10;
+        for (size_t i = 0; i < n; i++)
+            len += (size_t)snprintf(lines + len, cap - len, "%s%s:%s",
+                                    i > 0 ? "\n" : "",
+                                    json_string_value(json_array_get(pairs[i], 0)),
+                                    json_string_value(json_array_get(pairs[i], 1)));
+        unsigned char digest[32];
+        crypto_generichash(digest, sizeof(digest), (const unsigned char *)lines,
+                           len, NULL, 0);
+        sodium_bin2hex(out, TX_HASH_HEX_LEN + 1, digest, sizeof(digest));
+    }
+    free(lines);
+    json_t *norm = rc == 0 && norm_out != NULL ? json_array() : NULL;
+    for (size_t i = 0; i < n; i++)
+    {
+        if (norm != NULL && pairs[i] != NULL)
+            json_array_append(norm, pairs[i]);
+        json_decref(pairs[i]);
+    }
+    free(pairs);
+    if (norm_out != NULL)
+        *norm_out = norm;
+    return rc;
+}
+
+int tx_history_roster_put(tx_history_t *hist, const json_t *members,
+                          char digest_out[TX_HASH_HEX_LEN + 1])
+{
+    char digest[TX_HASH_HEX_LEN + 1];
+    json_t *norm = NULL;
+    if (hist == NULL || roster_digest(members, digest, &norm) != 0 || norm == NULL)
+        return -1;
+    char *text = json_dumps(norm, JSON_COMPACT);
+    json_decref(norm);
+    if (text == NULL)
+        return -1;
+    map_set(&hist->rosters, (map_key_t)digest, string_data(text, strlen(text)));
+    free(text);
+    if (digest_out != NULL)
+        memcpy(digest_out, digest, sizeof(digest));
+    return 0;
+}
+
+int tx_history_roster_at(const tx_history_t *hist, int k, transaction_t *out)
+{
+    const transaction_t *best = NULL;
+    for (int i = 0; hist != NULL && i < hist->chain_len; i++)
+    {
+        const transaction_t *t = &hist->chain[i];
+        if (t->roster && t->index >= 0 && t->index < k
+            && (best == NULL || t->index > best->index))
+            best = t;
+    }
+    if (best == NULL)
+    {
+        if (hist == NULL || hist->roster_anchor[0] == '\0')
+            return -1;
+        if (out != NULL)
+        {
+            memset(out, 0, sizeof(*out));
+            out->index = -1;
+            out->roster = true;
+            at_strlcpy(out->roster_op, "genesis", sizeof(out->roster_op));
+            at_strlcpy(out->roster_digest, hist->roster_anchor,
+                       sizeof(out->roster_digest));
+            tx_roster_task_uuid(NULL, "genesis", NULL, hist->roster_anchor,
+                                out->task_uuid);
+        }
+        return 0;
+    }
+    if (out != NULL)
+        *out = *best;
+    return 0;
+}
+
+const char *tx_history_roster_members(const tx_history_t *hist, const char *digest)
+{
+    data_t *d = NULL;
+    char *text = NULL;
+    if (hist == NULL || digest == NULL
+        || map_get((map_t *)&hist->rosters, (map_key_t)digest, &d) != 0
+        || d == NULL || data_string_ptr(d, &text) != 0)
+        return NULL;
+    return text;
+}
+
+/* uuid5(NAMESPACE_URL, "urn:autonomous-trust:task-pair"), mirrored by Python
+ * PAIR_NS. */
+static const uuid_t AT_PAIR_NS = {
+    0x61, 0xc2, 0x24, 0x77, 0x13, 0x84, 0x51, 0xfd,
+    0xb2, 0x86, 0xbb, 0x4b, 0x7f, 0x28, 0x50, 0x44 };
+
+void tx_pair_task_uuid(const uuid_t task, const uuid_t executor, uuid_t out)
+{
+    char t[UUID_STRING_LEN + 1], e[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(task, t);
+    uuid_unparse_lower(executor, e);
+    char name[2 * UUID_STRING_LEN + 2];
+    int n = snprintf(name, sizeof(name), "%s|%s", t, e);
+    uuid_generate_sha1(out, AT_PAIR_NS, name, (size_t)n);
+}
+
+bool tx_attest_digest_valid(const char *digest)
+{
+    if (digest == NULL || strnlen(digest, TX_ATTEST_DIGEST_HEX_LEN + 1) != TX_ATTEST_DIGEST_HEX_LEN)
+        return false;
+    for (int i = 0; i < TX_ATTEST_DIGEST_HEX_LEN; i++)
+    {
+        char c = digest[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    }
+    return true;
 }
 
 bool tx_verify_chain_links(const transaction_t *chain, int count)
@@ -233,6 +543,58 @@ static int collect_window_leaves(const tx_history_t *hist,
     return n;
 }
 
+int tx_history_range_root(const tx_history_t *hist, int first, int count,
+                          char out[TX_HASH_HEX_LEN + 1])
+{
+    if (hist == NULL || count <= 0 || count > MAX_CHAIN_LEN)
+        return -1;
+    char leaves[MAX_CHAIN_LEN][TX_HASH_HEX_LEN + 1];
+    int n = 0;
+    for (int i = 0; i < hist->chain_len && n < count; i++)
+    {
+        const transaction_t *t = &hist->chain[i];
+        if (t->index < first || t->index >= first + count)
+            continue;
+        if (t->index != first + n)
+            return -1;
+        transaction_entry_hash(t, leaves[n]);
+        n++;
+    }
+    if (n != count)
+        return -1;
+    mth_range(leaves, 0, n, out);
+    return 0;
+}
+
+int tx_history_range_proof(const tx_history_t *hist, int first, int count,
+                           int abs_index, tx_merkle_step_t *steps, int *n_steps)
+{
+    if (n_steps != NULL)
+        *n_steps = 0;
+    if (hist == NULL || steps == NULL || count <= 0 || count > MAX_CHAIN_LEN
+        || abs_index < first || abs_index >= first + count)
+        return -1;
+    char leaves[MAX_CHAIN_LEN][TX_HASH_HEX_LEN + 1];
+    int n = 0;
+    for (int i = 0; i < hist->chain_len && n < count; i++)
+    {
+        const transaction_t *t = &hist->chain[i];
+        if (t->index < first || t->index >= first + count)
+            continue;
+        if (t->index != first + n)
+            return -1;
+        transaction_entry_hash(t, leaves[n]);
+        n++;
+    }
+    if (n != count)
+        return -1;
+    int cnt = 0;
+    audit_path(leaves, 0, n, abs_index - first, steps, &cnt);
+    if (n_steps != NULL)
+        *n_steps = cnt;
+    return 0;
+}
+
 void transaction_window_root(const tx_history_t *hist, char out[TX_HASH_HEX_LEN + 1])
 {
     char leaves[MAX_CHAIN_LEN][TX_HASH_HEX_LEN + 1];
@@ -313,7 +675,163 @@ int tx_history_init(tx_history_t *hist)
     if (err != 0) return err;
     err = map_init(&hist->peer_map);
     if (err != 0) return err;
+    err = map_init(&hist->attest_certs);
+    if (err != 0) return err;
+    err = map_init(&hist->commit_certs);
+    if (err != 0) return err;
+    hist->pool_len = 0;
+    hist->pool_rev = 0;
+    hist->roster_anchor[0] = '\0';
+    err = map_init(&hist->pool_certs);
+    if (err != 0) return err;
+    err = map_init(&hist->decided);
+    if (err != 0) return err;
+    err = map_init(&hist->decided_sigs);
+    if (err != 0) return err;
+    err = map_init(&hist->place_certs);
+    if (err != 0) return err;
+    err = map_init(&hist->place_from);
+    if (err != 0) return err;
+    err = map_init(&hist->rosters);
+    if (err != 0) return err;
     return map_init(&hist->evicted_set);
+}
+
+static void tx_history_evict_oldest(tx_history_t *hist);
+static void _drop_commit_certs(tx_history_t *hist, const transaction_t *tx);
+
+/* Append `slot` to peer_map[peer_uuid]'s index list, creating the list on
+ * first sight. Factored out of tx_history_update so the LOADERS
+ * (tx_history_era_from_json, _history_load_committed) can index a peer too.
+ *
+ * They previously did not, and that was a silent hole rather than a cosmetic
+ * one: every scoring function — reputation_pure, reputation_contrite_tft,
+ * reputation_consensus, reputation_consensus_by_tier — reaches its
+ * transactions through tx_history_by_peer, which reads ONLY peer_map. A chain
+ * arriving by catch-up (or restored from persisted evidence) therefore scored
+ * as if it were empty: present in the window, invisible to every algorithm
+ * that consumes it. */
+static int _index_peer_slot(tx_history_t *hist, const uuid_t peer_uuid, int slot)
+{
+    char peer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, peer_str);
+    data_t *peer_indices = NULL;
+    if (map_get(&hist->peer_map, (map_key_t)peer_str, &peer_indices) != 0)
+    {
+        /* array_create, not smrt_create + array_init: init zeroes the smrt
+         * header for the embedded case, and create is what re-asserts it for
+         * a heap array_t. Hand-rolling the pair left this array_t with
+         * refs==0, so the array_free in tx_history_free never released it. */
+        array_t *arr = NULL;
+        if (array_create(&arr) != 0) return EXCEPTION(ENOMEM);
+        array_append(arr, integer_data(slot));
+        map_set(&hist->peer_map, (map_key_t)peer_str,
+                object_ptr_data(arr, sizeof(array_t)));
+        return 0;
+    }
+    void *arr_ptr = NULL;
+    data_object_ptr(peer_indices, &arr_ptr);
+    if (arr_ptr == NULL) return -1;
+    array_append((array_t *)arr_ptr, integer_data(slot));
+    return 0;
+}
+
+/* Rebuild task_map and peer_map from chain[] as it now stands. Used after
+ * an entry is moved within the array; both maps store SLOT POSITIONS, so a
+ * move invalidates them. O(chain_len); chain_len <= MAX_CHAIN_LEN. */
+static void _rebuild_slot_maps(tx_history_t *hist)
+{
+    map_key_t key = NULL;
+    data_t *val = NULL;
+    map_entries_for_each(&hist->peer_map, key, val)
+    {
+        void *arr_ptr = NULL;
+        if (data_object_ptr(val, &arr_ptr) == 0 && arr_ptr != NULL)
+            array_free((array_t *)arr_ptr);   /* releases the array_t too */
+    }
+    map_end_for_each
+    map_free(&hist->peer_map);
+    map_init(&hist->peer_map);
+    map_free(&hist->task_map);
+    map_init(&hist->task_map);
+
+    for (int slot = 0; slot < hist->chain_len; slot++)
+    {
+        const transaction_t *tx = &hist->chain[slot];
+        char task_key[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(tx->task_uuid, task_key);
+        map_set(&hist->task_map, (map_key_t)task_key, integer_data(slot));
+        if (tx->p1_set)
+            _index_peer_slot(hist, tx->p1_uuid, slot);
+        if (tx->p2_set && uuid_compare(tx->p1_uuid, tx->p2_uuid) != 0)
+            _index_peer_slot(hist, tx->p2_uuid, slot);
+        if (tx->attested && uuid_compare(tx->p1_uuid, tx->subject_uuid) != 0)
+            _index_peer_slot(hist, tx->subject_uuid, slot);
+    }
+}
+
+/* Keep chain[]'s committed entries in COMMIT order: move the entry at @p idx,
+ * which has just gone bilateral, to the end of the array.
+ *
+ * chain[] holds pending entries too, at the slot where their FIRST half
+ * arrived, while index and prev_hash are assigned when the SECOND half lands.
+ * Two interleaved tasks therefore commit out of array order, and every
+ * reader that walks chain[] as the committed sequence (the catch-up wire,
+ * era, the checkpoint window leaves, the evidence export, the link check) saw
+ * a sequence whose hash links did not hold. The moderation cohort (run 8,
+ * 2026-09-23) found carol's persisted chain in index order [3, 0, 2, 1],
+ * failing verification, so every peer rejected her catch-up. Python never had
+ * this: its _chain holds only committed entries, appended as they commit. */
+static int _move_to_commit_position(tx_history_t *hist, int idx)
+{
+    int last = hist->chain_len - 1;
+    if (idx < 0 || idx >= last)
+        return idx;   /* already at the end */
+    transaction_t moved = hist->chain[idx];
+    memmove(&hist->chain[idx], &hist->chain[idx + 1],
+            (size_t)(last - idx) * sizeof(transaction_t));
+    hist->chain[last] = moved;
+    _rebuild_slot_maps(hist);
+    return last;
+}
+
+/* Load one already-committed entry verbatim — index, prev_hash and scores as
+ * they were persisted — and wire up the maps and counters around it.
+ *
+ * Verbatim is the whole point: tx_history_update would assign a fresh index
+ * and recompute prev_hash from the local head, which is exactly what a
+ * verifiable warm start must not do. The Merkle root only reproduces if the
+ * entries hash to what they hashed to when they were signed. Assumes the
+ * caller has already verified the segment's linkage. */
+static void _history_load_committed(tx_history_t *hist, const transaction_t *src)
+{
+    if (hist == NULL || src == NULL)
+        return;
+    if (hist->chain_len >= MAX_CHAIN_LEN)
+        tx_history_evict_oldest(hist);
+    int slot = hist->chain_len;
+    transaction_t *tx = &hist->chain[slot];
+    *tx = *src;
+
+    char task_key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(tx->task_uuid, task_key);
+    map_set(&hist->task_map, (map_key_t)task_key, integer_data(slot));
+    if (tx->p1_set)
+        _index_peer_slot(hist, tx->p1_uuid, slot);
+    if (tx->p2_set && uuid_compare(tx->p1_uuid, tx->p2_uuid) != 0)
+        _index_peer_slot(hist, tx->p2_uuid, slot);
+    if (tx->attested && uuid_compare(tx->p1_uuid, tx->subject_uuid) != 0)
+        _index_peer_slot(hist, tx->subject_uuid, slot);
+
+    if (hist->committed_count == 0 || tx->index < hist->first_index)
+        hist->first_index = tx->index;
+    hist->committed_count++;
+    hist->chain_len++;
+    if (tx->index + 1 > hist->next_index)
+        hist->next_index = tx->index + 1;
+    /* Resume the link from the loaded tail so subsequent local commits chain
+     * cleanly onto the restored history. */
+    transaction_entry_hash(tx, hist->head_hash);
 }
 
 /* Evict chain[0] FIFO-style: drop its task_map entry, scrub
@@ -336,10 +854,16 @@ static void tx_history_evict_oldest(tx_history_t *hist)
     transaction_t evicted = hist->chain[0];
     char task_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(evicted.task_uuid, task_str);
-    bool evicted_committed = evicted.p1_set && evicted.p2_set;
+    bool evicted_committed = tx_is_committed(&evicted);
 
-    /* 1. Drop evicted's task_map entry. */
+    /* 1. Drop evicted's task_map entry, and an attested entry's certificate. */
     map_remove(&hist->task_map, task_str);
+    map_remove(&hist->place_certs, task_str);
+    map_remove(&hist->place_from, task_str);
+    if (evicted.attested)
+        map_remove(&hist->attest_certs, task_str);
+    else
+        _drop_commit_certs(hist, &evicted);
 
     /* 1a. Push the evicted task_uuid onto the tombstone ring. If the
      * ring is full, the displaced key must first be removed from
@@ -425,14 +949,11 @@ static void tx_history_evict_oldest(tx_history_t *hist)
             write_idx++;
         }
         /* Trim any stale tail. array_set doesn't shrink; pop until
-         * size == write_idx. */
+         * size == write_idx. By index: array_remove matches by value, and a
+         * rewritten slot in front can equal the stale tail. */
         while (array_size(arr) > write_idx)
         {
-            data_t *tail = NULL;
-            if (array_get(arr, (int)(array_size(arr) - 1), &tail) == 0
-                && tail != NULL)
-                array_remove(arr, tail);
-            else
+            if (array_remove_at(arr, -1) != 0)
                 break;
         }
         if (array_size(arr) == 0)
@@ -486,7 +1007,7 @@ static void tx_history_evict_oldest(tx_history_t *hist)
         hist->first_index = hist->next_index;
         for (int i = 0; i < hist->chain_len; i++)
         {
-            if (hist->chain[i].p1_set && hist->chain[i].p2_set)
+            if (tx_is_committed(&hist->chain[i]))
             {
                 hist->first_index = hist->chain[i].index;
                 break;
@@ -508,8 +1029,18 @@ void tx_history_destroy(tx_history_t *hist)
  */
 /* Frama-C: skipped — [solver-timeout] map/array mutation preconditions */
 int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
-                      const uuid_t peer_uuid, double score)
+                      const uuid_t peer_uuid, double score,
+                      const char *channel)
 {
+    /* Refused before anything is written, and refused rather than coerced:
+     * the channel is part of the entry hash (transaction_canonical_bytes), so
+     * a spelling this node's vocabulary does not have would fork its chain
+     * away from the group's. Mirrors Python validate_tx_channel raising in
+     * Transaction's constructor. Absence (NULL / "") is legal -- that is a
+     * pre-channel producer, not a wrong one. */
+    if (channel != NULL && channel[0] != '\0' && !tx_channel_valid(channel))
+        return EXCEPTION(EINVAL);
+
     char task_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(task_uuid, task_str);
 
@@ -555,6 +1086,10 @@ int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
         uuid_copy(tx->p1_uuid, peer_uuid);
         tx->p1_score = score;
         tx->p1_set = true;
+        /* memset above already left this empty for an absent channel, which
+         * is how "no channel" is spelled in the struct. */
+        if (channel != NULL && channel[0] != '\0')
+            at_strlcpy(tx->p1_channel, channel, sizeof(tx->p1_channel));
         /* index is assigned monotonically only when the tx goes
          * bilateral (p2 also fills). Mark pending with -1 so callers
          * that look at tx->index for an unfinished tx see a sentinel.
@@ -596,12 +1131,18 @@ int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
          * NOT extend the slot count — the asymmetric p1/p2 scoring
          * semantics (requester ≠ worker) don't generalize. */
         transaction_t *tx = &hist->chain[idx];
+        /* An attested entry is complete on its own; nothing may fill the half
+         * its subject never gave (doc/architecture/reputation.md). */
+        if (tx->attested)
+            return 0;
         bool was_committed = tx->p1_set && tx->p2_set;
         if (!tx->p1_set)
         {
             uuid_copy(tx->p1_uuid, peer_uuid);
             tx->p1_score = score;
             tx->p1_set = true;
+            if (channel != NULL && channel[0] != '\0')
+                at_strlcpy(tx->p1_channel, channel, sizeof(tx->p1_channel));
         }
         else if (!tx->p2_set)
         {
@@ -618,6 +1159,8 @@ int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
             uuid_copy(tx->p2_uuid, peer_uuid);
             tx->p2_score = score;
             tx->p2_set = true;
+            if (channel != NULL && channel[0] != '\0')
+                at_strlcpy(tx->p2_channel, channel, sizeof(tx->p2_channel));
         }
         else
         {
@@ -648,32 +1191,784 @@ int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
              * self._head_hash = tx.entry_hash()`. */
             memcpy(tx->prev_hash, hist->head_hash, TX_HASH_HEX_LEN + 1);
             transaction_entry_hash(tx, hist->head_hash);
+            if (idx != hist->chain_len - 1)
+            {
+                /* The rebuild indexes both parties at the new slot, so the
+                 * append below would count this peer twice. */
+                _move_to_commit_position(hist, idx);
+                return 0;
+            }
         }
     }
 
     /* Update peer_map: add this index to the peer's list */
-    data_t *peer_indices = NULL;
-    if (map_get((map_t *)&hist->peer_map, peer_str, &peer_indices) != 0)
+    int perr = _index_peer_slot(hist, peer_uuid, idx);
+    if (perr != 0)
+        return perr;
+
+    return 0;
+}
+
+/* The chain's half of the attested-entry rule (tx_history_append_attested).
+ * Mirrors Python TransactionHistory._attested_well_formed. */
+static bool _attested_well_formed(const transaction_t *in)
+{
+    if (!in->attested || !in->p1_set || in->p2_set)
+        return false;
+    if (uuid_is_null(in->subject_uuid) || uuid_compare(in->subject_uuid, in->p1_uuid) == 0)
+        return false;
+    if (!(in->p1_score >= 0.0 && in->p1_score <= 1.0))
+        return false;
+    if (!tx_channel_attestable(in->p1_channel))
+        return false;
+    if (!tx_attest_digest_valid(in->evidence_digest))
+        return false;
+    if (in->attest_scope[0] != '\0' && !tx_attest_digest_valid(in->attest_scope))
+        return false;
+    uuid_t want;
+    tx_attest_task_uuid(in->p1_uuid, in->subject_uuid, in->evidence_digest, want);
+    return uuid_compare(want, in->task_uuid) == 0;
+}
+
+int tx_history_append_attested(tx_history_t *hist, const transaction_t *in,
+                                const char *cert_json)
+{
+    if (hist == NULL || in == NULL)
+        return EXCEPTION(EINVAL);
+    if (!_attested_well_formed(in))
+        return EXCEPTION(EINVAL);
+    char task_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(in->task_uuid, task_str);
+    data_t *d = NULL;
+    if (map_get(&hist->task_map, task_str, &d) == 0
+        || map_get(&hist->evicted_set, task_str, &d) == 0)
+        return EXCEPTION(EINVAL);   /* ever held: a duplicate or a replay */
+
+    if (hist->chain_len >= MAX_CHAIN_LEN)
+        tx_history_evict_oldest(hist);
+    int slot = hist->chain_len;
+    transaction_t *tx = &hist->chain[slot];
+    *tx = *in;
+    tx->p2_channel[0] = '\0';
+    memset(tx->p2_uuid, 0, sizeof(tx->p2_uuid));
+    tx->p2_score = 0.0;
+    tx->index = hist->next_index++;
+    if (hist->committed_count == 0)
+        hist->first_index = tx->index;
+    hist->committed_count++;
+    memcpy(tx->prev_hash, hist->head_hash, TX_HASH_HEX_LEN + 1);
+    transaction_entry_hash(tx, hist->head_hash);
+    hist->chain_len++;
+    map_set(&hist->task_map, task_str, integer_data(slot));
+    _index_peer_slot(hist, tx->p1_uuid, slot);
+    _index_peer_slot(hist, tx->subject_uuid, slot);
+    if (cert_json != NULL && cert_json[0] != '\0')
+        map_set(&hist->attest_certs, task_str,
+                string_data((string_t)cert_json, strlen(cert_json)));
+    return 0;
+}
+
+const char *tx_history_attest_cert(const tx_history_t *hist, const uuid_t task_uuid)
+{
+    if (hist == NULL)
+        return NULL;
+    char task_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(task_uuid, task_str);
+    data_t *d = NULL;
+    if (map_get((map_t *)&hist->attest_certs, task_str, &d) != 0 || d == NULL)
+        return NULL;
+    char *text = NULL;
+    if (data_string_ptr(d, &text) != 0)
+        return NULL;
+    return text;
+}
+
+/****************************
+ * Ordered placement (doc/architecture/reputation.md, "Agreeing on an order")
+ ****************************/
+
+static void _commit_cert_key(const uuid_t task, const uuid_t scorer,
+                             char out[2 * UUID_STRING_LEN + 2]);
+
+/* A buffered placement's entries, owned by hist->decided. */
+typedef struct {
+    int           n;
+    transaction_t entries[PLACE_BATCH_MAX];
+} tx_decided_t;
+
+static bool _task_placed(const tx_history_t *hist, const char *task_str)
+{
+    data_t *d = NULL;
+    if (map_get((map_t *)&hist->task_map, (map_key_t)task_str, &d) != 0 || d == NULL)
+        return false;
+    int slot = -1;
+    if (data_integer(d, &slot) != 0 || slot < 0 || slot >= hist->chain_len)
+        return false;
+    return tx_is_committed(&hist->chain[slot]);
+}
+
+static bool _task_tombstoned(const tx_history_t *hist, const char *task_str)
+{
+    data_t *d = NULL;
+    return map_get((map_t *)&hist->evicted_set, (map_key_t)task_str, &d) == 0;
+}
+
+static int _pool_slot(const tx_history_t *hist, const uuid_t task_uuid)
+{
+    for (int i = 0; i < hist->pool_len; i++)
+        if (uuid_compare(hist->pool[i].task_uuid, task_uuid) == 0)
+            return i;
+    return -1;
+}
+
+/* Forget the certificates kept for pooled @p tx. */
+static void _drop_pool_certs(tx_history_t *hist, const transaction_t *tx)
+{
+    char key[2 * UUID_STRING_LEN + 2];
+    if (tx->attested)
     {
-        /* Create new array for this peer */
-        array_t *arr = smrt_create(sizeof(array_t));
-        if (arr == NULL) return EXCEPTION(ENOMEM);
-        array_init(arr);
-        data_t *new_idx = integer_data(idx);
-        array_append(arr, new_idx);
-        data_t *arr_dat = object_ptr_data(arr, sizeof(array_t));
-        map_set(&hist->peer_map, peer_str, arr_dat);
+        uuid_unparse_lower(tx->task_uuid, key);
+        map_remove(&hist->pool_certs, key);
+        return;
+    }
+    if (tx->p1_set)
+    {
+        _commit_cert_key(tx->task_uuid, tx->p1_uuid, key);
+        map_remove(&hist->pool_certs, key);
+    }
+    if (tx->p2_set)
+    {
+        _commit_cert_key(tx->task_uuid, tx->p2_uuid, key);
+        map_remove(&hist->pool_certs, key);
+    }
+}
+
+/* Remove pool[slot], keeping the rest in arrival order. Its certificates are
+ * the caller's to move or drop first. */
+static void _pool_remove_at(tx_history_t *hist, int slot)
+{
+    if (slot < 0 || slot >= hist->pool_len)
+        return;
+    memmove(&hist->pool[slot], &hist->pool[slot + 1],
+            (size_t)(hist->pool_len - slot - 1) * sizeof(transaction_t));
+    hist->pool_len--;
+    hist->pool_rev++;
+}
+
+const char *tx_history_pool_cert(const tx_history_t *hist,
+                                 const uuid_t task_uuid, const uuid_t scorer)
+{
+    if (hist == NULL)
+        return NULL;
+    int slot = _pool_slot(hist, task_uuid);
+    if (slot < 0)
+        return NULL;
+    char key[2 * UUID_STRING_LEN + 2];
+    if (hist->pool[slot].attested)
+        uuid_unparse_lower(task_uuid, key);
+    else
+        _commit_cert_key(task_uuid, scorer, key);
+    data_t *d = NULL;
+    char *text = NULL;
+    if (map_get((map_t *)&hist->pool_certs, (map_key_t)key, &d) != 0 || d == NULL
+        || data_string_ptr(d, &text) != 0)
+        return NULL;
+    return text;
+}
+
+int tx_history_pool_drop(tx_history_t *hist, const uuid_t task_uuid)
+{
+    if (hist == NULL)
+        return -1;
+    int slot = _pool_slot(hist, task_uuid);
+    if (slot < 0)
+        return -1;
+    _drop_pool_certs(hist, &hist->pool[slot]);
+    _pool_remove_at(hist, slot);
+    return 0;
+}
+
+/* A free pool slot at the end, dropping the oldest entry when full. */
+static transaction_t *_pool_append(tx_history_t *hist)
+{
+    if (hist->pool_len >= MAX_CHAIN_LEN)
+    {
+        _drop_pool_certs(hist, &hist->pool[0]);
+        _pool_remove_at(hist, 0);
+    }
+    transaction_t *tx = &hist->pool[hist->pool_len++];
+    memset(tx, 0, sizeof(*tx));
+    tx->index = -1;
+    hist->pool_rev++;
+    return tx;
+}
+
+int tx_history_record_half(tx_history_t *hist, const uuid_t task_uuid,
+                           const uuid_t peer_uuid, double score,
+                           const char *channel, const char *cert_json)
+{
+    if (hist == NULL)
+        return -1;
+    if (channel != NULL && channel[0] != '\0' && !tx_channel_valid(channel))
+        return -1;
+    char task_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(task_uuid, task_str);
+    if (_task_placed(hist, task_str))
+        return TX_HALF_PLACED;
+    if (_task_tombstoned(hist, task_str))
+        return TX_HALF_TOMBSTONED;
+    int slot = _pool_slot(hist, task_uuid);
+    transaction_t *tx = NULL;
+    if (slot < 0)
+    {
+        tx = _pool_append(hist);
+        uuid_copy(tx->task_uuid, task_uuid);
+    }
+    else
+        tx = &hist->pool[slot];
+    if (tx->attested)
+        return TX_HALF_DUP;
+    char key[2 * UUID_STRING_LEN + 2];
+    _commit_cert_key(task_uuid, peer_uuid, key);
+    bool have_cert = cert_json != NULL && cert_json[0] != '\0';
+    if ((tx->p1_set && uuid_compare(tx->p1_uuid, peer_uuid) == 0)
+        || (tx->p2_set && uuid_compare(tx->p2_uuid, peer_uuid) == 0))
+    {
+        if (have_cert)
+        {
+            data_t *held = NULL;
+            char *text = NULL;
+            if (map_get(&hist->pool_certs, (map_key_t)key, &held) != 0
+                || held == NULL || data_string_ptr(held, &text) != 0
+                || text == NULL || strcmp(text, cert_json) != 0)
+            {
+                map_set(&hist->pool_certs, (map_key_t)key,
+                        string_data((string_t)cert_json, strlen(cert_json)));
+                hist->pool_rev++;
+            }
+        }
+        return TX_HALF_DUP;
+    }
+    if (tx->p1_set && tx->p2_set)
+        return TX_HALF_DUP;
+    const char *chan = channel != NULL ? channel : "";
+    if (!tx->p1_set)
+    {
+        uuid_copy(tx->p1_uuid, peer_uuid);
+        tx->p1_score = score;
+        tx->p1_set = true;
+        at_strlcpy(tx->p1_channel, chan, sizeof(tx->p1_channel));
     }
     else
     {
-        void *arr_ptr = NULL;
-        data_object_ptr(peer_indices, &arr_ptr);
-        array_t *arr = (array_t *)arr_ptr;
-        data_t *new_idx = integer_data(idx);
-        array_append(arr, new_idx);
+        uuid_copy(tx->p2_uuid, peer_uuid);
+        tx->p2_score = score;
+        tx->p2_set = true;
+        at_strlcpy(tx->p2_channel, chan, sizeof(tx->p2_channel));
     }
+    if (have_cert)
+        map_set(&hist->pool_certs, (map_key_t)key,
+                string_data((string_t)cert_json, strlen(cert_json)));
+    hist->pool_rev++;
+    return (tx->p1_set && tx->p2_set) ? TX_HALF_READY : TX_HALF_PENDING;
+}
 
+int tx_history_pool_attested(tx_history_t *hist, const transaction_t *in,
+                             const char *cert_json)
+{
+    if (hist == NULL || in == NULL || !_attested_well_formed(in))
+        return EXCEPTION(EINVAL);
+    char task_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(in->task_uuid, task_str);
+    data_t *d = NULL;
+    if (map_get(&hist->task_map, task_str, &d) == 0
+        || _task_tombstoned(hist, task_str)
+        || _pool_slot(hist, in->task_uuid) >= 0)
+        return EXCEPTION(EINVAL);   /* ever held: a duplicate or a replay */
+    transaction_t *tx = _pool_append(hist);
+    *tx = *in;
+    tx->index = -1;
+    tx->prev_hash[0] = '\0';
+    tx->p2_channel[0] = '\0';
+    memset(tx->p2_uuid, 0, sizeof(tx->p2_uuid));
+    tx->p2_score = 0.0;
+    if (cert_json != NULL && cert_json[0] != '\0')
+        map_set(&hist->pool_certs, (map_key_t)task_str,
+                string_data((string_t)cert_json, strlen(cert_json)));
     return 0;
+}
+
+const transaction_t *tx_history_pooled(const tx_history_t *hist,
+                                       const uuid_t task_uuid)
+{
+    if (hist == NULL)
+        return NULL;
+    int slot = _pool_slot(hist, task_uuid);
+    return slot < 0 ? NULL : &hist->pool[slot];
+}
+
+void placement_entry(const transaction_t *in, transaction_t *out)
+{
+    *out = *in;
+    out->index = -1;
+    out->prev_hash[0] = '\0';
+    if (out->attested || !out->p1_set || !out->p2_set)
+        return;
+    char a[UUID_STRING_LEN + 1], b[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(out->p1_uuid, a);
+    uuid_unparse_lower(out->p2_uuid, b);
+    if (strcmp(b, a) >= 0)
+        return;
+    uuid_t u;
+    uuid_copy(u, out->p1_uuid);
+    uuid_copy(out->p1_uuid, out->p2_uuid);
+    uuid_copy(out->p2_uuid, u);
+    double sc = out->p1_score;
+    out->p1_score = out->p2_score;
+    out->p2_score = sc;
+    char ch[TX_CHANNEL_NAMELEN + 1];
+    memcpy(ch, out->p1_channel, sizeof(ch));
+    memcpy(out->p1_channel, out->p2_channel, sizeof(ch));
+    memcpy(out->p2_channel, ch, sizeof(ch));
+}
+
+static int _cmp_task(const void *x, const void *y)
+{
+    char a[UUID_STRING_LEN + 1], b[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(((const transaction_t *)x)->task_uuid, a);
+    uuid_unparse_lower(((const transaction_t *)y)->task_uuid, b);
+    return strcmp(a, b);
+}
+
+int tx_history_ready_items(const tx_history_t *hist, transaction_t *out,
+                           int max_out)
+{
+    if (hist == NULL || out == NULL || max_out <= 0)
+        return 0;
+    transaction_t *ready = calloc((size_t)(hist->pool_len > 0 ? hist->pool_len : 1),
+                                  sizeof(transaction_t));
+    if (ready == NULL)
+        return 0;
+    int n = 0;
+    for (int i = 0; i < hist->pool_len; i++)
+    {
+        const transaction_t *tx = &hist->pool[i];
+        if (tx->attested || (tx->p1_set && tx->p2_set))
+            ready[n++] = *tx;
+    }
+    qsort(ready, (size_t)n, sizeof(transaction_t), _cmp_task);
+    if (n > max_out)
+        n = max_out;
+    for (int i = 0; i < n; i++)
+        placement_entry(&ready[i], &out[i]);
+    free(ready);
+    return n;
+}
+
+size_t place_value_bytes(const transaction_t *entries, int n, int k,
+                         uint8_t *out, size_t cap)
+{
+    static const char tag[] = "AT-PLACE-VALUE";
+    size_t len = sizeof(tag);   /* includes the NUL separator */
+    if (entries == NULL || out == NULL || n < 0 || cap < len)
+        return 0;
+    memcpy(out, tag, len);
+    for (int i = 0; i < n; i++)
+    {
+        transaction_t at = entries[i];
+        at.index = k + i;
+        char canon[TX_CANON_MAX];
+        int clen = transaction_canonical_bytes(&at, canon, sizeof(canon));
+        if (clen < 0)
+            return 0;
+        size_t need = (size_t)clen + (i > 0 ? 1 : 0);
+        if (len + need > cap)
+            return 0;
+        if (i > 0)
+            out[len++] = '\n';
+        memcpy(out + len, canon, (size_t)clen);
+        len += (size_t)clen;
+    }
+    return len;
+}
+
+void place_value_digest(const transaction_t *entries, int n, int k,
+                        char out[TX_HASH_HEX_LEN + 1])
+{
+    uint8_t *buf = malloc(PLACE_VALUE_MAX);
+    out[0] = '\0';
+    if (buf == NULL)
+        return;
+    size_t len = place_value_bytes(entries, n, k, buf, PLACE_VALUE_MAX);
+    if (len > 0)
+    {
+        unsigned char digest[32];
+        crypto_generichash(digest, sizeof(digest), buf, len, NULL, 0);
+        sodium_bin2hex(out, TX_HASH_HEX_LEN + 1, digest, sizeof(digest));
+    }
+    free(buf);
+}
+
+size_t place_designation(int k, const char *prev_hash, const char *digest,
+                         uint8_t *out, size_t cap)
+{
+    static const char tag[] = "AT-PLACE";
+    size_t tag_len = sizeof(tag);   /* includes the NUL separator */
+    if (out == NULL || digest == NULL || cap <= tag_len)
+        return 0;
+    int n = snprintf((char *)out + tag_len, cap - tag_len, "%d|%s|%s", k,
+                     prev_hash != NULL ? prev_hash : "", digest);
+    if (n < 0 || (size_t)n >= cap - tag_len)
+        return 0;
+    memcpy(out, tag, tag_len);
+    return tag_len + (size_t)n;
+}
+
+/* Move a pooled certificate under @p from_key to @p to_map under @p to_key. */
+static void _move_pool_cert(tx_history_t *hist, const char *from_key,
+                            map_t *to_map, const char *to_key)
+{
+    data_t *d = NULL;
+    char *text = NULL;
+    if (map_get(&hist->pool_certs, (map_key_t)from_key, &d) == 0 && d != NULL
+        && data_string_ptr(d, &text) == 0 && text != NULL)
+        map_set(to_map, (map_key_t)to_key, string_data((string_t)text, strlen(text)));
+    map_remove(&hist->pool_certs, (map_key_t)from_key);
+}
+
+static void _append_placed(tx_history_t *hist, const transaction_t *entries,
+                           int n, const char *sigs_json)
+{
+    char task_str[UUID_STRING_LEN + 1] = {0};
+    int first = hist->next_index;
+    for (int i = 0; i < n; i++)
+    {
+        transaction_t tx;
+        placement_entry(&entries[i], &tx);
+        tx.index = hist->next_index;
+        memcpy(tx.prev_hash, hist->head_hash, TX_HASH_HEX_LEN + 1);
+        _history_load_committed(hist, &tx);
+        uuid_unparse_lower(tx.task_uuid, task_str);
+        if (tx.attested)
+            _move_pool_cert(hist, task_str, &hist->attest_certs, task_str);
+        else
+        {
+            char key[2 * UUID_STRING_LEN + 2];
+            _commit_cert_key(tx.task_uuid, tx.p1_uuid, key);
+            _move_pool_cert(hist, key, &hist->commit_certs, key);
+            _commit_cert_key(tx.task_uuid, tx.p2_uuid, key);
+            _move_pool_cert(hist, key, &hist->commit_certs, key);
+        }
+        int slot = _pool_slot(hist, tx.task_uuid);
+        if (slot >= 0)
+        {
+            _drop_pool_certs(hist, &hist->pool[slot]);
+            _pool_remove_at(hist, slot);
+        }
+    }
+    if (n > 0 && sigs_json != NULL && sigs_json[0] != '\0')
+    {
+        map_set(&hist->place_certs, (map_key_t)task_str,
+                string_data((string_t)sigs_json, strlen(sigs_json)));
+        map_set(&hist->place_from, (map_key_t)task_str, integer_data(first));
+    }
+}
+
+/* A placement's certificate, on its last entry @p obj: "place_from" and
+ * "place_sigs", omitted unless both are held. Outside the entry hash. */
+static void _place_cert_to_json(const tx_history_t *hist, const char *task_str,
+                                json_t *obj)
+{
+    data_t *d = NULL, *fd = NULL;
+    char *text = NULL;
+    int from = -1;
+    if (map_get((map_t *)&hist->place_certs, (map_key_t)task_str, &d) != 0
+        || d == NULL || data_string_ptr(d, &text) != 0 || text == NULL
+        || map_get((map_t *)&hist->place_from, (map_key_t)task_str, &fd) != 0
+        || fd == NULL || data_integer(fd, &from) != 0 || from < 0)
+        return;
+    json_t *sj = json_loads(text, 0, NULL);
+    if (!json_is_object(sj) || json_object_size(sj) == 0)
+    {
+        json_decref(sj);
+        return;
+    }
+    json_object_set_new(obj, "place_from", json_integer(from));
+    json_object_set_new(obj, "place_sigs", sj);
+}
+
+/* Keep the placement certificate entry @p obj carries, for its task. The
+ * caller verified it (catch-up) or wrote it (evidence). */
+static void _place_cert_from_json(tx_history_t *hist, const json_t *obj,
+                                  const char *task_key)
+{
+    const char *task_str = json_string_value(json_object_get((json_t *)obj, task_key));
+    json_t *sigs = json_object_get((json_t *)obj, "place_sigs");
+    json_t *from = json_object_get((json_t *)obj, "place_from");
+    uuid_t tk;
+    if (task_str == NULL || !json_is_object(sigs) || json_object_size(sigs) == 0
+        || !json_is_integer(from) || json_integer_value(from) < 0
+        || uuid_parse(task_str, tk) != 0)
+        return;
+    char *text = json_dumps(sigs, JSON_COMPACT | JSON_SORT_KEYS);
+    if (text == NULL)
+        return;
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(tk, key);
+    map_set(&hist->place_certs, (map_key_t)key, string_data(text, strlen(text)));
+    map_set(&hist->place_from, (map_key_t)key,
+            integer_data((int)json_integer_value(from)));
+    free(text);
+}
+
+int tx_history_apply_placed(tx_history_t *hist, int k,
+                            const transaction_t *entries, int n,
+                            const char *sigs_json)
+{
+    if (hist == NULL || n < 0 || n > PLACE_BATCH_MAX || (n > 0 && entries == NULL))
+        return -1;
+    if (n == 0)
+        return TX_PLACE_EMPTY;
+    if (k < hist->next_index)
+        return TX_PLACE_OLD;
+    char key[24];
+    if (k > hist->next_index)
+    {
+        tx_decided_t *dec = calloc(1, sizeof(*dec));
+        if (dec == NULL)
+            return -1;
+        dec->n = n;
+        memcpy(dec->entries, entries, (size_t)n * sizeof(transaction_t));
+        snprintf(key, sizeof(key), "%d", k);
+        map_set(&hist->decided, (map_key_t)key,
+                owned_object_data((ptr_t)dec, sizeof(*dec)));
+        if (sigs_json != NULL && sigs_json[0] != '\0')
+            map_set(&hist->decided_sigs, (map_key_t)key,
+                    string_data((string_t)sigs_json, strlen(sigs_json)));
+        else
+            map_remove(&hist->decided_sigs, (map_key_t)key);
+        return TX_PLACE_BUFFERED;
+    }
+    _append_placed(hist, entries, n, sigs_json);
+    for (;;)
+    {
+        snprintf(key, sizeof(key), "%d", hist->next_index);
+        data_t *d = NULL;
+        void *ptr = NULL;
+        if (map_get(&hist->decided, (map_key_t)key, &d) != 0 || d == NULL
+            || data_object_ptr(d, &ptr) != 0 || ptr == NULL)
+            break;
+        tx_decided_t dec = *(tx_decided_t *)ptr;
+        char *sigs = NULL;
+        data_t *sd = NULL;
+        if (map_get(&hist->decided_sigs, (map_key_t)key, &sd) == 0 && sd != NULL)
+        {
+            char *text = NULL;
+            if (data_string_ptr(sd, &text) == 0 && text != NULL)
+                sigs = strdup(text);
+        }
+        map_remove(&hist->decided, (map_key_t)key);
+        map_remove(&hist->decided_sigs, (map_key_t)key);
+        _append_placed(hist, dec.entries, dec.n, sigs);
+        free(sigs);
+    }
+    /* Anything still buffered below the chain was overtaken. */
+    array_t *keys = map_keys(&hist->decided);
+    for (size_t i = 0; keys != NULL && i < array_size(keys); i++)
+    {
+        data_t *kd = NULL;
+        char *kstr = NULL;
+        if (array_get(keys, (int)i, &kd) != 0 || data_string_ptr(kd, &kstr) != 0
+            || kstr == NULL)
+            continue;
+        if (atoi(kstr) < hist->next_index)
+        {
+            map_remove(&hist->decided, (map_key_t)kstr);
+            map_remove(&hist->decided_sigs, (map_key_t)kstr);
+        }
+    }
+    return TX_PLACE_APPLIED;
+}
+
+int tx_history_placed_end(const tx_history_t *hist)
+{
+    if (hist == NULL)
+        return -1;
+    int end = -1;
+    for (int i = 0; i < hist->chain_len; i++)
+    {
+        const transaction_t *tx = &hist->chain[i];
+        if (!tx_is_committed(tx))
+            continue;
+        char task_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(tx->task_uuid, task_str);
+        data_t *d = NULL;
+        if (map_get((map_t *)&hist->place_certs, (map_key_t)task_str, &d) == 0
+            && tx->index + 1 > end)
+            end = tx->index + 1;
+    }
+    return end;
+}
+
+const char *tx_history_place_cert(const tx_history_t *hist,
+                                  const uuid_t task_uuid)
+{
+    if (hist == NULL)
+        return NULL;
+    char task_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(task_uuid, task_str);
+    data_t *d = NULL;
+    char *text = NULL;
+    if (map_get((map_t *)&hist->place_certs, (map_key_t)task_str, &d) != 0
+        || d == NULL || data_string_ptr(d, &text) != 0)
+        return NULL;
+    return text;
+}
+
+/****************************
+ * Commit certificates (doc/architecture/reputation.md)
+ ****************************/
+
+size_t commit_designation(const uuid_t scorer, const uuid_t task, double score,
+                          const char *channel, uint8_t *out, size_t cap)
+{
+    static const char tag[] = "AT-COMMIT";
+    size_t tag_len = sizeof(tag);   /* includes the NUL separator */
+    if (out == NULL || cap <= tag_len)
+        return 0;
+    char s_str[UUID_STRING_LEN + 1];
+    char t_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(scorer, s_str);
+    uuid_unparse_lower(task, t_str);
+    int n = snprintf((char *)out + tag_len, cap - tag_len, "%s|%s|%.17g|%s",
+                     s_str, t_str, score, tx_channel_or_default(channel));
+    if (n < 0 || (size_t)n >= cap - tag_len)
+        return 0;
+    memcpy(out, tag, tag_len);
+    return tag_len + (size_t)n;
+}
+
+static void _commit_cert_key(const uuid_t task, const uuid_t scorer,
+                             char out[2 * UUID_STRING_LEN + 2])
+{
+    char t_str[UUID_STRING_LEN + 1];
+    char s_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(task, t_str);
+    uuid_unparse_lower(scorer, s_str);
+    snprintf(out, 2 * UUID_STRING_LEN + 2, "%s|%s", t_str, s_str);
+}
+
+/* Does @p tx hold an ordinary half scored by @p scorer? */
+static bool _holds_half(const transaction_t *tx, const uuid_t scorer)
+{
+    if (tx->attested)
+        return false;
+    return (tx->p1_set && uuid_compare(tx->p1_uuid, scorer) == 0)
+        || (tx->p2_set && uuid_compare(tx->p2_uuid, scorer) == 0);
+}
+
+static int _slot_of_task(const tx_history_t *hist, const uuid_t task);
+
+int tx_history_attach_commit_cert(tx_history_t *hist, const uuid_t task,
+                                  const uuid_t scorer, const char *cert_json)
+{
+    if (hist == NULL || cert_json == NULL || cert_json[0] == '\0')
+        return -1;
+    int slot = _slot_of_task(hist, task);
+    if (slot < 0 || !_holds_half(&hist->chain[slot], scorer))
+        return -1;
+    char key[2 * UUID_STRING_LEN + 2];
+    _commit_cert_key(task, scorer, key);
+    return map_set(&hist->commit_certs, (map_key_t)key,
+                   string_data((string_t)cert_json, strlen(cert_json)));
+}
+
+const char *tx_history_commit_cert(const tx_history_t *hist, const uuid_t task,
+                                   const uuid_t scorer)
+{
+    if (hist == NULL)
+        return NULL;
+    char key[2 * UUID_STRING_LEN + 2];
+    _commit_cert_key(task, scorer, key);
+    data_t *d = NULL;
+    if (map_get((map_t *)&hist->commit_certs, key, &d) != 0 || d == NULL)
+        return NULL;
+    char *text = NULL;
+    if (data_string_ptr(d, &text) != 0)
+        return NULL;
+    return text;
+}
+
+/* Forget both halves' certificates of @p tx (eviction, or a fork dropping it). */
+static void _drop_commit_certs(tx_history_t *hist, const transaction_t *tx)
+{
+    char key[2 * UUID_STRING_LEN + 2];
+    if (tx->p1_set)
+    {
+        _commit_cert_key(tx->task_uuid, tx->p1_uuid, key);
+        map_remove(&hist->commit_certs, key);
+    }
+    if (tx->p2_set)
+    {
+        _commit_cert_key(tx->task_uuid, tx->p2_uuid, key);
+        map_remove(&hist->commit_certs, key);
+    }
+}
+
+/* {scorer: {voter: sig}} for @p tx's halves, or NULL when it holds none. The
+ * key is "commit_sigs" on the catch-up wire and in the evidence document, as
+ * in Python. Caller owns the reference. */
+static json_t *_commit_sigs_json(const tx_history_t *hist, const transaction_t *tx)
+{
+    if (tx->attested)
+        return NULL;
+    json_t *out = NULL;
+    const uuid_t *scorers[2] = { tx->p1_set ? &tx->p1_uuid : NULL,
+                                 tx->p2_set ? &tx->p2_uuid : NULL };
+    for (int k = 0; k < 2; k++)
+    {
+        if (scorers[k] == NULL)
+            continue;
+        const char *cert = tx_history_commit_cert(hist, tx->task_uuid, *scorers[k]);
+        json_t *cj = cert != NULL ? json_loads(cert, 0, NULL) : NULL;
+        if (!json_is_object(cj) || json_object_size(cj) == 0)
+        {
+            json_decref(cj);
+            continue;
+        }
+        if (out == NULL)
+            out = json_object();
+        char s_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(*scorers[k], s_str);
+        json_object_set_new(out, s_str, cj);
+    }
+    return out;
+}
+
+/* Attach the "commit_sigs" an entry @p obj carries to the half it names in
+ * @p hist. The caller verified them (catch-up) or wrote them (evidence). */
+static void _commit_sigs_from_json(tx_history_t *hist, const json_t *obj,
+                                   const char *task_key)
+{
+    json_t *all = json_object_get((json_t *)obj, "commit_sigs");
+    const char *task_str = json_string_value(json_object_get((json_t *)obj, task_key));
+    uuid_t task;
+    if (!json_is_object(all) || task_str == NULL || uuid_parse(task_str, task) != 0)
+        return;
+    const char *scorer_str = NULL;
+    json_t *sigs = NULL;
+    json_object_foreach(all, scorer_str, sigs)
+    {
+        uuid_t scorer;
+        if (!json_is_object(sigs) || uuid_parse(scorer_str, scorer) != 0)
+            continue;
+        char *text = json_dumps(sigs, JSON_COMPACT | JSON_SORT_KEYS);
+        if (text != NULL)
+        {
+            (void)tx_history_attach_commit_cert(hist, task, scorer, text);
+            free(text);
+        }
+    }
 }
 
 /* Frama-C: skipped — [solver-timeout] map lookup preconditions */
@@ -741,7 +2036,7 @@ int tx_history_era(const tx_history_t *hist, int start_idx, int end_idx,
     int committed_seen = 0;
     for (int i = 0; i < hist->chain_len && committed_seen < end_idx; i++)
     {
-        if (!hist->chain[i].p1_set || !hist->chain[i].p2_set)
+        if (!tx_is_committed(&hist->chain[i]))
             continue;
         if (committed_seen >= start_idx)
         {
@@ -783,6 +2078,15 @@ void tx_history_free(tx_history_t *hist)
     map_end_for_each
     map_free(&hist->peer_map);
     map_free(&hist->evicted_set);
+    map_free(&hist->attest_certs);
+    map_free(&hist->commit_certs);
+    map_free(&hist->pool_certs);
+    map_free(&hist->decided);
+    map_free(&hist->decided_sigs);
+    map_free(&hist->place_certs);
+    map_free(&hist->place_from);
+    map_free(&hist->rosters);
+    hist->pool_len = 0;
     hist->chain_len = 0;
     hist->committed_count = 0;
     hist->next_index = 0;
@@ -795,6 +2099,118 @@ void tx_history_free(tx_history_t *hist)
 /****************************
  * JSON serialization for chain sync
  ****************************/
+
+/* Read the optional p1_channel / p2_channel keys onto @p tx.
+ *
+ * Absent leaves the field empty (a pre-channel sender); a spelling outside
+ * the closed set is also left empty rather than stored, because storing it
+ * would put a channel this node cannot name into the entry hash. That is
+ * detected rather than silent: the entry then hashes without the channel the
+ * sender hashed with, the link check fails, and the segment is rejected
+ * whole -- the same treatment tampering gets. */
+static void _tx_channels_from_json(const json_t *obj, transaction_t *tx)
+{
+    const char *c1 = json_string_value(json_object_get((json_t *)obj, "p1_channel"));
+    const char *c2 = json_string_value(json_object_get((json_t *)obj, "p2_channel"));
+    tx->p1_channel[0] = '\0';
+    tx->p2_channel[0] = '\0';
+    if (tx_channel_valid(c1))
+        at_strlcpy(tx->p1_channel, c1, sizeof(tx->p1_channel));
+    if (tx_channel_valid(c2))
+        at_strlcpy(tx->p2_channel, c2, sizeof(tx->p2_channel));
+}
+
+/* Read the optional attested keys onto @p tx: "attested", the subject (key
+ * @p subject_key -- "subject" on the catch-up wire, "subject_id" in the
+ * evidence document, as each side's Python twin names it) and
+ * "evidence_digest". A malformed subject or digest leaves the entry
+ * unattested, so it then hashes differently from what its sender hashed and
+ * the segment is rejected as a broken link, as tampering is. */
+static void _tx_attested_from_json_key(const json_t *obj, transaction_t *tx,
+                                       const char *subject_key)
+{
+    tx->attested = false;
+    memset(tx->subject_uuid, 0, sizeof(tx->subject_uuid));
+    tx->evidence_digest[0] = '\0';
+    tx->attest_scope[0] = '\0';
+    if (!json_is_true(json_object_get((json_t *)obj, "attested")))
+        return;
+    const char *subj = json_string_value(json_object_get((json_t *)obj, subject_key));
+    const char *dig = json_string_value(json_object_get((json_t *)obj, "evidence_digest"));
+    const char *scope = json_string_value(json_object_get((json_t *)obj, "attest_scope"));
+    uuid_t su;
+    if (subj == NULL || uuid_parse(subj, su) != 0 || !tx_attest_digest_valid(dig))
+        return;
+    if (scope != NULL && !tx_attest_digest_valid(scope))
+        return;
+    tx->attested = true;
+    uuid_copy(tx->subject_uuid, su);
+    at_strlcpy(tx->evidence_digest, dig, sizeof(tx->evidence_digest));
+    if (scope != NULL)
+        at_strlcpy(tx->attest_scope, scope, sizeof(tx->attest_scope));
+    tx->p2_set = false;
+}
+
+/* A roster entry's fields on the catch-up wire and in evidence:
+ * "roster_op", "roster_uuid" (null for none), "roster_digest" and
+ * "roster_members", the list checked against the digest. Omitted otherwise.
+ * Mirrors Python Transaction.to_dict / evidence_to_dict. */
+static void _tx_roster_to_json(const tx_history_t *hist, const transaction_t *tx,
+                               json_t *obj)
+{
+    if (!tx->roster)
+        return;
+    json_object_set_new(obj, "roster_op", json_string(tx->roster_op));
+    if (uuid_is_null(tx->roster_uuid))
+        json_object_set_new(obj, "roster_uuid", json_null());
+    else
+    {
+        char who[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(tx->roster_uuid, who);
+        json_object_set_new(obj, "roster_uuid", json_string(who));
+    }
+    json_object_set_new(obj, "roster_digest", json_string(tx->roster_digest));
+    const char *members = tx_history_roster_members(hist, tx->roster_digest);
+    json_t *mj = members != NULL ? json_loads(members, 0, NULL) : NULL;
+    json_object_set_new(obj, "roster_members", mj != NULL ? mj : json_array());
+}
+
+/* Read a roster entry's fields onto @p tx, keeping its member list in
+ * @p hist when given. A malformed one leaves the entry an ordinary one, which
+ * then hashes differently from what its sender hashed: the segment is
+ * rejected as a broken link, as tampering is. */
+static void _tx_roster_from_json(const json_t *obj, transaction_t *tx,
+                                 tx_history_t *hist)
+{
+    tx->roster = false;
+    tx->roster_op[0] = '\0';
+    memset(tx->roster_uuid, 0, sizeof(tx->roster_uuid));
+    tx->roster_digest[0] = '\0';
+    const char *op = json_string_value(json_object_get((json_t *)obj, "roster_op"));
+    if (!tx_roster_op_valid(op))
+        return;
+    const char *who = json_string_value(json_object_get((json_t *)obj, "roster_uuid"));
+    const char *dig = json_string_value(json_object_get((json_t *)obj, "roster_digest"));
+    json_t *members = json_object_get((json_t *)obj, "roster_members");
+    char want[TX_HASH_HEX_LEN + 1];
+    uuid_t wu;
+    if (dig == NULL || roster_digest(members, want, NULL) != 0
+        || strcmp(want, dig) != 0 || (who != NULL && uuid_parse(who, wu) != 0))
+        return;
+    tx->roster = true;
+    at_strlcpy(tx->roster_op, op, sizeof(tx->roster_op));
+    if (who != NULL)
+        uuid_copy(tx->roster_uuid, wu);
+    at_strlcpy(tx->roster_digest, dig, sizeof(tx->roster_digest));
+    tx->p1_set = tx->p2_set = false;
+    if (hist != NULL)
+        (void)tx_history_roster_put(hist, members, NULL);
+}
+
+static void _tx_attested_from_json(const json_t *obj, transaction_t *tx)
+{
+    _tx_attested_from_json_key(obj, tx, "subject");
+}
 
 /* Frama-C: skipped — [serialization] jansson JSON serialization */
 int tx_history_era_to_json(const tx_history_t *hist, int start_idx, int end_idx, json_t **out)
@@ -814,7 +2230,7 @@ int tx_history_era_to_json(const tx_history_t *hist, int start_idx, int end_idx,
     for (int i = 0; i < hist->chain_len && committed_seen < end_idx; i++)
     {
         const transaction_t *tx = &hist->chain[i];
-        if (!tx->p1_set || !tx->p2_set)
+        if (!tx_is_committed(tx))
             continue;
         if (committed_seen < start_idx)
         {
@@ -839,6 +2255,43 @@ int tx_history_era_to_json(const tx_history_t *hist, int start_idx, int end_idx,
             json_decref(arr);
             return -1;
         }
+        /* Channels are OMITTED when absent (R+D.md §12.8), the same rule
+         * transaction_canonical_bytes follows: an untagged entry -- every
+         * entry a legacy peer holds -- goes on the wire exactly as it did
+         * before this field existed. A tagged one must carry them, or the
+         * receiver rebuilds the entry without the channel and computes a
+         * different entry hash for it, breaking the link it just verified. */
+        if (tx->p1_channel[0] != '\0')
+            json_object_set_new(obj, "p1_channel", json_string(tx->p1_channel));
+        if (tx->p2_channel[0] != '\0')
+            json_object_set_new(obj, "p2_channel", json_string(tx->p2_channel));
+        /* An attested entry carries its subject and digest (they are in its
+         * hash) and its certificate (it is not, but catch-up refuses an
+         * attested entry without one). Omitted otherwise. */
+        if (tx->attested)
+        {
+            char sstr[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(tx->subject_uuid, sstr);
+            json_object_set_new(obj, "attested", json_true());
+            json_object_set_new(obj, "subject", json_string(sstr));
+            json_object_set_new(obj, "evidence_digest", json_string(tx->evidence_digest));
+            if (tx->attest_scope[0] != '\0')
+                json_object_set_new(obj, "attest_scope", json_string(tx->attest_scope));
+            const char *cert = tx_history_attest_cert(hist, tx->task_uuid);
+            json_t *cj = cert != NULL ? json_loads(cert, 0, NULL) : NULL;
+            if (json_is_object(cj))
+                json_object_set_new(obj, "attest_sigs", cj);
+            else
+                json_decref(cj);
+        }
+        /* Commit certificates, omitted when none: an undeclared group's
+         * entries go on the wire as they always did. */
+        json_t *commit_sigs = _commit_sigs_json(hist, tx);
+        if (commit_sigs != NULL)
+            json_object_set_new(obj, "commit_sigs", commit_sigs);
+        /* A placement's certificate, on its last entry. */
+        _place_cert_to_json(hist, task_str, obj);
+        _tx_roster_to_json(hist, tx, obj);
         json_array_append_new(arr, obj);
         committed_seen++;
     }
@@ -848,87 +2301,933 @@ int tx_history_era_to_json(const tx_history_t *hist, int start_idx, int end_idx,
 }
 
 /* Frama-C: skipped — [serialization] jansson JSON deserialization */
+/* Parse one wire entry into @p tx. Returns false for an entry with no task
+ * or parties (skipped, as the loader always has). */
+static bool _tx_from_json(const json_t *obj, transaction_t *tx)
+{
+    const char *task_str = json_string_value(json_object_get((json_t *)obj, "task"));
+    const char *p1_str = json_string_value(json_object_get((json_t *)obj, "p1"));
+    const char *p2_str = json_string_value(json_object_get((json_t *)obj, "p2"));
+    if (task_str == NULL || p1_str == NULL || p2_str == NULL)
+        return false;
+    memset(tx, 0, sizeof(*tx));
+    uuid_parse(task_str, tx->task_uuid);
+    uuid_parse(p1_str, tx->p1_uuid);
+    tx->p1_score = json_number_value(json_object_get((json_t *)obj, "p1_score"));
+    tx->p1_set = json_boolean_value(json_object_get((json_t *)obj, "p1_set"));
+    uuid_parse(p2_str, tx->p2_uuid);
+    tx->p2_score = json_number_value(json_object_get((json_t *)obj, "p2_score"));
+    tx->p2_set = json_boolean_value(json_object_get((json_t *)obj, "p2_set"));
+    json_t *j_index = json_object_get((json_t *)obj, "index");
+    tx->index = json_is_integer(j_index) ? (int)json_integer_value(j_index) : -1;
+    /* Channels feed the entry hash, so the link check needs them too. An
+     * unknown spelling is dropped rather than refused: the hash then
+     * mismatches and the segment is rejected as a broken link. */
+    _tx_channels_from_json(obj, tx);
+    _tx_attested_from_json(obj, tx);
+    _tx_roster_from_json(obj, tx, NULL);
+    const char *ph = json_string_value(json_object_get((json_t *)obj, "prev_hash"));
+    tx->prev_hash[0] = '\0';
+    if (ph != NULL)
+    {
+        strncpy(tx->prev_hash, ph, TX_HASH_HEX_LEN);
+        tx->prev_hash[TX_HASH_HEX_LEN] = '\0';
+    }
+    return true;
+}
+
+/* Our COMMITTED entry at absolute @p index, or NULL. chain[] holds committed
+ * entries in index order (see _move_to_commit_position), pending ones
+ * interleaved; N <= MAX_CHAIN_LEN, so a scan is fine. */
+static const transaction_t *_committed_at(const tx_history_t *hist, int index)
+{
+    for (int i = 0; i < hist->chain_len; i++)
+    {
+        const transaction_t *t = &hist->chain[i];
+        if (tx_is_committed(t) && t->index == index)
+            return t;
+    }
+    return NULL;
+}
+
+static int _slot_of_task(const tx_history_t *hist, const uuid_t task)
+{
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(task, key);
+    data_t *d = NULL;
+    int slot = -1;
+    if (map_get((map_t *)&hist->task_map, key, &d) == 0 && d != NULL)
+        data_integer(d, &slot);
+    return (slot >= 0 && slot < hist->chain_len) ? slot : -1;
+}
+
 int tx_history_era_from_json(tx_history_t *hist, const json_t *arr)
 {
+    return tx_history_reconcile(hist, arr, -1, NULL);
+}
+
+/* LONGEST VERIFIED CHAIN (ISSUES.md §2.15; user decision 2026-09-23). Mirrors
+ * Python's TransactionHistory.reconcile step for step.
+ *
+ * Chains forked by ORDER: each node numbers an entry when its second half
+ * lands, and catch-up used to append only past our own next_index, so two
+ * nodes holding different tasks at one index never came back together, and
+ * since a grant needs equal chain lengths, Paxos stalled for good (moderation
+ * cohort run 12: chains of 9/10/11, carol sharing no prefix with anyone).
+ *
+ *  1. the segment's links must verify (tampering rejects it whole);
+ *  2. the fork point f is the first index where the two differ by entry
+ *     hash, or where only the peer has an entry (a pure extension has
+ *     f == next_index);
+ *  3. on a real divergence the peer wins only with the higher tip: last
+ *     index + 1, then the LOWER head hash on a tie, which every node orders
+ *     the same way, so they converge and cannot flap;
+ *  4. nothing below @p final_end (our finalized checkpoint) is rewritten;
+ *  5. adopting drops our committed entries from f on (both halves of what
+ *     only we held there are lost: the price of the rule) and loads the
+ *     peer's VERBATIM, completing a task we held pending in place. Verbatim,
+ *     so that two nodes that agree become byte-identical and compute the same
+ *     window root. */
+int tx_history_reconcile(tx_history_t *hist, const json_t *arr,
+                         int final_end, tx_reconcile_result_t *out)
+{
+    return tx_history_reconcile_attested(hist, arr, final_end, NULL, out);
+}
+
+/* True iff the verified, index-sorted segment holds every index of the
+ * attested window, in order, and they hash to its root. */
+static bool _segment_reproduces(const transaction_t *seg, int n,
+                                const tx_attested_t *att)
+{
+    if (att == NULL || att->count <= 0 || att->count > MAX_CHAIN_LEN)
+        return false;
+    char leaves[MAX_CHAIN_LEN][TX_HASH_HEX_LEN + 1];
+    int k = 0;
+    for (int i = 0; i < n && k < att->count; i++)
+    {
+        if (seg[i].index < att->first_index)
+            continue;
+        if (seg[i].index != att->first_index + k)
+            return false;
+        transaction_entry_hash(&seg[i], leaves[k]);
+        k++;
+    }
+    if (k != att->count)
+        return false;
+    char root[TX_HASH_HEX_LEN + 1];
+    mth_range(leaves, 0, k, root);
+    return strcmp(root, att->root) == 0;
+}
+
+static bool _in_set(const int *set, int n, int v)
+{
+    for (int i = 0; set != NULL && i < n; i++)
+        if (set[i] == v)
+            return true;
+    return false;
+}
+
+static int _reconcile(tx_history_t *hist, const json_t *arr, int final_end,
+                      const tx_attested_t *attested,
+                      const int *certified, int n_cert, bool placing,
+                      tx_reconcile_result_t *out);
+
+int tx_history_reconcile_attested(tx_history_t *hist, const json_t *arr,
+                                  int final_end,
+                                  const tx_attested_t *attested,
+                                  tx_reconcile_result_t *out)
+{
+    return _reconcile(hist, arr, final_end, attested, NULL, 0, false, out);
+}
+
+int tx_history_reconcile_placed(tx_history_t *hist, const json_t *arr,
+                                int final_end,
+                                const tx_attested_t *attested,
+                                const int *certified, int n_certified,
+                                tx_reconcile_result_t *out)
+{
+    if (certified == NULL)
+        return _reconcile(hist, arr, final_end, attested, NULL, 0, false, out);
+    return _reconcile(hist, arr, final_end, attested, certified, n_certified,
+                      true, out);
+}
+
+int tx_history_place_batches(const tx_history_t *hist, const json_t *arr,
+                             tx_place_batch_t **out, int *n_out)
+{
+    if (out == NULL || n_out == NULL)
+        return -1;
+    *out = NULL;
+    *n_out = 0;
     if (!json_is_array(arr))
         return -1;
-
-    size_t idx;
-    json_t *obj;
-    int max_loaded_index = -1;
-
-    /* Phase 1: verify the incoming segment's hash-linkage before loading
-     * any of it. A peer (or a corrupted transfer) cannot slip an altered
-     * committed entry past us — the "verifiable instead of social" sync win
-     * (reputation-vs-blockchain-analysis.md §2.1). Mirrors Python
-     * TransactionHistory.catchup's wholesale reject. We stream-verify with
-     * just the previous committed entry so an over-long array needs no temp
-     * buffer. */
+    size_t n_all = json_array_size(arr);
+    transaction_t *seg = calloc(n_all > 0 ? n_all : 1, sizeof(transaction_t));
+    if (seg == NULL)
+        return EXCEPTION(ENOMEM);
+    int n = 0, closers = 0;
+    for (size_t i = 0; i < n_all; i++)
     {
-        transaction_t prev;
-        bool have_prev = false;
-        json_array_foreach(arr, idx, obj)
+        const json_t *o = json_array_get(arr, i);
+        if (_tx_from_json(o, &seg[n]) && seg[n].index >= 0 && tx_is_committed(&seg[n]))
         {
-            const char *task_str = json_string_value(json_object_get(obj, "task"));
-            const char *p1_str = json_string_value(json_object_get(obj, "p1"));
-            const char *p2_str = json_string_value(json_object_get(obj, "p2"));
-            if (task_str == NULL || p1_str == NULL || p2_str == NULL)
+            if (json_is_object(json_object_get((json_t *)o, "place_sigs")))
+                closers++;
+            n++;
+        }
+    }
+    if (closers == 0)
+    {
+        free(seg);
+        return 0;
+    }
+    tx_place_batch_t *batches = calloc((size_t)closers, sizeof(tx_place_batch_t));
+    if (batches == NULL)
+    {
+        free(seg);
+        return EXCEPTION(ENOMEM);
+    }
+    int nb = 0;
+    for (size_t i = 0; i < n_all && nb < closers; i++)
+    {
+        const json_t *o = json_array_get(arr, i);
+        json_t *sigs = json_object_get((json_t *)o, "place_sigs");
+        json_t *from = json_object_get((json_t *)o, "place_from");
+        transaction_t last;
+        if (!json_is_object(sigs) || !_tx_from_json(o, &last) || last.index < 0
+            || !tx_is_committed(&last))
+            continue;
+        tx_place_batch_t *b = &batches[nb++];
+        b->sigs = sigs;
+        b->k = json_is_integer(from) ? (int)json_integer_value(from) : -1;
+        if (b->k < 0 || b->k > last.index || last.index - b->k >= PLACE_BATCH_MAX)
+            continue;
+        b->whole = true;
+        int m = 0;
+        for (int at = b->k; at <= last.index; at++)
+        {
+            const transaction_t *e = NULL;
+            for (int j = 0; j < n; j++)
+                if (seg[j].index == at) { e = &seg[j]; break; }
+            if (e == NULL)
+            {
+                b->whole = false;
+                e = _committed_at(hist, at);
+            }
+            if (e == NULL)
+            {
+                m = 0;
+                break;
+            }
+            b->entries[m++] = *e;
+        }
+        b->n = m;
+        if (m == 0)
+            b->whole = false;
+    }
+    free(seg);
+    *out = batches;
+    *n_out = nb;
+    return 0;
+}
+
+static int _reconcile(tx_history_t *hist, const json_t *arr, int final_end,
+                      const tx_attested_t *attested,
+                      const int *certified, int n_cert, bool placing,
+                      tx_reconcile_result_t *out)
+{
+    tx_reconcile_result_t res = { TX_RECONCILE_NONE, -1, 0, 0, NULL, 0 };
+    bool jumped = false;
+    if (out != NULL)
+        out->dropped_entries = NULL;   /* never a stale pointer, whatever happens */
+    if (!json_is_array(arr))
+        return -1;
+    size_t n_all = json_array_size(arr);
+    transaction_t *seg = calloc(n_all > 0 ? n_all : 1, sizeof(transaction_t));
+    if (seg == NULL)
+        return EXCEPTION(ENOMEM);
+    int n = 0;
+    for (size_t i = 0; i < n_all; i++)
+    {
+        transaction_t cur;
+        if (!_tx_from_json(json_array_get(arr, i), &cur) || cur.index < 0
+            || !tx_is_committed(&cur))
+            continue;
+        /* Index order, stable insertion: a peer on an older build lists its
+         * entries in arrival order. */
+        int j = n;
+        while (j > 0 && seg[j - 1].index > cur.index)
+        {
+            seg[j] = seg[j - 1];
+            j--;
+        }
+        seg[j] = cur;
+        n++;
+    }
+    if (n == 0)
+        goto done;
+    if (!tx_verify_chain_links(seg, n))
+    {
+        res.status = TX_RECONCILE_REJECTED;
+        goto done;
+    }
+
+    int placed_end = placing ? tx_history_placed_end(hist) : -1;
+    if (placing)
+    {
+        /* From the first certified index (or our own placed end, if that
+         * comes first) on, only certified entries: cut at the first that is
+         * not. */
+        int cut = -1;
+        for (int i = 0; i < n_cert; i++)
+            if (cut < 0 || certified[i] < cut)
+                cut = certified[i];
+        if (placed_end >= 0 && (cut < 0 || placed_end < cut))
+            cut = placed_end;
+        if (cut >= 0)
+        {
+            int keep = 0;
+            while (keep < n && (seg[keep].index < cut
+                                || _in_set(certified, n_cert, seg[keep].index)))
+                keep++;
+            n = keep;
+        }
+        if (n == 0)
+            goto done;
+    }
+
+    int f = -1;
+    if (hist->committed_count == 0)
+    {
+        f = seg[0].index;
+    }
+    else
+    {
+        if (seg[0].index > hist->next_index)
+        {
+            /* A certified placement may carry us across the gap: our window
+             * goes (tombstoned, so a late commit cannot revive it) and the
+             * segment from that placement's start is taken whole. */
+            int start = -1;
+            if (placing)
+            {
+                size_t ji;
+                json_t *jo;
+                json_array_foreach((json_t *)arr, ji, jo)
+                {
+                    json_t *pf = json_object_get(jo, "place_from");
+                    json_t *ix = json_object_get(jo, "index");
+                    if (!json_is_object(json_object_get(jo, "place_sigs"))
+                        || !json_is_integer(pf) || !json_is_integer(ix)
+                        || !_in_set(certified, n_cert, (int)json_integer_value(ix)))
+                        continue;
+                    int from = (int)json_integer_value(pf);
+                    if (from >= seg[0].index && (start < 0 || from < start))
+                        start = from;
+                }
+            }
+            if (start < 0)
+            {
+                res.status = TX_RECONCILE_REJECTED;   /* a gap: nothing to link to */
+                goto done;
+            }
+            int skip = 0;
+            while (skip < n && seg[skip].index < start)
+                skip++;
+            memmove(seg, seg + skip, (size_t)(n - skip) * sizeof(transaction_t));
+            n -= skip;
+            while (hist->committed_count > 0)
+                tx_history_evict_oldest(hist);
+            jumped = true;
+            f = seg[0].index;
+            goto fork_found;
+        }
+        char ho[TX_HASH_HEX_LEN + 1], hs[TX_HASH_HEX_LEN + 1];
+        for (int i = 0; i < n; i++)
+        {
+            if (seg[i].index < hist->first_index)
                 continue;
-            transaction_t cur;
-            memset(&cur, 0, sizeof(cur));
-            uuid_parse(task_str, cur.task_uuid);
-            uuid_parse(p1_str, cur.p1_uuid);
-            cur.p1_score = json_number_value(json_object_get(obj, "p1_score"));
-            cur.p1_set = json_boolean_value(json_object_get(obj, "p1_set"));
-            uuid_parse(p2_str, cur.p2_uuid);
-            cur.p2_score = json_number_value(json_object_get(obj, "p2_score"));
-            cur.p2_set = json_boolean_value(json_object_get(obj, "p2_set"));
-            cur.index = (int)json_integer_value(json_object_get(obj, "index"));
-            const char *ph = json_string_value(json_object_get(obj, "prev_hash"));
-            cur.prev_hash[0] = '\0';
-            if (ph != NULL)
+            const transaction_t *o = _committed_at(hist, seg[i].index);
+            if (o == NULL)
             {
-                strncpy(cur.prev_hash, ph, TX_HASH_HEX_LEN);
-                cur.prev_hash[TX_HASH_HEX_LEN] = '\0';
+                f = seg[i].index;
+                break;
             }
-            if (cur.index < 0)
-                continue;  /* pending entry — not part of the committed link */
-            if (have_prev)
+            transaction_entry_hash(o, ho);
+            transaction_entry_hash(&seg[i], hs);
+            if (strcmp(ho, hs) != 0)
             {
-                char expect[TX_HASH_HEX_LEN + 1];
-                transaction_entry_hash(&prev, expect);
-                if (strncmp(cur.prev_hash, expect, TX_HASH_HEX_LEN + 1) != 0)
-                    return 0;  /* broken link — reject the whole segment */
+                f = seg[i].index;
+                break;
             }
-            prev = cur;
-            have_prev = true;
+        }
+        if (f < 0)
+            goto done;                              /* we already hold all of it */
+        /* The peer's entry at f must continue OUR prefix. */
+        const transaction_t *s_at_f = NULL;
+        for (int i = 0; i < n; i++)
+            if (seg[i].index == f) { s_at_f = &seg[i]; break; }
+        const transaction_t *pred = _committed_at(hist, f - 1);
+        const transaction_t *o_at_f = _committed_at(hist, f);
+        if (pred != NULL)
+        {
+            transaction_entry_hash(pred, ho);
+            if (strcmp(s_at_f->prev_hash, ho) != 0)
+            {
+                res.status = TX_RECONCILE_REJECTED;
+                goto done;
+            }
+        }
+        else if (o_at_f != NULL && strcmp(s_at_f->prev_hash, o_at_f->prev_hash) != 0)
+        {
+            res.status = TX_RECONCILE_REJECTED;
+            goto done;
+        }
+    }
+fork_found:
+    res.fork = f;
+
+    if (placing && hist->committed_count > 0 && placed_end >= 0 && f < placed_end)
+    {
+        /* Nothing below our placed end is rewritten. */
+        res.status = _in_set(certified, n_cert, f) ? TX_RECONCILE_EQUIVOCATION
+                                                   : TX_RECONCILE_KEPT;
+        goto done;
+    }
+    if (placing && hist->committed_count > 0 && f < hist->next_index
+        && _in_set(certified, n_cert, f))
+    {
+        /* A certified entry at the fork wins whatever the lengths, but never
+         * inside our finalized checkpoint. */
+        if (final_end >= 0 && f < final_end)
+        {
+            res.status = TX_RECONCILE_REFUSED_FINAL;
+            goto done;
+        }
+    }
+    else if (hist->committed_count > 0 && f < hist->next_index)
+    {
+        int s_tip = seg[n - 1].index + 1;
+        int o_tip = hist->next_index;
+        char s_head[TX_HASH_HEX_LEN + 1];
+        transaction_entry_hash(&seg[n - 1], s_head);
+        /* A chain the quorum finalized beats one it outvoted, whatever the
+         * tips: an order fork at equal length would otherwise go to the lower
+         * head hash, which can be the losing side, and never converge. */
+        bool quorum_chain = _segment_reproduces(seg, n, attested);
+        if (!quorum_chain
+            && (s_tip < o_tip
+                || (s_tip == o_tip && strcmp(s_head, hist->head_hash) >= 0)))
+        {
+            res.status = TX_RECONCILE_KEPT;
+            goto done;
+        }
+        if (final_end >= 0 && f < final_end)
+        {
+            res.status = TX_RECONCILE_REFUSED_FINAL;
+            goto done;
         }
     }
 
-    json_array_foreach(arr, idx, obj)
+    /* A task we hold COMMITTED below the fork cannot appear again above it. */
+    for (int i = 0; i < n; i++)
     {
-        const char *task_str = json_string_value(json_object_get(obj, "task"));
-        const char *p1_str = json_string_value(json_object_get(obj, "p1"));
-        const char *p2_str = json_string_value(json_object_get(obj, "p2"));
-        if (task_str == NULL || p1_str == NULL || p2_str == NULL)
+        if (seg[i].index < f)
             continue;
+        int slot = _slot_of_task(hist, seg[i].task_uuid);
+        if (slot >= 0)
+        {
+            const transaction_t *h = &hist->chain[slot];
+            if (tx_is_committed(h) && h->index < f)
+            {
+                res.status = TX_RECONCILE_REJECTED;
+                goto done;
+            }
+        }
+    }
 
-        if (hist->chain_len >= MAX_CHAIN_LEN)
-            tx_history_evict_oldest(hist);
+    /* Drop our committed entries from f on; pending entries stay. Copies go
+     * back to the caller, who re-proposes its own half of each. */
+    if (out != NULL && hist->chain_len > 0)
+    {
+        res.dropped_entries = calloc((size_t)hist->chain_len, sizeof(transaction_t));
+        if (res.dropped_entries == NULL)
+        {
+            free(seg);
+            return EXCEPTION(ENOMEM);   /* before anything is rewritten */
+        }
+    }
+    int w = 0;
+    for (int i = 0; i < hist->chain_len; i++)
+    {
+        const transaction_t *t = &hist->chain[i];
+        if (tx_is_committed(t) && t->index >= f)
+        {
+            if (res.dropped_entries != NULL)
+                res.dropped_entries[res.dropped] = *t;
+            res.dropped++;
+            char dkey[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(t->task_uuid, dkey);
+            map_remove(&hist->place_certs, (map_key_t)dkey);
+            map_remove(&hist->place_from, (map_key_t)dkey);
+            continue;
+        }
+        if (w != i)
+            hist->chain[w] = hist->chain[i];
+        w++;
+    }
+    hist->chain_len = w;
+    hist->committed_count -= res.dropped;
+    if (res.dropped > 0)
+        _rebuild_slot_maps(hist);
 
-        transaction_t *tx = &hist->chain[hist->chain_len];
-        memset(tx, 0, sizeof(transaction_t));
-        uuid_parse(task_str, tx->task_uuid);
-        uuid_parse(p1_str, tx->p1_uuid);
+    int last_loaded = -1;
+    for (int i = 0; i < n; i++)
+    {
+        if (seg[i].index < f)
+            continue;
+        char key[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(seg[i].task_uuid, key);
+        map_remove(&hist->evicted_set, key);
+        /* Placed now: it leaves the pool. */
+        int pslot = _pool_slot(hist, seg[i].task_uuid);
+        if (pslot >= 0)
+        {
+            _drop_pool_certs(hist, &hist->pool[pslot]);
+            _pool_remove_at(hist, pslot);
+        }
+        int slot = _slot_of_task(hist, seg[i].task_uuid);
+        if (slot >= 0)
+        {
+            /* Pending here: the peer's committed copy completes it in place,
+             * then it moves to commit position (which rebuilds the maps). */
+            hist->chain[slot] = seg[i];
+            if (_move_to_commit_position(hist, slot) == slot)
+                _rebuild_slot_maps(hist);
+        }
+        else
+        {
+            if (hist->chain_len >= MAX_CHAIN_LEN)
+                tx_history_evict_oldest(hist);
+            int at = hist->chain_len;
+            hist->chain[at] = seg[i];
+            map_set(&hist->task_map, key, integer_data(at));
+            _index_peer_slot(hist, seg[i].p1_uuid, at);
+            if (uuid_compare(seg[i].p1_uuid, seg[i].p2_uuid) != 0)
+                _index_peer_slot(hist, seg[i].p2_uuid, at);
+            hist->chain_len++;
+        }
+        hist->committed_count++;
+        res.added++;
+        last_loaded = seg[i].index;
+    }
+    if (last_loaded + 1 > f)
+        hist->next_index = last_loaded + 1;
+    else
+        hist->next_index = f;
+
+    /* first_index and head follow the committed entries as they now stand. */
+    hist->head_hash[0] = '\0';
+    bool have_first = false;
+    for (int i = 0; i < hist->chain_len; i++)
+    {
+        const transaction_t *t = &hist->chain[i];
+        if (!tx_is_committed(t))
+            continue;
+        if (!have_first) { hist->first_index = t->index; have_first = true; }
+        transaction_entry_hash(t, hist->head_hash);
+    }
+    if (!have_first)
+        hist->first_index = hist->next_index;
+    res.status = (res.dropped > 0 || jumped) ? TX_RECONCILE_ADOPTED
+               : res.added > 0   ? TX_RECONCILE_EXTENDED
+                                 : TX_RECONCILE_NONE;
+done:
+    free(seg);
+    /* Under ordered placement, what an adoption drops goes back to the pool
+     * to be placed again, each half with its certificate (before those leave
+     * the chain's maps below). A half without one is not returned: no
+     * acceptor would take it. Mirrors Python _pool_dropped. */
+    for (int di = 0; placing && res.status == TX_RECONCILE_ADOPTED
+                     && di < res.dropped && res.dropped_entries != NULL; di++)
+    {
+        const transaction_t *t = &res.dropped_entries[di];
+        if (t->attested)
+        {
+            const char *cert = tx_history_attest_cert(hist, t->task_uuid);
+            char *copy = cert != NULL ? strdup(cert) : NULL;
+            if (tx_history_pool_attested(hist, t, copy) == 0)
+                res.pooled++;
+            free(copy);
+            continue;
+        }
+        const unsigned char *who[2] = { t->p1_uuid, t->p2_uuid };
+        const double sc[2] = { t->p1_score, t->p2_score };
+        const char *ch[2] = { t->p1_channel, t->p2_channel };
+        const bool set[2] = { t->p1_set, t->p2_set };
+        for (int side = 0; side < 2; side++)
+        {
+            const char *cert = set[side]
+                ? tx_history_commit_cert(hist, t->task_uuid, who[side]) : NULL;
+            char *copy = cert != NULL ? strdup(cert) : NULL;
+            if (copy != NULL)
+                (void)tx_history_record_half(hist, t->task_uuid, who[side],
+                                             sc[side], ch[side][0] != '\0'
+                                             ? ch[side] : NULL, copy);
+            free(copy);
+        }
+        if (tx_history_pooled(hist, t->task_uuid) != NULL)
+            res.pooled++;
+    }
+    /* A dropped entry's commit certificates go with it, even when the peer's
+     * copy of the same task comes back below: the peer's halves may carry
+     * different scores, and only the peer's own certificates fit them. */
+    for (int di = 0; di < res.dropped && res.dropped_entries != NULL; di++)
+        if (!res.dropped_entries[di].attested)
+            _drop_commit_certs(hist, &res.dropped_entries[di]);
+    /* An attested entry that came in keeps its certificate, and an ordinary
+     * one its commit certificates (the caller checked them before
+     * reconciling). */
+    if (res.status == TX_RECONCILE_ADOPTED || res.status == TX_RECONCILE_EXTENDED)
+    {
+        size_t ci;
+        json_t *co;
+        json_array_foreach((json_t *)arr, ci, co)
+        {
+            if (!json_is_true(json_object_get(co, "attested")))
+                _commit_sigs_from_json(hist, co, "task");
+            /* A placement certificate on an entry now held (the caller
+             * verified it). */
+            const char *pt = json_string_value(json_object_get(co, "task"));
+            uuid_t ptk;
+            if (placing && pt != NULL && uuid_parse(pt, ptk) == 0
+                && _slot_of_task(hist, ptk) >= 0)
+                _place_cert_from_json(hist, co, "task");
+            /* A roster entry's member list (checked against its digest). */
+            if (json_object_get(co, "roster_op") != NULL)
+            {
+                transaction_t scratch;
+                memset(&scratch, 0, sizeof(scratch));
+                _tx_roster_from_json(co, &scratch, hist);
+            }
+        }
+        size_t ai;
+        json_t *ao;
+        json_array_foreach((json_t *)arr, ai, ao)
+        {
+            if (!json_is_true(json_object_get(ao, "attested")))
+                continue;
+            const char *task_str = json_string_value(json_object_get(ao, "task"));
+            json_t *sigs = json_object_get(ao, "attest_sigs");
+            uuid_t tk;
+            if (task_str == NULL || !json_is_object(sigs) || uuid_parse(task_str, tk) != 0
+                || _slot_of_task(hist, tk) < 0)
+                continue;
+            char *text = json_dumps(sigs, JSON_COMPACT | JSON_SORT_KEYS);
+            if (text != NULL)
+            {
+                map_set(&hist->attest_certs, (map_key_t)task_str,
+                        string_data(text, strlen(text)));
+                free(text);
+            }
+        }
+    }
+    if (res.dropped == 0)
+    {
+        free(res.dropped_entries);
+        res.dropped_entries = NULL;
+    }
+    if (out != NULL)
+        *out = res;
+    else
+        free(res.dropped_entries);
+    return 0;
+}
+
+void tx_reconcile_result_free(tx_reconcile_result_t *res)
+{
+    if (res == NULL)
+        return;
+    free(res->dropped_entries);
+    res->dropped_entries = NULL;
+}
+
+/****************************  *
+ * Persisted reputation evidence (verifiable warm start, doc/architecture/reputation.md)
+ * ************************** */
+
+int rep_checkpoint_init(rep_checkpoint_t *ckpt)
+{
+    if (ckpt == NULL) return -1;
+    memset(ckpt, 0, sizeof(*ckpt));
+    return map_init(&ckpt->sigs);
+}
+
+void rep_checkpoint_free(rep_checkpoint_t *ckpt)
+{
+    if (ckpt == NULL) return;
+    map_free(&ckpt->sigs);
+    ckpt->present = false;
+}
+
+size_t rep_checkpoint_designation(const char *proposer, const char *root,
+                                  int64_t epoch, int64_t first_index,
+                                  int64_t count, const char *group_uuid,
+                                  uint8_t *out, size_t cap)
+{
+    if (proposer == NULL || root == NULL || out == NULL)
+        return 0;
+    static const char tag[] = "AT-CKPT";
+    size_t tag_len = sizeof(tag);   /* includes the NUL separator */
+    if (cap <= tag_len)
+        return 0;
+    bool have_group = (group_uuid != NULL && group_uuid[0] != '\0');
+    int n = snprintf((char *)out + tag_len, cap - tag_len,
+                     "%s|%s|%lld|%lld|%lld%s%s", proposer, root,
+                     (long long)epoch, (long long)first_index,
+                     (long long)count,
+                     have_group ? "|" : "",
+                     have_group ? group_uuid : "");
+    if (n < 0 || (size_t)n >= cap - tag_len)
+        return 0;
+    memcpy(out, tag, tag_len);
+    return tag_len + (size_t)n;
+}
+
+int reputation_evidence_to_json(const tx_history_t *hist,
+                                const rep_checkpoint_t *ckpt, json_t **out)
+{
+    if (hist == NULL || out == NULL) return -1;
+
+    json_t *chain = json_array();
+    if (chain == NULL) return EXCEPTION(ENOMEM);
+
+    for (int i = 0; i < hist->chain_len; i++)
+    {
+        const transaction_t *tx = &hist->chain[i];
+        /* An un-indexed entry is not yet evidence of anything: the index is
+         * what a committed bilateral entry has. Mirrors the Python writer's
+         * `if tx.index is None: continue`. */
+        if (tx->index < 0 || !tx_is_committed(tx))
+            continue;
+        char task_str[UUID_STRING_LEN + 1];
+        char p1_str[UUID_STRING_LEN + 1];
+        char p2_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(tx->task_uuid, task_str);
+        uuid_unparse_lower(tx->p1_uuid, p1_str);
+        uuid_unparse_lower(tx->p2_uuid, p2_str);
+        /* An attested entry has no second party: null, as Python writes it. */
+        /* A roster entry has no parties: null, as Python writes it. */
+        json_t *obj = json_pack("{s:s, s:o, s:o, s:o, s:o, s:i, s:s}",
+            "task_id", task_str,
+            "p1_id", tx->roster ? json_null() : json_string(p1_str),
+            "p1_score", tx->roster ? json_null() : json_real(tx->p1_score),
+            "p2_id", tx->attested || tx->roster ? json_null() : json_string(p2_str),
+            "p2_score", tx->attested || tx->roster ? json_null() : json_real(tx->p2_score),
+            "index", tx->index,
+            "prev_hash", tx->prev_hash);
+        if (obj == NULL)
+        {
+            json_decref(chain);
+            return -1;
+        }
+        /* Additive to schema 1, omitted when absent (R+D.md §12.8) -- the
+         * same rule as the canonical bytes, so an untagged entry's document
+         * is byte-for-byte what it was before this field. A verifier
+         * recomputing entry hashes over a TAGGED entry needs them, or its
+         * inclusion proofs miss the root. Mirrors Python evidence_to_dict. */
+        if (tx->p1_channel[0] != '\0')
+            json_object_set_new(obj, "p1_channel", json_string(tx->p1_channel));
+        if (tx->p2_channel[0] != '\0')
+            json_object_set_new(obj, "p2_channel", json_string(tx->p2_channel));
+        /* A verifier-attested entry, additive and omitted otherwise; its
+         * certificate travels beside it. Mirrors Python evidence_to_dict. */
+        if (tx->attested)
+        {
+            char sstr[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(tx->subject_uuid, sstr);
+            json_object_set_new(obj, "attested", json_true());
+            json_object_set_new(obj, "subject_id", json_string(sstr));
+            json_object_set_new(obj, "evidence_digest", json_string(tx->evidence_digest));
+            if (tx->attest_scope[0] != '\0')
+                json_object_set_new(obj, "attest_scope", json_string(tx->attest_scope));
+            const char *cert = tx_history_attest_cert(hist, tx->task_uuid);
+            json_t *cj = cert != NULL ? json_loads(cert, 0, NULL) : NULL;
+            if (json_is_object(cj) && json_object_size(cj) > 0)
+                json_object_set_new(obj, "attest_sigs", cj);
+            else
+                json_decref(cj);
+        }
+        /* Commit certificates of ordinary halves, additive and omitted when
+         * absent. Mirrors Python evidence_to_dict. */
+        json_t *commit_sigs = _commit_sigs_json(hist, tx);
+        if (commit_sigs != NULL)
+            json_object_set_new(obj, "commit_sigs", commit_sigs);
+        /* A placement certificate, on the last entry of each placement:
+         * additive, omitted otherwise. Mirrors Python evidence_to_dict. */
+        {
+            char ptask[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(tx->task_uuid, ptask);
+            _place_cert_to_json(hist, ptask, obj);
+        }
+        _tx_roster_to_json(hist, tx, obj);
+        json_array_append_new(chain, obj);
+    }
+
+    json_t *ck_json = json_null();
+    if (ckpt != NULL && ckpt->present)
+    {
+        json_t *sigs = json_object();
+        if (sigs == NULL)
+        {
+            json_decref(chain);
+            json_decref(ck_json);
+            return EXCEPTION(ENOMEM);
+        }
+        map_key_t key = NULL;
+        data_t *val = NULL;
+        map_entries_for_each((map_t *)&ckpt->sigs, key, val)
+        {
+            string_t sig = NULL;
+            if (data_string_ptr(val, &sig) == 0 && sig != NULL)
+                json_object_set_new(sigs, key, json_string(sig));
+        }
+        map_end_for_each
+        json_decref(ck_json);
+        ck_json = json_pack("{s:s, s:s, s:I, s:i, s:i, s:s, s:o}",
+            "proposer_uuid", ckpt->proposer_uuid,
+            "root", ckpt->root,
+            "epoch", (json_int_t)ckpt->epoch,
+            "first_index", ckpt->first_index,
+            "count", ckpt->count,
+            /* Which chain the checkpoint covers ("" == primary). Part of the
+             * signed designation when non-empty, so it has to travel with the
+             * signatures or a restart could not re-derive the bytes they were
+             * made over. Additive to schema 1: a reader predating child chains
+             * ignores it, and this reader defaults it to "". */
+            "group_uuid", ckpt->group_uuid,
+            "sigs", sigs);
+        if (ck_json == NULL)
+        {
+            json_decref(chain);
+            json_decref(sigs);
+            return -1;
+        }
+    }
+
+    json_t *doc = json_pack("{s:s, s:o, s:o}",
+                            "schema", REP_EVIDENCE_SCHEMA,
+                            "chain", chain,
+                            "checkpoint", ck_json);
+    if (doc == NULL)
+    {
+        json_decref(chain);
+        json_decref(ck_json);
+        return -1;
+    }
+    *out = doc;
+    return 0;
+}
+
+int reputation_evidence_from_json(const json_t *doc, tx_history_t *hist_out,
+                                  rep_checkpoint_t *ckpt_out)
+{
+    if (doc == NULL || !json_is_object(doc) || hist_out == NULL)
+        return -1;
+    const char *schema = json_string_value(json_object_get((json_t *)doc, "schema"));
+    if (schema == NULL || strcmp(schema, REP_EVIDENCE_SCHEMA) != 0)
+        return -1;   /* pinned: refuse rather than misparse */
+    json_t *chain = json_object_get((json_t *)doc, "chain");
+    if (!json_is_array(chain))
+        return -1;
+
+    /* Stage the entries before touching hist_out: the linkage check below
+     * must be able to reject the whole document, and a half-loaded history
+     * would be worse than none. */
+    int n = (int)json_array_size(chain);
+    if (n > MAX_CHAIN_LEN)
+        n = MAX_CHAIN_LEN;   /* the tail is what the checkpoint covers */
+    transaction_t *staged = calloc(n > 0 ? (size_t)n : 1, sizeof(transaction_t));
+    if (staged == NULL)
+        return EXCEPTION(ENOMEM);
+    int staged_n = 0;
+    size_t idx;
+    json_t *obj;
+    json_array_foreach(chain, idx, obj)
+    {
+        if (staged_n >= n)
+            break;
+        if (!json_is_object(obj))
+        {
+            free(staged);
+            return -1;
+        }
+        json_t *index_j = json_object_get(obj, "index");
+        if (!json_is_integer(index_j))
+        {
+            free(staged);
+            return -1;   /* no index == not a committed entry */
+        }
+        const char *task_str = json_string_value(json_object_get(obj, "task_id"));
+        const char *p1_str = json_string_value(json_object_get(obj, "p1_id"));
+        const char *p2_str = json_string_value(json_object_get(obj, "p2_id"));
+        bool attested = json_is_true(json_object_get(obj, "attested"));
+        transaction_t *tx = &staged[staged_n];
+        memset(tx, 0, sizeof(*tx));
+        if (task_str != NULL && json_object_get(obj, "roster_op") != NULL)
+        {
+            /* A roster entry: no parties, its member list kept beside it. */
+            const char *ph = json_string_value(json_object_get(obj, "prev_hash"));
+            if (uuid_parse(task_str, tx->task_uuid) != 0)
+            {
+                free(staged);
+                return -1;
+            }
+            _tx_roster_from_json(obj, tx, hist_out);
+            if (!tx->roster)
+            {
+                free(staged);
+                return -1;
+            }
+            tx->index = (int)json_integer_value(index_j);
+            if (ph != NULL)
+                at_strlcpy(tx->prev_hash, ph, sizeof(tx->prev_hash));
+            staged_n++;
+            continue;
+        }
+        if (task_str == NULL || p1_str == NULL || (p2_str == NULL && !attested))
+        {
+            free(staged);
+            return -1;   /* an entry no counterparty agreed to is not evidence */
+        }
+        if (uuid_parse(task_str, tx->task_uuid) != 0
+            || uuid_parse(p1_str, tx->p1_uuid) != 0
+            || (!attested && uuid_parse(p2_str, tx->p2_uuid) != 0))
+        {
+            free(staged);
+            return -1;
+        }
         tx->p1_score = json_number_value(json_object_get(obj, "p1_score"));
-        tx->p1_set = json_boolean_value(json_object_get(obj, "p1_set"));
-        uuid_parse(p2_str, tx->p2_uuid);
         tx->p2_score = json_number_value(json_object_get(obj, "p2_score"));
-        tx->p2_set = json_boolean_value(json_object_get(obj, "p2_set"));
-        tx->index = (int)json_integer_value(json_object_get(obj, "index"));
-        /* Preserve the wire prev_hash (consistent with preserving the wire
-         * index above); the verified segment is self-consistent, so the
-         * loaded chain's links hold. */
+        /* The set flags are not on the wire: Python's document omits them, and
+         * an entry naming both counterparties with an index IS bilateral by
+         * construction. Deriving them beats trusting a field that could
+         * disagree with the ids beside it. */
+        tx->p1_set = true;
+        tx->p2_set = !attested;
+        tx->index = (int)json_integer_value(index_j);
+        _tx_channels_from_json(obj, tx);
+        if (attested)
+        {
+            /* An attested entry that does not parse is refused rather than
+             * loaded as something else: its hash would no longer reproduce. */
+            _tx_attested_from_json_key(obj, tx, "subject_id");
+            if (!tx->attested)
+            {
+                free(staged);
+                return -1;
+            }
+        }
         const char *ph = json_string_value(json_object_get(obj, "prev_hash"));
         tx->prev_hash[0] = '\0';
         if (ph != NULL)
@@ -936,49 +3235,216 @@ int tx_history_era_from_json(tx_history_t *hist, const json_t *arr)
             strncpy(tx->prev_hash, ph, TX_HASH_HEX_LEN);
             tx->prev_hash[TX_HASH_HEX_LEN] = '\0';
         }
-
-        /* Update maps */
-        char task_key[UUID_STRING_LEN + 1];
-        uuid_unparse_lower(tx->task_uuid, task_key);
-        data_t *idx_d = integer_data(hist->chain_len);
-        map_set(&hist->task_map, task_key, idx_d);
-
-        /* Loaded entries from era_to_json are always bilateral
-         * (era_to_json filters unilateral out), but tolerate
-         * malformed input that drops the *_set flags. Only
-         * bilateral entries increment committed_count and feed
-         * next_index. Matches Python catch-up flow where era()
-         * + update() pair only commits whole pairs. */
-        if (tx->p1_set && tx->p2_set)
-        {
-            if (hist->committed_count == 0 ||
-                tx->index < hist->first_index)
-                hist->first_index = tx->index;
-            hist->committed_count++;
-            if (tx->index > max_loaded_index)
-                max_loaded_index = tx->index;
-        }
-
-        hist->chain_len++;
+        staged_n++;
     }
-    /* Seed next_index past the largest absolute index just loaded
-     * so subsequent local commits don't collide. Mirrors Python's
-     * `max_existing + 1` seed in TransactionHistory.__init__
-     * (reputation.py:130-133). */
-    if (max_loaded_index + 1 > hist->next_index)
-        hist->next_index = max_loaded_index + 1;
-    /* Phase 1: resume the link from the loaded tail so subsequent local
-     * commits chain cleanly. The last committed slot is the head. */
-    hist->head_hash[0] = '\0';
-    for (int i = hist->chain_len - 1; i >= 0; i--)
+
+    /* Index order first: a snapshot written before _move_to_commit_position
+     * lists committed entries in arrival order, which fails the link check
+     * below for a chain that is sound. Stable insertion sort, n is bounded. */
+    for (int i = 1; i < staged_n; i++)
     {
-        if (hist->chain[i].p1_set && hist->chain[i].p2_set)
+        transaction_t cur = staged[i];
+        int j = i;
+        while (j > 0 && staged[j - 1].index > cur.index)
         {
-            transaction_entry_hash(&hist->chain[i], hist->head_hash);
-            break;
+            staged[j] = staged[j - 1];
+            j--;
+        }
+        staged[j] = cur;
+    }
+
+    /* Hash-linkage before anything is adopted. A broken link means the file
+     * was altered or truncated; the caller degrades to clamped restoration. */
+    if (!tx_verify_chain_links(staged, staged_n))
+    {
+        free(staged);
+        return -1;
+    }
+
+    for (int i = 0; i < staged_n; i++)
+        _history_load_committed(hist_out, &staged[i]);
+    free(staged);
+
+    /* Attested entries keep their quorum certificates across a restart, and
+     * ordinary halves their commit certificates. */
+    json_array_foreach(chain, idx, obj)
+    {
+        _place_cert_from_json(hist_out, obj, "task_id");
+        if (!json_is_true(json_object_get(obj, "attested")))
+        {
+            _commit_sigs_from_json(hist_out, obj, "task_id");
+            continue;
+        }
+        json_t *sigs = json_object_get(obj, "attest_sigs");
+        const char *task_str = json_string_value(json_object_get(obj, "task_id"));
+        uuid_t tk;
+        if (!json_is_object(sigs) || task_str == NULL || uuid_parse(task_str, tk) != 0)
+            continue;
+        if (_slot_of_task(hist_out, tk) < 0)
+            continue;
+        char *text = json_dumps(sigs, JSON_COMPACT | JSON_SORT_KEYS);
+        if (text != NULL)
+        {
+            map_set(&hist_out->attest_certs, (map_key_t)task_str,
+                    string_data(text, strlen(text)));
+            free(text);
+        }
+    }
+
+    if (ckpt_out != NULL)
+    {
+        json_t *ck = json_object_get((json_t *)doc, "checkpoint");
+        if (json_is_object(ck))
+        {
+            AT_JSON_STRING(ck, "proposer_uuid", ckpt_out->proposer_uuid);
+            AT_JSON_STRING(ck, "root", ckpt_out->root);
+            AT_JSON_STRING(ck, "group_uuid", ckpt_out->group_uuid);
+            ckpt_out->epoch = (int64_t)json_integer_value(json_object_get(ck, "epoch"));
+            ckpt_out->first_index = (int)json_integer_value(json_object_get(ck, "first_index"));
+            ckpt_out->count = (int)json_integer_value(json_object_get(ck, "count"));
+            json_t *sigs = json_object_get(ck, "sigs");
+            if (json_is_object(sigs))
+            {
+                const char *voter;
+                json_t *sig;
+                json_object_foreach(sigs, voter, sig)
+                {
+                    const char *hex = json_string_value(sig);
+                    if (hex == NULL)
+                        continue;
+                    map_set(&ckpt_out->sigs, (map_key_t)voter,
+                            string_data((string_t)hex, strlen(hex)));
+                }
+            }
+            ckpt_out->present = (ckpt_out->proposer_uuid[0] != '\0');
         }
     }
     return 0;
+}
+
+int reputation_checkpoint_window_root(const tx_history_t *hist,
+                                      const rep_checkpoint_t *ckpt,
+                                      char out[TX_HASH_HEX_LEN + 1])
+{
+    if (hist == NULL || ckpt == NULL || out == NULL || ckpt->count < 0)
+        return -1;
+    char leaves[MAX_CHAIN_LEN][TX_HASH_HEX_LEN + 1];
+    int n = 0;
+    int lo = ckpt->first_index;
+    int hi = ckpt->first_index + ckpt->count;
+    for (int i = 0; i < hist->chain_len && n < MAX_CHAIN_LEN; i++)
+    {
+        const transaction_t *tx = &hist->chain[i];
+        if (tx->index < lo || tx->index >= hi)
+            continue;
+        transaction_entry_hash(tx, leaves[n]);
+        n++;
+    }
+    /* Exactly `count` entries or nothing: a short window cannot reproduce the
+     * root, and crediting a partial one would attest entries nobody signed. */
+    if (n != ckpt->count)
+        return -1;
+    mth_range(leaves, 0, n, out);
+    return 0;
+}
+
+int reputation_evidence_ceilings(const tx_history_t *hist,
+                                 const rep_checkpoint_t *ckpt,
+                                 const char *self_uuid_str, map_t *out)
+{
+    if (hist == NULL || ckpt == NULL || out == NULL)
+        return -1;
+    map_t sums, counts;
+    if (map_init(&sums) != 0) return EXCEPTION(ENOMEM);
+    if (map_init(&counts) != 0)
+    {
+        map_free(&sums);
+        return EXCEPTION(ENOMEM);
+    }
+    int lo = ckpt->first_index;
+    int hi = ckpt->first_index + ckpt->count;
+    for (int i = 0; i < hist->chain_len; i++)
+    {
+        const transaction_t *tx = &hist->chain[i];
+        if (tx->index < lo || tx->index >= hi)
+            continue;
+        if (!tx_is_committed(tx))
+            continue;
+        /* A peer's score in a tx is the COUNTERPARTY's side of it — the same
+         * direction reputation_consensus folds. An attested entry is about its
+         * subject only, its certificate standing in for the counterparty. */
+        const uuid_t *who[2] = { &tx->p1_uuid, &tx->p2_uuid };
+        double score[2] = { tx->p2_score, tx->p1_score };
+        int sides = 2;
+        if (tx->attested)
+        {
+            who[0] = &tx->subject_uuid;
+            score[0] = tx->p1_score;
+            sides = 1;
+        }
+        for (int s = 0; s < sides; s++)
+        {
+            char key[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(*who[s], key);
+            if (self_uuid_str != NULL && strcmp(key, self_uuid_str) == 0)
+                continue;
+            double prev_sum = 0.0;
+            int prev_count = 0;
+            data_t *d = NULL;
+            if (map_get(&sums, (map_key_t)key, &d) == 0 && d != NULL)
+                data_floating_pt_dbl(d, &prev_sum);
+            if (map_get(&counts, (map_key_t)key, &d) == 0 && d != NULL)
+                data_integer(d, &prev_count);
+            map_set(&sums, (map_key_t)key,
+                    floating_pt_dbl_data(prev_sum + score[s]));
+            map_set(&counts, (map_key_t)key, integer_data(prev_count + 1));
+        }
+    }
+
+    double k = REP_RESTORE_SHRINKAGE_K;
+    double neutral = PREREP_NEUTRAL;
+    map_key_t key = NULL;
+    data_t *val = NULL;
+    map_entries_for_each(&counts, key, val)
+    {
+        int count = 0;
+        if (data_integer(val, &count) != 0 || count < REP_RESTORE_EVIDENCE_MIN_TX)
+            continue;
+        double sum = 0.0;
+        data_t *sd = NULL;
+        if (map_get(&sums, key, &sd) != 0 || sd == NULL
+            || data_floating_pt_dbl(sd, &sum) != 0)
+            continue;
+        double observed = sum / (double)count;
+        double ceiling = ((double)count * observed + k * neutral)
+                         / ((double)count + k);
+        if (ceiling < 0.0) ceiling = 0.0;
+        if (ceiling > 1.0) ceiling = 1.0;
+        map_set(out, key, floating_pt_dbl_data(ceiling));
+    }
+    map_end_for_each
+
+    map_free(&sums);
+    map_free(&counts);
+    return 0;
+}
+
+/****************************
+ * Staleness decay
+ ****************************/
+
+double reputation_decayed_score(double score, double idle_seconds)
+{
+    double asymptote = REP_DECAY_ASYMPTOTE;
+    /* ASYMMETRIC: absence never rehabilitates a distrusted node. */
+    if (score <= asymptote)
+        return score;
+    if (idle_seconds <= REP_DECAY_ONSET)
+        return score;
+    double elapsed = idle_seconds - REP_DECAY_ONSET;
+    double factor = pow(0.5, elapsed / REP_DECAY_HALF_LIFE);
+    double decayed = asymptote + (score - asymptote) * factor;
+    return decayed < asymptote ? asymptote : decayed;
 }
 
 /****************************
@@ -1072,10 +3538,18 @@ double reputation_env_double(const char *name, double dflt)
  ****************************/
 
 /**
- * Pure socially-weighted average:
- *   For each transaction involving peer, find the counterparty.
- *   Sum = counterparty_score_in_tx * reputation[counterparty]
- *   Return sum / count
+ * Pure socially-weighted average (doc/architecture/trust-tiers.md §5):
+ *   For each transaction involving peer, the counterparty's score for it,
+ *   weighted by the counterparty's reputation and the task's weight.
+ *   Return sum(score * rep * w) / sum(rep * w).
+ *
+ * The divisor carries the reputation too. It used to be sum(w) alone, which
+ * multiplied every score by its reporter's reputation instead of averaging:
+ * fed back through the rescore sweep, a group of well-behaved peers decayed
+ * toward a fixed point below tier 1 once they shared each other's evidence
+ * (moderation cohort mod-2520518, 2026-09-23: 0.90 transactions, scores
+ * settling at 0.43). Reporters with no reputation contribute nothing; if none
+ * has any, the peer is at the neutral prior.
  */
 double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
                        const uuid_t peer_uuid,
@@ -1089,28 +3563,18 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
         return PREREP_NEUTRAL;  /* Default neutral reputation */
 
     double sum = 0.0;
-    int total_weight = 0;
+    double total_weight = 0.0;
 
     for (int i = 0; i < count; i++)
     {
         const transaction_t *tx = &txns[i];
-        if (!tx->p1_set || !tx->p2_set)
-            continue;
-
-        /* Determine which side is our peer, which is counterparty */
+        /* Which side is our peer, which is the counterparty. An attested
+         * entry counts like any third-party observation, its verifier
+         * standing in for the counterparty (transaction_score_about). */
         uuid_t counterparty;
         double counterparty_score;
-
-        if (uuid_compare(tx->p1_uuid, peer_uuid) == 0)
-        {
-            uuid_copy(counterparty, tx->p2_uuid);
-            counterparty_score = tx->p2_score;
-        }
-        else
-        {
-            uuid_copy(counterparty, tx->p1_uuid);
-            counterparty_score = tx->p1_score;
-        }
+        if (!transaction_score_about(tx, peer_uuid, &counterparty_score, counterparty))
+            continue;
 
         /* Weight by counterparty's reputation */
         double cp_rep = PREREP_NEUTRAL;
@@ -1134,13 +3598,13 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
         }
 
         sum += counterparty_score * cp_rep * (double)w;
-        total_weight += w;
+        total_weight += cp_rep * (double)w;
     }
 
-    if (total_weight == 0)
+    if (total_weight <= 0.0)
         return PREREP_NEUTRAL;
 
-    return sum / (double)total_weight;
+    return sum / total_weight;
 }
 
 /**
@@ -1180,22 +3644,10 @@ static double reputation_prereputation_prior(const tx_history_t *hist,
     for (int i = 0; i < count; i++)
     {
         const transaction_t *tx = &txns[i];
-        if (!tx->p1_set || !tx->p2_set)
-            continue;
-
-        bool peer_is_p1 = (uuid_compare(tx->p1_uuid, peer_uuid) == 0);
-        bool peer_is_p2 = (uuid_compare(tx->p2_uuid, peer_uuid) == 0);
         double about_peer;
-        const unsigned char *counterparty;
-        if (peer_is_p1) {
-            about_peer = tx->p2_score;
-            counterparty = tx->p2_uuid;
-        } else if (peer_is_p2) {
-            about_peer = tx->p1_score;
-            counterparty = tx->p1_uuid;
-        } else {
+        uuid_t counterparty;
+        if (!transaction_score_about(tx, peer_uuid, &about_peer, counterparty))
             continue;
-        }
         /* A bilateral-with-us tx is CTFT's job, not the cold-start prior. */
         if (uuid_compare(counterparty, self_uuid) == 0)
             continue;
@@ -1237,7 +3689,7 @@ static double reputation_prereputation_prior(const tx_history_t *hist,
  * in [0.0, 1.0], not the binary 0.0/1.0 the previous implementation
  * returned from the last direct tx alone.
  *
- *   - No bilateral history with us → reputation_prereputation_prior (§2.4),
+ *   - No bilateral history with us → reputation_prereputation_prior (doc/architecture/networking.md),
  *       which is PREREP_NEUTRAL (0.2) when the chain knows nothing of the peer
  *   - peer defected last AND my standing is poor → max(0.51, peer_standing)
  *   - peer defected last AND my standing is good  → min(0.49, peer_standing)
@@ -1284,7 +3736,7 @@ double reputation_contrite_tft(const tx_history_t *hist, const reputations_t *re
 
     if (n < 1)
         /* Cold-start: no bilateral history WITH us. Fall back to a
-         * transaction-memory prior rather than a flat neutral (§2.4). */
+         * transaction-memory prior rather than a flat neutral (doc/architecture/networking.md). */
         return reputation_prereputation_prior(hist, reps, self_uuid, peer_uuid);
 
     double peer_standing = peer_sum / (double)n;
@@ -1355,14 +3807,8 @@ double reputation_consensus(const tx_history_t *hist, const uuid_t peer_uuid,
     for (int i = 0; i < count; i++)
     {
         const transaction_t *tx = &txns[i];
-        if (!tx->p1_set || !tx->p2_set)
-            continue;
         double cp_score;
-        if (uuid_compare(tx->p1_uuid, peer_uuid) == 0)
-            cp_score = tx->p2_score;
-        else if (uuid_compare(tx->p2_uuid, peer_uuid) == 0)
-            cp_score = tx->p1_score;
-        else
+        if (!transaction_score_about(tx, peer_uuid, &cp_score, NULL))
             continue;
         /* Per-task transaction_weight: a tier-w transaction moves the
          * EMA exactly as far as w tier-1 transactions would. Mirrors
@@ -1433,14 +3879,8 @@ int reputation_consensus_by_tier(const tx_history_t *hist, const uuid_t peer_uui
     for (int i = 0; i < count; i++)
     {
         const transaction_t *tx = &txns[i];
-        if (!tx->p1_set || !tx->p2_set)
-            continue;
         double cp_score;
-        if (uuid_compare(tx->p1_uuid, peer_uuid) == 0)
-            cp_score = tx->p2_score;
-        else if (uuid_compare(tx->p2_uuid, peer_uuid) == 0)
-            cp_score = tx->p1_score;
-        else
+        if (!transaction_score_about(tx, peer_uuid, &cp_score, NULL))
             continue;
         /* dedup by task: by_peer can list a tx under both p1 and p2. */
         bool dup = false;

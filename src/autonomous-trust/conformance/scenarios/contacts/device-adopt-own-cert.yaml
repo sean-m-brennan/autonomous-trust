@@ -1,0 +1,48 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: device-adopt-own-cert
+description: A contact learns its operator key from a cert naming its own first device.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: device
+    mode: adopt
+    contact:
+      identity:
+        typename: identity
+        uuid: dddddddd-0000-4000-8000-000000000051
+        address: ''
+        nickname: alice-phone
+        signature:
+          hex_seed: c050c5637a44fa8629fff3cccce2300cb362a63d99d95fc54145266f4332445a
+        encryptor:
+          hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+      petname: alice-phone
+      verified: true
+      provenance: token
+      trust_seed: 0.3
+      rendezvous: []
+      nonce: ''
+      added_at: 1.0
+      verified_at: 2.0
+    cert:
+      body: '{"v":1,"typename":"at-device-cert","operator":"17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce","uuid":"dddddddd-0000-4000-8000-000000000051","key":"c050c5637a44fa8629fff3cccce2300cb362a63d99d95fc54145266f4332445a","issued_at":1790000000}'
+      sig: 8b890079f578a6b9f880f72d818e76f2eef250a7877ea58b7a128f7582861febc1e73133b61c247d9e976aaa67348033a65e1d2b4b27074af5178658fb82c40c
+steps:
+- id: 1
+  from: host
+  to: host
+  function: device
+  description: 'trigger: device adopt'
+expected_state:
+  host:
+    device_status: ok
+    operator_key: 17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce

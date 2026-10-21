@@ -1,0 +1,41 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: catchup-roster-anchor-newcomer-adopts
+byte_pinning: false
+description: |
+    Membership recorded in the chain (doc/architecture/reputation.md, "Who is
+    in the group"). bob is new to the group {alice, carol, dave} and knows no
+    roster of its chain, so he anchors on the segment's latest roster entry: the
+    add of bob himself. It differs from the group as identity shows it to him
+    only by himself, lists the keys identity holds, and alice and carol -- a
+    majority of the roster before it -- signed it. bob adopts the history, the
+    genesis and the task before it taken by their hash links.
+
+participants:
+  - id: alice
+    role: provider
+  - id: bob
+    role: consumer
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  roster: {}          # an unfounded chain: no roster in force
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: latest update
+    payload:
+      chain:
+        - {roster: genesis, members: [alice, carol, dave], placed_by: [alice, carol, dave]}
+        - {task: a, p1: 0.7, p2: 0.5, batch: 1, placed_by: [alice, carol], certified_by: [alice, carol, dave]}
+        - {roster: add, member: bob, placed_by: [alice, carol]}
+
+expected_state:
+  bob:
+    committed_tx_count: 3

@@ -1,0 +1,40 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: sync-older-tombstone-changes-nothing
+description: A tombstone older than ours is not news.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: sync
+    now: 1800000000.0
+    store:
+      typename: contacts
+      version: 1
+      contacts: {}
+      tombstones:
+        eeeeeeee-0000-4000-8000-000000000001: 1950.0
+    payload:
+      v: 1
+      typename: at-contacts-sync
+      contacts: {}
+      tombstones:
+        eeeeeeee-0000-4000-8000-000000000001: 1900.0
+steps:
+- id: 1
+  from: host
+  to: host
+  function: sync
+  description: 'trigger: sync'
+expected_state:
+  host:
+    changes: []
+    tombstones:
+      eeeeeeee-0000-4000-8000-000000000001: 1950.0

@@ -33,6 +33,17 @@ CFG_DIR="$CONFIG_DIR/cfg"
 ENV_NAME="autonomous_trust"
 MINIFORGE_HOME="$HOME/.miniforge3"
 
+# Pinned conda toolchain (config/cfg/toolchain-pins.env). MINIFORGE_VERSION selects the
+# installer release below; the file also carries the container-image pin the
+# Dockerfiles use. Fall back to `latest` only if the file is missing, and say so
+# -- a floating installer is exactly the drift that file exists to prevent.
+TOOLCHAIN_PINS="$CFG_DIR/toolchain-pins.env"
+if [ -f "$TOOLCHAIN_PINS" ]; then
+    # shellcheck source=../config/cfg/toolchain-pins.env
+    source "$TOOLCHAIN_PINS"
+fi
+MINIFORGE_VERSION="${MINIFORGE_VERSION:-}"
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -66,9 +77,17 @@ install_miniforge() {
         return 0
     fi
 
-    info "Installing Miniforge to $MINIFORGE_HOME ..."
+    local url
+    if [ -n "$MINIFORGE_VERSION" ]; then
+        info "Installing Miniforge $MINIFORGE_VERSION (pinned) to $MINIFORGE_HOME ..."
+        url="https://github.com/conda-forge/miniforge/releases/download/${MINIFORGE_VERSION}/Miniforge3-${PLATFORM}-${ARCH}.sh"
+    else
+        warn "No MINIFORGE_VERSION in $TOOLCHAIN_PINS -- falling back to the" \
+             "floating latest release (want config/cfg/toolchain-pins.env)"
+        info "Installing Miniforge to $MINIFORGE_HOME ..."
+        url="https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-${PLATFORM}-${ARCH}.sh"
+    fi
     local installer="/tmp/miniforge-installer.sh"
-    local url="https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-${PLATFORM}-${ARCH}.sh"
     curl -fsSL "$url" -o "$installer"
     bash "$installer" -b -p "$MINIFORGE_HOME"
     rm -f "$installer"
@@ -113,10 +132,10 @@ create_conda_env() {
     # Platform-specific compiler packages
     local platform_yaml
     case "$PLATFORM-$ARCH" in
-        Linux-x86_64)   platform_yaml="$CFG_DIR/linux-64/platform.yaml" ;;
-        Linux-aarch64)  platform_yaml="$CFG_DIR/linux-64/platform.yaml" ;;
-        MacOSX-x86_64)  platform_yaml="$CFG_DIR/osx-64/platform.yaml" ;;
-        MacOSX-arm64)   platform_yaml="$CFG_DIR/osx-64/platform.yaml" ;;
+        Linux-x86_64)   platform_yaml="$CFG_DIR/linux-64/platform.yml" ;;
+        Linux-aarch64)  platform_yaml="$CFG_DIR/linux-64/platform.yml" ;;
+        MacOSX-x86_64)  platform_yaml="$CFG_DIR/osx-64/platform.yml" ;;
+        MacOSX-arm64)   platform_yaml="$CFG_DIR/osx-64/platform.yml" ;;
     esac
     if [ -n "${platform_yaml:-}" ] && [ -f "$platform_yaml" ]; then
         info "Installing platform compiler packages ..."
@@ -127,12 +146,41 @@ create_conda_env() {
 }
 
 update_conda_env() {
-    conda update -n base -c conda-forge conda
+    # No `conda update -n base conda` here: it floats base conda to whatever
+    # conda-forge published today, which defeats the pinned installer above and
+    # is one of the drifts that broke a working build. To move conda, move the pin in
+    # config/cfg/toolchain-pins.env and re-run the install path.
     activate_conda
     info "Updating conda environment '$ENV_NAME' ..."
-    conda env update -n "$ENV_NAME" --file "$REPO_DIR/environment.yml" --prune
+    # NO --prune. This env is described by TWO spec files, and prune deletes
+    # everything the file in hand does not name -- so pruning against
+    # environment.yml removes the whole dev toolchain that devel_environ.yml
+    # installs (gxx_linux-64, clang, poetry, pytest, ...). Two ways that bites,
+    # and it bit both on 2026-09-01, breaking the autonomous-trust-full-devel
+    # image build:
+    #   * `conda env update` runs the file's `pip:` block with -U in the SAME
+    #     invocation, after the prune. This runs inside the activated env, and
+    #     gxx_linux-64's activation script has already exported
+    #     CXX=x86_64-conda-linux-gnu-c++ -- so once the prune deletes that
+    #     package, a pip dep that has to compile (pykcs11 has no Linux wheel,
+    #     ever) invokes a compiler that is no longer there: "No such file or
+    #     directory: 'x86_64-conda-linux-gnu-c++'". The env is left with
+    #     dangling deactivate.d scripts, which is the tell.
+    #   * the failure aborts the run before the devel_environ.yml pass below
+    #     could put the toolchain back -- and an image that ships only
+    #     environment.yml (src/Dockerfile-devel did) never had that pass
+    #     available anyway, so the removal was permanent: a devel image with no
+    #     compiler, no poetry and no pytest.
+    # Losing prune costs only that a package dropped from a spec file lingers
+    # in an existing env until the env is recreated (the no-argument path,
+    # which runs `conda env create` against both files).
+    conda env update -n "$ENV_NAME" --file "$REPO_DIR/environment.yml"
     if [ -f "$CFG_DIR/devel_environ.yml" ]; then
         conda env update -n "$ENV_NAME" --file "$CFG_DIR/devel_environ.yml"
+    else
+        # Not fatal, but say so: the dev toolchain is what this env is FOR, and
+        # a silent skip is how an image ends up without a compiler.
+        warn "devel_environ.yml not found at $CFG_DIR — dev toolchain not updated"
     fi
     info "Environment updated"
 }

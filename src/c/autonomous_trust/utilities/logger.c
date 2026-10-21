@@ -35,7 +35,7 @@
 #define ERR_INFO_FMT "%s (%s)"
 #define ERR_INFO_LEN (1024 + 64 + 3)
 
-#define ORIGIN_FMT "\tfrom %s, line %ld\n"
+#define ORIGIN_FMT "\tfrom %s, line %zu\n"
 #define ORIGIN_LEN (MAX_FILENAME + MAX_INT_STR + 14)
 
 extern _Thread_local exception_t _exception;
@@ -214,7 +214,7 @@ void _vlogging(logger_t *logger_ptr, log_level_t level, const char *srcfile, con
     else
         fprintf(logger->file, "%-10s", log_level_strings[level]);
 
-    fprintf(logger->file, "%s: line %lu: ", srcfile, line);
+    fprintf(logger->file, "%s: line %zu: ", srcfile, line);
 
     vfprintf(logger->file, fmt, argp);
 }
@@ -227,6 +227,37 @@ void _logging(logger_t *logger_ptr, log_level_t level, const char *srcfile, cons
     va_end(argp);
 }
 
+
+int error_table_append(int num, const char *errstr, const char *description)
+{
+    if (errstr == NULL)
+    {
+        fprintf(stderr, "error_table_append: refusing an unnamed error\n");
+        return -1;
+    }
+    for (size_t i = 0; i < error_table_size; i++)
+        if (error_table[i].errnum == num)
+        {
+            /* Declared for the generator and defined for an extension build
+             * alike: the same error twice is one error. */
+            if (strcmp(error_table[i].errstr, errstr) == 0)
+                return 0;
+            fprintf(stderr, "error_table_append: refusing %s: %d is already %s\n",
+                    errstr, num, error_table[i].errstr);
+            return -1;
+        }
+    if (error_table_size >= ERROR_TABLE_MAX)
+    {
+        fprintf(stderr, "error_table_append: refusing %s: table full (%d)\n",
+                errstr, ERROR_TABLE_MAX);
+        return -1;
+    }
+    error_table[error_table_size].errnum = num;
+    error_table[error_table_size].errstr = errstr;
+    error_table[error_table_size].description = description;
+    error_table_size++;
+    return 0;
+}
 
 /*@
   requires \valid_read(error_table + (0 .. error_table_size - 1));

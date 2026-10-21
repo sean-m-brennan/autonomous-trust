@@ -97,6 +97,35 @@ typedef struct {
     uuid_t task_uuid;
     map_t results;     /* uuid_str -> data_t* (result blob) */
     int expected;
+    /** What WE asked for, kept so the returned result can be judged against
+     *  it. Python's TaskTracker subclasses Task and so keeps the whole
+     *  `parameters` for free; this is the same fact, narrowed to the two
+     *  pieces the requestor-side scorer needs.
+     *
+     *  It must be our own record and never anything read back off the
+     *  responder's reply: a known-answer check that trusts the reply's account
+     *  of the challenge verifies nothing, because a peer that computed the
+     *  wrong answer reports the challenge its answer would have satisfied
+     *  (result 99 with a claimed nonce of 98 is a perfect increment). Mirrors
+     *  Python TaskResult.attach_requested_parameters. See R+D.md §12.7. */
+    char capability_name[CAP_NAMELEN + 1];
+    char kwargs_json[TASK_KWARGS_LEN + 1];
+    /** When the request was recorded, on the wall clock (seconds; 0 = never).
+     *  Opens at.time-attest's window: an honest answer was read between this
+     *  and the scoring instant (ISSUES §2.53). */
+    double issued_at;
+    /** The peers the announce invited (uuid_str -> 1), and whether the announce
+     *  recorded them. Once known, a result from anyone else is not scored:
+     *  scoring per executor (ISSUES §2.50) would otherwise let a peer that
+     *  learned a task id earn a full bilateral transaction (§2.8). A tracker
+     *  built without an announce (unit tests) leaves it unknown. */
+    map_t invited;
+    bool  invited_known;
+    /** The deadline sweep's record: status requests sent since the deadline
+     *  last moved, and when the latest went out (wall clock, seconds). A live
+     *  answer resets both; NEG_STATUS_ASKS unanswered rounds drop the tracker. */
+    int    status_asks;
+    double status_asked_at;
 } task_tracker_t;
 
 /*@
@@ -142,6 +171,33 @@ int  task_tracker_set_result(task_tracker_t *tracker, const uuid_t peer_uuid, co
   ensures \result >= 0;
 */
 int  task_tracker_result_count(const task_tracker_t *tracker);
+
+/** Record what the requestor asked for on this tracker: the capability name
+ *  and the compact-JSON keyword arguments (either may be NULL, which clears
+ *  that field). Separate from @ref task_tracker_init so the existing
+ *  two-and-three-argument creators keep their signatures; call it from the
+ *  announce path, where the task is still in hand. */
+/*@
+  requires \valid(tracker);
+  assigns tracker->capability_name[0 .. CAP_NAMELEN],
+          tracker->kwargs_json[0 .. TASK_KWARGS_LEN];
+  ensures \result == 0;
+*/
+int  task_tracker_set_request(task_tracker_t *tracker,
+                              const char *capability_name,
+                              const char *kwargs_json);
+
+/** Record that @p peer_uuid was invited to this tracker's task; from the first
+ *  call on, @ref task_tracker_was_invited answers from the record. */
+int  task_tracker_add_invited(task_tracker_t *tracker, const uuid_t peer_uuid);
+
+/** Whether a result from @p peer_uuid may be scored: true when the announce
+ *  recorded no invitees (the tracker was built without one), else only for an
+ *  invited peer. */
+bool task_tracker_was_invited(const task_tracker_t *tracker, const uuid_t peer_uuid);
+
+/** Whether this tracker already holds a result from @p peer_uuid (a replay). */
+bool task_tracker_has_result(const task_tracker_t *tracker, const uuid_t peer_uuid);
 
 /*@
   requires \valid(tracker);

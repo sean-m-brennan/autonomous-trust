@@ -309,6 +309,71 @@ class TestComposeAndK8sGeneration:
         # standalone `-m examples.multi_agency` inspector.
         assert "examples.multi_agency.coordinator" in ins
 
+    def test_compose_passes_inspector_security_env_through(self):
+        """The dashboard port is published, so the operator needs a way to turn
+        TLS and the bearer token on. Compose forwards only what it is told to,
+        hence explicit `${VAR:-}` lines — and the `:-` default is what keeps the
+        generated file inert when the host sets nothing."""
+        from autonomous_trust.evaluation.scenarios.disaster_response_compose import (
+            ComposeOptions, generate_compose,
+        )
+        yaml_text = generate_compose(DisasterResponseScenario(), ComposeOptions())
+        for var in ('AT_INSPECTOR_TLS_CERT', 'AT_INSPECTOR_TLS_KEY',
+                    'AT_INSPECTOR_WS_TOKEN'):
+            assert '%s: "${%s:-}"' % (var, var) in yaml_text, var
+
+    def test_compose_is_valid_yaml_with_security_env(self):
+        import yaml as yaml_mod
+        from autonomous_trust.evaluation.scenarios.disaster_response_compose import (
+            ComposeOptions, generate_compose,
+        )
+        doc = yaml_mod.safe_load(generate_compose(DisasterResponseScenario(),
+                                                  ComposeOptions()))
+        env = doc['services']['coordinator']['environment']
+        # Empty by default: `${VAR:-}` is what compose substitutes when the host
+        # has nothing set, and the inspector reads empty as "not configured".
+        assert env['AT_INSPECTOR_WS_TOKEN'] == '${AT_INSPECTOR_WS_TOKEN:-}'
+
+    def test_k8s_security_env_is_inert_optional_secret(self):
+        """On the cluster path the credential comes from a Secret, and every
+        reference is optional: absent Secret means the variables never appear,
+        which is the plaintext posture the demo has always run."""
+        import yaml as yaml_mod
+        from autonomous_trust.evaluation.scenarios.disaster_response_compose import (
+            generate_k8s_manifests,
+        )
+        ins = generate_k8s_manifests(DisasterResponseScenario())['coordinator.yaml']
+        docs = [d for d in yaml_mod.safe_load_all(ins) if d]
+        dep = [d for d in docs if d['kind'] == 'Deployment'][0]
+        pod = dep['spec']['template']['spec']
+        container = pod['containers'][0]
+        refs = {e['name']: e['valueFrom']['secretKeyRef']
+                for e in container['env'] if 'valueFrom' in e
+                and 'secretKeyRef' in e['valueFrom']}
+        assert set(refs) == {'AT_INSPECTOR_WS_TOKEN', 'AT_INSPECTOR_TLS_CERT',
+                             'AT_INSPECTOR_TLS_KEY'}, sorted(refs)
+        for name, ref in refs.items():
+            assert ref['optional'] is True, name
+            assert ref['name'] == 'inspector-transport', name
+        # The certificate itself arrives as an optional Secret volume, so the
+        # paths above resolve only when the Secret exists.
+        tls_vol = [v for v in pod['volumes'] if v['name'] == 'inspector-tls']
+        assert tls_vol and tls_vol[0]['secret']['optional'] is True
+        assert any(m['name'] == 'inspector-tls'
+                   for m in container['volumeMounts'])
+
+    def test_k8s_probe_flags_the_tls_scheme_requirement(self):
+        """The readiness probe speaks plaintext. Turning TLS on without also
+        setting `scheme: HTTPS` leaves the pod permanently unready, which looks
+        like a broken dashboard — so the manifest has to say so where the probe
+        is."""
+        from autonomous_trust.evaluation.scenarios.disaster_response_compose import (
+            generate_k8s_manifests,
+        )
+        ins = generate_k8s_manifests(DisasterResponseScenario())['coordinator.yaml']
+        probe_at = ins.index('readinessProbe:')
+        assert 'scheme: HTTPS' in ins[max(0, probe_at - 600):probe_at]
+
     def test_compose_scenario_export_is_json(self):
         # The compose generator writes a scenario.json the dashboard reads;
         # verify the roundtrip works on a tempdir.

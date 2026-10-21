@@ -15,7 +15,9 @@
 # ******************
 cmake_minimum_required(VERSION 3.23)
 
-if(DEFINED ENV{CONDA_PREFIX})
+# Only where the env ships conda's Linux sysroot: a macOS (or compiler-less)
+# env has none, and APPLE is not yet defined before project().
+if(DEFINED ENV{CONDA_PREFIX} AND EXISTS "$ENV{CONDA_PREFIX}/x86_64-conda-linux-gnu/sysroot")
     set(CONDA_ROOT $ENV{CONDA_PREFIX} CACHE PATH "Conda base directory")
     set(CMAKE_C_COMPILE_OPTIONS_SYSROOT "--sysroot=")
     set(CMAKE_CXX_COMPILE_OPTIONS_SYSROOT "--sysroot=")
@@ -38,6 +40,28 @@ if(DEFINED ENV{CONDA_PREFIX})
 endif()
 
 project(autonomous_trust C CXX)
+
+if(WIN32)
+    # Windows (MinGW-w64, UCRT): the POSIX the sources are written against comes
+    # from compat/win32 — stand-ins for the POSIX headers MinGW lacks, and
+    # at_win32.h, force-included everywhere, with the Winsock wrappers. A
+    # consumer compiling against AT's headers (Agora's native layer) applies the
+    # same options: AT_WIN32_COMPILE_OPTIONS / AT_WIN32_INCLUDE_DIR.
+    set(AT_WIN32_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/compat/win32"
+        CACHE INTERNAL "AT's POSIX stand-in headers for Windows")
+    set(AT_WIN32_COMPILE_OPTIONS "SHELL:-include ${AT_WIN32_INCLUDE_DIR}/at_win32.h"
+        CACHE INTERNAL "Force-include AT's Windows POSIX layer")
+    include_directories(BEFORE ${AT_WIN32_INCLUDE_DIR})
+    add_compile_options(${AT_WIN32_COMPILE_OPTIONS})
+endif()
+
+if(APPLE)
+    # The sources ask for POSIX (_XOPEN_SOURCE/_POSIX_C_SOURCE), which on Darwin
+    # HIDES the BSD extensions they also use (struct ip_mreq, IP_ADD_MEMBERSHIP);
+    # _DARWIN_C_SOURCE restores them, as _DEFAULT_SOURCE does on glibc.
+    # UUID_STR_LEN is util-linux's; the libSystem <uuid/uuid.h> lacks it.
+    add_compile_definitions(_DARWIN_C_SOURCE UUID_STR_LEN=37)
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -126,7 +150,13 @@ if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
     list(APPEND useful_warnings -Wuse-after-free -Wfree-nonheap-object -Wno-cast-function-type)
 endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
-    list(APPEND useful_warnings -Wno-microsoft-anon-tag -Wno-deprecated-non-prototype -Wno-unused-but-set-variable -Wno-unknown-pragmas -Wno-cast-align -Wno-cast-function-type-mismatch)
+    list(APPEND useful_warnings -Wno-microsoft-anon-tag -Wno-deprecated-non-prototype -Wno-unused-but-set-variable -Wno-unknown-pragmas -Wno-cast-align)
+    # LLVM 19+; an older (Apple) clang rejects the unknown flag under -Werror.
+    include(CheckCCompilerFlag)
+    check_c_compiler_flag(-Wno-cast-function-type-mismatch AT_HAVE_WNO_CFTM)
+    if(AT_HAVE_WNO_CFTM)
+        list(APPEND useful_warnings -Wno-cast-function-type-mismatch)
+    endif()
     # conda's default CFLAGS are GCC-tuned (e.g. -fno-merge-constants) and leak
     # into CMAKE_C_FLAGS; clang ignores them but, under -Werror, the resulting
     # -Wignored-optimization-argument would otherwise fail the build.
@@ -147,47 +177,63 @@ add_link_options(-pthread ${sysroot_flag})
 # Static linking option for embedded/IoT builds
 option(AT_STATIC "Link at_demo fully statically (no shared library dependencies)" OFF)
 
-# Zero Trust Architecture integration (requires OpenSSL)
-option(AT_ZTA "Enable Zero Trust Architecture credential integration" OFF)
+# Zero Trust Architecture integration: builds libat_zta (src/c/extensions/zta,
+# which brings OpenSSL). The core itself needs neither (FEATURE_SPLIT_PLAN Phase 6).
+option(AT_ZTA "Build the Zero Trust credential integration library (libat_zta)" OFF)
+# First contact: introductions, contacts, the directory and area hubs, one
+# human's devices (src/c/extensions/first_contact, FEATURE_SPLIT_PLAN Phase 7).
+# Built by default; $AT_FIRST_CONTACT still turns it on at run time.
+option(AT_FIRST_CONTACT_LIB "Build the first-contact library (libat_first_contact)" ON)
+# Rendezvous: the relay client and server, reachability records, the seed list
+# and rosters (src/c/extensions/rendezvous, FEATURE_SPLIT_PLAN Phase 7b). Built
+# by default; first contact needs it. $AT_USE_RELAY / $AT_RELAY turn it on at
+# run time.
+option(AT_RENDEZVOUS_LIB "Build the rendezvous library (libat_rendezvous)" ON)
+# Fleet (consensus on updates, artifacts, config distribution) and the
+# data-source ingest process are extensions too (FEATURE_SPLIT_PLAN Phase 8),
+# OFF by default: a node configured to start their subsystems without them
+# refuses to start.
+option(AT_FLEET_LIB "Build the fleet library (libat_fleet)" OFF)
+option(AT_DATA_SOURCE_LIB "Build the data-source ingest library (libat_data_source)" OFF)
 
-# DTN / Bundle Protocol transport (see at-over-dtn.md). Adds the "dtn_bp"
-# network transport and compiles a DTN-specific receiver path.
-option(AT_NET_DTN "Enable DTN/Bundle-Protocol network transport" OFF)
-# Which BP backend to link — currently only "stub" (no external deps);
-# add ION / uD3TN backends by implementing dtn_backend.h and selecting here.
-set(AT_NET_DTN_BACKEND "stub" CACHE STRING "BP library backend: stub | ion | ud3tn")
-set_property(CACHE AT_NET_DTN_BACKEND PROPERTY STRINGS stub ion ud3tn)
+# Extension libraries that live OUTSIDE this tree (e.g. Agora's libat_social):
+# a list of directories, each holding an extension's CMakeLists.txt. Each is
+# added inside this project's scope, after the in-tree extensions, so it builds
+# exactly as an in-tree one does (at_extension_library, the core's flags and
+# include dirs); its binary dir is extensions/<basename>. See
+# doc/architecture/extensions.md, "External extensions".
+set(AT_EXTERNAL_EXTENSIONS "" CACHE STRING
+    "Directories of extension libraries outside the AT tree (;-separated)")
 
-# Plaintext forwarding envelope (see at-over-dtn.md §4.3, net_envelope.h).
-# When ON, peer-to-peer wire frames carry a 36-byte plaintext routing header
-# so gateway nodes can bridge transports without decrypting the inner payload.
-# Default OFF so traffic on non-gateway deployments stays byte-for-byte
-# compatible with pre-2b builds until net_proc.c opts into wrapping.
-option(AT_NET_ENVELOPE "Enable plaintext forwarding envelope for gateway relay" OFF)
+# DTN / Bundle Protocol transport (see at-over-dtn.md): builds the libat_dtn
+# extension library (extensions/dtn/), which adds the "dtn_bp" transport to
+# whatever links it. The backend choice, AT_NET_DTN_BACKEND, lives there.
+option(AT_NET_DTN "Build the DTN/Bundle-Protocol transport library (libat_dtn)" OFF)
 
-# Group UUID -> gateway leg routing for cross-group bridging
-# (at-over-dtn.md §4.3 stage F). Gateway receives a GROUP-addressed envelope
-# for a remote group UUID, looks up a configured leg, and re-emits via that
-# leg. Requires AT_NET_ENVELOPE since envelope-less wire frames carry no
-# destination UUID for the routing lookup.
-option(AT_NET_GROUP_FORWARD "Enable group UUID -> gateway routing for cross-leg bridging" OFF)
+# Gateway relay (routing envelope, broadcast relay, cross-leg group forward,
+# cross-cluster discovery): builds the libat_gateway extension library
+# (extensions/gateway/). ON by default because building it turns nothing on:
+# a node uses it only when its network config sets "envelope": true, and the
+# core refuses such a config when the library is absent.
+option(AT_NET_GATEWAY "Build the gateway relay library (libat_gateway)" ON)
 
-# Cross-cluster peer discovery (at-over-dtn.md §4.3 stage E). When ON,
-# gateway-forwarded ID_ANNOUNCE broadcasts carrying NET_ENV_FLAG_FORWARDED
-# register the originating peer as a remote peer whose address is left as-is
-# so the hybrid CIDR matcher routes replies back via the gateway. Requires
-# AT_NET_ENVELOPE since the forwarding trust signal comes from the envelope
-# flag byte.
-option(AT_DISCOVERY_CROSS_CLUSTER "Enable cross-cluster peer discovery via gateway forwarding" OFF)
-
-if(AT_NET_GROUP_FORWARD AND NOT AT_NET_ENVELOPE)
-    message(FATAL_ERROR "AT_NET_GROUP_FORWARD=ON requires AT_NET_ENVELOPE=ON")
+# The verification layers of R+D.md §12, each its own extension library
+# (extensions/<layer>/, FEATURE_SPLIT_PLAN Phase 3). ON by default, as they were
+# always compiled into the core: each speaks only when its declaration
+# ($AT_PHYSICS, $AT_CALIBRATION, $AT_PREQUENTIAL, $AT_CERTIFICATES) names a
+# model, and a node declaring a layer its build lacks refuses to start.
+option(AT_ORACLE_PHYSICS      "Build the physical-consistency layer (libat_physics)" ON)
+option(AT_ORACLE_CALIBRATION  "Build the coverage-audit layer (libat_calibration)" ON)
+option(AT_ORACLE_CERTIFICATES "Build the certificate layer (libat_certificates)" ON)
+option(AT_ORACLE_PREQUENTIAL  "Build the prequential-competence layer (libat_prequential)" ON)
+option(AT_ORACLE_REPLICATION  "Build the replicated-execution layer (libat_replication)" ON)
+if(AT_ORACLE_REPLICATION AND NOT AT_ORACLE_CERTIFICATES)
+    message(FATAL_ERROR "AT_ORACLE_REPLICATION=ON requires AT_ORACLE_CERTIFICATES=ON (SplitMix64)")
 endif()
 
-if(AT_DISCOVERY_CROSS_CLUSTER AND NOT AT_NET_ENVELOPE)
-    message(FATAL_ERROR "AT_DISCOVERY_CROSS_CLUSTER=ON requires AT_NET_ENVELOPE=ON")
+if(AT_STATIC AND APPLE)
+    message(FATAL_ERROR "AT_STATIC is not supported on macOS: Apple's linker has no -static for user programs")
 endif()
-
 if(AT_STATIC)
     # Prefer .a archives in subsequent find_library() calls AND pass -static to
     # the linker so transitive deps resolve statically too. Must come BEFORE the
@@ -204,6 +250,19 @@ endif()
 # library/program dependencies
 
 # UUID
+if(WIN32)
+    # compat/win32/uuid.c implements the libuuid API AT uses.
+    set(LIBUUID_INCLUDE_DIR "")
+    set(LIBUUID_LIBRARY "")
+    message("-- libuuid: compat/win32 (Windows)")
+elseif(APPLE)
+    # libuuid is part of libSystem, and the SDK's <uuid/uuid.h> has the same API.
+    # Do NOT search: Homebrew's ossp-uuid installs a libuuid and a uuid.h with a
+    # different API, and util-linux's is keg-only.
+    set(LIBUUID_INCLUDE_DIR "")
+    set(LIBUUID_LIBRARY "")
+    message("-- libuuid: from libSystem (macOS)")
+else()
 find_path(LIBUUID_INCLUDE_DIR uuid.h PATH_SUFFIXES uuid HINTS ${CONDA_ROOT})
 find_library(LIBUUID_LIBRARY NAMES uuid HINTS ${CONDA_ROOT})
 include_directories(${LIBUUID_INCLUDE_DIR})
@@ -211,6 +270,7 @@ if(LIBUUID_LIBRARY)
     message("-- Found libuuid at ${LIBUUID_LIBRARY}")
 else()
     message(FATAL_ERROR "Required dependency libuuid not found.")
+endif()
 endif()
 
 # libsodium
@@ -354,17 +414,13 @@ if(NOT LIBSUBUNIT_LIBRARY)
     set(LIBSUBUNIT_LIBRARY "")
 endif()
 
-# OpenSSL (required only when AT_ZTA is ON)
-if(AT_ZTA)
-    find_package(OpenSSL REQUIRED)
-    if(OPENSSL_FOUND)
-        message("-- Found OpenSSL ${OPENSSL_VERSION} at ${OPENSSL_LIBRARIES}")
-    else()
-        message(FATAL_ERROR "AT_ZTA=ON requires OpenSSL. Install libssl-dev.")
-    endif()
+set(AT_PLATFORM_LIBS)
+if(WIN32)
+    set(AT_PLATFORM_LIBS ws2_32 iphlpapi)
 endif()
 
 set(DEPENDENCIES
+    ${AT_PLATFORM_LIBS}
     ${LIBUUID_LIBRARY}
     ${LIBSODIUM_LIBRARY}
     ${Protobuf_LIBRARIES}
@@ -374,10 +430,6 @@ set(DEPENDENCIES
     ${CMAKE_THREAD_LIBS_INIT}
     m
 )
-
-if(AT_ZTA)
-    list(APPEND DEPENDENCIES OpenSSL::SSL OpenSSL::Crypto)
-endif()
 
 # Expose DEPENDENCIES to parent scope so examples/ can link them — but only
 # when actually built via add_subdirectory(); a standalone build has no parent.
@@ -406,6 +458,7 @@ set(protos
     autonomous_trust/core/protobuf/identity/identity.proto
     autonomous_trust/core/protobuf/identity/protocol.proto
     autonomous_trust/core/protobuf/negotiation/task.proto
+    autonomous_trust/core/protobuf/network/net_message.proto
     autonomous_trust/core/protobuf/processes/capabilities.proto
     autonomous_trust/core/protobuf/structures/dag.proto
     autonomous_trust/core/protobuf/structures/data.proto
@@ -442,19 +495,27 @@ set(libsrc
     autonomous_trust/config/configuration.c
     autonomous_trust/config/discover.c
     autonomous_trust/config/names.c
+    autonomous_trust/config/trust_ladder.c
     autonomous_trust/identity/encryptor.c
     autonomous_trust/identity/group.c
     autonomous_trust/identity/hexlify.c
     autonomous_trust/identity/history.c
     autonomous_trust/identity/identity.c
     autonomous_trust/identity/id_proc.c
+    autonomous_trust/utilities/send_retry.c
+    autonomous_trust/identity/id_ext.c
+    autonomous_trust/identity/package_hash.c
     autonomous_trust/identity/peers.c
     autonomous_trust/identity/signature.c
     autonomous_trust/negotiation/task.c
     autonomous_trust/negotiation/negotiation.c
     autonomous_trust/negotiation/neg_proc.c
+    autonomous_trust/negotiation/neg_oracle.c
+    autonomous_trust/negotiation/neg_ext.c
+    autonomous_trust/negotiation/neg_certified.c
     autonomous_trust/reputation/reputation.c
     autonomous_trust/reputation/rep_proc.c
+    autonomous_trust/reputation/rep_ext.c
     autonomous_trust/config/generate.c
     autonomous_trust/network/net_message.c
     autonomous_trust/network/net_proc.c
@@ -463,6 +524,9 @@ set(libsrc
     autonomous_trust/network/net_transport_tcp.c
     autonomous_trust/network/net_transport_hybrid.c
     autonomous_trust/network/net_transport_registry.c
+    autonomous_trust/network/net_filter.c
+    autonomous_trust/network/net_presence.c
+    autonomous_trust/network/net_ext.c
     autonomous_trust/network/network.c
     autonomous_trust/bootstrap/bootstrap_capabilities.c
     autonomous_trust/bootstrap/bootstrap_worker.c
@@ -470,6 +534,8 @@ set(libsrc
     autonomous_trust/processes/daemonize.c
     autonomous_trust/processes/process_tracker.c
     autonomous_trust/processes/processes.c
+    autonomous_trust/processes/extension.c
+    autonomous_trust/processes/plaintext_verbs.c
     autonomous_trust/structures/array.c
     autonomous_trust/structures/dag.c
     autonomous_trust/structures/data.c
@@ -483,188 +549,30 @@ set(libsrc
     autonomous_trust/utilities/clock.c
     autonomous_trust/utilities/err_str.c
     autonomous_trust/utilities/exception.c
+    autonomous_trust/utilities/freshness.c
     autonomous_trust/utilities/logger.c
     autonomous_trust/utilities/message.c
     autonomous_trust/utilities/msg_types.c
+    autonomous_trust/utilities/msg_registry.c
     autonomous_trust/utilities/probes.c
     autonomous_trust/utilities/protobuf_shutdown.cpp
     autonomous_trust/utilities/queue_pool.c
     autonomous_trust/utilities/sighandler.c
     autonomous_trust/utilities/socket_helpers.c
+    autonomous_trust/utilities/portable.c
+    autonomous_trust/utilities/message_inproc.c
+    autonomous_trust/utilities/message_stream.c
     autonomous_trust/utilities/timeout.c
     autonomous_trust/utilities/util.c
-    autonomous_trust/fleet/update_proposal.c
-    autonomous_trust/fleet/fleet_helpers.c
-    autonomous_trust/fleet/fleet_ops.c
-    autonomous_trust/data_source/data_source_proc.c
-    autonomous_trust/fleet/fleet_proc.c
-    autonomous_trust/fleet/artifact_store.c
-    autonomous_trust/fleet/artifact_proc_helpers.c
-    autonomous_trust/fleet/artifact_proc.c
-    autonomous_trust/fleet/update_proc_helpers.c
-    autonomous_trust/fleet/update_selftest.c
-    autonomous_trust/fleet/update_proc.c
-    autonomous_trust/fleet/config_proc_helpers.c
-    autonomous_trust/fleet/config_proc.c
 )
-
-# ZTA sources (only compiled when AT_ZTA is enabled)
-if(AT_ZTA)
+if(WIN32)
     list(APPEND libsrc
-        autonomous_trust/zta/zta_verifier.c
-        autonomous_trust/zta/x509_verifier.c
-        autonomous_trust/zta/oidc_verifier.c
-        autonomous_trust/zta/zta_policy.c
-        autonomous_trust/zta/zta_audit.c
-        autonomous_trust/zta/zta_process.c
-        autonomous_trust/zta/zta_binding.c
-    )
+        compat/win32/uuid.c
+        compat/win32/ifaddrs.c
+        compat/win32/win32.c)
 endif()
 
-# DTN sources (only compiled when AT_NET_DTN is enabled). Files live in
-# a `dtn/` subdirectory so the process-table preprocessor can exclude them
-# cleanly when AT_NET_DTN is off (see `_exclude_args` in preprocess()).
-if(AT_NET_DTN)
-    list(APPEND libsrc
-        autonomous_trust/network/dtn/dtn_eid.c
-        autonomous_trust/network/dtn/net_transport_dtn.c
-    )
-    if(AT_NET_DTN_BACKEND STREQUAL "stub")
-        list(APPEND libsrc autonomous_trust/network/dtn/dtn_backend_stub.c)
-    elseif(AT_NET_DTN_BACKEND STREQUAL "ion")
-        # NASA ION bp_* API. Two modes:
-        #   (a) Submodule present at ./third_party/ION-DTN — we build it
-        #       via autotools into a build-local prefix. No sudo required.
-        #   (b) Submodule absent — fall back to system-installed ION (or
-        #       paths supplied explicitly via -DION_* cache vars).
-        # The node's local EID must be pre-provisioned via bpadmin before
-        # the transport is used at runtime.
-        set(ION_SUBMODULE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ION-DTN)
-        set(ION_PREFIX    ${CMAKE_BINARY_DIR}/ion-install)
 
-        if(EXISTS ${ION_SUBMODULE}/configure.ac)
-            message("-- ION: building from submodule into ${ION_PREFIX}")
-
-            # Surface autotools-missing failures at CMake-configure time
-            # with a useful message, rather than a cryptic build-time error.
-            find_program(AUTORECONF_EXEC autoreconf)
-            find_program(AUTOMAKE_EXEC   automake)
-            find_program(LIBTOOLIZE_EXEC NAMES libtoolize glibtoolize)
-            if(NOT AUTORECONF_EXEC OR NOT AUTOMAKE_EXEC OR NOT LIBTOOLIZE_EXEC)
-                message(FATAL_ERROR
-                    "AT_NET_DTN_BACKEND=ion needs autotools to build the submodule. "
-                    "Install: sudo apt-get install -y autoconf automake libtool pkg-config libexpat1-dev")
-            endif()
-
-            include(ExternalProject)
-            include(ProcessorCount)
-            ProcessorCount(ION_PARALLEL)
-            if(ION_PARALLEL EQUAL 0)
-                set(ION_PARALLEL 1)
-            endif()
-
-            # BUILD_IN_SOURCE because ION's autotools setup does not cleanly
-            # support out-of-tree builds. Artifacts land inside the submodule
-            # checkout under third_party/ION-DTN (its own .gitignore covers them).
-            ExternalProject_Add(ion_external
-                SOURCE_DIR        ${ION_SUBMODULE}
-                BUILD_IN_SOURCE   1
-                CONFIGURE_COMMAND
-                    sh -c "cd <SOURCE_DIR> && (make distclean 2>/dev/null || true) && rm -f *.la libtool config.status && autoreconf -fi && ./configure --prefix=${ION_PREFIX} --enable-shared --disable-static"
-                BUILD_COMMAND
-                    make -C <SOURCE_DIR> -j${ION_PARALLEL}
-                INSTALL_COMMAND
-                    make -C <SOURCE_DIR> install
-                BUILD_BYPRODUCTS
-                    ${ION_PREFIX}/lib/libbp${CMAKE_SHARED_LIBRARY_SUFFIX}
-                    ${ION_PREFIX}/lib/libici${CMAKE_SHARED_LIBRARY_SUFFIX}
-                LOG_CONFIGURE 1
-                LOG_BUILD     1
-                LOG_INSTALL   1
-            )
-            # Pre-create the include dir so include_directories() below has
-            # something to add even before the first build runs.
-            file(MAKE_DIRECTORY ${ION_PREFIX}/include)
-            set(ION_INCLUDE_DIR ${ION_PREFIX}/include)
-            set(ION_BP_LIB  ${ION_PREFIX}/lib/libbp${CMAKE_SHARED_LIBRARY_SUFFIX})
-            set(ION_ICI_LIB ${ION_PREFIX}/lib/libici${CMAKE_SHARED_LIBRARY_SUFFIX})
-            set(ION_EXTERNAL_TARGET ion_external)
-            # Propagate RPATH so AT executables can find the in-build ION
-            # shared libs at runtime without LD_LIBRARY_PATH.
-            list(APPEND CMAKE_BUILD_RPATH   ${ION_PREFIX}/lib)
-            list(APPEND CMAKE_INSTALL_RPATH ${ION_PREFIX}/lib)
-        else()
-            find_path(ION_INCLUDE_DIR bp.h PATH_SUFFIXES ion)
-            find_library(ION_BP_LIB  NAMES bp)
-            find_library(ION_ICI_LIB NAMES ici)
-            if(NOT ION_INCLUDE_DIR OR NOT ION_BP_LIB OR NOT ION_ICI_LIB)
-                message(FATAL_ERROR
-                    "AT_NET_DTN_BACKEND=ion selected but the ION-DTN submodule is missing "
-                    "AND no system install was found. Fix one of:\n"
-                    "  git submodule update --init src/c/third_party/ION-DTN\n"
-                    "  sudo make install (in a cloned ION-DTN)\n"
-                    "  cmake ... -DION_INCLUDE_DIR=... -DION_BP_LIB=... -DION_ICI_LIB=...")
-            endif()
-            message("-- Found ION bp at ${ION_BP_LIB}, ici at ${ION_ICI_LIB}")
-            set(ION_EXTERNAL_TARGET "")
-        endif()
-
-        list(APPEND libsrc autonomous_trust/network/dtn/dtn_backend_ion.c)
-        include_directories(${ION_INCLUDE_DIR})
-        list(APPEND DEPENDENCIES      ${ION_BP_LIB} ${ION_ICI_LIB})
-        list(APPEND TEST_DEPENDENCIES ${ION_BP_LIB} ${ION_ICI_LIB})
-    elseif(AT_NET_DTN_BACKEND STREQUAL "ud3tn")
-        # uD3TN legacy AAP v1 binary protocol over Unix-socket or TCP — no
-        # external library needed; the daemon must be reachable at runtime via
-        # AT_DTN_UD3TN_SOCKET (e.g. "unix:./ud3tn.aap.socket" or "tcp:host:port").
-        list(APPEND libsrc autonomous_trust/network/dtn/dtn_backend_ud3tn.c)
-    elseif(AT_NET_DTN_BACKEND STREQUAL "ud3tnv2")
-        # uD3TN AAP 2.0: protobuf-delimited framing. Schema lives at
-        # autonomous_trust/network/dtn/proto/aap2.proto, vendored verbatim
-        # from https://gitlab.com/d3tn/ud3tn/-/raw/master/components/aap2/aap2.proto
-        # Currently symlinked to submodule location in ./third_party/ud3tn/
-        #
-        # Codegen is a standalone protoc-c run — we don't reuse the main
-        # `protos` list because aap2.proto lives under the DTN tree, not the
-        # AT protobuf/ root. Generated sources land in the build tree.
-        set(AAP2_PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust/network/dtn/proto)
-        set(AAP2_GEN_DIR   ${CMAKE_CURRENT_BINARY_DIR}/autonomous_trust/network/dtn/proto)
-        add_custom_command(
-            OUTPUT ${AAP2_GEN_DIR}/aap2.pb-c.c ${AAP2_GEN_DIR}/aap2.pb-c.h
-            COMMAND ${CMAKE_COMMAND} -E make_directory ${AAP2_GEN_DIR}
-            COMMAND ${Protobuf_PROTOC_EXECUTABLE}
-                --c_out=${AAP2_GEN_DIR}
-                -I${AAP2_PROTO_DIR}
-                ${AAP2_PROTO_DIR}/aap2.proto
-            COMMENT "Generating protobuf-c sources for aap2.proto"
-            DEPENDS ${AAP2_PROTO_DIR}/aap2.proto
-            VERBATIM
-        )
-        list(APPEND libsrc
-            autonomous_trust/network/dtn/dtn_backend_ud3tnv2.c
-            ${AAP2_GEN_DIR}/aap2.pb-c.c
-        )
-        include_directories(${AAP2_GEN_DIR})
-    else()
-        message(FATAL_ERROR "Unknown AT_NET_DTN_BACKEND: ${AT_NET_DTN_BACKEND}")
-    endif()
-    add_compile_definitions(AT_NET_DTN)
-endif()
-
-# Forwarding envelope (see at-over-dtn.md §4.3). Codec only — consumers of
-# the header are wired in net_proc.c in slice 2b.2.
-if(AT_NET_ENVELOPE)
-    list(APPEND libsrc autonomous_trust/network/net_envelope.c)
-    add_compile_definitions(AT_NET_ENVELOPE)
-endif()
-
-if(AT_NET_GROUP_FORWARD)
-    add_compile_definitions(AT_NET_GROUP_FORWARD)
-endif()
-
-if(AT_DISCOVERY_CROSS_CLUSTER)
-    add_compile_definitions(AT_DISCOVERY_CROSS_CLUSTER)
-endif()
 
 set(libhdr
     autonomous_trust.h
@@ -684,6 +592,7 @@ set(libhdr
     autonomous_trust/config/names.h
     autonomous_trust/identity/history.h
     autonomous_trust/identity/identity.h
+    autonomous_trust/identity/package_hash.h
     autonomous_trust/identity/peers.h
     autonomous_trust/network/net_message.h
     autonomous_trust/network/net_transport.h
@@ -699,30 +608,16 @@ set(libhdr
     autonomous_trust/utilities/logger.h
     autonomous_trust/utilities/message.h
     autonomous_trust/utilities/msg_types.h
+    autonomous_trust/utilities/msg_registry.h
+    autonomous_trust/processes/extension.h
     autonomous_trust/utilities/queue_pool.h
     autonomous_trust/utilities/sighandler.h
     autonomous_trust/negotiation/negotiation.h
     autonomous_trust/reputation/reputation.h
     autonomous_trust/config/generate.h
-    autonomous_trust/fleet/update_proposal.h
-    autonomous_trust/fleet/fleet_proc.h
-    autonomous_trust/fleet/artifact_store.h
-    autonomous_trust/fleet/artifact_proc.h
-    autonomous_trust/fleet/update_proc.h
-    autonomous_trust/fleet/config_proc.h
 )
 
-if(AT_ZTA)
-    list(APPEND libhdr
-        autonomous_trust/zta/zta_verifier.h
-        autonomous_trust/zta/x509_verifier.h
-        autonomous_trust/zta/oidc_verifier.h
-        autonomous_trust/zta/zta_policy.h
-        autonomous_trust/zta/zta_audit.h
-        autonomous_trust/zta/zta_process.h
-        autonomous_trust/zta/zta_protocol.h
-    )
-endif()
+
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust)
 
@@ -777,21 +672,21 @@ endforeach()
 ####################
 # generate tables headers
 
+# macOS (and many distros) ship `python3` with no `python`.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
 function(preprocess _file_in)
     get_filename_component(_base ${_file_in} NAME_WE)
     set(_fullpath ${CMAKE_CURRENT_SOURCE_DIR}/${_file_in})
     set(_header_file ${CMAKE_CURRENT_BINARY_DIR}/${_base}.h)
     set(_src_dir ${CMAKE_CURRENT_SOURCE_DIR})
-    set(_exclude_args)                                                                                      
-    if(NOT AT_ZTA)
-        list(APPEND _exclude_args --exclude zta)
-    endif()
-    if(NOT AT_NET_DTN)
-        list(APPEND _exclude_args --exclude dtn)
-    endif()
+    # Extension libraries register at load (DEFINE_*); scanning them would put
+    # their rows in the core's static tables too, and include their headers in
+    # the core (FEATURE_SPLIT_PLAN Phase 8).
+    set(_exclude_args --exclude extensions)
     add_custom_command(
         OUTPUT ${_header_file}
-        COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/preprocess.py ${_fullpath} ${_header_file} ${_src_dir}/ autonomous_trust ${_exclude_args}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/preprocess.py ${_fullpath} ${_header_file} ${_src_dir}/ autonomous_trust ${_exclude_args}
         COMMENT "Preprocessing table header from ${_file_in}"
         # Depend on the generator too: a change to preprocess.py (e.g. which
         # directories it scans) must re-run generation, or stale tables linger.
@@ -865,13 +760,7 @@ add_custom_target(proto_python DEPENDS ${proto_py_src})
 ####################
 # create libraries
 
-# When AT_ZTA is enabled, ALL targets must see AT_ZTA_ENABLED because it
-# changes the size of public_identity_t (adds ZTA credential fields).
-# A struct size mismatch between the library and consumers causes crashes.
-if(AT_ZTA)
-    add_compile_definitions(AT_ZTA_ENABLED)
-    include_directories(${OPENSSL_INCLUDE_DIR})
-endif()
+
 
 # Ryu (shortest-decimal d2s) for JCS number formatting.  Pulled in as a
 # git submodule under third_party/ryu/; the upstream repo's C sources live
@@ -893,6 +782,11 @@ target_compile_options(at_ryu PRIVATE -O2 -Wno-error -Wno-unused-function)
 
 add_library(autonomous_trust SHARED ${libsrc} ${libhdr} ${proto_c_src} ${table_hdrs})
 set_target_properties(autonomous_trust PROPERTIES COMPILE_FLAGS "${lib_compile_flags}")
+# The shared library names its own dependencies. It used to leave them to each
+# final executable (a .so may carry unresolved symbols), which Apple's linker
+# refuses for a dylib; on Linux it adds the DT_NEEDED entries the library always
+# had in practice through its consumers.
+target_link_libraries(autonomous_trust PRIVATE ${DEPENDENCIES})
 target_sources(autonomous_trust PUBLIC ${libsrc}
     PUBLIC FILE_SET HEADERS
     BASE_DIRS ${CMAKE_CURRENT_BINARY_DIR} FILES ${genhdr}
@@ -908,14 +802,6 @@ target_sources(autonomous_trust PUBLIC ${libsrc}
     BASE_DIRS ${CMAKE_CURRENT_BINARY_DIR} FILES ${genhdr}
     )
 
-# If ION is being built from the in-tree submodule, force the ExternalProject
-# to complete (install libs + headers) before either AT library starts
-# compiling — otherwise dtn_backend_ion.c would fail on #include <bp.h>.
-if(DEFINED ION_EXTERNAL_TARGET AND ION_EXTERNAL_TARGET)
-    add_dependencies(autonomous_trust        ${ION_EXTERNAL_TARGET})
-    add_dependencies(autonomous_trust_static ${ION_EXTERNAL_TARGET})
-endif()
-
 
 ####################
 # Export library targets so examples/ can find them via add_subdirectory()
@@ -926,11 +812,31 @@ endif()
 ####################
 # tests (only built when libcheck is available)
 #
-# Test executables link against the static library archive.  With AT_ZTA=ON
-# the msg_types.c object acquires new dependencies on ZTA + proto symbols.
-# A single-pass linker may fail to resolve them because it only scans the
-# archive once.  Wrapping in --start-group/--end-group allows multiple passes.
-set(AT_TEST_LIBS -Wl,--start-group autonomous_trust_static ${TEST_DEPENDENCIES} -Wl,--end-group)
+# Test executables link against the static library archive. msg_types.c and
+# the protobuf-c generated objects pull in symbols defined later in the
+# archive, and a single-pass linker scans it once; --start-group/--end-group
+# allows multiple passes.
+# Apple's linker searches archives repeatedly by itself and has no group flags.
+if(APPLE)
+    set(AT_TEST_LIBS autonomous_trust_static ${TEST_DEPENDENCIES})
+else()
+    set(AT_TEST_LIBS -Wl,--start-group autonomous_trust_static ${TEST_DEPENDENCIES} -Wl,--end-group)
+endif()
+
+# at_whole_archive(<out-var> <static-target>...): link items that keep every
+# member of each archive (registration constructors live in members nothing
+# references). GNU ld: --whole-archive; Apple ld: -force_load per archive.
+function(at_whole_archive out)
+    if(APPLE)
+        set(_items)
+        foreach(_t ${ARGN})
+            list(APPEND _items "-Wl,-force_load,$<TARGET_FILE:${_t}>" ${_t})
+        endforeach()
+    else()
+        set(_items -Wl,--whole-archive ${ARGN} -Wl,--no-whole-archive)
+    endif()
+    set(${out} ${_items} PARENT_SCOPE)
+endfunction()
 
 if(LIBCHECK_LIBRARY)
 
@@ -1002,6 +908,10 @@ add_executable(reputation_test test/reputation_test.c)
 set_source_files_properties(test/reputation_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(reputation_test PRIVATE ${AT_TEST_LIBS} m)
 
+add_executable(peers_address_test test/peers_address_test.c)
+set_source_files_properties(test/peers_address_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(peers_address_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(history_test test/history_test.c)
 set_source_files_properties(test/history_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(history_test PRIVATE ${AT_TEST_LIBS})
@@ -1026,9 +936,110 @@ add_executable(late_joiner_caps_resync_test test/late_joiner_caps_resync_test.c)
 set_source_files_properties(test/late_joiner_caps_resync_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(late_joiner_caps_resync_test PRIVATE ${AT_TEST_LIBS})
 
+
 add_executable(identity_resync_test test/identity_resync_test.c)
 set_source_files_properties(test/identity_resync_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(identity_resync_test PRIVATE ${AT_TEST_LIBS})
+add_executable(group_rotation_sibling_test test/group_rotation_sibling_test.c)
+set_source_files_properties(test/group_rotation_sibling_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(group_rotation_sibling_test PRIVATE ${AT_TEST_LIBS})
+add_executable(bridged_group_test test/bridged_group_test.c)
+set_source_files_properties(test/bridged_group_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(bridged_group_test PRIVATE ${AT_TEST_LIBS})
+add_executable(amnesia_recognition_test test/amnesia_recognition_test.c)
+set_source_files_properties(test/amnesia_recognition_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(amnesia_recognition_test PRIVATE ${AT_TEST_LIBS})
+add_executable(handoff_retry_test test/handoff_retry_test.c)
+set_source_files_properties(test/handoff_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(handoff_retry_test PRIVATE ${AT_TEST_LIBS})
+add_executable(net_presence_test test/net_presence_test.c)
+set_source_files_properties(test/net_presence_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_presence_test PRIVATE ${AT_TEST_LIBS})
+add_executable(net_route_policy_test test/net_route_policy_test.c)
+set_source_files_properties(test/net_route_policy_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_route_policy_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME net_route_policy_test COMMAND $<TARGET_FILE:net_route_policy_test>)
+add_executable(net_held_group_test test/net_held_group_test.c)
+set_source_files_properties(test/net_held_group_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_held_group_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME net_held_group_test COMMAND $<TARGET_FILE:net_held_group_test>)
+add_executable(send_retry_test test/send_retry_test.c)
+set_source_files_properties(test/send_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(send_retry_test PRIVATE ${AT_TEST_LIBS})
+add_executable(neg_send_keep_test test/neg_send_keep_test.c)
+set_source_files_properties(test/neg_send_keep_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(neg_send_keep_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_commit_retry_test test/rep_commit_retry_test.c)
+set_source_files_properties(test/rep_commit_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_commit_retry_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_half_handoff_test test/rep_half_handoff_test.c)
+set_source_files_properties(test/rep_half_handoff_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_half_handoff_test PRIVATE ${AT_TEST_LIBS})
+add_executable(id_own_caps_test test/id_own_caps_test.c)
+set_source_files_properties(test/id_own_caps_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(id_own_caps_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_cosign_test test/rep_cosign_test.c)
+set_source_files_properties(test/rep_cosign_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_cosign_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_attest_retry_test test/rep_attest_retry_test.c)
+set_source_files_properties(test/rep_attest_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_attest_retry_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_archive_test test/rep_archive_test.c)
+set_source_files_properties(test/rep_archive_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_archive_test PRIVATE ${AT_TEST_LIBS})
+add_executable(package_hash_test test/package_hash_test.c)
+set_source_files_properties(test/package_hash_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(package_hash_test PRIVATE ${AT_TEST_LIBS})
+add_executable(admission_send_test test/admission_send_test.c)
+set_source_files_properties(test/admission_send_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(admission_send_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(rep_quorum_test test/rep_quorum_test.c)
+set_source_files_properties(test/rep_quorum_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_quorum_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_update_pages_test test/rep_update_pages_test.c)
+set_source_files_properties(test/rep_update_pages_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_update_pages_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(rep_round_majority_test test/rep_round_majority_test.c)
+set_source_files_properties(test/rep_round_majority_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_round_majority_test PRIVATE ${AT_TEST_LIBS})
+add_executable(reputation_place_test test/reputation_place_test.c)
+set_source_files_properties(test/reputation_place_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(reputation_place_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_place_acceptor_test test/rep_place_acceptor_test.c)
+set_source_files_properties(test/rep_place_acceptor_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_place_acceptor_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_place_reconcile_test test/rep_place_reconcile_test.c)
+set_source_files_properties(test/rep_place_reconcile_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_place_reconcile_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_place_pool_persist_test test/rep_place_pool_persist_test.c)
+set_source_files_properties(test/rep_place_pool_persist_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_place_pool_persist_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_place_roster_test test/rep_place_roster_test.c)
+set_source_files_properties(test/rep_place_roster_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_place_roster_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_place_halves_test test/rep_place_halves_test.c)
+set_source_files_properties(test/rep_place_halves_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_place_halves_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_place_proposer_test test/rep_place_proposer_test.c)
+set_source_files_properties(test/rep_place_proposer_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_place_proposer_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_commit_cert_test test/rep_commit_cert_test.c)
+set_source_files_properties(test/rep_commit_cert_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_commit_cert_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(rep_resp_shape_test test/rep_resp_shape_test.c)
+set_source_files_properties(test/rep_resp_shape_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_resp_shape_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(rep_warmstart_test test/rep_warmstart_test.c)
+set_source_files_properties(test/rep_warmstart_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_warmstart_test PRIVATE ${AT_TEST_LIBS} m)
+
+add_executable(rep_resolve_test test/rep_resolve_test.c)
+set_source_files_properties(test/rep_resolve_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_resolve_test PRIVATE ${AT_TEST_LIBS} m)
 
 add_executable(subtree_roster_test test/subtree_roster_test.c)
 set_source_files_properties(test/subtree_roster_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1042,9 +1053,6 @@ add_executable(data_test test/data_test.c)
 set_source_files_properties(test/data_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(data_test PRIVATE ${AT_TEST_LIBS})
 
-add_executable(data_source_test test/data_source_test.c)
-set_source_files_properties(test/data_source_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(data_source_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(net_proc_ageout_test test/net_proc_ageout_test.c)
 set_source_files_properties(test/net_proc_ageout_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1057,6 +1065,14 @@ target_link_libraries(datetime_test PRIVATE ${AT_TEST_LIBS})
 add_executable(b64_test test/b64_test.c)
 set_source_files_properties(test/b64_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(b64_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(portable_test test/portable_test.c)
+set_source_files_properties(test/portable_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(portable_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(ipc_paths_test test/ipc_paths_test.c)
+set_source_files_properties(test/ipc_paths_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(ipc_paths_test PRIVATE ${AT_TEST_LIBS} pthread)
 
 add_executable(clock_test test/clock_test.c)
 set_source_files_properties(test/clock_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1111,7 +1127,7 @@ target_link_libraries(jcs_test PRIVATE
     ${LIBSUBUNIT_LIBRARY}  # empty (and skipped) unless a subunit lib was found
     m
     pthread
-    rt
+    $<$<NOT:$<OR:$<PLATFORM_ID:Darwin>,$<PLATFORM_ID:Windows>>>:rt>
 )
 
 enable_testing()
@@ -1134,19 +1150,50 @@ add_test(NAME at_jansson_test COMMAND $<TARGET_FILE:at_jansson_test>)
 add_test(NAME negotiation_test COMMAND $<TARGET_FILE:negotiation_test>)
 add_test(NAME reputation_test COMMAND $<TARGET_FILE:reputation_test>)
 add_test(NAME history_test COMMAND $<TARGET_FILE:history_test>)
+add_test(NAME peers_address_test COMMAND $<TARGET_FILE:peers_address_test>)
 add_test(NAME queue_pool_test COMMAND $<TARGET_FILE:queue_pool_test>)
 add_test(NAME network_test COMMAND $<TARGET_FILE:network_test>)
 add_test(NAME identity_test COMMAND $<TARGET_FILE:identity_test>)
 add_test(NAME partition_recovery_test COMMAND $<TARGET_FILE:partition_recovery_test>)
 add_test(NAME late_joiner_caps_resync_test COMMAND $<TARGET_FILE:late_joiner_caps_resync_test>)
 add_test(NAME identity_resync_test COMMAND $<TARGET_FILE:identity_resync_test>)
+add_test(NAME group_rotation_sibling_test COMMAND $<TARGET_FILE:group_rotation_sibling_test>)
+add_test(NAME bridged_group_test COMMAND $<TARGET_FILE:bridged_group_test>)
+add_test(NAME amnesia_recognition_test COMMAND $<TARGET_FILE:amnesia_recognition_test>)
+add_test(NAME handoff_retry_test COMMAND $<TARGET_FILE:handoff_retry_test>)
+add_test(NAME net_presence_test COMMAND $<TARGET_FILE:net_presence_test>)
+add_test(NAME send_retry_test COMMAND $<TARGET_FILE:send_retry_test>)
+add_test(NAME neg_send_keep_test COMMAND $<TARGET_FILE:neg_send_keep_test>)
+add_test(NAME rep_commit_retry_test COMMAND $<TARGET_FILE:rep_commit_retry_test>)
+add_test(NAME rep_half_handoff_test COMMAND $<TARGET_FILE:rep_half_handoff_test>)
+add_test(NAME id_own_caps_test COMMAND $<TARGET_FILE:id_own_caps_test>)
+add_test(NAME rep_cosign_test COMMAND $<TARGET_FILE:rep_cosign_test>)
+add_test(NAME rep_attest_retry_test COMMAND $<TARGET_FILE:rep_attest_retry_test>)
+add_test(NAME rep_archive_test COMMAND $<TARGET_FILE:rep_archive_test>)
+add_test(NAME package_hash_test COMMAND $<TARGET_FILE:package_hash_test>)
+add_test(NAME admission_send_test COMMAND $<TARGET_FILE:admission_send_test>)
+add_test(NAME rep_quorum_test COMMAND $<TARGET_FILE:rep_quorum_test>)
+add_test(NAME rep_update_pages_test COMMAND $<TARGET_FILE:rep_update_pages_test>)
+add_test(NAME rep_round_majority_test COMMAND $<TARGET_FILE:rep_round_majority_test>)
+add_test(NAME rep_commit_cert_test COMMAND $<TARGET_FILE:rep_commit_cert_test>)
+add_test(NAME reputation_place_test COMMAND $<TARGET_FILE:reputation_place_test>)
+add_test(NAME rep_place_acceptor_test COMMAND $<TARGET_FILE:rep_place_acceptor_test>)
+add_test(NAME rep_place_proposer_test COMMAND $<TARGET_FILE:rep_place_proposer_test>)
+add_test(NAME rep_place_halves_test COMMAND $<TARGET_FILE:rep_place_halves_test>)
+add_test(NAME rep_place_roster_test COMMAND $<TARGET_FILE:rep_place_roster_test>)
+add_test(NAME rep_place_reconcile_test COMMAND $<TARGET_FILE:rep_place_reconcile_test>)
+add_test(NAME rep_place_pool_persist_test COMMAND $<TARGET_FILE:rep_place_pool_persist_test>)
+add_test(NAME rep_resp_shape_test COMMAND $<TARGET_FILE:rep_resp_shape_test>)
+add_test(NAME rep_warmstart_test COMMAND $<TARGET_FILE:rep_warmstart_test>)
+add_test(NAME rep_resolve_test COMMAND $<TARGET_FILE:rep_resolve_test>)
 add_test(NAME subtree_roster_test COMMAND $<TARGET_FILE:subtree_roster_test>)
 add_test(NAME operator_attestation_test COMMAND $<TARGET_FILE:operator_attestation_test>)
 add_test(NAME data_test COMMAND $<TARGET_FILE:data_test>)
-add_test(NAME data_source_test COMMAND $<TARGET_FILE:data_source_test>)
 add_test(NAME net_proc_ageout_test COMMAND $<TARGET_FILE:net_proc_ageout_test>)
 add_test(NAME datetime_test COMMAND $<TARGET_FILE:datetime_test>)
 add_test(NAME b64_test COMMAND $<TARGET_FILE:b64_test>)
+add_test(NAME portable_test COMMAND $<TARGET_FILE:portable_test>)
+add_test(NAME ipc_paths_test COMMAND $<TARGET_FILE:ipc_paths_test>)
 add_test(NAME clock_test COMMAND $<TARGET_FILE:clock_test>)
 add_test(NAME group_test COMMAND $<TARGET_FILE:group_test>)
 add_test(NAME data_json_test COMMAND $<TARGET_FILE:data_json_test>)
@@ -1178,9 +1225,17 @@ add_executable(unencrypted_verbs_test test/unencrypted_verbs_test.c)
 set_source_files_properties(test/unencrypted_verbs_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(unencrypted_verbs_test PRIVATE ${AT_TEST_LIBS})
 
+
+
+
+
 add_executable(net_source_bind_test test/net_source_bind_test.c)
 set_source_files_properties(test/net_source_bind_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(net_source_bind_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(net_tcp_multiframe_test test/net_tcp_multiframe_test.c)
+set_source_files_properties(test/net_tcp_multiframe_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_tcp_multiframe_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(proc_tracker2_test test/proc_tracker2_test.c)
 set_source_files_properties(test/proc_tracker2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1200,6 +1255,7 @@ add_test(NAME net_port_test COMMAND $<TARGET_FILE:net_port_test>)
 add_test(NAME cidr_split_test COMMAND $<TARGET_FILE:cidr_split_test>)
 add_test(NAME unencrypted_verbs_test COMMAND $<TARGET_FILE:unencrypted_verbs_test>)
 add_test(NAME net_source_bind_test COMMAND $<TARGET_FILE:net_source_bind_test>)
+add_test(NAME net_tcp_multiframe_test COMMAND $<TARGET_FILE:net_tcp_multiframe_test>)
 add_test(NAME proc_tracker2_test COMMAND $<TARGET_FILE:proc_tracker2_test>)
 add_test(NAME processes_test COMMAND $<TARGET_FILE:processes_test>)
 add_test(NAME capabilities_test COMMAND $<TARGET_FILE:capabilities_test>)
@@ -1233,6 +1289,21 @@ target_link_libraries(map2_test PRIVATE ${AT_TEST_LIBS})
 add_executable(reputation3_test test/reputation3_test.c)
 set_source_files_properties(test/reputation3_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(reputation3_test PRIVATE ${AT_TEST_LIBS})
+add_executable(reputation_fork_test test/reputation_fork_test.c)
+set_source_files_properties(test/reputation_fork_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(reputation_fork_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_attest_test test/rep_attest_test.c)
+set_source_files_properties(test/rep_attest_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_attest_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(trust_ladder_test test/trust_ladder_test.c)
+set_source_files_properties(test/trust_ladder_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(trust_ladder_test PRIVATE ${AT_TEST_LIBS})
+# The shared-example case reads config/cfg/trust_ladder.example.json -- the very
+# file the Python suite reads -- so the "one file, both runtimes" claim is pinned
+# rather than asserted. It skips itself when the tree is not a source checkout.
+target_compile_definitions(trust_ladder_test PRIVATE
+    AT_REPO_ROOT_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/../..")
 
 add_executable(config2_test test/config2_test.c)
 set_source_files_properties(test/config2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1248,6 +1319,11 @@ target_link_libraries(msg_types2_test PRIVATE ${AT_TEST_LIBS})
 
 add_test(NAME map2_test COMMAND $<TARGET_FILE:map2_test>)
 add_test(NAME reputation3_test COMMAND $<TARGET_FILE:reputation3_test>)
+add_test(NAME reputation_fork_test COMMAND $<TARGET_FILE:reputation_fork_test>)
+add_test(NAME rep_attest_test COMMAND $<TARGET_FILE:rep_attest_test>)
+add_test(NAME trust_ladder_test COMMAND $<TARGET_FILE:trust_ladder_test>)
+set_tests_properties(trust_ladder_test PROPERTIES
+    ENVIRONMENT "AT_REPO_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/../..")
 add_test(NAME config2_test COMMAND $<TARGET_FILE:config2_test>)
 add_test(NAME util2_test COMMAND $<TARGET_FILE:util2_test>)
 add_test(NAME msg_types2_test COMMAND $<TARGET_FILE:msg_types2_test>)
@@ -1274,78 +1350,6 @@ add_test(NAME paxos_test COMMAND $<TARGET_FILE:paxos_test>)
 # test files (array_test, array2_test, paxos_test, msg_types2_test,
 # identity2_test, config_test, group2_test).
 
-add_executable(update_proposal_test test/update_proposal_test.c)
-set_source_files_properties(test/update_proposal_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(update_proposal_test PRIVATE ${AT_TEST_LIBS})
-
-add_test(NAME update_proposal_test COMMAND $<TARGET_FILE:update_proposal_test>)
-
-# Fleet tests compile their own .c files (not via the library), so they need
-# proto and table headers to exist before compilation starts.  Depend on the
-# static library target which already generates both.
-#
-# Fleet .c files call helpers from autonomous_trust/utilities/util.c
-# (path_join, makedirs, min/max, strremove).  Pulling those from the static
-# archive would cause duplicate-symbol conflicts against the directly-
-# compiled fleet sources, so compile util.c into each fleet test instead.
-set(fleet_test_util_srcs
-    autonomous_trust/utilities/util.c
-    autonomous_trust/utilities/exception.c)
-
-add_executable(fleet_proc_test
-    test/fleet_proc_test.c
-    autonomous_trust/fleet/fleet_helpers.c
-    autonomous_trust/fleet/update_proposal.c
-    ${fleet_test_util_srcs})
-set_source_files_properties(test/fleet_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(fleet_proc_test PRIVATE ${TEST_DEPENDENCIES})
-add_dependencies(fleet_proc_test autonomous_trust_static)
-
-add_test(NAME fleet_proc_test COMMAND $<TARGET_FILE:fleet_proc_test>)
-
-add_executable(artifact_store_test
-    test/artifact_store_test.c
-    autonomous_trust/fleet/artifact_store.c
-    ${fleet_test_util_srcs})
-set_source_files_properties(test/artifact_store_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(artifact_store_test PRIVATE ${TEST_DEPENDENCIES})
-add_dependencies(artifact_store_test autonomous_trust_static)
-
-add_test(NAME artifact_store_test COMMAND $<TARGET_FILE:artifact_store_test>)
-
-add_executable(artifact_proc_test
-    test/artifact_proc_test.c
-    autonomous_trust/fleet/artifact_proc_helpers.c
-    ${fleet_test_util_srcs})
-set_source_files_properties(test/artifact_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(artifact_proc_test PRIVATE ${TEST_DEPENDENCIES})
-add_dependencies(artifact_proc_test autonomous_trust_static)
-
-add_test(NAME artifact_proc_test COMMAND $<TARGET_FILE:artifact_proc_test>)
-
-add_executable(update_proc_test
-    test/update_proc_test.c
-    autonomous_trust/fleet/update_proc_helpers.c
-    autonomous_trust/fleet/update_selftest.c
-    autonomous_trust/utilities/at_jansson.c
-    ${fleet_test_util_srcs})
-set_source_files_properties(test/update_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(update_proc_test PRIVATE ${TEST_DEPENDENCIES})
-add_dependencies(update_proc_test autonomous_trust_static)
-
-add_test(NAME update_proc_test COMMAND $<TARGET_FILE:update_proc_test>)
-
-add_executable(config_proc_test
-    test/config_proc_test.c
-    autonomous_trust/fleet/config_proc_helpers.c
-    autonomous_trust/fleet/update_proc_helpers.c
-    autonomous_trust/utilities/at_jansson.c
-    ${fleet_test_util_srcs})
-set_source_files_properties(test/config_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(config_proc_test PRIVATE ${TEST_DEPENDENCIES})
-add_dependencies(config_proc_test autonomous_trust_static)
-
-add_test(NAME config_proc_test COMMAND $<TARGET_FILE:config_proc_test>)
 
 add_executable(util3_test test/util3_test.c)
 set_source_files_properties(test/util3_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1362,6 +1366,20 @@ target_link_libraries(identity2_test PRIVATE ${AT_TEST_LIBS})
 add_executable(group2_test test/group2_test.c)
 set_source_files_properties(test/group2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(group2_test PRIVATE ${AT_TEST_LIBS})
+# A failed mint, for test_group_rotate_key_failed_mint_retires_nothing: the
+# test's __wrap_encryptor_generate returns NULL on demand. Works because the
+# library is linked statically, so group.o's reference resolves at this link.
+if(APPLE OR WIN32)
+    # Apple's linker and lld-link have no --wrap; the failed-mint case is
+    # skipped there (AT_NO_LINK_WRAP in test/group2_test.c).
+    target_compile_definitions(group2_test PRIVATE AT_NO_LINK_WRAP)
+else()
+    target_link_options(group2_test PRIVATE -Wl,--wrap=encryptor_generate)
+endif()
+
+add_executable(vote_collection_test test/vote_collection_test.c)
+set_source_files_properties(test/vote_collection_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(vote_collection_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(map3_test test/map3_test.c)
 set_source_files_properties(test/map3_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1387,42 +1405,13 @@ add_test(NAME util3_test COMMAND $<TARGET_FILE:util3_test>)
 add_test(NAME capabilities2_test COMMAND $<TARGET_FILE:capabilities2_test>)
 add_test(NAME identity2_test COMMAND $<TARGET_FILE:identity2_test>)
 add_test(NAME group2_test COMMAND $<TARGET_FILE:group2_test>)
+add_test(NAME vote_collection_test COMMAND $<TARGET_FILE:vote_collection_test>)
 add_test(NAME map3_test COMMAND $<TARGET_FILE:map3_test>)
 add_test(NAME data_proto_test COMMAND $<TARGET_FILE:data_proto_test>)
 add_test(NAME array3_test COMMAND $<TARGET_FILE:array3_test>)
 add_test(NAME message2_test COMMAND $<TARGET_FILE:message2_test>)
 add_test(NAME capabilities3_test COMMAND $<TARGET_FILE:capabilities3_test>)
 
-# ZTA tests (only when AT_ZTA is enabled)
-if(AT_ZTA)
-    add_executable(zta_verifier_test test/zta_verifier_test.c)
-    set_source_files_properties(test/zta_verifier_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(zta_verifier_test PRIVATE ${AT_TEST_LIBS})
-
-    add_executable(zta_policy_test test/zta_policy_test.c)
-    set_source_files_properties(test/zta_policy_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(zta_policy_test PRIVATE ${AT_TEST_LIBS})
-
-    add_executable(zta_audit_test test/zta_audit_test.c)
-    set_source_files_properties(test/zta_audit_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(zta_audit_test PRIVATE ${AT_TEST_LIBS})
-
-    add_executable(zta_ocsp_test test/zta_ocsp_test.c)
-    set_source_files_properties(test/zta_ocsp_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_compile_definitions(zta_ocsp_test PRIVATE
-        GEN_CA_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/test/zta_test_ca/generate_test_ca.sh")
-    target_link_libraries(zta_ocsp_test PRIVATE ${AT_TEST_LIBS})
-
-    add_executable(zta_delegation_test test/zta_delegation_test.c)
-    set_source_files_properties(test/zta_delegation_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(zta_delegation_test PRIVATE ${AT_TEST_LIBS})
-
-    add_test(NAME zta_verifier_test COMMAND $<TARGET_FILE:zta_verifier_test>)
-    add_test(NAME zta_policy_test COMMAND $<TARGET_FILE:zta_policy_test>)
-    add_test(NAME zta_audit_test COMMAND $<TARGET_FILE:zta_audit_test>)
-    add_test(NAME zta_ocsp_test COMMAND $<TARGET_FILE:zta_ocsp_test>)
-    add_test(NAME zta_delegation_test COMMAND $<TARGET_FILE:zta_delegation_test>)
-endif() # AT_ZTA
 
 # Hybrid-transport routing unit tests — always compiled; no backend needed,
 # this is a pure-math test of the matcher logic.
@@ -1453,10 +1442,32 @@ set_source_files_properties(test/peer_rtt_update_test.c PROPERTIES COMPILE_FLAGS
 target_link_libraries(peer_rtt_update_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME peer_rtt_update_test COMMAND $<TARGET_FILE:peer_rtt_update_test>)
 
-add_executable(app_events_test test/app_events_test.c)
-set_source_files_properties(test/app_events_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(app_events_test PRIVATE ${AT_TEST_LIBS})
-add_test(NAME app_events_test COMMAND $<TARGET_FILE:app_events_test>)
+add_executable(neg_oracle_test test/neg_oracle_test.c)
+set_source_files_properties(test/neg_oracle_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(neg_oracle_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME neg_oracle_test COMMAND $<TARGET_FILE:neg_oracle_test>)
+add_executable(ext_hooks_test test/ext_hooks_test.c)
+set_source_files_properties(test/ext_hooks_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(ext_hooks_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME ext_hooks_test COMMAND $<TARGET_FILE:ext_hooks_test>)
+
+add_executable(net_filter_test test/net_filter_test.c)
+set_source_files_properties(test/net_filter_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_filter_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME net_filter_test COMMAND $<TARGET_FILE:net_filter_test>)
+
+add_executable(extension_test test/extension_test.c)
+set_source_files_properties(test/extension_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(extension_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME extension_test COMMAND $<TARGET_FILE:extension_test>)
+
+# app_abi_test pins the flat app-event layout, which must be identical in
+# every build -- so, unlike app_events_test, it is built in every config.
+add_executable(app_abi_test test/app_abi_test.c)
+set_source_files_properties(test/app_abi_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(app_abi_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME app_abi_test COMMAND $<TARGET_FILE:app_abi_test>)
+
 
 # The flat lifecycle ABI (app_node.h) and the non-forking half of
 # at_node_start. Creates and binds under its own AUTONOMOUS_TRUST_ROOT.
@@ -1467,106 +1478,131 @@ set_source_files_properties(test/operator_binding_test.c PROPERTIES COMPILE_FLAG
 target_link_libraries(operator_binding_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME operator_binding_test COMMAND $<TARGET_FILE:operator_binding_test>)
 
+add_executable(process_child_exit_test test/process_child_exit_test.c)
+set_source_files_properties(test/process_child_exit_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(process_child_exit_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME process_child_exit_test COMMAND $<TARGET_FILE:process_child_exit_test>)
+
 add_executable(zta_binding_test test/zta_binding_test.c)
 set_source_files_properties(test/zta_binding_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(zta_binding_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME zta_binding_test COMMAND $<TARGET_FILE:zta_binding_test>)
 
+# ISSUES.md §10.5. NO LONGER GUARDED BY AT_ZTA (Phase 4 P4.1). It used to be,
+# because it drives peer_standing_msg_t, which only existed when ZTA was
+# compiled in — which meant the ceiling machinery went untested in exactly the
+# configuration that ships it to an app (apps/agora builds with AT_ZTA OFF).
+# The standing mechanism is substrate-level now, so this builds and runs
+# everywhere.
+add_executable(peer_standing_test test/peer_standing_test.c)
+set_source_files_properties(test/peer_standing_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(peer_standing_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME peer_standing_test COMMAND $<TARGET_FILE:peer_standing_test>)
+
+add_executable(rep_tenure_test test/rep_tenure_test.c)
+set_source_files_properties(test/rep_tenure_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_tenure_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rep_tenure_test COMMAND $<TARGET_FILE:rep_tenure_test>)
+
+add_executable(group_adopt_test test/group_adopt_test.c)
+set_source_files_properties(test/group_adopt_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(group_adopt_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME group_adopt_test COMMAND $<TARGET_FILE:group_adopt_test>)
+
+add_executable(rescore_sweep_test test/rescore_sweep_test.c)
+set_source_files_properties(test/rescore_sweep_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rescore_sweep_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rescore_sweep_test COMMAND $<TARGET_FILE:rescore_sweep_test>)
+
+# Phase 4 P4.1. Core, not an extension's: app_peer_standing is always compiled,
+# because a governance tier bounding a peer is not an Agora-specific idea.
+add_executable(peer_standing_verb_test test/peer_standing_verb_test.c)
+set_source_files_properties(test/peer_standing_verb_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(peer_standing_verb_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME peer_standing_verb_test COMMAND $<TARGET_FILE:peer_standing_verb_test>)
+
 add_executable(app_node_test test/app_node_test.c)
 set_source_files_properties(test/app_node_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(app_node_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME app_node_test COMMAND $<TARGET_FILE:app_node_test>)
-
-# Envelope codec unit tests — gated by AT_NET_ENVELOPE since the codec TU
-# itself is only compiled when that option is ON.
-if(AT_NET_ENVELOPE)
-    add_executable(net_envelope_test test/net_envelope_test.c)
-    set_source_files_properties(test/net_envelope_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(net_envelope_test PRIVATE ${AT_TEST_LIBS})
-    add_test(NAME net_envelope_test COMMAND $<TARGET_FILE:net_envelope_test>)
-
-    # Multi-hop relay test — exercises the envelope forwarding protocol
-    # end-to-end across simulated A -> G [-> G2] -> B paths without
-    # bringing up real transports or threads.
-    add_executable(envelope_relay_test test/envelope_relay_test.c)
-    set_source_files_properties(test/envelope_relay_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(envelope_relay_test PRIVATE ${AT_TEST_LIBS})
-    add_test(NAME envelope_relay_test COMMAND $<TARGET_FILE:envelope_relay_test>)
-
-    # Cross-leg broadcast forwarding gate + dedup fingerprint. Split from
-    # envelope_relay_test to stay under the 9-test RUN_TESTS cap.
-    add_executable(envelope_bcast_test test/envelope_bcast_test.c)
-    set_source_files_properties(test/envelope_bcast_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(envelope_bcast_test PRIVATE ${AT_TEST_LIBS})
-    add_test(NAME envelope_bcast_test COMMAND $<TARGET_FILE:envelope_bcast_test>)
-
-    # Integration-ish test: drives the real net_proc handle_inbound_peer()
-    # through a mock transport, asserting forward/drop/local behavior
-    # end-to-end without bringing up daemonize()'d processes or sockets.
-    add_executable(net_proc_relay_test test/net_proc_relay_test.c)
-    set_source_files_properties(test/net_proc_relay_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(net_proc_relay_test PRIVATE ${AT_TEST_LIBS})
-    add_test(NAME net_proc_relay_test COMMAND $<TARGET_FILE:net_proc_relay_test>)
-
-    # Deferred-message uuid-keyed retry (stage G). Verifies that under
-    # envelope mode the deferred-message ring keys by envelope src_uuid,
-    # not the gateway's transport from_addr.
-    add_executable(net_proc_defer_test test/net_proc_defer_test.c)
-    set_source_files_properties(test/net_proc_defer_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(net_proc_defer_test PRIVATE ${AT_TEST_LIBS})
-    add_test(NAME net_proc_defer_test COMMAND $<TARGET_FILE:net_proc_defer_test>)
-
-    # Cross-group forward path (stage F) — gated on AT_NET_GROUP_FORWARD
-    # because it drives the code in handle_inbound_group that only exists
-    # under that option. Envelope is still needed for envelope pack/unpack.
-    if(AT_NET_GROUP_FORWARD)
-        add_executable(envelope_group_forward_test test/envelope_group_forward_test.c)
-        set_source_files_properties(test/envelope_group_forward_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-        target_link_libraries(envelope_group_forward_test PRIVATE ${AT_TEST_LIBS})
-        add_test(NAME envelope_group_forward_test COMMAND $<TARGET_FILE:envelope_group_forward_test>)
-    endif()
-
-    # Cross-cluster peer discovery (stage E) — verifies that forwarded
-    # ID_ANNOUNCE broadcasts preserve the announcer's self-reported
-    # address (so replies route back through the gateway).
-    if(AT_DISCOVERY_CROSS_CLUSTER)
-        add_executable(discovery_cross_cluster_test test/discovery_cross_cluster_test.c)
-        set_source_files_properties(test/discovery_cross_cluster_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-        target_link_libraries(discovery_cross_cluster_test PRIVATE ${AT_TEST_LIBS})
-        add_test(NAME discovery_cross_cluster_test COMMAND $<TARGET_FILE:discovery_cross_cluster_test>)
-    endif()
-
-    # Per-leg broadcast exclusion (stage D-followup). Verifies
-    # handle_inbound_broadcast uses send_broadcast_except_leg when the
-    # transport reports a known last_recv_leg, and falls back to
-    # send_broadcast otherwise. Compiled whenever envelope mode is on —
-    # the refinement is zero-cost when irrelevant, so no separate option.
-    add_executable(broadcast_except_leg_test test/broadcast_except_leg_test.c)
-    set_source_files_properties(test/broadcast_except_leg_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(broadcast_except_leg_test PRIVATE ${AT_TEST_LIBS})
-    add_test(NAME broadcast_except_leg_test COMMAND $<TARGET_FILE:broadcast_except_leg_test>)
-endif()
-
-# DTN tests (only when AT_NET_DTN is enabled). dtn_eid_test is pure string
-# math so it runs against any backend. dtn_transport_test exercises the
-# transport's send/recv paths through the backend vtable; it assumes the
-# no-op stub (send returns 0, recv returns ENOMSG) and would misbehave
-# against a real daemon, so it is gated to the stub backend only.
-if(AT_NET_DTN)
-    add_executable(dtn_eid_test test/dtn_eid_test.c)
-    set_source_files_properties(test/dtn_eid_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(dtn_eid_test PRIVATE ${AT_TEST_LIBS})
-    add_test(NAME dtn_eid_test COMMAND $<TARGET_FILE:dtn_eid_test>)
-
-    if(AT_NET_DTN_BACKEND STREQUAL "stub")
-        add_executable(dtn_transport_test test/dtn_transport_test.c)
-        set_source_files_properties(test/dtn_transport_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-        target_link_libraries(dtn_transport_test PRIVATE ${AT_TEST_LIBS})
-        add_test(NAME dtn_transport_test COMMAND $<TARGET_FILE:dtn_transport_test>)
-    endif()
-endif()
+# An external libat_social (Agora) has social_app_routing_test on the same queue
+# names; never run the two at once.
+set_tests_properties(app_node_test PROPERTIES RESOURCE_LOCK app_node)
 
 endif() # LIBCHECK_LIBRARY
+
+# Extension libraries (src/c/extensions/): built by this project, after the
+# core targets and AT_TEST_LIBS, because they use the core's private headers
+# and flags. See doc/architecture/extensions.md.
+include(extensions/at_extension.cmake)
+if(AT_NET_DTN)
+    add_subdirectory(extensions/dtn)
+endif()
+if(AT_NET_GATEWAY)
+    add_subdirectory(extensions/gateway)
+endif()
+# Certificates before replication, which links it.
+foreach(_layer PHYSICS CALIBRATION CERTIFICATES PREQUENTIAL REPLICATION)
+    if(AT_ORACLE_${_layer})
+        string(TOLOWER ${_layer} _dir)
+        add_subdirectory(extensions/${_dir})
+    endif()
+endforeach()
+if(AT_ZTA)
+    add_subdirectory(extensions/zta)
+    # Core tests with a ZTA half: built with it, and libat_zta linked whole, in
+    # an AT_ZTA build; the core half alone otherwise.
+    if(LIBCHECK_LIBRARY)
+        foreach(_t operator_attestation_test msg_types3_test operator_binding_test
+                   zta_binding_test peer_standing_test)
+            target_compile_definitions(${_t} PRIVATE AT_ZTA_ENABLED)
+            target_include_directories(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/extensions)
+            # The core group again after the library: it reaches back into the core.
+            at_whole_archive(_whole at_zta_static)
+            target_link_libraries(${_t} PRIVATE
+                ${_whole} ${AT_TEST_LIBS} OpenSSL::SSL OpenSSL::Crypto)
+        endforeach()
+    endif()
+endif()
+if(AT_RENDEZVOUS_LIB)
+    add_subdirectory(extensions/rendezvous)
+endif()
+if(AT_FLEET_LIB)
+    add_subdirectory(extensions/fleet)
+endif()
+if(AT_DATA_SOURCE_LIB)
+    add_subdirectory(extensions/data_source)
+endif()
+if(AT_FIRST_CONTACT_LIB)
+    if(NOT AT_RENDEZVOUS_LIB)
+        message(FATAL_ERROR "AT_FIRST_CONTACT_LIB needs AT_RENDEZVOUS_LIB: first "
+                            "contact rides the rendezvous relays")
+    endif()
+    add_subdirectory(extensions/first_contact)
+    # Core tests with a first-contact half: built with it, and the library
+    # linked whole, when it is built; the core half alone otherwise.
+    if(LIBCHECK_LIBRARY)
+        foreach(_t extension_test unencrypted_verbs_test)
+            target_compile_definitions(${_t} PRIVATE AT_FIRST_CONTACT_ENABLED)
+            target_include_directories(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/extensions)
+            at_whole_archive(_whole at_first_contact_static at_rendezvous_static)
+            target_link_libraries(${_t} PRIVATE ${_whole} ${AT_TEST_LIBS})
+        endforeach()
+        # Rendezvous's own roster test (it links rendezvous already): the hub
+        # preference needs first contact's area provider.
+        target_compile_definitions(net_relay_rosters_test PRIVATE AT_FIRST_CONTACT_ENABLED)
+        at_whole_archive(_whole at_first_contact_static)
+        target_link_libraries(net_relay_rosters_test PRIVATE ${_whole} ${AT_TEST_LIBS})
+    endif()
+endif()
+foreach(_ext_dir ${AT_EXTERNAL_EXTENSIONS})
+    get_filename_component(_ext_dir "${_ext_dir}" ABSOLUTE)
+    get_filename_component(_ext_name "${_ext_dir}" NAME)
+    if(NOT EXISTS "${_ext_dir}/CMakeLists.txt")
+        message(FATAL_ERROR "AT_EXTERNAL_EXTENSIONS: no CMakeLists.txt in ${_ext_dir}")
+    endif()
+    add_subdirectory("${_ext_dir}" extensions/${_ext_name})
+endforeach()
 
 ####################
 # Conformance harness (cross-language test corpus runner)
@@ -1575,6 +1611,20 @@ endif() # LIBCHECK_LIBRARY
 # at build time, runs each case through C-side adapters, emits a results
 # JSON whose shape matches the Python harness output. Optional — only
 # wired when the autonomous-trust Python sources are present alongside.
+# Tests that need fork, pipes between processes or POSIX signals: not built on
+# Windows, whose nodes run in-process (the in-process and stream paths have
+# their own tests, ipc_paths_test).
+if(WIN32 AND LIBCHECK_LIBRARY)
+    foreach(_t msg_test process_child_exit_test socket_helpers_test first_contact_live_test)
+        if(TARGET ${_t})
+            set_target_properties(${_t} PROPERTIES EXCLUDE_FROM_ALL TRUE)
+            # Registered in its own directory (an extension's, for some).
+            get_target_property(_tdir ${_t} SOURCE_DIR)
+            set_tests_properties(${_t} DIRECTORY ${_tdir} PROPERTIES DISABLED TRUE)
+        endif()
+    endforeach()
+endif()
+
 if(EXISTS ${CMAKE_SOURCE_DIR}/../autonomous-trust/conformance)
     add_subdirectory(conformance)
 endif()

@@ -120,6 +120,18 @@ class TestPeers:
         found = p.find_by_address('10.0.0.1/24')
         assert found is peer
 
+    def test_find_by_address_keeps_an_eid_whole(self):
+        # A DTN EID's slashes are its own; cutting at the first one used to
+        # collapse every EID-addressed peer to "dtn:".
+        p = Peers()
+        a = _mock_peer(nickname='a', address='dtn://at-aaaaaaaa/peer')
+        b = _mock_peer(nickname='b', address='dtn://at-bbbbbbbb/peer')
+        p.add(a)
+        p.add(b)
+        assert p.find_by_address('dtn://at-aaaaaaaa/peer') is a
+        assert p.find_by_address('dtn://at-bbbbbbbb/peer') is b
+        assert p.find_by_address('dtn:') is None
+
     def test_find_by_address_not_found(self):
         p = Peers()
         assert p.find_by_address('1.2.3.4') is None
@@ -311,3 +323,20 @@ class TestPromoteNotInValuation:
         p.promote(peer)
         # Should add to valuation[-1]
         assert peer.nickname in p.valuation[-1]
+
+
+class TestFindByUuidTypes:
+    """A peer's uuid is a str or a UUID depending on where its Identity was
+    built; the same peer must be found either way."""
+
+    @pytest.mark.parametrize('stored_as_str', [True, False])
+    def test_found_by_str_or_uuid(self, stored_as_str):
+        u = uuid4()
+        peers = Peers()
+        peer = _mock_peer(uuid=str(u) if stored_as_str else u)
+        peers.add(peer, peers.mid_level)
+        assert peers.find_by_uuid(u) is peer
+        assert peers.find_by_uuid(str(u)) is peer
+        assert peers.find_by_uuid(str(u).upper()) is peer
+        assert peers.find_by_uuid(uuid4()) is None
+        assert peers.find_by_uuid(None) is None

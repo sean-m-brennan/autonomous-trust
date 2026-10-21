@@ -1,0 +1,42 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-propose-replication-veteran-verifier-cosigned
+byte_pinning: false
+description: |
+    The control for attest-propose-replication-young-verifier-declined: the
+    same 0.9, the same 600 s minimum, but bob first held alice 1000 s ago. Her
+    tenure is served, she is tier 4, and bob co-signs her replication
+    (doc/architecture/reputation.md, "Tenure").
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+fixtures:
+  reputations:
+    bob:
+      alice: 0.9
+  tenure:
+    bob:
+      min_sec: 600
+      alice: 1000
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest propose
+    payload:
+      subject: carol
+      score: 0.3
+      channel: replication
+    description: a replication from a verifier bob has held for 1000 s.
+
+expected_state:
+  bob:
+    attest_signs_sent: 1

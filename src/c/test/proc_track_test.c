@@ -61,6 +61,7 @@ DEFINE_TEST(test_process_tracker_write_config)
     char *ptr = fgets(actual, 100, f);
     ck_assert_ptr_nonnull(ptr);
     fclose(f);
+    remove(filename);  /* written into the cwd; do not leave it behind */
 
     ck_assert_str_eq(actual, expected);
 }
@@ -73,7 +74,7 @@ DEFINE_TEST(test_process_tracker_read_config)
 
     FILE *f = fopen(filename, "w");
     ck_assert_ptr_nonnull(f);
-    ck_assert_ret_nonzero(fputs(config, f));
+    ck_assert(fputs(config, f) >= 0);   /* non-negative is success (UCRT returns 0) */
     fclose(f);
 
     logger_t logger;
@@ -86,6 +87,7 @@ DEFINE_TEST(test_process_tracker_read_config)
         log_exception(&logger);
 
     ck_assert_int_eq(2, map_size(tracker.registry));
+    remove(filename);
 }
 END_TEST_DEFINITION()
 

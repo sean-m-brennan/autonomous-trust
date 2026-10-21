@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from autonomous_trust.core.reputation.reputation import (
     TransactionScore, Transaction, TransactionHistory,
-    Reputation, Reputations,
+    Reputation, Reputations, PeerReputation, ReconcileResult,
 )
 from autonomous_trust.core.reputation.repprocess import ReputationProcess
 
@@ -28,6 +28,440 @@ class TestTransactionScore:
     def test_init(self):
         ts = TransactionScore(task_id=uuid4(), score=0.9)
         assert ts.score == 0.9
+
+
+class TestTransactionScoreRange:
+    """The [0, 1] score bound (doc/architecture/reputation.md), from
+    kith-covenant's erosion-legibility audit. The [0, 1]
+    scale was a convention rather than an enforced invariant, so an out-of-range
+    score was GRADED — folded into the weighted average, moving a reputation by an
+    unbounded amount — instead of rejected."""
+
+    @pytest.mark.parametrize('score', [0.0, 0.2, 1.0])
+    def test_in_range_scores_are_accepted(self, score):
+        assert TransactionScore(task_id=uuid4(), score=score).score == score
+
+    @pytest.mark.parametrize('score', [1.0001, 5.0, 1e9, -0.0001, -1.0])
+    def test_out_of_range_is_rejected_not_clamped(self, score):
+        """Clamping would hide the submitter's bug while still handing the peer
+        more credit than any honest score could earn."""
+        with pytest.raises(ValueError):
+            TransactionScore(task_id=uuid4(), score=score)
+
+    def test_nan_is_rejected(self):
+        """The one value that would poison an average with no way back."""
+        with pytest.raises(ValueError):
+            TransactionScore(task_id=uuid4(), score=float('nan'))
+
+    @pytest.mark.parametrize('score', [float('inf'), float('-inf')])
+    def test_infinities_are_rejected(self, score):
+        with pytest.raises(ValueError):
+            TransactionScore(task_id=uuid4(), score=score)
+
+    def test_a_non_number_is_rejected(self):
+        with pytest.raises(ValueError):
+            TransactionScore(task_id=uuid4(), score='high')
+
+    def test_none_is_rejected(self):
+        with pytest.raises(ValueError):
+            TransactionScore(task_id=uuid4(), score=None)
+
+    def test_an_int_is_accepted_as_a_float(self):
+        assert TransactionScore(task_id=uuid4(), score=1).score == 1.0
+
+    def test_the_message_names_the_scale(self):
+        """An operator reading the log needs the bound, not just a refusal."""
+        with pytest.raises(ValueError, match=r'\[0, 1\]'):
+            TransactionScore(task_id=uuid4(), score=2.0)
+
+    def test_the_wire_form_is_checked_too(self):
+        """`from_json_string` reconstructs via `cls(**kwargs)`, so the constructor
+        IS the wire-side gate -- which is why the handlers catch instead of
+        letting a peer raise inside the process loop."""
+        from autonomous_trust.core import from_json_string, to_json_string
+        good = TransactionScore(task_id=uuid4(), score=0.5)
+        payload = to_json_string(good).replace('0.5', '7.5')
+        with pytest.raises(ValueError):
+            from_json_string(payload)
+
+    def test_the_bound_is_one_value_not_a_repeated_literal(self):
+        from autonomous_trust.core.reputation.reputation import (
+            TX_SCORE_MIN, TX_SCORE_MAX)
+        assert (TX_SCORE_MIN, TX_SCORE_MAX) == (0.0, 1.0)
+
+
+class TestTransactionScoreChannel:
+    """Evidence channels (R+D.md §12.8, doc/verification_oracle.md "Keep the
+    channels separate"). A score says how well a peer did; the channel says how
+    we know. "Refuted by conservation of energy" and "failed a replicated task"
+    warrant different responses, and collapsing both into one scalar before the
+    reputation algebra sees it destroys what an escalation path would need.
+
+    The first slice was legibility only; the second (R+D.md §12.8's
+    differentiated responses) gives the channel consequences. These tests pin
+    the vocabulary, the closed-set refusal and the wire round-trip; what the
+    channel now DOES is pinned in TestChannelResponses below."""
+
+    def test_default_is_task_outcome(self):
+        """Every producer predating the field was grading a completed task, so
+        absence has one right answer rather than needing a None sentinel."""
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_TASK_OUTCOME)
+        ts = TransactionScore(task_id=uuid4(), score=0.9)
+        assert ts.channel == TX_CHANNEL_TASK_OUTCOME
+
+    @pytest.mark.parametrize('channel', [None, ''])
+    def test_absence_normalizes_rather_than_staying_none(self, channel):
+        """Normalized so a reader never has to know whether None meant "task
+        outcome" or "producer forgot"."""
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_DEFAULT)
+        ts = TransactionScore(task_id=uuid4(), score=0.9, channel=channel)
+        assert ts.channel == TX_CHANNEL_DEFAULT
+
+    def test_every_known_channel_is_accepted(self):
+        from autonomous_trust.core.reputation.reputation import TX_CHANNELS
+        for channel in TX_CHANNELS:
+            ts = TransactionScore(task_id=uuid4(), score=0.9, channel=channel)
+            assert ts.channel == channel
+
+    @pytest.mark.parametrize('channel', ['nonsense', 'physicall',
+                                         'task-outcome', 'Physical', 'PHYSICAL',
+                                         # A channel added later is held to the
+                                         # same rule as the ones it joined.
+                                         'First_Person', 'first-person'])
+    def test_unknown_is_refused_not_coerced(self, channel):
+        """Refused rather than passed through OR silently defaulted. Passing it
+        through makes the channel "some string a peer sent"; defaulting it turns
+        a typo'd physics refutation into an ordinary task grade with no trace
+        that anything was lost. Case-sensitive because a closed set that
+        accepts near-misses is not closed."""
+        with pytest.raises(ValueError):
+            TransactionScore(task_id=uuid4(), score=0.9, channel=channel)
+
+    def test_a_non_string_is_refused(self):
+        with pytest.raises(ValueError):
+            TransactionScore(task_id=uuid4(), score=0.9, channel=7)
+
+    def test_the_message_names_the_vocabulary(self):
+        """An operator reading the log needs to know what WOULD have been
+        accepted, not just that this was not."""
+        with pytest.raises(ValueError, match=r'task_outcome'):
+            TransactionScore(task_id=uuid4(), score=0.9, channel='nope')
+
+    def test_the_wire_form_is_checked_too(self):
+        """Same reasoning as the score bound: `from_json_string` reconstructs
+        via `cls(**kwargs)`, so the constructor IS the wire-side gate, and the
+        handlers catch ValueError rather than let a peer raise inside the
+        process loop."""
+        from autonomous_trust.core import from_json_string, to_json_string
+        good = TransactionScore(task_id=uuid4(), score=0.5, channel='physical')
+        payload = to_json_string(good).replace('"physical"', '"physicall"')
+        with pytest.raises(ValueError):
+            from_json_string(payload)
+
+    def test_the_channel_survives_the_wire(self):
+        from autonomous_trust.core import from_json_string, to_json_string
+        ts = TransactionScore(task_id=uuid4(), score=0.5,
+                              capability_name='cap', channel='self_consistency')
+        back = from_json_string(to_json_string(ts))
+        assert back.channel == 'self_consistency'
+        assert back.capability_name == 'cap'
+        assert back.score == 0.5
+
+    def test_a_legacy_payload_without_the_field_still_parses(self):
+        """A peer running a build from before channels existed is absent, not
+        wrong — its scores must keep flowing."""
+        import json
+        from autonomous_trust.core import from_json_string, to_json_string
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_TASK_OUTCOME)
+        payload = json.loads(to_json_string(
+            TransactionScore(task_id=uuid4(), score=0.5)))
+        del payload['channel']
+        back = from_json_string(json.dumps(payload))
+        assert back.channel == TX_CHANNEL_TASK_OUTCOME
+
+    def test_the_vocabulary_matches_the_c_twin(self):
+        """These strings cross the wire verbatim, so a divergence from the C
+        twin's TX_CHANNEL_* is a score one side accepts and the other drops.
+        Pinned as literals here and in reputation3_test.c so a rename cannot
+        pass silently on one side."""
+        from autonomous_trust.core.reputation.reputation import TX_CHANNELS
+        assert TX_CHANNELS == ('task_outcome', 'physical', 'certificate',
+                               'calibration', 'self_consistency',
+                               'replication', 'swarm_disagreement', 'probe',
+                               'first_person')
+
+    def test_the_channel_does_not_reach_the_chain_entry_hash(self):
+        """The channel rides on the TS and stops at the chain boundary: a
+        committed entry answers "who transacted, and how well," and the channel
+        is provenance for the score rather than part of the committed fact.
+        Pinned because adding it to the canonical bytes would silently change
+        every entry hash in every resident chain and break C parity."""
+        tx = Transaction(task_id=uuid4(), p1_id=uuid4(), p1_score=0.9,
+                         p2_id=uuid4(), p2_score=0.5, index=0)
+        assert b'physical' not in tx._canonical_bytes()
+        assert b'task_outcome' not in tx._canonical_bytes()
+        assert b'channel' not in tx._canonical_bytes()
+
+    def test_a_remote_channel_does_not_change_the_weight(self):
+        """A peer picks its own channel, so honoring its tag would let anyone
+        treble the weight of a score they fabricated. The wire path
+        (`handle_transaction`) therefore weights by capability alone, exactly
+        as before channels existed."""
+        proc = ReputationProcess.__new__(ReputationProcess)
+        proc.capabilities = []
+        plain = TransactionScore(task_id=uuid4(), score=0.9)
+        tagged = TransactionScore(task_id=uuid4(), score=0.9,
+                                  channel='physical')
+        assert (proc._resolve_tx_weight(plain)
+                == proc._resolve_tx_weight(tagged))
+
+    def test_the_subject_never_reaches_the_wire(self):
+        """`subject_uuid` is the requestor's own attribution. Dropping it from
+        the serialized form is what makes "locally-produced evidence only"
+        structural: a score off the wire has no subject to accuse."""
+        from autonomous_trust.core import from_json_string, to_json_string
+        ts = TransactionScore(task_id=uuid4(), score=0.1, channel='physical',
+                              subject_uuid=uuid4())
+        payload = to_json_string(ts)
+        assert 'subject_uuid' not in payload
+        assert from_json_string(payload).subject_uuid is None
+
+
+
+class TestChannelResponses:
+    """What a channel DOES (R+D.md §12.8, the differentiated responses).
+
+    Two responses, and one rule that bounds both: a channel only has power
+    over evidence THIS node produced. The scorer chooses its own channel, so
+    the moment a remote tag carries weight or an accusation, every peer holds
+    a lever on every other peer's reputation.
+
+    Mirror in C: reputation3_test.c (tx_channel weights + hard set) and the
+    `reputation/channel-*` conformance scenarios.
+    """
+
+    # --- weighting --------------------------------------------------------
+
+    def _proc(self, **attrs):
+        proc = ReputationProcess.__new__(ReputationProcess)
+        proc.capabilities = []
+        for k, v in attrs.items():
+            setattr(proc, k, v)
+        return proc
+
+    def test_a_local_hard_channel_outweighs_a_task_outcome(self):
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_PHYSICAL, TX_CHANNEL_TASK_OUTCOME)
+        proc = self._proc()
+        graded = TransactionScore(task_id=uuid4(), score=0.3,
+                                  channel=TX_CHANNEL_TASK_OUTCOME)
+        refuted = TransactionScore(task_id=uuid4(), score=0.3,
+                                   channel=TX_CHANNEL_PHYSICAL)
+        assert (proc._resolve_tx_weight(refuted, local=True)
+                > proc._resolve_tx_weight(graded, local=True))
+
+    def test_calibration_stays_at_the_baseline(self):
+        """The oracle doc names calibration as the channel that should decay a
+        peer GRADUALLY; amplifying it would be the opposite."""
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_CALIBRATION)
+        proc = self._proc()
+        ts = TransactionScore(task_id=uuid4(), score=0.3,
+                              channel=TX_CHANNEL_CALIBRATION)
+        assert proc._resolve_tx_weight(ts, local=True) == 1
+
+    def test_swarm_disagreement_stays_at_the_baseline(self):
+        """It should open a DISPUTE, not levy a bigger penalty — a majority is
+        not an oracle. Until the dispute path exists, the honest response is
+        no amplification at all."""
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_SWARM_DISAGREEMENT)
+        proc = self._proc()
+        ts = TransactionScore(task_id=uuid4(), score=0.3,
+                              channel=TX_CHANNEL_SWARM_DISAGREEMENT)
+        assert proc._resolve_tx_weight(ts, local=True) == 1
+
+    def test_the_channel_multiplies_the_capability_weight(self):
+        """They compose rather than override: a heavy capability refuted on
+        physics is both."""
+        from types import SimpleNamespace as NS
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_PHYSICAL, tx_channel_weight)
+        proc = self._proc(protocol=NS(capabilities={
+            'heavy': NS(transaction_weight=4)}))
+        ts = TransactionScore(task_id=uuid4(), score=0.3,
+                              capability_name='heavy',
+                              channel=TX_CHANNEL_PHYSICAL)
+        assert (proc._resolve_tx_weight(ts, local=True)
+                == 4 * tx_channel_weight(TX_CHANNEL_PHYSICAL))
+
+    def test_an_unknown_channel_never_outweighs_a_known_one(self):
+        """Reading a raw string off an older record must not amplify it, or
+        adding a channel on one side of the wire would silently give it weight
+        on the other."""
+        from autonomous_trust.core.reputation.reputation import tx_channel_weight
+        assert tx_channel_weight('a_channel_from_the_future') == 1
+
+    def test_first_person_is_the_weakest_evidence(self):
+        """Phase 4 P4.1. A first-person account is one peer's reading of one
+        event, with the added problem that the peer is an interested party, so
+        it weighs 1 — the floor of the ranking.
+
+        Asserted on BOTH sides (C: reputation3_test's
+        test_tx_channel_weights_match_the_python_twin) because the two reach
+        that 1 by different routes: a written entry in this dict, and the
+        fall-through in C's tx_channel_weight. A divergence would be invisible
+        in either file read alone.
+
+        The bound on a report is the ACCRUAL CAP, not this weight — a reporter
+        spends their own daily budget, so report-spam costs the spammer.
+        """
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_FIRST_PERSON, TX_CHANNEL_WEIGHTS, tx_channel_weight)
+        assert tx_channel_weight(TX_CHANNEL_FIRST_PERSON) == 1
+        # Written explicitly, not merely defaulted: silence here would become a
+        # divergence the moment someone tightened the lookup.
+        assert TX_CHANNEL_WEIGHTS[TX_CHANNEL_FIRST_PERSON] == 1
+
+    # --- durability: the channel is part of the committed fact -----------
+
+    def test_the_committed_entry_keeps_the_reason(self):
+        """§12.8's second response. A score's channel reaches the chain entry,
+        so every acceptor retains WHY a score was poor and can judge it for
+        itself -- which is the whole basis for there being no accusation
+        mechanism. Before this the `committed` broadcast carried a bare score
+        and the reason stopped at the chain boundary."""
+        from autonomous_trust.core.reputation.reputation import (
+            TransactionHistory, TX_CHANNEL_PHYSICAL)
+        task, a, b = uuid4(), uuid4(), uuid4()
+        hist = TransactionHistory()
+        hist.update(task, a, 0.9)
+        hist.update(task, b, 0.2, TX_CHANNEL_PHYSICAL)
+        tx = list(hist)[0]
+        assert tx.p2_channel == TX_CHANNEL_PHYSICAL
+        assert tx.p1_channel is None       # absent, not defaulted in
+
+    def test_an_untagged_entry_hashes_exactly_as_it_did_before(self):
+        """The condition on the canonical bytes, and the reason this is not a
+        chain migration: entry hashes chain and roll up into the window root
+        that checkpoints are quorum-signed over, so appending a field
+        unconditionally would invalidate every stored chain and every
+        finalized checkpoint at once. An explicit default is the SAME CLAIM as
+        absence, so it must be the same bytes."""
+        from autonomous_trust.core.reputation.reputation import (
+            TransactionHistory, TX_CHANNEL_TASK_OUTCOME, TX_CHANNEL_PHYSICAL)
+
+        task, a, b = uuid4(), uuid4(), uuid4()
+
+        def canon(channel):
+            # Same ids every time, so the only difference is the channel.
+            hist = TransactionHistory()
+            hist.update(task, a, 0.9)
+            hist.update(task, b, 0.2, channel)
+            return list(hist)[0]._canonical_bytes()
+
+        assert canon(None) == canon(TX_CHANNEL_TASK_OUTCOME)
+        assert b'task_outcome' not in canon(None)
+        # A real channel DOES change the bytes -- which is what makes
+        # STRIPPING a refutation off an entry break the chain link.
+        assert canon(TX_CHANNEL_PHYSICAL) != canon(None)
+        assert canon(TX_CHANNEL_PHYSICAL).endswith(b'|task_outcome|physical')
+
+    def test_an_unknown_channel_cannot_reach_the_entry(self):
+        """Refused rather than coerced: the channel is in the entry hash now,
+        so a spelling the group does not share would fork this node's chain
+        rather than merely mislabel it."""
+        from autonomous_trust.core.reputation.reputation import Transaction
+        with pytest.raises(ValueError):
+            Transaction(task_id=uuid4(), p1_id=uuid4(), p1_score=0.2,
+                        p1_channel='a_channel_from_the_future')
+
+    def test_the_evidence_document_round_trips_the_reason(self):
+        """A verifier recomputing entry hashes from attested evidence needs
+        the channel, or its inclusion proofs miss the root it was handed."""
+        from autonomous_trust.core.reputation.reputation import (
+            TransactionHistory, evidence_to_dict, evidence_from_dict,
+            TX_CHANNEL_SELF_CONSISTENCY)
+        task, a, b = uuid4(), uuid4(), uuid4()
+        hist = TransactionHistory()
+        hist.update(task, a, 0.9)
+        hist.update(task, b, 0.2, TX_CHANNEL_SELF_CONSISTENCY)
+        chain, _ = evidence_from_dict(evidence_to_dict(list(hist)))
+        assert chain[0].p2_channel == TX_CHANNEL_SELF_CONSISTENCY
+        assert chain[0].entry_hash() == list(hist)[0].entry_hash()
+
+    def test_an_untagged_evidence_document_is_unchanged(self):
+        """Additive: an entry with no channel serializes exactly as it did
+        before the field existed, so a reader predating it sees no new keys."""
+        from autonomous_trust.core.reputation.reputation import (
+            TransactionHistory, evidence_to_dict)
+        task, a, b = uuid4(), uuid4(), uuid4()
+        hist = TransactionHistory()
+        hist.update(task, a, 0.9)
+        hist.update(task, b, 0.2)
+        entry = evidence_to_dict(list(hist))['chain'][0]
+        assert 'p1_channel' not in entry and 'p2_channel' not in entry
+
+    # --- and no third response: no accusation ----------------------------
+
+    def test_a_channel_no_longer_accuses_anyone(self):
+        """The accusation path is GONE (user's call, 2026-09-02): a poorly
+        scored transaction carries its reason, every peer sees both, and each
+        judges for itself. Pinned as an absence because the alternative --
+        one detector's verdict pinning a peer's reputation from outside the
+        EMA -- is what was deliberately removed."""
+        assert not hasattr(ReputationProcess, '_maybe_slash_for_channel')
+        from autonomous_trust.core.reputation import reputation as rep
+        for gone in ('TX_CHANNELS_HARD', 'tx_channel_is_hard',
+                     'slash_reason_for_channel'):
+            assert not hasattr(rep, gone), gone
+
+    def test_slashing_is_disarmed_by_default(self):
+        """What remains of the slash path is opt-in. Unarmed, a node
+        originates nothing, declines to co-sign, and ignores a finalized
+        slash -- so a quorum elsewhere cannot pin a peer here."""
+        assert ReputationProcess.SLASH_ENABLED is False
+
+    def test_a_disarmed_node_does_not_originate(self):
+        from types import SimpleNamespace as NS
+        from autonomous_trust.core.reputation.reputation import SlashAttestation
+        proc = ReputationProcess.__new__(ReputationProcess)
+        proc.logger = NS(warning=lambda *a, **k: None)
+        att = SlashAttestation(slasher_uuid=uuid4(), target_uuid=uuid4(),
+                               reason=SlashAttestation.REASON_PEER_EXCLUDE,
+                               floor_score=0.45)
+        # Consumed and logged, never signed or broadcast: with no queues in
+        # hand, reaching the broadcast would raise rather than return.
+        assert proc.forward_slash(None, att) is True
+
+
+class TestPeerReputationCarrier:
+    """The app-facing peer carrier (doc/architecture/app-peer-carrier.md).
+    Mirror of C's `peer_reputation_msg_t` / `at_app_reputation_t`:
+    `rated` says whether AT holds a rating at all, because an unrated peer reads
+    as PREREP_NEUTRAL, which is also a score a peer can genuinely earn."""
+
+    def test_a_rated_carrier_keeps_its_score(self):
+        pr = PeerReputation(str(uuid4()), 0.73, rated=True)
+        assert (pr.rated, pr.score) == (True, 0.73)
+
+    def test_an_unrated_carrier_zeroes_the_score(self):
+        """C's `_publish_reputation` zeroes it regardless of what the caller
+        passed, so a consumer that ignores the flag cannot silently read a
+        plausible-looking number -- and PREREP_NEUTRAL is exactly that."""
+        pr = PeerReputation(str(uuid4()), 0.2, rated=False)
+        assert pr.rated is False
+        assert pr.score == 0.0
+
+    def test_rated_defaults_to_true(self):
+        """Change-driven emissions are rated by construction."""
+        assert PeerReputation(str(uuid4()), 0.4).rated is True
+
+    def test_rated_is_coerced_to_bool(self):
+        assert PeerReputation(str(uuid4()), 0.4, rated=1).rated is True
 
 
 class TestTransaction:
@@ -92,7 +526,10 @@ class TestTransactionHistory:
         p1, p2 = uuid4(), uuid4()
         th.update(tid, p1, 0.8)
         th.update(tid, p2, 0.9)
-        assert len(th.by_peer(p1)) >= 1
+        # Exactly once per side: indexing p1 again when p2 completed the tx
+        # double-counted it in every by_peer() consumer.
+        assert th.by_peer(p1) == [th[tid]]
+        assert th.by_peer(p2) == [th[tid]]
 
     def test_era(self):
         th = TransactionHistory()
@@ -202,7 +639,7 @@ class TestTransactionHistory:
         assert first_tid not in th._task_mapping
 
     # ----- Phase 1: prev-hash linking (reputation-vs-blockchain-analysis
-    # §2.1). Lockstep with the C twin's hash-link tests in
+    # doc/architecture/process-architecture.md). Lockstep with the C twin's hash-link tests in
     # src/c/test/reputation2_test.c — keep the canonical serialization and
     # blake2b hashing byte-identical so the two languages agree on links.
 
@@ -367,6 +804,193 @@ class TestTransactionHistory:
                 th.window_root()) is True
 
 
+class TestChainForkReconcile:
+    """LONGEST VERIFIED CHAIN (ISSUES.md §2.15). Mirrors C's
+    reputation_fork_test.c case for case.
+
+    Tasks are named by letter and share ids and peers across histories, so two
+    histories built from the same prefix hold hash-identical entries up to the
+    point where their letters differ: that is where they fork."""
+
+    @pytest.fixture(autouse=True)
+    def _ids(self):
+        self.tasks = {c: uuid4() for c in 'abcdefghijklmnopqrstuvwxyz'}
+        self.p1, self.p2 = uuid4(), uuid4()
+
+    def _chain(self, letters):
+        th = TransactionHistory()
+        for c in letters:
+            t = ord(c) - ord('a')
+            th.update(self.tasks[c], self.p1, 0.3 + 0.02 * t)
+            th.update(self.tasks[c], self.p2, 0.9 - 0.02 * t)
+        return th
+
+    @staticmethod
+    def _wire(th):
+        # Through the wire, as a peer's report arrives: no shared objects.
+        from autonomous_trust.core.config import (
+            to_json_string, from_json_string)
+        return from_json_string(to_json_string(list(th)))
+
+    def test_adopts_the_longer_chain(self):
+        ours, theirs = self._chain('abx'), self._chain('abcd')
+        res = ours.reconcile(self._wire(theirs))
+        assert res.status == ReconcileResult.ADOPTED
+        assert res.fork == 2
+        assert [t.task_id for t in res.dropped] == [self.tasks['x']]
+        assert len(res.added) == 2
+        assert len(ours) == 4 and ours._next_index == 4
+        assert ours.verify_links()
+        assert ours.window_root() == theirs.window_root()  # verbatim
+        assert self.tasks['x'] not in ours._task_mapping
+        assert ours[self.tasks['d']].index == 3
+        assert len(ours.by_peer(self.p2)) == 4
+        # Agreeing now, the same report again changes nothing.
+        assert ours.reconcile(self._wire(theirs)).status == ReconcileResult.NONE
+
+    def test_hands_back_what_it_dropped(self):
+        # Agora Phase 4 DDIL: the process re-proposes its own half of each
+        # dropped entry, so the result carries them whole and in chain order,
+        # and catchup (the majority path) returns the same result. Mirrors C's
+        # test_tx_fork_hands_back_what_it_dropped.
+        ours, theirs = self._chain('abxy'), self._chain('abcde')
+        res = ours.catchup(self._wire(theirs))
+        assert res.status == ReconcileResult.ADOPTED
+        assert [t.task_id for t in res.dropped] == [self.tasks['x'],
+                                                     self.tasks['y']]
+        x = res.dropped[0]
+        assert x.p1_id == self.p1 and x.p2_id == self.p2
+        assert x.p1_score == pytest.approx(0.3 + 0.02 * (ord('x') - ord('a')))
+        assert x.index == 2
+        assert ours.catchup(self._wire(theirs)).dropped == []
+        short = self._chain('ab')
+        res = short.catchup(self._wire(theirs))
+        assert res.status == ReconcileResult.EXTENDED and res.dropped == []
+
+    def test_keeps_our_chain_when_the_peer_is_shorter(self):
+        ours, theirs = self._chain('abxy'), self._chain('abc')
+        before = ours.window_root()
+        res = ours.reconcile(self._wire(theirs))
+        assert res.status == ReconcileResult.KEPT
+        assert res.fork == 2
+        assert len(ours) == 4 and ours.window_root() == before
+
+    def test_tiebreak_is_symmetric(self):
+        # Equal tips: the LOWER head hash wins, whichever side reconciles.
+        a, b = self._chain('abx'), self._chain('abc')
+        a_lower = a._head_hash < b._head_hash
+        a2, b2 = self._chain('abx'), self._chain('abc')
+        ra = a2.reconcile(self._wire(b))
+        rb = b2.reconcile(self._wire(a))
+        adopted, kept = ReconcileResult.ADOPTED, ReconcileResult.KEPT
+        assert ra.status == (kept if a_lower else adopted)
+        assert rb.status == (adopted if a_lower else kept)
+        assert a2.window_root() == b2.window_root()
+
+    def test_the_quorum_chain_wins_an_equal_length_tiebreak(self):
+        """mod-2538837: an equal-length order fork goes to the lower head hash,
+        which can be the side the quorum outvoted. A segment reproducing the
+        attested window wins instead. Mirrors C."""
+        mine, theirs = 'abx', 'abc'
+        probe = self._chain(mine)
+        if probe.reconcile(self._wire(self._chain(theirs))).status \
+                != ReconcileResult.KEPT:
+            mine, theirs = theirs, mine
+        keeper, other = self._chain(mine), self._chain(theirs)
+        attested = (other.window_root(), 0, 3)
+        res = keeper.reconcile(self._wire(other), attested=attested)
+        assert res.status == ReconcileResult.ADOPTED
+        assert keeper.window_root() == other.window_root()
+        # An attestation the segment does not reproduce changes nothing.
+        k2 = self._chain(mine)
+        res = k2.reconcile(self._wire(other), attested=(b'0' * 64, 0, 3))
+        assert res.status == ReconcileResult.KEPT
+
+    def test_refused_inside_the_finalized_checkpoint(self):
+        ours, theirs = self._chain('abx'), self._chain('abcd')
+        before = ours.window_root()
+        res = ours.reconcile(self._wire(theirs), final_end=3)
+        assert res.status == ReconcileResult.REFUSED_FINAL
+        assert res.fork == 2 and ours.window_root() == before
+        # The fork past the checkpoint is adopted.
+        res = ours.reconcile(self._wire(theirs), final_end=2)
+        assert res.status == ReconcileResult.ADOPTED
+        assert ours.window_root() == theirs.window_root()
+
+    def test_adoption_keeps_pending_work(self):
+        ours, theirs = self._chain('abx'), self._chain('abcd')
+        z, d = self.tasks['z'], self.tasks['d']
+        ours.update(z, self.p1, 0.4)
+        ours.update(d, self.p1, 0.3 + 0.02 * 3)
+        res = ours.reconcile(self._wire(theirs))
+        assert res.status == ReconcileResult.ADOPTED
+        assert len(ours) == 4
+        assert ours.window_root() == theirs.window_root()
+        assert len(ours[d]) == 2 and len(ours[z]) == 1
+        ours.update(z, self.p2, 0.6)
+        assert len(ours) == 5 and ours[z].index == 4
+        assert ours.verify_links()
+
+
+class TestFinalityNeedsQuorum:
+    """Finality means a quorum attested the window and our own entries over it
+    still hash to the attested root (ISSUES.md §2.15). Moderation cohort runs
+    mod-2481048 and mod-2483539 (2026-09-23) refused every reconciliation
+    because a proposer's own proposal, stored with only its own signature,
+    counted as final. Mirrors rep_quorum_test.c."""
+
+    def _proc(self, letters):
+        tasks = {c: uuid4() for c in 'abcdefghijklmnopqrstuvwxyz'}
+        p1, p2 = uuid4(), uuid4()
+        th = TransactionHistory()
+        for c in letters:
+            t = ord(c) - ord('a')
+            th.update(tasks[c], p1, 0.3 + 0.02 * t)
+            th.update(tasks[c], p2, 0.9 - 0.02 * t)
+        stub = SimpleNamespace(history=th, _finalized=None,
+                               _quorum_for_group=lambda g: 1,
+                               _checkpoint_quorum=lambda g: 1)
+        return stub
+
+    @staticmethod
+    def _ckpt(root, count):
+        from autonomous_trust.core._python.reputation.reputation import Checkpoint
+        return Checkpoint(proposer_uuid=uuid4(), root=root, epoch=1,
+                          first_index=0, count=count)
+
+    def test_our_own_proposal_alone_is_not_final(self):
+        stub = self._proc('abx')
+        ckpt = self._ckpt(stub.history.window_root(), 3)
+        ReputationProcess._note_final(stub, ckpt, {'me': 'sig'}, '')
+        assert stub._finalized is None
+        assert ReputationProcess._final_end(stub) is None
+
+    def test_a_quorate_checkpoint_over_our_chain_is_final(self):
+        stub = self._proc('abx')
+        ckpt = self._ckpt(stub.history.window_root(), 3)
+        ReputationProcess._note_final(stub, ckpt, {'me': 's', 'bob': 's'}, '')
+        assert ReputationProcess._final_end(stub) == 3
+
+    def test_a_quorate_checkpoint_our_chain_lost_is_not_final(self):
+        stub = self._proc('abx')
+        ckpt = self._ckpt(b'0' * 64, 3)
+        ReputationProcess._note_final(stub, ckpt, {'bob': 's', 'carol': 's'}, '')
+        assert stub._finalized is ckpt
+        assert ReputationProcess._final_end(stub) is None
+
+    def test_a_child_chain_checkpoint_is_not_primary_finality(self):
+        stub = self._proc('abx')
+        ckpt = self._ckpt(stub.history.window_root(), 3)
+        ReputationProcess._note_final(stub, ckpt, {'a': 's', 'b': 's'}, 'grp')
+        assert stub._finalized is None
+
+    def test_range_root_matches_window_root_and_refuses_gaps(self):
+        th = self._proc('abx').history
+        assert th.range_root(0, 3) == th.window_root()
+        assert th.range_root(0, 4) is None
+        assert th.range_root(1, 2) is not None
+
+
 class TestReputation:
     def test_init(self):
         pid = uuid4()
@@ -400,13 +1024,11 @@ class TestReputations:
         assert r[pid] == 0.7
 
 
-# Algorithm pins for ReputationProcess._contrite_tit_for_tat and
-# ._pure_reputation.  These mirror the C unit tests in
-# src/c/test/reputation3_test.c (test_reputation_contrite_tft,
-# test_reputation_pure_with_counterparty) using identical input shapes
-# and expected outputs, so cross-language divergence in the algorithm
-# fails one side's tests immediately.  Documented in
-# doc/architecture/reputation.md:71-83.
+# Algorithm pins for ReputationProcess._contrite_tit_for_tat and ._pure_reputation.
+# These mirror the C unit tests in src/c/test/reputation3_test.c
+# (test_reputation_contrite_tft, test_reputation_pure_with_counterparty) using identical
+# input shapes and expected outputs, so cross-language divergence in the algorithm fails
+# one side's tests immediately.  Documented in doc/architecture/reputation.md:71-83.
 
 def _stub_proc(self_uuid, reputations=None):
     """Build the minimal SimpleNamespace that _contrite_tit_for_tat /
@@ -589,8 +1211,58 @@ class TestPureReputation:
         stub.history.update(t, self_id, 0.7)   # self is p2 (counterparty)
         score = ReputationProcess._pure_reputation(
             stub, SimpleNamespace(uuid=peer_id))
-        # counterparty_score = 0.7, cp_rep = 0.8 → 0.56.
-        assert score == pytest.approx(0.56, abs=0.001)
+        # One entry: the average is its score, whatever the weight (0.56
+        # before 2026-09-23, when the divisor left the reputation out).
+        assert score == pytest.approx(0.7, abs=0.001)
+
+    def test_reporters_are_weighted_by_their_reputation(self):
+        """sum(score * rep) / sum(rep): a trusted reporter's 0.9 outweighs an
+        untrusted one's 0.3. A plain average gives 0.6; the old divisor,
+        sum(w) alone, gave 0.39 and so decayed well-behaved peers."""
+        self_id, peer_id, a, b = uuid4(), uuid4(), uuid4(), uuid4()
+        reps = Reputations()
+        reps.update(a, 0.8)
+        reps.update(b, 0.2)
+        stub = _stub_proc(self_id, reputations=reps)
+        for reporter, s in ((a, 0.9), (b, 0.3)):
+            t = uuid4()
+            stub.history.update(t, peer_id, 0.5)
+            stub.history.update(t, reporter, s)
+        score = ReputationProcess._pure_reputation(
+            stub, SimpleNamespace(uuid=peer_id))
+        assert score == pytest.approx((0.9 * 0.8 + 0.3 * 0.2) / 1.0, abs=1e-6)
+
+    def test_well_behaved_peers_do_not_decay_under_rescoring(self):
+        """Fed back through repeated rescoring, peers whose every transaction
+        scores 0.9 stay at 0.9. The old divisor drove them toward zero."""
+        self_id, p, q = uuid4(), uuid4(), uuid4()
+        reps = Reputations()
+        reps.update(p, 0.7)
+        reps.update(q, 0.7)
+        stub = _stub_proc(self_id, reputations=reps)
+        for _ in range(4):
+            t = uuid4()
+            stub.history.update(t, p, 0.9)
+            stub.history.update(t, q, 0.9)
+        for _ in range(20):
+            sp = ReputationProcess._pure_reputation(stub, SimpleNamespace(uuid=p))
+            sq = ReputationProcess._pure_reputation(stub, SimpleNamespace(uuid=q))
+            reps.update(p, sp)
+            reps.update(q, sq)
+        assert sp == pytest.approx(0.9, abs=1e-6)
+        assert sq == pytest.approx(0.9, abs=1e-6)
+
+    def test_reporters_without_reputation_leave_the_prior(self):
+        self_id, peer_id, a = uuid4(), uuid4(), uuid4()
+        reps = Reputations()
+        reps.update(a, 0.0)
+        stub = _stub_proc(self_id, reputations=reps)
+        t = uuid4()
+        stub.history.update(t, peer_id, 0.5)
+        stub.history.update(t, a, 0.9)
+        score = ReputationProcess._pure_reputation(
+            stub, SimpleNamespace(uuid=peer_id))
+        assert score == pytest.approx(stub.PREREP_NEUTRAL)
 
     def test_unknown_counterparty_uses_default_neutral(self):
         """Counterparty missing from self.reputations falls back to
@@ -603,8 +1275,8 @@ class TestPureReputation:
         stub.history.update(t, self_id, 0.6)
         score = ReputationProcess._pure_reputation(
             stub, SimpleNamespace(uuid=peer_id))
-        # counterparty_score = 0.6, cp_rep = 0.2 → 0.12.
-        assert score == pytest.approx(0.12, abs=0.001)
+        # Counted, at the fallback weight: one entry, so its score.
+        assert score == pytest.approx(0.6, abs=0.001)
 
 
 class TestProposerHistoryBilateral:
@@ -664,20 +1336,28 @@ class TestProposerHistoryBilateral:
         stub._chain_for_group = lambda g: history
         stub._note_interaction = lambda *a, **k: None
         stub._fold_committed_tx = lambda *a, **k: None
+        # A stand-in certificate passes: certificates are
+        # test_commit_certificates'.
+        stub._commit_cert_ok = lambda *a, **k: True
+        stub._record_committed_half = lambda *a: \
+            ReputationProcess._record_committed_half(stub, *a)
         stub.identity = SimpleNamespace(uuid=self_id)
         stub.logger = SimpleNamespace(
             warning=lambda *a, **k: None, debug=lambda *a, **k: None,
             info=lambda *a, **k: None)
 
         task = uuid4()
+        # A commit is signed and writes its SENDER's own half (ISSUES.md
+        # §2.16, shape 2), so it comes from the proposer it names.
         msg = SimpleNamespace(
             function=ReputationProtocol.committed,
-            obj=to_json_string((task, peer_id, 0.7)),
+            obj=to_json_string((task, peer_id, 0.7, None, None, {'s': 'ab'})),
+            verified=True, from_whom=SimpleNamespace(uuid=peer_id, nickname='p'),
         )
         ReputationProcess.handle_committed(stub, {}, msg)
 
-        # Acceptor wrote the proposer's entry.
-        tx = history[task]
+        # Acceptor pooled the proposer's half, to be placed.
+        tx = history.pooled(task)
         assert tx.p1_id == peer_id
         assert tx.p1_score == pytest.approx(0.7)
         assert tx.p2_id is None  # only the proposer's slot is filled
@@ -686,18 +1366,19 @@ class TestProposerHistoryBilateral:
         # avoid double-write (handle_accepted already wrote it).
         msg_self = SimpleNamespace(
             function=ReputationProtocol.committed,
-            obj=to_json_string((task, self_id, 0.9)),
+            obj=to_json_string((task, self_id, 0.9, None, None, {'s': 'ab'})),
+            verified=True, from_whom=SimpleNamespace(uuid=self_id, nickname='s'),
         )
         ReputationProcess.handle_committed(stub, {}, msg_self)
         # Re-fetch; p2 must still be empty.
-        tx = history[task]
+        tx = history.pooled(task)
         assert tx.p2_id is None
 
     def test_bilateral_via_two_commits(self):
-        """Putting the two halves together: a proposer's own
-        handle_accepted writes their entry; the peer's committed
-        broadcast then fills the second slot.  This is the path
-        CTFT relies on for non-default scoring."""
+        """Putting the two halves together in the pool: a proposer's own
+        handle_accepted pools its half; the peer's committed broadcast then
+        fills the second slot, and the entry is ready to be placed. This is
+        the path CTFT relies on for non-default scoring."""
         from autonomous_trust.core.reputation.protocol import (
             ReputationProtocol,
         )
@@ -707,11 +1388,11 @@ class TestProposerHistoryBilateral:
         history = TransactionHistory()
         task = uuid4()
 
-        # 1. Self's handle_accepted reaches majority — writes
-        #    (task, self, 0.9) directly.  We simulate that with a
-        #    plain history.update.
-        history.update(task, self_id, 0.9)
-        assert {history[task].p1_id, history[task].p2_id} == {self_id, None}
+        # 1. Self's handle_accepted reaches majority -- pools
+        #    (task, self, 0.9).  We simulate that with record_half.
+        history.record_half(task, self_id, 0.9)
+        assert {history.pooled(task).p1_id,
+                history.pooled(task).p2_id} == {self_id, None}
 
         # 2. Peer's committed broadcast arrives.  Our handle_committed
         #    fills the second slot.
@@ -721,18 +1402,22 @@ class TestProposerHistoryBilateral:
             _chain_for_group=lambda g: history,
             _note_interaction=lambda *a, **k: None,
             _fold_committed_tx=lambda *a, **k: None,
+            _commit_cert_ok=lambda *a, **k: True,
             identity=SimpleNamespace(uuid=self_id),
             logger=SimpleNamespace(
                 warning=lambda *a, **k: None, debug=lambda *a, **k: None,
                 info=lambda *a, **k: None),
         )
+        stub._record_committed_half = lambda *a: \
+            ReputationProcess._record_committed_half(stub, *a)
         msg = SimpleNamespace(
             function=ReputationProtocol.committed,
-            obj=to_json_string((task, peer_id, 0.3)),
+            obj=to_json_string((task, peer_id, 0.3, None, None, {'s': 'ab'})),
+            verified=True, from_whom=SimpleNamespace(uuid=peer_id, nickname='p'),
         )
         ReputationProcess.handle_committed(stub, {}, msg)
 
-        tx = history[task]
+        tx = history.pooled(task)
         assert {tx.p1_id, tx.p2_id} == {self_id, peer_id}
 
     def test_forward_transaction_does_not_write_history(self):
@@ -750,6 +1435,7 @@ class TestProposerHistoryBilateral:
         stub.logger = SimpleNamespace(
             error=lambda *a, **k: None, debug=lambda *a, **k: None)
         stub._start_paxos = lambda q, m: start_paxos_calls.append((q, m))
+        stub.admit_new_half = lambda m: True   # §2.60 probe gate: not under test
 
         task = uuid4()
         ts = TransactionScore(task_id=task, score=0.9)

@@ -1,0 +1,56 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: group-wire-format-canonical
+byte_pinning: false
+description: |
+    The group's envelope format crosses the wire with the group
+    (doc/architecture/network-wire-format.md).
+
+    A cohort's format is carried BY THE GROUP rather than configured per node,
+    so that a joiner adopts it at admission and a cohort cannot end up half in
+    one format. That only works if both runtimes agree on the field: same key
+    name in the canonical group JSON, same two spellings, same reading of an
+    absent value. This case pins all three.
+
+    The absent-field reading is the compatibility hinge: a group from a peer
+    that predates this field, or a group config written before it, must read as
+    JSON -- not as an error and not as proto. The unknown-value reading is the
+    provisioning hinge: a typo must tighten to the format every node can read
+    rather than fail the load, the same discipline as zta_policy.binding_mode
+    falling back to `require`.
+
+    Production-code analogue:
+      Python: Group.to_canonical / Group.from_canonical, Group.wire_format.
+      C:      group_to_json / group_from_json, group_t::wire_format, via
+              net_wire_format_name / net_wire_format_from_name.
+
+participants:
+  - id: node
+    role: serializer
+
+fixtures:
+  group_uuid: "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+  address: "10.0.0.1"
+  address_map:
+    "3f2504e0-4f89-11d3-9a0c-0305e82c3301": "10.0.0.1"
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: group_wire_format_canonical
+    description: |
+        The adapter serializes a proto-format group to the canonical form and
+        reads it back; then reads back a form with the field REMOVED, and one
+        with an unrecognized value, recording what each resolves to.
+
+expected_state:
+  node:
+    # The key both runtimes write, and the value round-tripping intact.
+    canonical_key_present: true
+    proto_roundtrips: true
+    json_roundtrips: true
+    # Compatibility and provisioning hinges.
+    absent_reads_json: true
+    unknown_reads_json: true

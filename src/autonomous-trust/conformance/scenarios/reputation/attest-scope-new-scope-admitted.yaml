@@ -1,0 +1,52 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-scope-new-scope-admitted
+byte_pinning: false
+description: |
+    A new scope lifts the rate cap.
+
+    bob's chain holds alice's finding about carol in scope A (Stele: a scan of
+    one commit). alice attests again in scope B (a fresh scan of the commit that
+    fixed it). It is about something new, so it is under the cap, and bob signs.
+    Without a scope the cap is one per verifier and subject
+    (attest-propose-rate-cap-declined), and a finding could not be answered
+    until it left the window.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+fixtures:
+  reputations:
+    bob:
+      alice: 0.7
+  tx_history:
+    bob:
+      - attested: true
+        p1: alice
+        p1_score: 0.3
+        p1_channel: probe
+        subject: carol
+        evidence_digest: "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        attest_scope: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest propose
+    payload:
+      subject: carol
+      score: 0.8
+      channel: probe
+      scope: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    description: alice attests about carol in a new scope.
+
+expected_state:
+  bob:
+    attest_signs_sent: 1

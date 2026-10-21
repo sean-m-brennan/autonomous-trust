@@ -66,7 +66,7 @@ cd "$here"
 # autonomous_trust.* without a pip install. Repo root last so example
 # entrypoints resolve via `python -m examples.<name>` AND
 # `python -m examples.<name>.deploy.<x>`.
-AT_SRC_PATHS="$here/src/autonomous-trust:$here/src/autonomous-trust-evaluation:$here/src/autonomous-trust-inspector:$here/src/autonomous-trust-services:$here/src/autonomous-trust-simulator"
+AT_SRC_PATHS="$here/src/autonomous-trust:$here/src/autonomous-trust-oracle:$here/src/autonomous-trust-zta:$here/src/autonomous-trust-rendezvous:$here/src/autonomous-trust-first-contact:$here/src/autonomous-trust-evaluation:$here/src/autonomous-trust-inspector:$here/src/autonomous-trust-services:$here/src/autonomous-trust-simulator"
 export PYTHONPATH="${AT_SRC_PATHS}:${here}${PYTHONPATH:+:$PYTHONPATH}"
 
 # Force native backend on the host so it matches peer containers; the
@@ -109,6 +109,11 @@ COMPROMISE_MODE="abrupt"
 # generate_compose.py so the seeded identity format matches the runtime.
 C_MICRODRONES="${AT_C_MICRODRONES:-}"
 
+# Minikube VM size. The defaults (2 CPUs, 6 GB) OOM under dod-mission's
+# ~20 peer pods plus the in-VM image builds.
+MINIKUBE_CPUS="${AT_MINIKUBE_CPUS:-8}"
+MINIKUBE_MEMORY_MB="${AT_MINIKUBE_MEMORY_MB:-16384}"
+
 # Probes shared volume defaults to ON for multi-agency compose.
 export AT_PROBES="${AT_PROBES:-1}"
 
@@ -123,6 +128,11 @@ log()   { echo -e "${CYAN}[$VARIANT]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[$VARIANT]${NC} $*"; }
 err()   { echo -e "${RED}[$VARIANT]${NC} $*" >&2; }
 event() { echo -e "${GREEN}[T+${1}]${NC} $2"; }
+
+# build_image() + reclaim_superseded_images(): every image below carries a fixed
+# tag, so each --rebuild leaves the previous generation dangling and pinning its
+# snapshot chain. Sourced after the loggers so the helper can bind to log().
+source "$here/scripts/image-prune.sh"
 
 # Ensure a git submodule is checked out. Dockerfile-native COPYs the working
 # tree rather than cloning, so an uninitialized submodule surfaces as a CMake
@@ -260,7 +270,9 @@ dod-mission options:
 
 Environment overrides: VARIANT, NAMESPACE, INSPECTOR_PORT, DEPLOY_DIR,
                        REGISTRY, IMAGE_TAG, LOG_LEVEL, TILT_LOG,
-                       AT_RECORD, AT_RECORD_HOST_DIR, AT_RECORD_NODE_PATH
+                       AT_RECORD, AT_RECORD_HOST_DIR, AT_RECORD_NODE_PATH,
+                       AT_KEEP_SUPERSEDED (=1 keeps the image generation a
+                       rebuild replaces, instead of reclaiming it)
 EOF
     exit "${1:-0}"
 }
@@ -602,8 +614,22 @@ ensure_minikube_running() {
         exit 1
     fi
     if ! minikube status &>/dev/null; then
-        log "Starting Minikube..."
-        minikube start
+        log "Starting Minikube (${MINIKUBE_CPUS} CPUs, ${MINIKUBE_MEMORY_MB} MB)..."
+        minikube start --cpus="$MINIKUBE_CPUS" --memory="${MINIKUBE_MEMORY_MB}mb"
+    fi
+    # An existing VM keeps the size it was created with; `minikube start`
+    # flags cannot grow it. The pods carry no resource requests, so an
+    # undersized VM admits them all, exhausts RAM, and the apiserver stops
+    # answering (livez / log-stream TLS handshake timeouts).
+    local have_mb
+    have_mb=$(minikube profile list -o json 2>/dev/null | python3 -c '
+import json, sys
+for p in json.load(sys.stdin).get("valid", []):
+    if p["Name"] == "minikube":
+        print(p["Config"]["Memory"])' 2>/dev/null || true)
+    if [[ -n "$have_mb" && "$have_mb" -lt "$MINIKUBE_MEMORY_MB" ]]; then
+        warn "Minikube VM has ${have_mb} MB; this demo needs ~${MINIKUBE_MEMORY_MB} MB."
+        warn "Recreate it: minikube delete && rerun (or set AT_MINIKUBE_MEMORY_MB)."
     fi
 }
 
@@ -755,19 +781,19 @@ ensure_demo_images() {
             # dod-mission branch below for the rationale).
             if (( REBUILD == 1 )) || ! docker image inspect "$full_ref" &>/dev/null; then
                 log "Image $full_ref not found — building ..."
-                docker build "${build_args[@]}" -t "$full_ref" \
+                build_image "$full_ref" "${build_args[@]}" \
                     -f "$here/src/autonomous-trust/Dockerfile-native" "$here"
             fi
             if (( REBUILD == 1 )) || ! docker image inspect "$peer_ref" &>/dev/null; then
                 log "Image $peer_ref not found — building ..."
-                docker build --build-arg "BASE_IMAGE=$full_ref" \
-                    "${build_args[@]}" -t "$peer_ref" \
+                build_image "$peer_ref" --build-arg "BASE_IMAGE=$full_ref" \
+                    "${build_args[@]}" \
                     -f "$here/src/autonomous-trust-evaluation/Dockerfile" "$here"
             fi
             if (( REBUILD == 1 )) || ! docker image inspect "$inspector_ref" &>/dev/null; then
                 log "Image $inspector_ref not found — building ..."
-                docker build --build-arg "BASE_IMAGE=$full_ref" \
-                    "${build_args[@]}" -t "$inspector_ref" \
+                build_image "$inspector_ref" --build-arg "BASE_IMAGE=$full_ref" \
+                    "${build_args[@]}" \
                     -f "$here/src/autonomous-trust-inspector/Dockerfile" "$here"
             fi
             # Whether just built or served from cache, the image that will
@@ -806,13 +832,14 @@ ensure_demo_images() {
             # layer cache and the forced rebuild is nearly free.
             if (( REBUILD == 1 )) || ! docker image inspect "$base_ref" &>/dev/null; then
                 log "Building base image: $base_ref ..."
-                docker build --network host "${base_cache_flag[@]}" "${build_args[@]}" -t "$base_ref" \
+                build_image "$base_ref" --network host "${base_cache_flag[@]}" \
+                    "${build_args[@]}" \
                     -f "$here/src/autonomous-trust/Dockerfile-native" "$here"
             fi
             if (( REBUILD == 1 )) || ! docker image inspect "$inspector_ref" &>/dev/null; then
                 log "Building inspector image: $inspector_ref ..."
-                docker build --network host --build-arg "BASE_IMAGE=$base_ref" \
-                    "${build_args[@]}" -t "$inspector_ref" \
+                build_image "$inspector_ref" --network host \
+                    --build-arg "BASE_IMAGE=$base_ref" "${build_args[@]}" \
                     -f "$here/src/autonomous-trust-inspector/Dockerfile" "$here"
             fi
             # Same shared inspector image -> same stale-code risk; guard it.
@@ -822,14 +849,14 @@ ensure_demo_images() {
             # Docker's content-addressed cache might otherwise miss.
             if (( REBUILD == 1 )) || ! docker image inspect "$demo_ref" &>/dev/null; then
                 log "Building DoD mission demo image (coord + sim): $demo_ref ..."
-                docker build --network host --build-arg "BASE_IMAGE=$inspector_ref" \
-                    "${build_args[@]}" -t "$demo_ref" \
+                build_image "$demo_ref" --network host \
+                    --build-arg "BASE_IMAGE=$inspector_ref" "${build_args[@]}" \
                     -f "$here/examples/dod_mission/deploy/Dockerfile" "$here"
             fi
             if (( REBUILD == 1 )) || ! docker image inspect "$peer_ref" &>/dev/null; then
                 log "Building DoD mission peer image (lean): $peer_ref ..."
-                docker build --network host --build-arg "BASE_IMAGE=$base_ref" \
-                    "${build_args[@]}" -t "$peer_ref" \
+                build_image "$peer_ref" --network host \
+                    --build-arg "BASE_IMAGE=$base_ref" "${build_args[@]}" \
                     -f "$here/examples/dod_mission/deploy/Dockerfile-peer" "$here"
             fi
             # Embedded C at_demo image for --c-microdrones. Standalone build
@@ -840,12 +867,15 @@ ensure_demo_images() {
                 export AT_C_IMAGE="$c_ref"
                 if (( REBUILD == 1 )) || ! docker image inspect "$c_ref" &>/dev/null; then
                     log "Building embedded C at_demo image: $c_ref ..."
-                    docker build --network host "${build_args[@]}" -t "$c_ref" \
+                    build_image "$c_ref" --network host "${build_args[@]}" \
                         -f "$here/src/autonomous-trust/Dockerfile-c" "$here"
                 fi
             fi
             ;;
     esac
+    # After the whole chain, so an old base is reclaimed on the pass following
+    # the old overlay that pinned it as a parent. No-op when nothing was built.
+    reclaim_superseded_images
 }
 
 # --- Manifest generation (per variant) -----------------------------------

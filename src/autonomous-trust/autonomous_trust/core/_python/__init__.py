@@ -23,5 +23,6 @@
 from .config import Configuration, InitializableConfig, EmptyObject, \
     to_json_string, from_json_string, to_yaml_string, from_yaml_string
 from .system import CfgIds, QueueType
-from .processes import ProcessTracker, Process, ProcMeta, LogLevel
+from .processes import (ProcessTracker, Process, ProcMeta, LogLevel,
+                        LOG_FORMAT, LOG_DATEFMT)
 from .automate import AutonomousTrust  # noqa

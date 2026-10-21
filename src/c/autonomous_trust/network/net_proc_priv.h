@@ -24,6 +24,7 @@
 
 #include "processes/processes.h"
 #include "network/net_transport.h"
+#include "network/net_message.h"   /* net_wire_msg_t */
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
 #include "utilities/logger.h"
@@ -37,7 +38,8 @@ int network_tcp_ip4_run(process_t *proc, directory_t *queues, queue_id_t signal,
 int network_tcp_ip6_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 
 /* Shared runner selected by transport name; used by per-transport process
- * declarations (including the dtn_bp entry when AT_NET_DTN is enabled). */
+ * declarations, and by extension transports' DEFINE_PROCESS runners (DTN,
+ * src/c/extensions/dtn/). */
 int network_run_by_name(const char *impl_name, process_t *proc,
                         directory_t *queues, queue_id_t signal,
                         logger_t *logger);
@@ -61,8 +63,8 @@ typedef struct {
 
     /** Optional pointer to the transport's extra-config struct (e.g.
      *  hybrid_config_t for hybrid_net). NULL for transports that don't
-     *  use one, or when the matching config entry is absent. Consumed by
-     *  the AT_NET_GROUP_FORWARD path in handle_inbound_group to reach
+     *  use one, or when the matching config entry is absent. Read by the
+     *  gateway's group forward (libat_gateway) to reach
      *  hybrid_config_t::group_routes. */
     const void            *transport_cfg;
 } net_thread_ctx_t;
@@ -84,6 +86,14 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
                          uint8_t *buf, size_t nbytes,
                          const char *from_addr);
 
+/** @brief Process one frame a rendezvous relay delivered (net_relay.h),
+ *  attributed by @p from_uuid -- the sender the RELAY vouched for -- rather
+ *  than by an address. A known peer takes the ordinary peer path; from a
+ *  stranger only plaintext is read, and only if its envelope names the same
+ *  sender. The caller keeps @p buf. */
+void handle_inbound_relayed(net_thread_ctx_t *ctx, const uint8_t *buf,
+                            size_t nbytes, const char *from_uuid);
+
 /** @brief Process one inbound BROADCAST-channel frame. See @ref handle_inbound_peer. */
 void handle_inbound_broadcast(net_thread_ctx_t *ctx,
                               uint8_t *buf, size_t nbytes,
@@ -93,6 +103,30 @@ void handle_inbound_broadcast(net_thread_ctx_t *ctx,
 void handle_inbound_group(net_thread_ctx_t *ctx,
                           uint8_t *buf, size_t nbytes,
                           const char *from_addr);
+
+/** How many group frames that did not open are held for a key change, and for
+ *  how long (seconds) before one is dropped if no new key arrives. */
+#define NET_HELD_GROUP_FRAMES 16
+#define NET_HELD_GROUP_FRAME_SEC 10
+
+/** Try again every held group frame whose key differs from the one installed
+ *  now; one that still does not open is dropped. Drops frames held longer than
+ *  NET_HELD_GROUP_FRAME_SEC. The group receiver calls it every poll; returns
+ *  how many were retried. */
+size_t net_retry_held_group_frames(net_thread_ctx_t *ctx);
+
+/** Test seams: how many group frames are held; forget them all. */
+size_t net_held_group_frame_count(void);
+void net_held_group_frames_reset(void);
+
+/**
+ * @brief The registered peer whose identity uuid is @p uuid, or NULL.
+ *
+ * For a frame whose originator is named in the frame (the routing envelope)
+ * rather than by the transport address, which may be a gateway's. The
+ * pointer stays valid: peers[] is append-only and never reallocated.
+ */
+const public_identity_t *net_find_peer_by_uuid(const process_t *proc, const uuid_t uuid);
 
 /* ---- Test-only hooks for the deferred-message retry path ----
  * These let tests observe and reset the module-local `deferred_messages`
@@ -125,6 +159,22 @@ void net_proc_test_backdate_deferred(int64_t secs);
 /** @brief Run the age-out sweep now; returns the number of surviving entries. */
 size_t net_proc_test_sweep_stale(void);
 
+/* ---- Test-only hooks for the pest / annoy-limit path ----
+ * A tunable that never reaches its comparison is decorative, which is the
+ * failure mode doc/architecture/networking.md is about. These let a test drive the counter
+ * and observe the blacklist promotion without a live socket. */
+
+/** @brief Clear the pest counters and the blacklist. */
+void net_proc_test_reset_pests(void);
+
+/** @brief Record one annoyance from @p address, exactly as the receive path
+ *         does; promotes to the blacklist past the resolved annoy limit. */
+void net_proc_test_track_annoy(const char *address);
+
+/** @brief True iff @p address is currently blacklisted (its traffic is
+ *         dropped before any further processing). */
+bool net_proc_test_is_rejected(const char *address);
+
 /* ---- Test-only: route_to_process capture ----
  * Tests for AT_DISCOVERY_CROSS_CLUSTER observe whether a forwarded
  * broadcast preserved the wire payload's self-reported from_whom.address
@@ -138,6 +188,46 @@ void net_proc_test_reset_last_routed_from_addr(void);
  *         @p out (NUL-terminated, truncated to @p outlen). Empty string
  *         if no call has happened since the last reset. */
 void net_proc_test_get_last_routed_from_addr(char *out, size_t outlen);
+
+/** @brief route_to_process (the hand-off of every inbound wire frame to its
+ *         sibling process), for a test that drives it with a refusing
+ *         messaging hook (ISSUES §2.14). Not public API. Routes as a frame
+ *         from a peer we hold (NET_PATH_PEER). */
+int net_proc_test_route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
+                                   logger_t *logger);
+
+/** The receive path an inbound wire frame came in on. It decides which verbs
+ *  route_to_process lets through (ISSUES §2.17): a stranger's paths carry only
+ *  what a node says before it shares a key with us. */
+typedef enum {
+    NET_PATH_PEER,           /* decrypted from a peer we hold, or replayed after
+                              * its admission */
+    NET_PATH_PLAIN_KNOWN,    /* plaintext from a peer we hold (allowlisted at
+                              * try_unencrypted_from_known_peer) */
+    NET_PATH_STRANGER,       /* plaintext from an address we cannot place */
+    NET_PATH_RELAY_STRANGER, /* relayed from a uuid we do not hold */
+    NET_PATH_BROADCAST,      /* the broadcast (discovery) channel */
+    NET_PATH_GROUP,          /* group-encrypted, from a peer we hold */
+} net_route_path_t;
+
+/** route_to_process's return when the frame's verb is not let in on its path
+ *  (the frame is dropped, not routed). */
+#define NET_ROUTE_REFUSED 1
+
+/** @brief Whether a wire frame for @p process / @p function may be routed when
+ *         it came in on @p path. Never an `app_*` verb (those are the local
+ *         app's commands and never travel), never a command to the network
+ *         process except a remote stats_req, and on a stranger's or the
+ *         broadcast path only the plaintext / broadcast verbs. @p why, when
+ *         not NULL, is set to a static reason on refusal. */
+bool net_wire_verb_admitted(const char *process, const char *function,
+                            net_route_path_t path, const char **why);
+
+/** @brief route_to_process for @p wmsg as if it came in on @p path. Returns
+ *         NET_ROUTE_REFUSED when the verb is not let in there. Not public
+ *         API. */
+int net_proc_test_route_on_path(const net_wire_msg_t *wmsg, process_t *proc,
+                                logger_t *logger, net_route_path_t path);
 
 /* ---- ping_at refusal (divergence: C implements no PingAT) ----
  * The outbound drain answers the `ping_at` selector with an explicit refusal

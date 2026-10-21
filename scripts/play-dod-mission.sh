@@ -58,6 +58,10 @@ err() { printf '[play-dod-mission] ERROR: %s\n' "$*" >&2; }
 # and `autonomous_trust.*` both resolve without a pip install.
 export PYTHONPATH="\
 $here/src/autonomous-trust:\
+$here/src/autonomous-trust-oracle:\
+$here/src/autonomous-trust-zta:\
+$here/src/autonomous-trust-rendezvous:\
+$here/src/autonomous-trust-first-contact:\
 $here/src/autonomous-trust-evaluation:\
 $here/src/autonomous-trust-inspector:\
 $here/src/autonomous-trust-services:\

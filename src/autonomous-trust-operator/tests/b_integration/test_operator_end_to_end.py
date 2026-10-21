@@ -44,8 +44,8 @@ import pyotp
 from textual.widgets import Input
 
 from autonomous_trust.core.capabilities import Capabilities, PeerCapabilities
-from autonomous_trust.core.operator.operator_node import directory_from_state
-from autonomous_trust.core.operator.activate import enroll_totp
+from autonomous_trust.operator.node.operator_node import directory_from_state
+from autonomous_trust.operator.node.activate import enroll_totp
 from autonomous_trust.operator.app import OperatorApp
 from autonomous_trust.operator.bridge import OperatorNodeBridge
 from autonomous_trust.operator.screens import ActivateView, ActivityView, RequestView

@@ -1,0 +1,38 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: placed-genesis-unanimous-written
+byte_pinning: false
+description: |
+    Membership recorded in the chain (doc/architecture/reputation.md, "Who is
+    in the group"). A genesis signed by every member it lists is written: it is
+    the roster in force from index 1 on.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  roster: {}          # an unfounded chain: no roster in force
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: placed
+    payload:
+      k: 0
+      value:
+        - {roster: genesis, members: [alice, bob, carol]}
+      signers: [alice, bob, carol]
+
+expected_state:
+  bob:
+    committed_tx_count: 1
+

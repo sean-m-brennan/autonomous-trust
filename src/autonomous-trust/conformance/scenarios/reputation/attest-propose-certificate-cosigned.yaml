@@ -1,0 +1,41 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-propose-certificate-cosigned
+byte_pinning: false
+description: |
+    A member co-signs an attestation on the `certificate` channel.
+
+    alice checked a proof carol supplied about her own work (Stele: an SBOM,
+    against the dependencies alice's own scan sees) and found that it did not
+    hold. The finding is alice's to stand behind, so `certificate` is
+    attestable beside `probe`. bob vouches for admissibility only, as for any
+    attested score.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+fixtures:
+  reputations:
+    bob:
+      alice: 0.7
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest propose
+    payload:
+      subject: carol
+      score: 0.3
+      channel: certificate
+    description: alice attests that carol's certificate did not hold.
+
+expected_state:
+  bob:
+    attest_signs_sent: 1

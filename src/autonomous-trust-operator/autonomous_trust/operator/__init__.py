@@ -22,6 +22,6 @@ submitting ``Task`` DTOs on ``external_control`` — the node-coupling mirrors t
 Inspector bridge (``inspector/bridge.py``).
 
 Node-side core (verifiers, OperatorNode, ResourceDirectory) lives in
-``autonomous_trust.core.operator``. This package is scaffolding at P0; screens
+``autonomous_trust.operator.node``. This package is scaffolding at P0; screens
 land in P4/P5 (see PIV_MFA_OPERATOR_ACCESS_PLAN.md §3.7).
 """

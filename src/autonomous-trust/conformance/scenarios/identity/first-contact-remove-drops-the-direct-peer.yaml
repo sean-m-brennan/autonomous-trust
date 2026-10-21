@@ -1,0 +1,103 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: first-contact-remove-drops-the-direct-peer
+byte_pinning: false
+description: |
+    Removing a contact lets the direct peer go, not just the address-book line.
+
+    Alice and Bob complete the handshake (the same steps as
+    first-contact-hello-admits-direct-peer), so each holds the other as a
+    direct peer and as a contact. Then Bob's app removes Alice through the
+    production app verb (`app_first_contact_remove`). Both halves must follow:
+    the record leaves `contacts.cfg.json`, and Alice leaves Bob's peer list at
+    once, so Bob's node stops attributing and encrypting to her.
+
+    The peer half is the one that needed new machinery. C's peers[] was
+    append-only -- every process filled its copy from PEER messages and nothing
+    ever took an entry out -- so removal added processes_remove_peer and a
+    PEER_REMOVED broadcast. Python's Peers.delete cleared only the nickname
+    slots and left the address listing that lookups read, so removal added
+    Peers.remove. Two mechanisms, one observable.
+
+    A contact who is ALSO a cohort member keeps its peer entry (the group the
+    vote admitted it to owns that place); that half is pinned by unit tests on
+    each runtime, since here the two are strangers by construction.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000000a9"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000000b9"
+      size: 1
+
+steps:
+  - id: 1
+    from: bob
+    to: bob
+    function: trigger_first_contact_initiate
+    payload:
+      minted_by: alice
+      nonce: fc-remove-1
+      expiry: 0
+      rendezvous:
+        - 10.0.0.1
+    description: |
+        Pseudo-step: Bob redeems Alice's invitation and sends his hello through
+        the production `initiate`. That is what makes Bob WAIT for Alice's ack:
+        an ack is honored only when it answers a hello this node sent (see
+        first-contact-unsolicited-ack-ignored). The hello it emits is not
+        delivered; step 2 is the delivered copy.
+  - id: 2
+    from: bob
+    to: alice
+    function: first_contact_hello
+    in_response_to: 1
+    payload:
+      minted_by: alice
+      nonce: fc-remove-1
+      expiry: 0
+      rendezvous:
+        - 10.0.0.1
+    description: |
+        Bob's hello, carrying Alice's own invitation as the ticket and his
+        identity on the envelope. Plaintext by necessity: Alice does not know
+        Bob yet, so there is no key to encrypt under.
+  - id: 3
+    from: alice
+    to: bob
+    function: first_contact_hello_ack
+    in_response_to: 2
+    payload:
+      nonce: fc-remove-1
+    description: |
+        Alice honored her own ticket and acknowledges. Delivered (not merely
+        asserted) so Bob's half of the handshake runs too: the ack is what
+        tells him the introduction landed.
+
+  - id: 4
+    from: bob
+    to: bob
+    function: trigger_first_contact_remove
+    payload:
+      peer: alice
+    description: |
+        Pseudo-step: Bob's app removes Alice. The scenario names the
+        participant; each adapter resolves its uuid.
+
+expected_state:
+  bob:
+    direct_peers:
+      alice: false
+    contacts:
+      alice: false

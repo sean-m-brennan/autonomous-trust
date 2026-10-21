@@ -18,6 +18,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -25,6 +26,8 @@
 #include <sodium.h>
 
 #include "processes/processes.h"
+#include "processes/extension.h"
+#include "processes/plaintext_verbs.h"
 #include "structures/map.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
@@ -33,45 +36,203 @@
 #include "utilities/timeout.h"
 #include "structures/data.h"
 #include "network/net_message.h"
+#include "network/network.h"  /* net_wire_mode_resolve (2.3) */
 #include "config/configuration.h"
 #include "peers.h"
+#include "utilities/send_retry.h"
 #include "history.h"
 #include "identity_priv.h"
 #include "id_proc_priv.h"
+#include "processes/capabilities_priv.h"   /* peer capability matrix */
+#include "id_ext.h"
+#include "package_hash.h"
 #include "utilities/b64.h"
-
-#ifdef AT_ZTA_ENABLED
-#include "zta/zta_policy.h"
-#include "zta/zta_verifier.h"
-#include "zta/zta_audit.h"
-#include "zta/x509_verifier.h"   /* x509_verify_data_signature, for the binding */
-#include "zta/zta_binding.h"     /* the credential->identity binding (ISSUES §1.5) */
-#endif
+#include "utilities/freshness.h"
 
 /* Operator-attended signal helpers (ethne D8/Q9); defined below _build_announcement
  * but used earlier in handle_welcoming_committee. */
 static json_t *_operator_attestation_json(const public_identity_t *pub);
+/* Cohort clock skew: drop every stored sample (caller holds id_state.lock).
+ * Defined with the rest of the skew code but used by identity_reset_state. */
+static void _free_clock_samples_locked(void);
 static void _apply_operator_attestation_json(const json_t *att, public_identity_t *pub);
-#ifdef AT_ZTA_ENABLED
-static bool _is_operator_credential(const zta_policy_t *policy,
-                                    const uint8_t *cred, size_t cred_len,
-                                    const uint8_t *advertised_hash);
-static void _verify_operator_key(const process_t *proc,
-                                 public_identity_t *pub,
-                                 const uint8_t *cred, size_t cred_len,
-                                 const uint8_t claimed_key[crypto_sign_PUBLICKEYBYTES]);
-typedef enum { ZTA_GATE_ADMIT, ZTA_GATE_ADMIT_CAPPED, ZTA_GATE_REJECT } zta_gate_t;
-static zta_gate_t _zta_admit(const process_t *proc, const zta_policy_t *policy,
-                             public_identity_t *pub,
-                             const uint8_t claimed_key[crypto_sign_PUBLICKEYBYTES]);
-#endif
-/* Defined with the partition-recovery helpers far below, but the ZTA gate needs
- * it to reach this node's own identity for the replay check. */
-static const identity_t *_partition_self_identity(const process_t *proc);
+static bool _group_has_address(group_t *group, const char *addr);
+
+/* Look one admitted peer up by uuid. Nothing social about it — it reads only
+ * proc->protocol.peers — but it lived inside the social block until Phase 4
+ * P4.1 gave an always-compiled handler (app_peer_standing) a reason to ask
+ * whether a peer is admitted at all. */
+bool identity_find_peer_pub(const process_t *proc, const uuid_t uuid,
+                            public_identity_t *out)
+{
+    bool found = false;
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+        if (uuid_compare(proc->protocol.peers[i].uuid, uuid) == 0) {
+            memcpy(out, &proc->protocol.peers[i], sizeof(public_identity_t));
+            found = true;
+            break;
+        }
+    }
+    peers_read_unlock(proc);
+    return found;
+}
+
+/* Hand net_proc a frame a PERSON asked for, and refuse to lose it quietly.
+ *
+ * messaging_send is non-blocking here, and an AF_UNIX datagram queue holds
+ * net.unix.max_dgram_qlen (10) frames. During a transaction burst — which in
+ * a cohort is most of the time, since every probe result forwards a score —
+ * a send loses the race and returns EAGAIN. The result was DISCARDED at every
+ * one of these call sites, so the frame vanished and the caller reported
+ * success to the operator.
+ *
+ * That is not a dropped notification: these are one-shot user actions. The
+ * 2026-09-21 reputation cohort caught it on the reaction path — bob's
+ * `react` returned rc=0, bob accrued his half of the bilateral score, and
+ * `peer_reaction` never reached the wire at all, so alice never submitted
+ * hers and the transaction could never go bilateral. An earlier run of the
+ * same script had worked, which is what a lost race looks like.
+ *
+ * Bounded retry, distinguishing saturation from a hard transport fault because
+ * they call for different answers. Mirrors the PEER-update loop at the top of
+ * this file, which fixed the same hazard for a different message in P3.3.
+ *
+ * 200 ms was not enough either (ISSUES §2.40): on 2026-10-02 a joiner's
+ * full_history (Agora part-603464), a DM (dev-620062) and a Stele attestation
+ * (st-660084) were each lost to a queue that stayed full for longer. A frame
+ * still refused after the inline tries is now KEPT (utilities/send_retry.h)
+ * and the process tick retries it for up to 30 s, so 0 means "this node owns the
+ * delivery", not "it is on the wire": a caller that scores on success is
+ * right to log success, because the frame either goes out or is reported
+ * lost. A caller whose action must only count once the frame is really out (a
+ * bilateral score: social's react and report) passes an on-sent callback to
+ * identity_send_to_then instead, and acts there: it is told once whether the
+ * frame went or was given up on. And a send to a queue that
+ * still holds kept frames waits behind them, so a DM sent after another
+ * arrives after it. */
+int identity_send_to_then(const process_t *proc, const char *queue,
+                          generic_msg_t *out, const char *what,
+                          const char *whom, at_send_sent_fn on_sent,
+                          const void *ctx, size_t ctx_len)
+{
+    /* proc may be NULL for a caller with no process in hand (first contact's
+     * local relay and sibling senders); the root logger takes the lines. The
+     * mechanism is every process's now (utilities/send_retry.h, §2.14). */
+    return at_send(proc, queue, out, what, whom, 0, on_sent, ctx, ctx_len);
+}
+
+int identity_send_to(const process_t *proc, const char *queue,
+                     generic_msg_t *out, const char *what, const char *whom)
+{
+    return identity_send_to_then(proc, queue, out, what, whom, NULL, NULL, 0);
+}
+
+int identity_send_to_network(const process_t *proc, generic_msg_t *out,
+                             const char *what, const char *whom)
+{
+    return identity_send_to(proc, "network", out, what, whom);
+}
+
+int identity_send_to_network_then(const process_t *proc, generic_msg_t *out,
+                                  const char *what, const char *whom,
+                                  at_send_sent_fn on_sent, const void *ctx,
+                                  size_t ctx_len)
+{
+    return identity_send_to_then(proc, "network", out, what, whom, on_sent,
+                                 ctx, ctx_len);
+}
+
+/* True iff this NET_MESSAGE came from THIS node's own app over the local
+ * queue, rather than from a peer over the wire (Phase 4 P4.1, ISSUES §2.17).
+ *
+ * An app verb and a peer's message are the same kind of object: both are
+ * NET_MESSAGEs dispatched on `net_msg.function` by run_message_handlers. The
+ * wire is closed to them first: route_to_process (net_proc.c) refuses any
+ * `app_*` function from the wire on every path, before routing
+ * (net_wire_verb_admitted). This check is the second line, in each app verb's
+ * handler, for a path that ever reaches a handler without passing there.
+ *
+ * It cannot be the only line. It reads from_whom, and on a stranger's paths
+ * (plaintext from an unknown address, broadcast) from_whom is whatever the
+ * envelope claims: a stranger could leave out from_uuid, or claim ours, and
+ * pass it. A refusal on the frame's names does not depend on the claim.
+ *
+ * THE TEST. The app builds its request as `generic_msg_t req = {0}` and never
+ * populates from_whom (see at_app_events_block in app_events.c), so a local
+ * app verb carries a NULL uuid. A frame off a path that knows its sender
+ * carries that sender's identity. Self is accepted too, for the handful of
+ * paths that loop a verb back through this node's own queue. Every app verb
+ * handler, core and social, now applies it. */
+bool identity_is_local_app_verb(const process_t *proc, const net_msg_t *nmsg)
+{
+    if (nmsg == NULL)
+        return false;
+    if (uuid_is_null(nmsg->from_whom.uuid))
+        return true;
+    const identity_t *self = identity_self_identity(proc);
+    if (self != NULL && uuid_compare(self->uuid, nmsg->from_whom.uuid) == 0)
+        return true;
+    return false;
+}
+
+/* Log and refuse an app verb that arrived from the wire. Shared by every
+ * moderation verb so the refusal reads identically in an operator's log. */
+bool identity_refuse_remote_app_verb(const process_t *proc,
+                                     const net_msg_t *nmsg, const char *verb)
+{
+    char who[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, who);
+    log_warn(proc->logger,
+             "Identity: refusing %s from the wire (peer %s) — app verbs are "
+             "local-only\n", verb, who);
+    return true;
+}
 
 DEFINE_ERROR(EID_NOQ, "Required process queue missing");
 
 #define MAJORITY(n) (((n) / 2) + 1)
+/* Votes an admission needs: a majority of the WHOLE group. The tally counts
+ * the proposer's own vote, but num_peers is the roster WITHOUT this node, so
+ * MAJORITY(num_peers) let two of a four-member group admit a newcomer and
+ * both halves of an even partition admit independently (ISSUES §2.26, the
+ * arithmetic §2.22 corrected for checkpoint finality). Odd-sized groups are
+ * unchanged; a lone node still admits on its own vote. */
+#define ADMISSION_QUORUM(num_peers) MAJORITY((num_peers) + 1)
+
+/* The roster an admission is sized against, this node NOT included: the peers
+ * that are members (processes_peer_is_member). A first-contact direct peer is
+ * in peers[] but never votes, so counting it raised the bar by one per contact
+ * (R+D.md §13.5 D2). Caller holds the peers read lock. */
+static size_t _admission_roster(const process_t *proc)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < proc->protocol.num_peers; i++)
+        if (processes_peer_is_member(proc, &proc->protocol.peers[i]))
+            count++;
+    return count;
+}
+/* How long we wait for other members' votes on a peer we just proposed before
+ * deciding on the votes in hand. Mirrors Python IdentityProcess.vote_timeout
+ * (idprocess.py:154). Short by design: it is a grace period for votes already
+ * in flight, not a consensus round. */
+#define ID_VOTE_TIMEOUT_SEC 0.5
+/* Admissions decided per sweep. A bound keeps the sweep's scratch arrays on the
+ * stack and off the lock for long; anything beyond it is simply decided on the
+ * next tick (~0.5s later), and a real cohort never has this many proposals
+ * pending at once. */
+#define ID_VOTE_SWEEP_MAX 16
+
+/* Monotonic seconds, for vote deadlines. CLOCK_MONOTONIC so a wall-clock step
+ * (NTP, a container's first time sync) cannot push a pending admission either
+ * into the past or years into the future. */
+static double _vote_now_sec(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0.0;
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
 
 /****************************
  * Protocol function names (must match Python IdentityProtocol)
@@ -97,9 +258,18 @@ static char ID_IDENTITY_RESPONSE[] = "peer_identity_response";
  * 2-element JSON array `[peer_uuid_str, new_tier_int]`. Mirrors
  * Python IdentityProtocol.tier_update. */
 static char ID_TIER[]        = "tier_update";
+/* Phase 4 P4.1. Always compiled: a governance tier bounding a peer is not
+ * an Agora-specific idea. */
+static char ID_APP_PEER_STANDING[] = AT_APP_PEER_STANDING;
 /* Local-only IPC from the app (via the daemon main loop): re-emit the peer
  * view on the app-facing carrier. See doc/architecture/app-peer-carrier.md. */
 static char ID_APP_ROSTER[]  = AT_APP_ROSTER_REQUEST;
+
+/* Feed gossip bounds (Increment 7, SOCIAL_APP_PLAN §7 Q2 "active network + one
+ * hop"). POST_MAX_HOPS is the highest hop_count a post may carry on the wire: a
+ * post arrives at the author's own cohort at hop 0 and is forwarded once (to
+ * hop 1), so a post that already carries hop >= POST_MAX_HOPS is delivered but
+ * not re-forwarded. POST_DEDUP_CAP bounds the app-content dedup ring. */
 /* Group partition recovery (doc/architecture/partition-recovery.md).
  *   ID_PARTITION_SIGNAL: local-only IPC from NetProcess when group-channel
  *                        traffic is rejected (no wire egress). Payload is
@@ -136,12 +306,27 @@ static char ID_ROSTER_RESPONSE[] = "subtree_roster_response";
  * rules are identical. See doc/architecture/operator-attended.md. */
 static char ID_ATTEST_QUERY[]    = "operator_attest_query";
 static char ID_ATTEST_RESPONSE[] = "operator_attest_response";
-
-/* Verbs this protocol legitimately puts on the wire in PLAINTEXT
- * (Message encrypt=false), and the only ones a receiver accepts unencrypted
- * from a peer it already knows. Mirrors Python's
- * identity.protocol.UNENCRYPTED_VERBS one-for-one -- the two lists are a
+/* Runtime hierarchy roots (protocol step 7,
+ * doc/architecture/gateway-reputation-tree.md). A node states its own position in the
+ * gateway tree — which cohorts it gateways, and which higher-rank node it federates
+ * through — so the mesh AGREES on the topology instead of each node inferring it
+ * privately. Advertised on the encrypted group channel when our own view changes, and
+ * on request so a late joiner converges without waiting for somebody's next change.
+ *
+ * Carries NO group key and confers no membership: an advertisement is a claim about
+ * ITSELF, recorded only from a peer that can prove a shared trust anchor. Our OWN
+ * parent is derived, never accepted from a peer. Mirrors Python
+ * IdentityProtocol.hierarchy / hierarchy_req. */
+static char ID_HIERARCHY[]       = "hierarchy_root";
+static char ID_HIERARCHY_QUERY[] = "hierarchy_query";
+/* The CORE verbs this protocol legitimately puts on the wire in PLAINTEXT
+ * (Message encrypt=false), and so the core verbs a receiver accepts
+ * unencrypted from a peer it already knows. Mirrors Python's
+ * identity.protocol.CORE_UNENCRYPTED_VERBS one-for-one -- the two lists are a
  * cross-language contract, so a change here needs the same change there.
+ * Compiled in: no configuration adds to or removes from them. An optional
+ * feature's plaintext verbs (first contact's hello, ...) are granted by
+ * unencrypted_verbs.cfg.json instead (processes/plaintext_verbs.h).
  *
  * Kept beside the verb table on purpose: this is the one place that already
  * owns these strings, so drift is visible in a single screen.
@@ -162,13 +347,89 @@ static char *const ID_UNENCRYPTED_VERBS[] = {
     ID_PARTITION_RESPONSE,  /* group_partition_response */
 };
 
-bool identity_verb_is_unencrypted(const char *verb)
+size_t identity_core_unencrypted_verb_count(void)
+{
+    return sizeof(ID_UNENCRYPTED_VERBS) / sizeof(ID_UNENCRYPTED_VERBS[0]);
+}
+
+size_t identity_unencrypted_verb_count(void)
+{
+    return identity_core_unencrypted_verb_count() + plaintext_verbs_granted_count();
+}
+
+bool identity_verb_is_core_unencrypted(const char *verb)
 {
     if (verb == NULL)
         return false;
     size_t n = sizeof(ID_UNENCRYPTED_VERBS) / sizeof(ID_UNENCRYPTED_VERBS[0]);
     for (size_t i = 0; i < n; i++) {
         if (strcmp(verb, ID_UNENCRYPTED_VERBS[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
+bool identity_verb_is_unencrypted(const char *verb)
+{
+    return identity_verb_is_core_unencrypted(verb) || plaintext_verb_granted(verb);
+}
+
+/* The identity verbs sent with no recipient and no group multicast, so they go
+ * out on the broadcast channel (net_proc's outbound drain) and must be let in
+ * there, beside the plaintext verbs. Mirrors Python
+ * identity.protocol.BROADCAST_ONLY_VERBS. */
+static char *const ID_BROADCAST_ONLY_VERBS[] = {
+    ID_UPDATE,              /* group_key_update */
+    ID_CONFIRM,             /* peer_accepted */
+    ID_PROPOSE,             /* propose_peer */
+};
+
+bool identity_verb_is_broadcast(const char *verb)
+{
+    if (verb == NULL)
+        return false;
+    if (identity_verb_is_unencrypted(verb))
+        return true;
+    size_t n = sizeof(ID_BROADCAST_ONLY_VERBS) / sizeof(ID_BROADCAST_ONLY_VERBS[0]);
+    for (size_t i = 0; i < n; i++)
+        if (strcmp(verb, ID_BROADCAST_ONLY_VERBS[i]) == 0)
+            return true;
+    return false;
+}
+
+/* The pre-admission handshake: the verbs that place a node INTO a group, and
+ * the ones the gateway boundary refuses to carry. Mirrors Python's
+ * identity.protocol.BOOTSTRAP_VERBS one-for-one -- another cross-language
+ * contract, same maintenance rule as ID_UNENCRYPTED_VERBS above.
+ *
+ * WHY these three: a gateway boundary exists to keep a group from spanning it,
+ * and the only way a group spans a gateway is for a node on one side to be
+ * ADMITTED by a cohort on the other. ID_ANNOUNCE asks, ID_ACCEPT grants and
+ * ID_HISTORY hands over the group and its key -- those three, and nothing
+ * else, move membership. The partition pair deliberately spans a group-KEY
+ * boundary (doc/architecture/partition-recovery.md) but stays inside one
+ * domain and confers no membership, so it is NOT bootstrap and must keep
+ * working across this gate.
+ *
+ * See doc/architecture/network-wire-format.md, "The gateway boundary". */
+static char *const ID_BOOTSTRAP_VERBS[] = {
+    ID_ANNOUNCE,            /* request_access -- asks to be admitted */
+    ID_ACCEPT,              /* access_granted -- grants admission */
+    ID_HISTORY,             /* full_history  -- hands over the group + key */
+};
+
+size_t identity_bootstrap_verb_count(void)
+{
+    return sizeof(ID_BOOTSTRAP_VERBS) / sizeof(ID_BOOTSTRAP_VERBS[0]);
+}
+
+bool identity_verb_is_bootstrap(const char *verb)
+{
+    if (verb == NULL)
+        return false;
+    size_t n = sizeof(ID_BOOTSTRAP_VERBS) / sizeof(ID_BOOTSTRAP_VERBS[0]);
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(verb, ID_BOOTSTRAP_VERBS[i]) == 0)
             return true;
     }
     return false;
@@ -182,6 +443,16 @@ static struct {
     array_t histories;
     map_t peer_potentials;
     map_t vote_collection;
+    /* Pending vote finalizations: proposed-peer uuid -> the wall-clock time at
+     * which we stop waiting for other members' votes and decide on what we
+     * have. Mirrors Python's per-proposal _vote_collection thread, which sleeps
+     * vote_timeout and then finalizes; C has no thread per proposal, so the
+     * identity loop sweeps this map instead (identity_periodic_vote_collection).
+     * Without it C only ever counts votes when an inbound vote message arrives,
+     * so a cohort whose other members are gone can never admit anybody — its
+     * own self-vote, already recorded and already a majority, is never looked
+     * at. See id_proc.c's vote path and doc/architecture/identity-protocol.md. */
+    map_t vote_deadlines;
     bool choosing_group;
     /* Group-merge tracking — mirrors Python's self.self_bootstrapped
      * and self.merging in idprocess.py:126-127. Set when choose_group's
@@ -216,6 +487,20 @@ static struct {
      * whose nonce is absent here is unsolicited or replayed and is dropped.
      * Mirrors Python IdentityProcess._attest_sent. */
     map_t attest_sent;
+    /* When each outstanding pull was SENT: nonce string -> double epoch. This
+     * is the round trip's t1, and it deliberately never goes on the wire — it
+     * is ours, and a peer echoing it back could lie about it. Parallel to
+     * attest_sent rather than folded into it so that map keeps its single
+     * meaning (nonce -> whom we asked). Mirrors the third element of Python's
+     * _attest_sent tuple. */
+    map_t attest_sent_clock;
+    /* Newest clock sample per peer: lowercased uuid string -> heap
+     * at_clock_sample_t. Measurement only: nothing here steers a clock, and no
+     * offset is ever applied to our own time. Conformance/assertion surface via
+     * identity_get_peer_clock_sample. Mirrors Python's
+     * IdentityProcess._peer_clock_samples. See
+     * doc/architecture/cohort-clock-skew.md. */
+    map_t peer_clock_samples;
     /* Optional per-capability descriptors learned from the descriptor form
      * of caps_response (PIV_MFA_OPERATOR_ACCESS_PLAN.md §3.5). Keyed by
      * capability NAME (not peer uuid — a descriptor is a property of the
@@ -261,14 +546,70 @@ static struct {
      *                                independently in the handlers. */
     map_t partition_probe_cooldown;
     map_t partition_response_cooldown;
-    /* Two-phase admission (ISSUES.md §3.1-a). Key "<proc>|<peer_uuid>",
+    /* Two-phase admission (doc/architecture/identity-protocol.md). Key "<proc>|<peer_uuid>",
      * value array_t* of DISTINCT confirmer uuid strings. A peer stays
      * PROVISIONAL (group key withheld in _add_peer) until the entry reaches
      * proc->protocol.admission_quorum, then handle_confirm_peer promotes it
      * and clears the entry. Mirrors Python's _provisional_confirmations. */
     map_t provisional_confirmations;
+    /* Runtime hierarchy roots (protocol step 7, doc/architecture/gateway-reputation-tree.md).
+     *   peer_hierarchy: peer-uuid string -> string_data(the claim it sent, as
+     *                   rendered JSON). Recorded only from peers that prove a
+     *                   shared anchor; read when choosing a roster-recursion
+     *                   target, where a peer's own claim outranks rank
+     *                   inference.
+     *   parent_gateway: the higher-rank node we federate through, DERIVED (see
+     *                   _derive_parent_gateway) and never accepted from a peer.
+     *                   Empty when we are the root of our own cohort.
+     *   last_hierarchy_claim: the claim we last broadcast, so an unchanged one
+     *                   is not re-sent (the group_update flood lesson).
+     *   hierarchy_requested: one-shot guard on the post-admission query. */
+    map_t peer_hierarchy;
+    char parent_gateway[UUID_STRING_LEN + 1];
+    char last_hierarchy_claim[512];
+    bool hierarchy_requested;
     char partition_recovery_target[64];
     int64_t partition_recovery_started_us;
+    /* Runtime cross-group join (doc/architecture/gateway-reputation-tree.md). Cohorts
+     * we have ASKED to join and not yet been admitted to: group-uuid string ->
+     * string_data(same). The gate on _adopt_solicited_group -- a group arriving without
+     * an entry here is somebody handing us a cohort we never asked for, and adopting
+     * that would let any peer install itself in our tree. Mirrors Python
+     * IdentityProcess._pending_joins. */
+    map_t pending_joins;
+    /* Per-verb replay marks and our own send sequence, persisted. Used by the
+     * verbs whose payloads carried no freshness token of their own; verbs that
+     * already carry one (group key epochs, attestation nonces, relayed query
+     * ids) are untouched. C twin of Python IdentityProcess.freshness. */
+    freshness_t freshness;
+    /* Freshness sequence of the probe round we are currently running, 0 if
+     * none. A partition_response must echo it: `in_response_to` is only our
+     * uuid, which never changes, so it cannot tell an answer to this round
+     * from one captured in an earlier one. */
+    int64_t probe_seq;
+    /* group_key_update frames that arrived before phase 3, oldest first, each
+     * a private copy, replayed by identity_replay_held_group_updates once the
+     * group is chosen. The senders see us as a member already and never
+     * resend, so a dropped one was a key we could not learn any other way:
+     * partition cohort part-3615656 (2026-10-14), cal dropped amy's and dee's
+     * winning epoch-5 key in phase 2, adopted the losing one from the merge
+     * history, and decrypted nothing from its island again (ISSUES §2.18,
+     * §2.61). Python holds them the same way: an unhandled message goes back
+     * to IdentityProcess.messages and is retried every pass. */
+    generic_msg_t held_group_updates[ID_HELD_GROUP_UPDATES];
+    size_t num_held_group_updates;
+    /* request_access frames that arrived before phase 3, the same way, at most
+     * one per requester. Nobody resends one once it has a peer, so a founder
+     * still choosing its group lost a second founder's request, and the two
+     * bootstrapped groups of their own (Stele st-284840). Python
+     * holds them in IdentityProcess.messages, as above. */
+    generic_msg_t held_access_requests[ID_HELD_ACCESS_REQUESTS];
+    size_t num_held_access_requests;
+    /* Groups other than ours that admitted us, whose members we have already
+     * sent our history to (_tell_bridged_group), oldest first. Once per group,
+     * so two members of different groups cannot bounce histories forever. */
+    char told_bridged[ID_TOLD_BRIDGED_MAX][UUID_STRING_LEN + 1];
+    size_t num_told_bridged;
 } id_state;
 
 static void _ensure_id_init(void)
@@ -278,14 +619,22 @@ static void _ensure_id_init(void)
         array_init(&id_state.histories);
         map_init(&id_state.peer_potentials);
         map_init(&id_state.vote_collection);
+        map_init(&id_state.vote_deadlines);
         map_init(&id_state.own_caps_by_proc);
         map_init(&id_state.peer_caps_map);
+        /* Features that keep per-peer state (identity/id_ext.h). */
+        identity_ext_init();
         map_init(&id_state.attest_sent);
+        map_init(&id_state.attest_sent_clock);
+        map_init(&id_state.peer_clock_samples);
         map_init(&id_state.peer_cap_descriptors_map);
         map_init(&id_state.peer_tiers);
         map_init(&id_state.partition_probe_cooldown);
         map_init(&id_state.partition_response_cooldown);
         map_init(&id_state.provisional_confirmations);
+        map_init(&id_state.pending_joins);
+        freshness_init(&id_state.freshness, "identity", NULL);
+        id_state.probe_seq = 0;
         id_state.partition_recovery_target[0] = '\0';
         id_state.partition_recovery_started_us = 0;
         id_state.self_tier = 0;
@@ -314,15 +663,9 @@ static identity_history_t *_ensure_history_locked(const process_t *proc)
     if (proc == NULL || proc->configs == NULL)
         return NULL;
 
-    data_t *id_dat = NULL;
-    char id_key[] = "identity";
-    if (map_get(proc->configs, id_key, &id_dat) != 0 || id_dat == NULL)
+    const identity_t *self_id = identity_self_identity(proc);
+    if (self_id == NULL)
         return NULL;
-    config_t *id_cfg = NULL;
-    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0 ||
-        id_cfg == NULL || id_cfg->data_struct == NULL)
-        return NULL;
-    identity_t *self_id = (identity_t *)id_cfg->data_struct;
     public_identity_t *self_pub = NULL;
     if (identity_publish(self_id, &self_pub) != 0 || self_pub == NULL)
         return NULL;
@@ -408,16 +751,90 @@ void identity_set_own_capabilities(const process_t *proc,
     {
         if (cap_names[i] == NULL) continue;
         size_t len = strlen(cap_names[i]);
-        char *dup = smrt_create(len + 1);
-        if (dup == NULL) continue;
-        memcpy(dup, cap_names[i], len + 1);
-        data_t *str_dat = string_data(dup, len + 1);
-        if (str_dat == NULL) { smrt_deref(dup); continue; }
+        /* string_data copies; no intermediate buffer to leak */
+        data_t *str_dat = string_data((char *)cap_names[i], len + 1);
+        if (str_dat == NULL) continue;
         array_append(arr, str_dat);
     }
     data_t *arr_dat = object_ptr_data(arr, sizeof(array_t));
     map_set(&id_state.own_caps_by_proc, key, arr_dat);
     pthread_mutex_unlock(&id_state.lock);
+}
+
+size_t identity_advertise_local_capabilities(const process_t *proc)
+{
+    if (proc == NULL)
+        return 0;
+    _ensure_id_init();
+    /* A list someone installed (the conformance adapter's fixtures) stands. */
+    if (_id_own_caps_for(proc) != NULL)
+        return 0;
+    char self_str[UUID_STRING_LEN + 1] = "";
+    const identity_t *self = identity_self_identity(proc);
+    if (self != NULL)
+        uuid_unparse_lower(self->uuid, self_str);
+    array_t *caps = NULL;
+    if (build_local_capabilities(self_str, &caps) != 0 || caps == NULL)
+    {
+        if (caps != NULL)
+            array_free(caps);
+        return 0;
+    }
+    size_t n = array_size(caps);
+    const char **names = calloc(n > 0 ? n : 1, sizeof(*names));
+    size_t k = 0;
+    for (size_t i = 0; names != NULL && i < n; i++)
+    {
+        data_t *d = NULL;
+        capability_t *cap = NULL;
+        if (array_get(caps, (int)i, &d) == 0 && d != NULL
+            && data_object_ptr(d, (ptr_t *)&cap) == 0 && cap != NULL
+            && cap->name[0] != '\0')
+            names[k++] = cap->name;
+    }
+    if (k > 0)
+        identity_set_own_capabilities(proc, names, k);
+    free((void *)names);
+    array_free(caps);
+    return k;
+}
+
+int64_t identity_freshness_refusals(const char *verb)
+{
+    if (!id_state.initialized) return 0;
+    pthread_mutex_lock(&id_state.lock);
+    int64_t n = freshness_refusals(&id_state.freshness, verb);
+    pthread_mutex_unlock(&id_state.lock);
+    return n;
+}
+
+void identity_state_ensure_init(void)
+{
+    _ensure_id_init();
+}
+
+bool identity_state_initialized(void)
+{
+    return id_state.initialized;
+}
+
+int64_t identity_freshness_stamp(logger_t *logger)
+{
+    if (!id_state.initialized) return 0;
+    pthread_mutex_lock(&id_state.lock);
+    int64_t seq = freshness_stamp(&id_state.freshness, logger);
+    pthread_mutex_unlock(&id_state.lock);
+    return seq;
+}
+
+bool identity_freshness_accept(const char *sender, const char *verb,
+                               int64_t seq, logger_t *logger)
+{
+    if (!id_state.initialized) return false;
+    pthread_mutex_lock(&id_state.lock);
+    bool fresh = freshness_accept(&id_state.freshness, sender, verb, seq, logger);
+    pthread_mutex_unlock(&id_state.lock);
+    return fresh;
 }
 
 int identity_get_peer_caps_count(const uuid_t uuid)
@@ -435,11 +852,12 @@ int identity_get_peer_caps_count(const uuid_t uuid)
     return n;
 }
 
+
 size_t identity_provisional_count(const process_t *proc)
 {
-    /* Two-phase admission observable (ISSUES.md §3.1-a): number of peers this
-     * process is holding PROVISIONAL (confirm seen, quorum not yet met, group
-     * key withheld). Counts provisional_confirmations keys prefixed "<proc>|".
+    /* Two-phase admission observable (doc/architecture/identity-protocol.md): number of
+     * peers this process is holding PROVISIONAL (confirm seen, quorum not yet met,
+     * group key withheld). Counts provisional_confirmations keys prefixed "<proc>|".
      * Mirrors the Python adapter's provisional_peer_count. */
     if (!id_state.initialized || proc == NULL) return 0;
     char prefix[64];
@@ -483,6 +901,48 @@ int identity_get_peer_cap_descriptor(const char *cap_name, char *buf, size_t buf
     return rc;
 }
 
+/* Test seam: arm a pending admission exactly as handle_receive_access_request
+ * does — the proposed peer in potentials, a vote tally, and a deadline — so a
+ * unit test can drive identity_periodic_vote_collection without standing up the
+ * whole access handshake. @p deadline_offset_sec is relative to now, so a
+ * NEGATIVE value means the grace period has already expired. */
+void identity_arm_pending_vote(const public_identity_t *peer, int votes,
+                               double deadline_offset_sec)
+{
+    _ensure_id_init();
+    if (peer == NULL)
+        return;
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer->uuid, uuid_str);
+
+    public_identity_t *potential = smrt_create(sizeof(public_identity_t));
+    if (potential == NULL)
+        return;
+    memcpy(potential, peer, sizeof(public_identity_t));
+    data_t *pot_dat = object_ptr_data(potential, sizeof(public_identity_t));
+    data_t *vote_dat = integer_data(votes);
+    data_t *deadline = floating_pt_dbl_data(_vote_now_sec() + deadline_offset_sec);
+
+    pthread_mutex_lock(&id_state.lock);
+    map_set(&id_state.peer_potentials, uuid_str, pot_dat);
+    map_set(&id_state.vote_collection, uuid_str, vote_dat);
+    map_set(&id_state.vote_deadlines, uuid_str, deadline);
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+/* Test seam: is an admission still waiting on its grace period? */
+bool identity_pending_vote_armed(const uuid_t uuid)
+{
+    _ensure_id_init();
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(uuid, uuid_str);
+    pthread_mutex_lock(&id_state.lock);
+    data_t *value = NULL;
+    bool armed = (map_get(&id_state.vote_deadlines, uuid_str, &value) == 0);
+    pthread_mutex_unlock(&id_state.lock);
+    return armed;
+}
+
 void identity_install_peer_caps(const uuid_t uuid,
                                 const char *const *caps, size_t n_caps)
 {
@@ -498,10 +958,98 @@ void identity_install_peer_caps(const uuid_t uuid,
     }
     char uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(uuid, uuid_str);
-    data_t *arr_dat = object_ptr_data(arr, sizeof(array_t));
+    data_t *arr_dat = owned_array_data(arr);
+    if (arr_dat == NULL)
+    {
+        array_free(arr);
+        return;
+    }
     pthread_mutex_lock(&id_state.lock);
     map_set(&id_state.peer_caps_map, uuid_str, arr_dat);
     pthread_mutex_unlock(&id_state.lock);
+}
+
+static int _remember_activity(const process_t *proc, directory_t *queues,
+                              generic_msg_t *msg);
+
+/* Does @p uuid_str already hold exactly these capability names, in this
+ * order? Caller holds id_state.lock. */
+static bool _same_caps_locked(const char *uuid_str, array_t *arr)
+{
+    data_t *dat = NULL;
+    array_t *cur = NULL;
+    if (map_get(&id_state.peer_caps_map, (map_key_t)uuid_str, &dat) != 0
+        || dat == NULL || data_object_ptr(dat, (void **)&cur) != 0
+        || cur == NULL || array_size(cur) != array_size(arr))
+        return false;
+    for (size_t i = 0; i < array_size(arr); i++)
+    {
+        data_t *a = NULL, *b = NULL;
+        char *sa = NULL, *sb = NULL;
+        if (array_get(cur, (int)i, &a) != 0 || array_get(arr, (int)i, &b) != 0
+            || data_string_ptr(a, &sa) != 0 || data_string_ptr(b, &sb) != 0
+            || sa == NULL || sb == NULL || strcmp(sa, sb) != 0)
+            return false;
+    }
+    return true;
+}
+
+/* The capability matrix (peer uuid -> capabilities) built from
+ * id_state.peer_caps_map into @p out, which the caller map_free()s. */
+static int _build_caps_matrix(peer_capabilities_matrix_t *out)
+{
+    if (map_init(out) != 0)
+        return -1;
+    pthread_mutex_lock(&id_state.lock);
+    char *uuid_str = NULL;
+    data_t *dat = NULL;
+    map_entries_for_each(&id_state.peer_caps_map, uuid_str, dat)
+        array_t *names = NULL;
+        if (data_object_ptr(dat, (void **)&names) != 0 || names == NULL)
+            continue;
+        size_t n = array_size(names);
+        const char **list = calloc(n > 0 ? n : 1, sizeof(*list));
+        if (list == NULL)
+            continue;
+        for (size_t i = 0; i < n; i++)
+        {
+            data_t *nd = NULL;
+            char *s = NULL;
+            if (array_get(names, (int)i, &nd) == 0 && data_string_ptr(nd, &s) == 0)
+                list[i] = s;
+        }
+        peer_capabilities_add(out, uuid_str, list, n);
+        free(list);
+    map_end_for_each
+    pthread_mutex_unlock(&id_state.lock);
+    return 0;
+}
+
+/* Hand the capability matrix to every sibling process and keep a copy as our
+ * own protocol.peer_capabilities, which _acquire_capabilities waits on. The
+ * C counterpart of Python's identity putting peer_capabilities on the main
+ * and negotiation queues: negotiation invites only the peers it names. Sent
+ * on change; a lost hand-off is repaired by the next change, not retried
+ * (the message carries pointers into a matrix freed after the send). */
+static void _publish_peer_capabilities(const process_t *proc, directory_t *queues)
+{
+    generic_msg_t msg = {0};
+    msg.type = PEER_CAPABILITIES;
+    if (_build_caps_matrix(&msg.info.peer_capabilities) == 0)
+    {
+        _remember_activity(proc, queues, &msg);
+        map_free(&msg.info.peer_capabilities);
+    }
+    peer_capabilities_matrix_t mine;
+    if (_build_caps_matrix(&mine) == 0)
+    {
+        peer_capabilities_matrix_t *fresh = peer_capabilities_take(&mine);
+        process_t *p = (process_t *)proc;
+        peer_capabilities_matrix_t *old = p->protocol.peer_capabilities;
+        p->protocol.peer_capabilities = fresh;
+        if (old != NULL)
+            map_free(old);
+    }
 }
 
 /****************************
@@ -509,8 +1057,178 @@ void identity_install_peer_caps(const uuid_t uuid,
  ****************************/
 
 /* Frama-C: skipped — [solver-timeout] logging/map preconditions */
+/* Sibling hand-offs that failed, kept for the identity tick to retry.
+ *
+ * GROUP, PEER and PEER_REMOVED are STATE, not events: a sibling that misses
+ * one holds a stale view forever, and a PEER it never got is a peer whose every
+ * frame it defers (partition cohort part-3473787, 2026-09-29: ada's network
+ * process never learned ben after a five-founder admission burst kept its
+ * queue full past the 200 ms inline retry). An EAGAIN from a datagram send
+ * means the message was NOT queued, so trying again cannot duplicate it.
+ *
+ * An entry records WHICH state to resend, never a copy of it: public_identity_t
+ * carries heap pointers, and by the time a retry runs the state may have moved
+ * on. The retry rebuilds the message from identity's current view, so the
+ * latest group wins and a peer removed meanwhile is not re-added. One entry per
+ * (queue, type, peer); GROUP entries have no peer and so coalesce per queue.
+ * Guarded by its own mutex: _remember_activity is reached with other locks
+ * held. ISSUES §2.27. */
+#define ID_HANDOFF_PENDING_MAX 64
+typedef struct {
+    char   queue[PROC_NAME_LEN + 1];
+    long   type;
+    uuid_t uuid;        /* zero for GROUP */
+    int    retries;
+} id_handoff_t;
+static id_handoff_t g_handoffs[ID_HANDOFF_PENDING_MAX];
+static size_t g_num_handoffs;
+static pthread_mutex_t g_handoffs_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool _handoff_retryable(long type)
+{
+    return type == GROUP || type == PEER || type == PEER_REMOVED;
+}
+
+static const unsigned char *_handoff_uuid(const generic_msg_t *msg)
+{
+    if (msg->type == PEER)
+        return msg->info.peer.uuid;
+    if (msg->type == PEER_REMOVED)
+        return msg->info.peer_removed.peer_uuid;
+    return NULL;
+}
+
+/* Record (or refresh) a failed hand-off. Returns false when the table is full. */
+static bool _handoff_defer(const char *queue, const generic_msg_t *msg)
+{
+    uuid_t key = {0};
+    const unsigned char *u = _handoff_uuid(msg);
+    if (u != NULL)
+        memcpy(key, u, sizeof(uuid_t));
+    bool ok = true;
+    pthread_mutex_lock(&g_handoffs_lock);
+    size_t i;
+    for (i = 0; i < g_num_handoffs; i++) {
+        id_handoff_t *h = &g_handoffs[i];
+        /* A PEER and a PEER_REMOVED for the same peer are one question, "does
+         * the sibling know this peer": the later one supersedes. */
+        bool same_kind = (h->type == msg->type)
+            || (h->type != GROUP && msg->type != GROUP);
+        if (strcmp(h->queue, queue) == 0 && same_kind
+            && uuid_compare(h->uuid, key) == 0) {
+            h->type = msg->type;
+            break;
+        }
+    }
+    if (i == g_num_handoffs) {
+        if (g_num_handoffs < ID_HANDOFF_PENDING_MAX) {
+            id_handoff_t *h = &g_handoffs[g_num_handoffs++];
+            memset(h, 0, sizeof(*h));
+            snprintf(h->queue, sizeof(h->queue), "%s", queue);
+            h->type = msg->type;
+            memcpy(h->uuid, key, sizeof(uuid_t));
+        } else {
+            ok = false;
+        }
+    }
+    pthread_mutex_unlock(&g_handoffs_lock);
+    return ok;
+}
+
+/* Rebuild the message a pending entry stands for, from identity's view now.
+ * Returns false when there is nothing left to say (the peer is gone, or came
+ * back before its removal could be told). */
+static bool _handoff_rebuild(process_t *proc, const id_handoff_t *h,
+                             generic_msg_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->type = h->type;
+    if (h->type == GROUP) {
+        memcpy(&out->info.group, &proc->protocol.group, sizeof(group_t));
+        return true;
+    }
+    bool present = false;
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+        if (uuid_compare(proc->protocol.peers[i].uuid, h->uuid) == 0) {
+            present = true;
+            if (h->type == PEER)
+                memcpy(&out->info.peer, &proc->protocol.peers[i],
+                       sizeof(public_identity_t));
+            break;
+        }
+    }
+    peers_read_unlock(proc);
+    if (h->type == PEER)
+        return present;
+    memcpy(out->info.peer_removed.peer_uuid, h->uuid, sizeof(uuid_t));
+    return !present;
+}
+
+void identity_retry_sibling_handoffs(process_t *proc)
+{
+    if (proc == NULL)
+        return;
+    id_handoff_t work[ID_HANDOFF_PENDING_MAX];
+    pthread_mutex_lock(&g_handoffs_lock);
+    size_t n = g_num_handoffs;
+    memcpy(work, g_handoffs, n * sizeof(id_handoff_t));
+    g_num_handoffs = 0;
+    pthread_mutex_unlock(&g_handoffs_lock);
+
+    for (size_t i = 0; i < n; i++) {
+        id_handoff_t *h = &work[i];
+        generic_msg_t msg;
+        if (!_handoff_rebuild(proc, h, &msg))
+            continue;   /* superseded: nothing left to tell */
+        /* One try per tick: the tick is the retry loop. */
+        int ret = messaging_send(h->queue, msg.type, &msg, false);
+        if (ret == 0) {
+            log_info(proc->logger,
+                     "Identity: handed %s the %s update it missed (%d retr%s)\n",
+                     h->queue, message_type_to_string(msg.type),
+                     h->retries + 1, h->retries == 0 ? "y" : "ies");
+            continue;
+        }
+        h->retries++;
+        pthread_mutex_lock(&g_handoffs_lock);
+        /* Put it back unless a newer failure for the same thing arrived
+         * meanwhile (that one already stands for it). */
+        bool superseded = false;
+        for (size_t j = 0; j < g_num_handoffs; j++)
+            if (strcmp(g_handoffs[j].queue, h->queue) == 0
+                && uuid_compare(g_handoffs[j].uuid, h->uuid) == 0
+                && ((g_handoffs[j].type == GROUP) == (h->type == GROUP)))
+                superseded = true;
+        if (!superseded && g_num_handoffs < ID_HANDOFF_PENDING_MAX)
+            g_handoffs[g_num_handoffs++] = *h;
+        pthread_mutex_unlock(&g_handoffs_lock);
+    }
+}
+
+size_t identity_pending_sibling_handoffs(void)
+{
+    pthread_mutex_lock(&g_handoffs_lock);
+    size_t n = g_num_handoffs;
+    pthread_mutex_unlock(&g_handoffs_lock);
+    return n;
+}
+
+static void _handoffs_reset(void)
+{
+    pthread_mutex_lock(&g_handoffs_lock);
+    g_num_handoffs = 0;
+    pthread_mutex_unlock(&g_handoffs_lock);
+}
+
 static int _remember_activity(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
+    /* A harness may drive a handler with no queue directory at all (several
+     * unit tests do). There is then nobody to tell, which is not an error —
+     * but walking a NULL array is a crash, and this is now reached from the
+     * peer-learning paths a test exercises directly. */
+    if (proc == NULL || queues == NULL || msg == NULL)
+        return 0;
     /* Update proc configs with latest data; broadcast to all other processes */
     size_t qsize = array_size(queues);
     for (size_t i = 0; i < qsize; i++)
@@ -523,7 +1241,52 @@ static int _remember_activity(const process_t *proc, directory_t *queues, generi
             continue;
         if (strcmp(qname, proc->name) == 0)
             continue;
-        messaging_send(qname, msg->type, msg, false);
+        /* THE RESULT USED TO BE DISCARDED, and for a PEER message that is not a
+         * dropped notification — it is a peer the network process will never
+         * know about. net_proc's peers[] is filled ONLY from here; without the
+         * entry, find_peer_by_address cannot place that peer's address and
+         * every encrypted frame it sends is deferred as an unknown peer,
+         * forever. Nothing retries, because nothing knew anything was lost.
+         *
+         * This is exactly what a cohort bootstrap does to it: all three nodes
+         * admit each other inside the same second, the AF_UNIX queues hold 10
+         * datagrams (net.unix.max_dgram_qlen), and the sends that lose the race
+         * vanish. In the P3.3 staff cohort EVERY node ended up knowing exactly
+         * ONE peer, at the same instant — the keeper heard ada and never bob,
+         * so bob's co-signature was deferred on arrival and the exchange came
+         * back 1-of-2.
+         *
+         * Bounded retry, then say so. Mirrors _announce_identity_for's
+         * retry-until-the-network-socket-is-ready loop, but shorter: this runs
+         * inside a message handler, not at startup. */
+        int ret = -1;
+        for (int attempt = 0; attempt < 10; attempt++)
+        {
+            ret = messaging_send(qname, msg->type, msg, false);
+            if (ret == 0)
+                break;
+            usleep(20000); /* 20ms */
+        }
+        if (ret == EAGAIN && _handoff_retryable(msg->type)
+            && _handoff_defer(qname, msg))
+            /* Saturation, for state a sibling must not miss: the identity
+             * tick tries again until it lands (identity_retry_sibling_handoffs). */
+            log_warn(proc->logger,
+                     "Identity: could not hand %s a %s update after 10 tries"
+                     " (queue still full) — deferred; the identity tick"
+                     " retries it\n",
+                     qname, message_type_to_string(msg->type));
+        else if (ret != 0)
+            /* EAGAIN says the receiver's queue stayed full for the whole
+             * 200ms — saturation. Anything else is a hard transport fault
+             * (no socket bound at that key, most likely). They call for
+             * different answers from whoever reads this, so name which. */
+            log_warn(proc->logger,
+                     "Identity: could not hand %s a %s update after 10 tries"
+                     " (%s) — that process's view is now STALE and nothing"
+                     " retries it\n",
+                     qname, message_type_to_string(msg->type),
+                     ret == EAGAIN ? "queue still full" : "send failed");
     }
     return 0;
 }
@@ -547,6 +1310,39 @@ static int _remember_activity(const process_t *proc, directory_t *queues, generi
  ****************************/
 
 /* Frama-C: skipped — [solver-timeout] identity/peers/JSON preconditions */
+/* Name the key a group update carries, so the wire can be compared with what
+ * each side's identity and network processes hold (a three-way boot rotation
+ * forked the key in rep-2368077 and no line said which key went out). INFO
+ * when the key or epoch differs from the last update sent, debug otherwise:
+ * membership-only updates resend the same key and would drown the line. */
+static void _log_group_update_sent(const process_t *proc, size_t members)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static unsigned char last_key[crypto_box_PUBLICKEYBYTES];
+    static int64_t last_epoch = -1;
+    const group_t *g = &proc->protocol.group;
+    pthread_mutex_lock(&lock);
+    bool changed = g->key_epoch != last_epoch
+        || memcmp(last_key, g->encryptor.public, sizeof(last_key)) != 0;
+    last_epoch = g->key_epoch;
+    memcpy(last_key, g->encryptor.public, sizeof(last_key));
+    pthread_mutex_unlock(&lock);
+    char kfp[17] = {0};
+    sodium_bin2hex(kfp, sizeof(kfp), g->encryptor.public, 8);
+    int carries_key = sodium_is_zero(g->encryptor.private,
+                                     crypto_box_SECRETKEYBYTES) ? 0 : 1;
+    if (changed)
+        log_info(proc->logger,
+                 "Identity: sending group update with key %s… epoch %lld "
+                 "(carries_key=%d) to %zu member(s)\n",
+                 kfp, (long long)g->key_epoch, carries_key, members);
+    else
+        log_debug(proc->logger,
+                  "Identity: sending group update with key %s… epoch %lld "
+                  "(carries_key=%d) to %zu member(s)\n",
+                  kfp, (long long)g->key_epoch, carries_key, members);
+}
+
 static int _update_group(const process_t *proc, directory_t *queues)
 {
     (void)queues; /* network emission uses messaging_send by queue name */
@@ -568,11 +1364,14 @@ static int _update_group(const process_t *proc, directory_t *queues)
         }
         net_msg_pack_json(&update.info.net_msg, grp_json);
         json_decref(grp_json);
-        messaging_send("network", NET_MESSAGE, &update, false);
+        _log_group_update_sent(proc, 0);
+        (void)identity_send_to_network(proc, &update, "group_key_update", NULL);
+        net_msg_free_obj(&update.info.net_msg);
         return 0;
     }
 
     peers_read_lock(proc);
+    _log_group_update_sent(proc, proc->protocol.num_peers);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         generic_msg_t update = {0};
@@ -591,10 +1390,64 @@ static int _update_group(const process_t *proc, directory_t *queues)
         }
         net_msg_pack_json(&update.info.net_msg, grp_json);
         json_decref(grp_json);
-        messaging_send("network", NET_MESSAGE, &update, false);
+        /* Bounded retry per member, not a bare send (ISSUES §2.31). This is
+         * how a rotation reaches each member, and a member that misses it
+         * holds the old key until the next rotation, which may never come:
+         * in part-3637905 dee's epoch-4 update reached ada and amy and not
+         * bob, and bob could not read the cohort for the rest of the run. */
+        identity_send_to_network(proc, &update, "group_key_update",
+                                 proc->protocol.peers[i].nickname);
+        net_msg_free_obj(&update.info.net_msg);
     }
     peers_read_unlock(proc);
     return 0;
+}
+
+/* Mint a new shared key for our own group and hand it to every current member
+ * (doc/architecture/gateway-reputation-tree.md, user's call 2026-08-13).
+ *
+ * Only the node performing an admission calls this, and group_rotate_key
+ * refuses when we do not hold the current private key — a rotation minted by a
+ * node that cannot already decrypt the cohort would fork it into two halves
+ * that cannot hear each other.
+ *
+ * Distribution rides the EXISTING per-member group_key_update, which already
+ * carries the private seed to each member individually (group_to_json emits it
+ * when we own it, and the message is encrypted to that member). What makes it
+ * safe to ADOPT on the far side is the epoch: see group_accept_rotation.
+ *
+ * Each member's update gets a bounded retry (_update_group). A rotation that
+ * still fails to reach a member does NOT cost only the grace window, as this
+ * comment used to say: nothing re-sends it, so that member holds the old key
+ * until the next rotation (ISSUES §2.31, part-3637905). Refusing the admission
+ * over it would still be the worse trade. Mirrors Python _rotate_group_key. */
+/* Frama-C: skipped — [solver-timeout] libsodium/JSON/messaging preconditions */
+static bool _rotate_group_key(process_t *proc, directory_t *queues)
+{
+    if (proc == NULL)
+        return false;
+    int64_t epoch = group_rotate_key(&proc->protocol.group);
+    if (epoch < 0)
+        return false;   /* public-only view: not ours to rotate */
+    char kfp[17] = {0};
+    sodium_bin2hex(kfp, sizeof(kfp), proc->protocol.group.encryptor.public, 8);
+    log_info(proc->logger,
+             "Identity: rotated group key to epoch %lld (%zu member(s)), key %s…\n",
+             (long long)epoch, proc->protocol.num_peers, kfp);
+    _update_group(proc, queues);
+    /* Hand the freshly rotated key to our OWN sibling processes (network,
+     * reputation) so their protocol.group copy (processes.c GROUP handler:
+     * `proc->protocol.group = msg->info.group`) gets the new encryptor. Without
+     * this, _update_group only tells PEERS over the wire (ID_UPDATE) and the
+     * identity process itself — the network process keeps its pre-rotation
+     * encryptor, so every group multicast (Increment-7 feed posts) fails
+     * group_encrypt on a stale/zero key. Mirrors the adopt path's
+     * _remember_activity(GROUP). */
+    generic_msg_t group_msg = {0};
+    group_msg.type = GROUP;
+    memcpy(&group_msg.info.group, &proc->protocol.group, sizeof(group_t));
+    _remember_activity(proc, queues, &group_msg);
+    return true;
 }
 
 /****************************
@@ -605,7 +1458,7 @@ static int _update_group(const process_t *proc, directory_t *queues)
  ****************************/
 
 /* Helper: _confirm_group_membership — the CONFIRMED half of two-phase
- * admission (ISSUES.md §3.1-a). Records the peer's address in our group's
+ * admission (doc/architecture/identity-protocol.md). Records the peer's address in our group's
  * address_map and propagates the updated group (which carries the shared
  * private key) to existing peers. Split out of _add_peer so a PROVISIONAL
  * member can be tracked without the group key ever leaving this node until
@@ -638,6 +1491,16 @@ static void _confirm_group_membership(process_t *proc, directory_t *queues,
 static int _add_peer(process_t *proc, directory_t *queues,
                      const public_identity_t *new_peer, bool confirmed)
 {
+    /* Never list ourselves as a peer. A `peer_accepted` broadcast that names
+     * THIS node (a welcomer confirming us to the cohort) reaches us too; without
+     * this guard we would confirm+add our own identity as a peer and even open a
+     * self-connection to it. Self is never a member of peers[]. This is the sole
+     * chokepoint for every add path (handle_confirm_peer and the two internal
+     * callers); the history/resync backfills already self-check independently. */
+    const identity_t *self = identity_self_identity(proc);
+    if (self != NULL &&
+        uuid_compare(new_peer->uuid, self->uuid) == 0)
+        return 0;
     peers_write_lock(proc);
     /* Idempotency: an amnesia path may revisit a peer already in the list
      * (Python's _peer_accepted threads an explicit amnesia flag to skip
@@ -669,11 +1532,70 @@ static int _add_peer(process_t *proc, directory_t *queues,
      * Two-phase admission gates the GROUP KEY, not visibility. */
     identity_emit_peer_observed(proc, new_peer);
 
-    /* Two-phase admission (§3.1-a): propagate the group key only for a
+    /* Two-phase admission (doc/architecture/identity-protocol.md): propagate the group key only for a
      * CONFIRMED peer. A provisional add records the peer above (visibility /
      * reputation) but withholds the group key until the quorum is met. */
     if (confirmed)
         _confirm_group_membership(proc, queues, new_peer);
+    return 0;
+}
+
+/* No-vote, no-group-key admission of a DIRECT (1:1) peer -- the seam the
+ * optional first-contact handshake admits through (first_contact/first_contact.c).
+ *
+ * Records the peer exactly as a PROVISIONAL admission does (peers[], the local
+ * activity broadcast, the app-facing peer_observed) so the encrypted P2P
+ * channel can attribute its frames and reputation can score it, but never
+ * calls _confirm_group_membership (which would hand over the group key) and
+ * never touches the identity history: a first-contact peer is directly
+ * reachable, not a group member. Idempotent on the UUID.
+ *
+ * Mirrors Python first_contact._admit_direct_peer, which calls peers.add at
+ * mid_level plus _record_peers. C's peers[] is a flat array with no levels, so
+ * there is no level to pass -- the asymmetry is structural and predates this. */
+static int _send_caps_query(const process_t *proc, const public_identity_t *peer);
+
+int identity_admit_direct_peer(process_t *proc, directory_t *queues,
+                               const public_identity_t *who)
+{
+    if (proc == NULL || who == NULL) return -1;
+    bool known = false;
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers && !known; i++)
+        known = uuid_compare(proc->protocol.peers[i].uuid, who->uuid) == 0;
+    peers_read_unlock(proc);
+    int rc = _add_peer(proc, queues, who, false);
+    /* Ask what it can do now, as confirming a cohort member does
+     * (handle_confirm_peer), rather than leave it to the periodic caps sweep. */
+    if (rc == 0 && !known)
+        _send_caps_query(proc, who);
+    return rc;
+}
+
+/* The inverse of identity_admit_direct_peer, for a user removing a contact.
+ *
+ * A cohort MEMBER is never dropped this way: its place in peers[] belongs to
+ * the group the vote admitted it to, and pulling it out would leave the group
+ * key's holders and this node's peer list disagreeing. Only a direct peer -- in
+ * peers[] and absent from the group address map -- goes. The siblings forget it
+ * through a PEER_REMOVED broadcast, the inverse of the PEER one _add_peer sends,
+ * so the network process stops attributing its frames and every process's
+ * peers[] agrees. Reputation keeps whatever the peer earned. */
+int identity_remove_direct_peer(process_t *proc, directory_t *queues,
+                                const unsigned char *uuid)
+{
+    if (proc == NULL || uuid == NULL) return -1;
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(uuid, key);
+    data_t *member = NULL;
+    if (map_get(&proc->protocol.group.address_map, key, &member) == 0)
+        return 1;
+    if (!processes_remove_peer(proc, uuid))
+        return 2;
+    generic_msg_t gone = {0};
+    gone.type = PEER_REMOVED;
+    memcpy(gone.info.peer_removed.peer_uuid, uuid, sizeof(uuid_t));
+    _remember_activity(proc, queues, &gone);
     return 0;
 }
 
@@ -689,11 +1611,14 @@ static int _add_peer(process_t *proc, directory_t *queues,
  * the late joiner ends up in `peers[]` but absent from `peer_capabilities`,
  * invisible to cap-driven discovery (see memory feedback_late_joiner_caps).
  *
- * Encrypt=false: when the announce is lost we typically lack the peer's
- * crypto material, so we can't authenticated-encrypt to them. The peer's
- * `handle_caps_query` doesn't gate on encryption; the response back to us
- * (which has the encryptor key needed) is the encrypted leg. The caller
- * must populate `peer->address` for routing.
+ * Encrypt=true: peer_caps_query is NOT on the plaintext allowlist
+ * (identity_verb_is_unencrypted / Python UNENCRYPTED_VERBS), so a KNOWN peer's
+ * receive path refuses it as plaintext and annoy-tracks the decrypt failure --
+ * a plaintext query is simply dropped. Mirrors Python _send_caps_query, which
+ * builds the Message with the default encrypt=True. The encryptor public key
+ * rides the canonical confirm envelope, so `peer` (copied whole into to_whom)
+ * carries the material needed to authenticated-encrypt. The caller must
+ * populate `peer->address` for routing.
  ****************************/
 
 /* Frama-C: skipped — [solver-timeout] identity/messaging preconditions */
@@ -703,9 +1628,10 @@ static int _send_caps_query(const process_t *proc, const public_identity_t *peer
     query.type = NET_MESSAGE;
     strncpy(query.info.net_msg.process, "identity", PROC_NAME_LEN);
     query.info.net_msg.function = ID_CAPS_QUERY;
-    query.info.net_msg.encrypt = false;
+    query.info.net_msg.encrypt = true;
     memcpy(&query.info.net_msg.to_whom, peer, sizeof(public_identity_t));
     strncpy(query.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    /* Bare on purpose (caps resync re-queries every ~20 s): ISSUES §2.40. */
     messaging_send("network", NET_MESSAGE, &query, false);
     log_info(proc->logger,
              "Identity: sent caps_query to %s (UDP-loss recovery)\n",
@@ -733,102 +1659,140 @@ static int _send_caps_query(const process_t *proc, const public_identity_t *peer
  ****************************/
 
 /* Frama-C: skipped — [solver-timeout] identity/peers preconditions */
-static int _peer_accepted(process_t *proc, directory_t *queues,
-                          const public_identity_t *new_peer, int rank,
-                          bool amnesia)
+/* The access_granted body: [package_hash, [], seq].
+ *
+ * Slot 0 is this node's tagged package hash (package_hash.h), checked by the
+ * receiver against its allowlist when it has one. This runtime does not
+ * advertise a capability list on access_granted (the identity rides on the
+ * envelope). It DOES have to
+ * carry the freshness sequence, because access_granted is plaintext and adds
+ * the granter to the receiver's peer set on arrival, so unstamped it can be
+ * harvested off the wire and replayed at any node past the handshake.
+ *
+ * Slot order matches Python's (package_hash, capabilities, seq) exactly; the
+ * first two are left empty rather than removed so the receiver's indices are
+ * the same for both runtimes. Returns NULL on failure (caller must not send).
+ */
+static json_t *_accept_body(const process_t *proc)
 {
-    /* Record the peer's topology rank (carried on the message envelope) for
-     * rank-based child-gateway discovery — the live source that replaces the
-     * rank C peers drop (public_identity_t has none). Kept current even on the
-     * amnesia path. Only a known (non-zero) rank is stored; an absent/unknown
-     * rank (0) reads back as the default and must not clobber a prior value.
-     * Mirrors Python, whose peers carry _rank off the same envelope. */
-    if (new_peer != NULL && rank != 0) {
-        char ru[UUID_STRING_LEN + 1];
-        uuid_unparse_lower(new_peer->uuid, ru);
-        identity_set_peer_rank(proc, ru, rank);
-    }
+    pthread_mutex_lock(&id_state.lock);
+    int64_t seq = freshness_stamp(&id_state.freshness, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (seq <= 0)
+        return NULL;
+    json_t *body = json_array();
+    if (body == NULL)
+        return NULL;
+    json_array_append_new(body, json_string(at_package_hash()));
+    json_array_append_new(body, json_array());
+    json_array_append_new(body, json_integer((json_int_t)seq));
+    return body;
+}
 
-    /* Send ID_CONFIRM to existing group members with new_peer identity in JSON payload.
-     *
-     * Two modes:
-     *  - production: per-peer encrypted unicast (C lacks the group-key
-     *    broadcast Python uses, so the fanout is open-coded);
-     *  - synchronous_dispatch: a single broadcast send (to_whom zeroed)
-     *    so a bg-only conformance scenario sees one outbound regardless
-     *    of peer count. Mirrors Python's `to_whom=self.group` semantics.
-     */
-    if (id_state.synchronous_dispatch)
-    {
-        generic_msg_t confirm = {0};
-        confirm.type = NET_MESSAGE;
-        strncpy(confirm.info.net_msg.process, "identity", PROC_NAME_LEN);
-        confirm.info.net_msg.function = ID_CONFIRM;
-        confirm.info.net_msg.encrypt = false;
-        /* to_whom left zeroed → network layer broadcast */
-        /* DRY canonical: full public-identity payload (incl. sig/enc pubkeys),
-         * shared byte-shape with Python public_identity_to_canonical, so a
-         * Python member can parse the confirm announcement. (Was a
-         * {uuid,nickname,address} subset that dropped the public keys.) */
-        json_t *peer_json = NULL;
-        if (public_identity_to_json(new_peer, &peer_json) != 0 || peer_json == NULL) {
-            log_error(proc->logger, "Identity: public_identity_to_json failed (confirm broadcast)\n");
-            return EXCEPTION(ENOMEM);
-        }
-        net_msg_pack_json(&confirm.info.net_msg, peer_json);
+/* Wrap a canonical public identity in the confirm envelope:
+ * {"peer": {...}, "seq": N}. The stamp goes BESIDE the identity rather than
+ * into it because the canonical public-identity shape is shared with Python's
+ * public_identity_to_canonical and must stay byte-identical.
+ *
+ * Unstamped, a confirm was replayable: capture one off the group channel and a
+ * peer that had since been removed could be put back and, at quorum, handed
+ * the CURRENT group key. Returns NULL on failure (caller must not send).
+ * Mirrors Python IdentityProcess._peer_accepted. */
+static json_t *_confirm_envelope(const process_t *proc,
+                                 const public_identity_t *new_peer)
+{
+    json_t *peer_json = NULL;
+    if (public_identity_to_json(new_peer, &peer_json) != 0 || peer_json == NULL)
+        return NULL;
+    pthread_mutex_lock(&id_state.lock);
+    int64_t seq = freshness_stamp(&id_state.freshness, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (seq <= 0) {
         json_decref(peer_json);
-        messaging_send("network", NET_MESSAGE, &confirm, false);
+        return NULL;
     }
-    else
-    {
-        peers_read_lock(proc);
-        for (size_t i = 0; i < proc->protocol.num_peers; i++)
-        {
-            generic_msg_t confirm = {0};
-            confirm.type = NET_MESSAGE;
-            strncpy(confirm.info.net_msg.process, "identity", PROC_NAME_LEN);
-            confirm.info.net_msg.function = ID_CONFIRM;
-            confirm.info.net_msg.encrypt = true;
-            memcpy(&confirm.info.net_msg.to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
-            /* DRY canonical full public-identity payload (see the broadcast
-             * arm above) so a Python member can parse the confirm fanout. */
-            json_t *peer_json = NULL;
-            if (public_identity_to_json(new_peer, &peer_json) != 0 || peer_json == NULL) {
-                log_error(proc->logger, "Identity: public_identity_to_json failed (confirm fanout)\n");
-                continue;
-            }
-            net_msg_pack_json(&confirm.info.net_msg, peer_json);
-            json_decref(peer_json);
-            messaging_send("network", NET_MESSAGE, &confirm, false);
-        }
-        peers_read_unlock(proc);
+    json_t *env = json_object();
+    if (env == NULL) {
+        json_decref(peer_json);
+        return NULL;
     }
-    /* Send ID_ACCEPT to the new peer */
-    generic_msg_t accept = {0};
-    accept.type = NET_MESSAGE;
-    strncpy(accept.info.net_msg.process, "identity", PROC_NAME_LEN);
-    accept.info.net_msg.function = ID_ACCEPT;
-    accept.info.net_msg.encrypt = false;
-    memcpy(&accept.info.net_msg.to_whom, new_peer, sizeof(public_identity_t));
-    messaging_send("network", NET_MESSAGE, &accept, false);
+    json_object_set_new(env, "peer", peer_json);
+    json_object_set_new(env, "seq", json_integer((json_int_t)seq));
+    return env;
+}
 
-    /* Send ID_HISTORY to the new peer so they can decrypt subsequent
-     * group-encrypted traffic AND populate their peer list with our
-     * existing admissions. The payload is a 3-element JSON array
-     * [group_obj, [steps...], [peer_idents...]] matching Python's
-     * `to_json_string((self.group, self._history.recite(),
-     * [p.publish() for p in self.peers.all]))` (idprocess.py:507-510).
-     *
-     * The C identity process doesn't yet hold a per-process
-     * identity_history_t (Python's `self._history` field), so the
-     * `steps` slot ships as an empty array for now. The receive-side
-     * (handle_receive_history → choose_group → _populate_peers_from_history)
-     * tolerates that — the peers slot is what late-joiner sync
-     * actually needs to work. When per-process identity_history_t
-     * gets wired up, call dag_recite + linked_step_to_json here and
-     * replace the empty array. */
+/* True when @p who is ALREADY a member of our group, i.e. its uuid is already in
+ * our address_map — which means it already holds the shared key.
+ *
+ * Used to decide whether admitting it should rotate. Rotation exists so a JOINER
+ * cannot decrypt cohort ciphertext recorded before it was admitted; a node that
+ * is already a member has had the key all along, so rotating "away from" it
+ * hides nothing and costs a great deal. Two nodes that discover each other in
+ * the ordinary mesh way merge groups first and THEN each run the access
+ * handshake, so without this gate both admit a peer that is already a member and
+ * both mint the same epoch — the permanent group-key fork diagnosed on
+ * 2026-09-17 (see group_accept_rotation, which resolves the fork when it does
+ * happen; this is what keeps it from happening at all). */
+static bool _group_already_member(process_t *proc, const public_identity_t *who)
+{
+    if (proc == NULL || who == NULL)
+        return false;
+    if (proc->protocol.group.address_map.items == NULL)
+        return false;
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(who->uuid, uuid_str);
+    data_t *value = NULL;
+    return map_get(&proc->protocol.group.address_map, uuid_str, &value) == 0;
+}
+
+/* Whether two identities are the same keyholder: uuid, signing key and
+ * encryption key. Address and nickname are deliberately not compared, since a
+ * node that moved networks is still itself. Mirrors Python _same_keys. */
+static bool _same_keys(const public_identity_t *one, const public_identity_t *other)
+{
+    return uuid_compare(one->uuid, other->uuid) == 0
+        && sodium_memcmp(one->signature.public, other->signature.public,
+                         sizeof(one->signature.public)) == 0
+        && sodium_memcmp(one->encryptor.public, other->encryptor.public,
+                         sizeof(one->encryptor.public)) == 0;
+}
+
+/* A returning member came back from a new address (or under a new nickname):
+ * replace its peers[] record and the group address map's entry, and tell the
+ * group, so its traffic is attributed to it again. Mirrors Python
+ * _readdress_member. */
+static void _readdress_member(process_t *proc, directory_t *queues,
+                              const public_identity_t *existing,
+                              const public_identity_t *returned)
+{
+    log_info(proc->logger, "Identity: member %s returned from %s (was %s)\n",
+             returned->nickname, returned->address, existing->address);
+    peers_write_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++)
+    {
+        public_identity_t *p = &proc->protocol.peers[i];
+        if (uuid_compare(p->uuid, returned->uuid) != 0)
+            continue;
+        at_strlcpy(p->address, returned->address, sizeof(p->address));
+        at_strlcpy(p->nickname, returned->nickname, sizeof(p->nickname));
+        break;
+    }
+    peers_write_unlock(proc);
+    generic_msg_t peer_msg = {0};
+    peer_msg.type = PEER;
+    memcpy(&peer_msg.info.peer, returned, sizeof(public_identity_t));
+    _remember_activity(proc, queues, &peer_msg);
+    _confirm_group_membership(proc, queues, returned);
+}
+
+/* The full_history payload a welcomer hands a joiner: the 3-element array
+ * [group_obj, [steps...], [peer_idents...]] matching Python's
+ * _history_payload. NULL when out of memory. */
+static json_t *_history_payload(process_t *proc)
+{
     json_t *hist_arr = json_array();
-    if (hist_arr != NULL)
+    if (hist_arr == NULL)
+        return NULL;
     {
         /* Slot 0: group. */
         json_t *group_json = NULL;
@@ -894,6 +1858,141 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
             json_array_append_new(hist_arr, json_array());
         }
     }
+    return hist_arr;
+}
+
+static int _peer_accepted(process_t *proc, directory_t *queues,
+                          const public_identity_t *new_peer, int rank,
+                          bool amnesia)
+{
+    /* Record the peer's topology rank (carried on the message envelope) for
+     * rank-based child-gateway discovery — the live source that replaces the
+     * rank C peers drop (public_identity_t has none). Kept current even on the
+     * amnesia path. Only a known (non-zero) rank is stored; an absent/unknown
+     * rank (0) reads back as the default and must not clobber a prior value.
+     * Mirrors Python, whose peers carry _rank off the same envelope. */
+    if (new_peer != NULL && rank != 0) {
+        char ru[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(new_peer->uuid, ru);
+        identity_set_peer_rank(proc, ru, rank);
+    }
+
+    /* Send ID_CONFIRM to existing group members with new_peer identity in JSON payload.
+     *
+     * Two modes:
+     *  - production: per-peer encrypted unicast (C lacks the group-key
+     *    broadcast Python uses, so the fanout is open-coded);
+     *  - synchronous_dispatch: a single broadcast send (to_whom zeroed)
+     *    so a bg-only conformance scenario sees one outbound regardless
+     *    of peer count. Mirrors Python's `to_whom=self.group` semantics.
+     */
+    if (id_state.synchronous_dispatch)
+    {
+        generic_msg_t confirm = {0};
+        confirm.type = NET_MESSAGE;
+        strncpy(confirm.info.net_msg.process, "identity", PROC_NAME_LEN);
+        confirm.info.net_msg.function = ID_CONFIRM;
+        confirm.info.net_msg.encrypt = false;
+        /* to_whom left zeroed → network layer broadcast */
+        /* DRY canonical: full public-identity payload (incl. sig/enc pubkeys),
+         * shared byte-shape with Python public_identity_to_canonical, so a
+         * Python member can parse the confirm announcement. (Was a
+         * {uuid,nickname,address} subset that dropped the public keys.) */
+        json_t *peer_json = _confirm_envelope(proc, new_peer);
+        if (peer_json == NULL) {
+            log_error(proc->logger, "Identity: confirm envelope failed (confirm broadcast)\n");
+            return EXCEPTION(ENOMEM);
+        }
+        net_msg_pack_json(&confirm.info.net_msg, peer_json);
+        json_decref(peer_json);
+        (void)identity_send_to_network(proc, &confirm, "a peer confirmation", NULL);
+        net_msg_free_obj(&confirm.info.net_msg);
+    }
+    else
+    {
+        peers_read_lock(proc);
+        for (size_t i = 0; i < proc->protocol.num_peers; i++)
+        {
+            generic_msg_t confirm = {0};
+            confirm.type = NET_MESSAGE;
+            strncpy(confirm.info.net_msg.process, "identity", PROC_NAME_LEN);
+            confirm.info.net_msg.function = ID_CONFIRM;
+            confirm.info.net_msg.encrypt = true;
+            memcpy(&confirm.info.net_msg.to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
+            /* DRY canonical full public-identity payload (see the broadcast
+             * arm above) so a Python member can parse the confirm fanout. */
+            /* A fresh stamp per recipient: these are separate messages, and a
+             * receiver's mark is per (sender, verb), so reusing one sequence
+             * across the fanout would have every recipient after the first
+             * refuse it as a replay. */
+            json_t *peer_json = _confirm_envelope(proc, new_peer);
+            if (peer_json == NULL) {
+                log_error(proc->logger, "Identity: confirm envelope failed (confirm fanout)\n");
+                continue;
+            }
+            net_msg_pack_json(&confirm.info.net_msg, peer_json);
+            json_decref(peer_json);
+            (void)identity_send_to_network(proc, &confirm, "a peer confirmation", NULL);
+            net_msg_free_obj(&confirm.info.net_msg);
+        }
+        peers_read_unlock(proc);
+    }
+    /* Send ID_ACCEPT to the new peer */
+    generic_msg_t accept = {0};
+    accept.type = NET_MESSAGE;
+    strncpy(accept.info.net_msg.process, "identity", PROC_NAME_LEN);
+    accept.info.net_msg.function = ID_ACCEPT;
+    accept.info.net_msg.encrypt = false;
+    memcpy(&accept.info.net_msg.to_whom, new_peer, sizeof(public_identity_t));
+    json_t *accept_body = _accept_body(proc);
+    if (accept_body == NULL) {
+        log_error(proc->logger,
+                  "Identity: no freshness sequence; not sending access_granted\n");
+        return EXCEPTION(ENOMEM);
+    }
+    net_msg_pack_json(&accept.info.net_msg, accept_body);
+    json_decref(accept_body);
+    /* Bounded retry, not a bare send (ISSUES §2.14, §2.30): the admission is
+     * one-shot, and nothing re-sends it. */
+    identity_send_to_network(proc, &accept, "access_granted", new_peer->nickname);
+    net_msg_free_obj(&accept.info.net_msg);
+
+    /* Send ID_HISTORY to the new peer so they can decrypt subsequent
+     * group-encrypted traffic AND populate their peer list with our
+     * existing admissions. The payload is a 3-element JSON array
+     * [group_obj, [steps...], [peer_idents...]] matching Python's
+     * `to_json_string((self.group, self._history.recite(),
+     * [p.publish() for p in self.peers.all]))` (idprocess.py:507-510).
+     *
+     * The C identity process doesn't yet hold a per-process
+     * identity_history_t (Python's `self._history` field), so the
+     * `steps` slot ships as an empty array for now. The receive-side
+     * (handle_receive_history → choose_group → _populate_peers_from_history)
+     * tolerates that — the peers slot is what late-joiner sync
+     * actually needs to work. When per-process identity_history_t
+     * gets wired up, call dag_recite + linked_step_to_json here and
+     * replace the empty array. */
+    /* Rotate the shared key BEFORE the joiner is handed the group
+     * (doc/architecture/gateway-reputation-tree.md, user's call 2026-08-13). The order
+     * is the whole point: the joiner receives only the new key, so cohort ciphertext it
+     * recorded before being admitted stays closed to it. Existing members are handed
+     * the new key by the _update_group inside, and keep decrypting old-key traffic
+     * through GROUP_PREVIOUS_KEY_GRACE while that propagates — a rotation is not
+     * synchronous across a cohort. Mirrors Python _peer_accepted.
+     *
+     * ONLY for an actual joiner, though: see _group_already_member. Admitting a
+     * node that is already in our group rotates away from nothing (it holds the
+     * key already) and, when both sides do it at once, forks the cohort's key
+     * permanently. */
+    if (_group_already_member(proc, new_peer))
+        log_info(proc->logger,
+                 "Identity: %s is already a group member; not rotating "
+                 "(nothing to withhold, and a simultaneous rotation forks the key)\n",
+                 new_peer->nickname);
+    else
+        _rotate_group_key(proc, queues);
+
+    json_t *hist_arr = _history_payload(proc);
 
     generic_msg_t hist = {0};
     hist.type = NET_MESSAGE;
@@ -906,12 +2005,33 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
         net_msg_pack_json(&hist.info.net_msg, hist_arr);
         json_decref(hist_arr);
     }
-    messaging_send("network", NET_MESSAGE, &hist, false);
+    /* THE frame a joiner cannot do without, and it leaves in the burst the
+     * rotation above just queued. It went out as a bare non-blocking send, so
+     * in partition cohort part-3616429 (2026-09-29) amy's access_granted
+     * reached bob and her history did not: bob waited out choose_group, found
+     * "no histories received", and bootstrapped a group of his own. Bounded
+     * retry, then a warning that names the joiner (ISSUES §2.30). */
+    identity_send_to_network(proc, &hist, "full_history", new_peer->nickname);
+    net_msg_free_obj(&hist.info.net_msg);
 
     /* Skip _add_peer in the amnesia case — the peer is already in our
      * list and re-adding would emit a redundant group update. */
     if (amnesia)
         return 0;
+    /* A contact the vote admitted was in peers[] before it was a member, so
+     * _add_peer's idempotency would return before confirming it: the group
+     * address map, and with it the key, would never follow the vote. */
+    bool promoted = false;
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers && !promoted; i++)
+        promoted = uuid_compare(proc->protocol.peers[i].uuid, new_peer->uuid) == 0;
+    peers_read_unlock(proc);
+    if (promoted)
+    {
+        if (!_group_already_member(proc, new_peer))
+            _confirm_group_membership(proc, queues, new_peer);
+        return 0;
+    }
     /* Welcomer path — post-finalize, so this admission is CONFIRMED. */
     return _add_peer(proc, queues, new_peer, true);
 }
@@ -933,10 +2053,65 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
   requires \valid(msg);
   requires proc->logger == \null || \valid(proc->logger);
 */
+static int _own_rank(const process_t *proc);
+static int _roster_member_rank(const process_t *proc, const char *uuid);
+
+/* Whether a peer may even ASK this cohort to admit it
+ * (doc/architecture/gateway-reputation-tree.md).
+ *
+ * Two gates, both reused rather than invented (user's call, 2026-08-13):
+ * a PROVED shared ZTA anchor — the same rule federation and deep-resolution
+ * evidence already apply — and out-ranking us, matching _derive_parent_gateway's
+ * direction, because a cohort is joined from ABOVE by the node that will
+ * gateway it. A peer at or below our rank asking to join is not forming a
+ * hierarchy, and admitting it would let any anchored peer collect cohort keys
+ * sideways.
+ *
+ * Inert when the policy is not enforcing at admission or we hold no anchors of
+ * our own: with nothing to compare against, refusing every requester would
+ * break joins for non-ZTA deployments rather than protect anything. Same inert
+ * conditions as _gateway_authorized, deliberately. */
+static bool _join_authorized(const process_t *proc,
+                             const public_identity_t *new_id, int their_rank)
+{
+    if (proc == NULL || new_id == NULL)
+        return false;
+    if (identity_ext_join_refused(proc, new_id))
+        return false;
+    /* Rank sources, in Python's order (_member_rank first, then the identity):
+     * the peer_ranks seam is the live record and outranks a single envelope,
+     * which may legitimately be absent -- public_identity_t drops rank (see the
+     * roster note in doc/architecture/gateway-reputation-tree.md), which is why
+     * the caller passes nmsg->from_rank through as the fallback. Reading only
+     * the envelope would make this gate refuse a peer whose rank we already
+     * know, and the two runtimes would then disagree about who may solicit. */
+    char req_uuid[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(new_id->uuid, req_uuid);
+    int known = _roster_member_rank(proc, req_uuid);
+    if (known != 0)
+        their_rank = known;
+    int own_rank = _own_rank(proc);
+    if (their_rank <= own_rank)
+    {
+        log_warn(proc->logger,
+                 "Identity: join request from %s refused: rank %d does not "
+                 "exceed ours (%d)\n", new_id->nickname, their_rank, own_rank);
+        return false;
+    }
+    return true;
+}
+
+static void _hold_access_request(const process_t *proc, const generic_msg_t *msg);
+
 static bool handle_welcoming_committee(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     if (proc->protocol.phase != 3)
-        return false;
+    {
+        /* A requester with a peer never resends, so the request is held and
+         * replayed once our group is chosen. */
+        _hold_access_request(proc, msg);
+        return true;
+    }
 
     net_msg_t *nmsg = &msg->info.net_msg;
     log_info(proc->logger, "Identity: received access request from %s\n",
@@ -949,29 +2124,106 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
         return true;
     }
 
-    /* Check if already a peer.  If so, re-send access_granted in case the
-     * peer restarted and lost its in-memory peer list (it still holds the
-     * same identity/keys, but needs us to re-acknowledge it). */
-    peers_read_lock(proc);
+    /* Optional payload slot 3: the cohort the requester is asking to join
+     * (doc/architecture/gateway-reputation-tree.md, runtime cross-group join). Absent =
+     * the ordinary open
+     * request, handled exactly as before. Present and naming somebody else's
+     * cohort = not ours to answer, so it is dropped here rather than admitting
+     * into OUR group a peer that asked for a different one. Same arity
+     * tolerance the operator attestation in slot 2 already relies on; mirrors
+     * Python welcoming_committee's join_target. */
+    bool solicited_join = false;
+    {
+        json_t *jpayload = NULL;
+        if (net_msg_unpack_json(nmsg, &jpayload) == 0 && jpayload != NULL)
+        {
+            if (json_is_array(jpayload) && json_array_size(jpayload) > 3)
+            {
+                const char *target =
+                    json_string_value(json_array_get(jpayload, 3));
+                if (target != NULL && target[0] != '\0')
+                {
+                    char own[UUID_STRING_LEN + 1] = {0};
+                    uuid_unparse_lower(proc->protocol.group.uuid, own);
+                    if (strcmp(target, own) != 0)
+                    {
+                        json_decref(jpayload);
+                        return true;   /* not our cohort to answer for */
+                    }
+                    solicited_join = true;
+                }
+            }
+            json_decref(jpayload);
+        }
+    }
+
+    /* Package-hash gate (package_hash.h): with an allowlist in etc/at, a
+     * requester must present a listed hash; without one, admission is what it
+     * always was. Before the amnesia path, so a node that was admitted before
+     * the allowlist shipped is not re-admitted on its old standing. Mirrors
+     * Python welcoming_committee's _package_hash_admissible. */
+    {
+        char tagged[160] = {0};
+        json_t *hpayload = NULL;
+        if (net_msg_unpack_json(nmsg, &hpayload) == 0 && json_is_array(hpayload)
+            && json_array_size(hpayload) > 0)
+            at_package_hash_of_json(json_array_get(hpayload, 0), tagged,
+                                    sizeof(tagged));
+        json_decref(hpayload);
+        char why[96] = {0};
+        if (!at_package_hash_admissible(tagged, why, sizeof(why)))
+        {
+            log_warn(proc->logger, "Identity: Counterfeit %s refused (%s)\n",
+                     nmsg->from_whom.nickname, why);
+            probes_counter("id.join", "counterfeit", "refused");
+            return true;
+        }
+    }
+
+    /* Recognizing a returning node (doc/architecture/identity-protocol.md,
+     * "Amnesia"). A known uuid must present the keys it is known by; address
+     * and nickname may change. Only a MEMBER of our group is readmitted
+     * without a vote: anything else in peers[] -- a first-contact direct peer,
+     * a provisional admission -- takes the ordinary path below, admission gate
+     * and vote included, because readmission hands over the group key. Mirrors
+     * Python welcoming_committee. */
+    public_identity_t existing;
     bool already_known = false;
+    peers_read_lock(proc);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         if (uuid_compare(proc->protocol.peers[i].uuid, nmsg->from_whom.uuid) == 0)
         {
+            memcpy(&existing, &proc->protocol.peers[i], sizeof(existing));
             already_known = true;
             break;
         }
     }
     peers_read_unlock(proc);
-    if (already_known)
+    if (already_known && !_same_keys(&nmsg->from_whom, &existing))
     {
-        /* Amnesiac peer: re-run the full admission emission cycle
+        char known_uuid[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(nmsg->from_whom.uuid, known_uuid);
+        log_warn(proc->logger,
+                 "Identity: access request from %s refused: uuid %.8s is known "
+                 "under different keys\n",
+                 nmsg->from_whom.nickname, known_uuid);
+        probes_counter("id.join", "known_uuid_new_keys", "refused");
+        return true;
+    }
+    if (already_known && _group_already_member((process_t *)proc, &nmsg->from_whom))
+    {
+        /* Amnesiac member: re-run the full admission emission cycle
          * (peer_accepted to group + access_granted to peer + full_history)
-         * so the returning peer recovers the same state it had before any
+         * so the returning member recovers the same state it had before any
          * restart. Matches Python's _peer_accepted(amnesia=True). */
         log_info(proc->logger,
                  "Identity: peer %s already known (amnesia path)\n",
                  nmsg->from_whom.nickname);
+        if (strcmp(existing.address, nmsg->from_whom.address) != 0
+            || strcmp(existing.nickname, nmsg->from_whom.nickname) != 0)
+            _readdress_member((process_t *)proc, queues, &existing,
+                              &nmsg->from_whom);
         _peer_accepted((process_t *)proc, queues, &nmsg->from_whom,
                        nmsg->from_rank, true);
         return true;
@@ -1014,36 +2266,22 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
                sizeof(nmsg->from_whom.operator_pubkey));
     }
 
-#ifdef AT_ZTA_ENABLED
-    /* ZTA credential verification at admission */
-    {
-        /* Look up ZTA policy from configs. Values are object_ptr_data(config_t)
-         * (load_all_configs), so unwrap data_t -> config_t -> data_struct,
-         * exactly as the "identity" config is read above. (A prior direct
-         * cast of the data_t wrapper to zta_policy_t* read garbage — the
-         * policy fields landed on the data_t header.) */
-        data_t *zta_dat = NULL;
-        config_t *zta_cfg = NULL;
-        zta_policy_t *zta_policy = NULL;
-        char zta_key[] = "zta_policy";
-        if (map_get(proc->configs, zta_key, &zta_dat) == 0 && zta_dat
-            && data_object_ptr(zta_dat, (void **)&zta_cfg) == 0
-            && zta_cfg != NULL && zta_cfg->data_struct != NULL)
-            zta_policy = (zta_policy_t *)zta_cfg->data_struct;
+    /* An admission authority (ZTA: zta/zta_identity.c) decides before the
+     * vote, and publishes the standing it decides itself (before the vote:
+     * a ceiling that arrives after the first commit is too late). */
+    if (identity_ext_admission_gate(proc, &nmsg->from_whom, claimed_operator_key)
+        == IDENTITY_EXT_REJECT)
+        return true; /* reject */
 
-        if (zta_policy != NULL) {
-            /* The whole decision — any-of across anchors, graded failure, the
-               credential->identity binding, replay, operator classification —
-               lives in _zta_admit, mirroring Python's _zta_admit one-for-one.
-               A capped admission is logged there; C has no reputation-cap set to
-               add the peer to (Python's _zta_capped), so the two runtimes differ
-               in bookkeeping, not in who gets admitted. */
-            if (_zta_admit(proc, zta_policy, &nmsg->from_whom,
-                           claimed_operator_key) == ZTA_GATE_REJECT)
-                return true; /* reject */
-        }
-    }
-#endif
+    /* A targeted join is bounded before the vote (doc/architecture/gateway-reputation-tree.md): the
+     * requester must prove an anchor we share and out-rank this cohort.
+     * Deliberately AFTER the ZTA block, which is what turns an asserted
+     * credential into proved anchors this reads, and deliberately BEFORE the
+     * vote — it bounds who may solicit, it does not decide. Mirrors Python
+     * _join_authorized. */
+    if (solicited_join
+        && !_join_authorized(proc, &nmsg->from_whom, (int)nmsg->from_rank))
+        return true;
 
     /* Bootstrap: auto-accept when no existing peers (no one to vote).
      * Skipped in synchronous_dispatch (conformance) mode so the harness
@@ -1051,7 +2289,7 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
      * test path always proposes regardless of peer count. */
     peers_read_lock(proc);
     bool bootstrap = (proc->protocol.num_peers == 0);
-    size_t snapshot_num_peers = proc->protocol.num_peers;
+    size_t snapshot_num_peers = _admission_roster(proc);
     peers_read_unlock(proc);
     if (bootstrap && !id_state.synchronous_dispatch)
     {
@@ -1083,6 +2321,12 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
     /* Proposer self-vote: count as 1 */
     data_t *self_vote = integer_data(1);
     map_set(&id_state.vote_collection, uuid_str, self_vote);
+    /* ...and arm the finalize. Votes from other members may arrive and decide
+     * this earlier (handle_count_vote); if none do, the identity loop decides
+     * on what we have once the grace period is up, which is what Python's
+     * per-proposal thread does after vote_timeout. */
+    data_t *deadline = floating_pt_dbl_data(_vote_now_sec() + ID_VOTE_TIMEOUT_SEC);
+    map_set(&id_state.vote_deadlines, uuid_str, deadline);
     pthread_mutex_unlock(&id_state.lock);
 
     /* Propose this peer to existing group members for voting.
@@ -1132,7 +2376,8 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
         propose_msg.info.net_msg.encrypt = false;
         /* to_whom zeroed → broadcast */
         net_msg_pack_json(&propose_msg.info.net_msg, proposal_json);
-        messaging_send("network", NET_MESSAGE, &propose_msg, false);
+        (void)identity_send_to_network(proc, &propose_msg, "a peer proposal", NULL);
+        net_msg_free_obj(&propose_msg.info.net_msg);
     }
     else
     {
@@ -1147,7 +2392,8 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
             memcpy(&propose_msg.info.net_msg.to_whom, &proc->protocol.peers[i],
                    sizeof(public_identity_t));
             net_msg_pack_json(&propose_msg.info.net_msg, proposal_json);
-            messaging_send("network", NET_MESSAGE, &propose_msg, false);
+            (void)identity_send_to_network(proc, &propose_msg, "a peer proposal", NULL);
+            net_msg_free_obj(&propose_msg.info.net_msg);
         }
         peers_read_unlock(proc);
     }
@@ -1163,7 +2409,7 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
      * scenarios that need >1 voter pre-stage extra peers). Mirrors what
      * Python's _vote_collection thread does after the timeout. */
     if (id_state.synchronous_dispatch
-        && 1 >= MAJORITY(snapshot_num_peers))
+        && 1 >= ADMISSION_QUORUM(snapshot_num_peers))
     {
         log_info(proc->logger,
                  "Identity: synchronous_dispatch — self-vote majority for %s\n",
@@ -1199,6 +2445,53 @@ static bool handle_acceptance(const process_t *proc, directory_t *queues, generi
     net_msg_t *nmsg = &msg->info.net_msg;
     log_info(proc->logger, "Identity: access granted by %s\n",
              nmsg->from_whom.nickname);
+
+    /* Freshness per granter, before anything is written. The body is
+     * [package_hash, capabilities, seq]; this runtime leaves the capabilities
+     * empty (see _accept_body) but the sequence is required. Unstamped is
+     * refused, not accepted as legacy: this verb is PLAINTEXT, so anyone on
+     * the wire can harvest one, and it appends the granter to our peer set
+     * below (doc/architecture/reputation.md, "Quorum attestation"). */
+    {
+        json_t *accept_payload = NULL;
+        int64_t accept_seq = 0;
+        char tagged[160] = {0};
+        if (net_msg_unpack_json(nmsg, &accept_payload) == 0
+            && accept_payload != NULL && json_is_array(accept_payload)
+            && json_array_size(accept_payload) >= 3)
+        {
+            json_t *j = json_array_get(accept_payload, 2);
+            if (json_is_integer(j))
+                accept_seq = (int64_t)json_integer_value(j);
+            at_package_hash_of_json(json_array_get(accept_payload, 0), tagged,
+                                    sizeof(tagged));
+        }
+        if (accept_payload != NULL)
+            json_decref(accept_payload);
+        /* The granter is held to the same allowlist as a requester: an
+         * accept adds it to our peer set as surely as a vote adds a newbie. */
+        char why[96] = {0};
+        if (!at_package_hash_admissible(tagged, why, sizeof(why)))
+        {
+            log_warn(proc->logger, "Identity: Counterfeit granter %s refused (%s)\n",
+                     nmsg->from_whom.nickname, why);
+            return true;
+        }
+        char granter[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(nmsg->from_whom.uuid, granter);
+        pthread_mutex_lock(&id_state.lock);
+        bool accept_fresh = freshness_accept(&id_state.freshness, granter,
+                                             ID_ACCEPT, accept_seq,
+                                             proc->logger);
+        pthread_mutex_unlock(&id_state.lock);
+        if (!accept_fresh) {
+            log_warn(proc->logger,
+                     "Identity: access_granted from %s refused: sequence %lld "
+                     "not above mark (replay or unstamped)\n", granter,
+                     (long long)accept_seq);
+            return true;
+        }
+    }
 
     /* Dedup + append under the write lock */
     peers_write_lock((process_t *)proc);
@@ -1287,21 +2580,15 @@ static int _announce_self_to_bundled_peers(const process_t *proc,
 
     /* Populate from_whom with our published identity, same way as
      * _build_announcement does it. */
-    data_t *id_dat = NULL;
-    char id_key[] = "identity";
-    if (map_get(proc->configs, id_key, &id_dat) == 0 && id_dat != NULL)
+    const identity_t *self = identity_self_identity(proc);
+    if (self != NULL)
     {
-        config_t *id_cfg = NULL;
-        if (data_object_ptr(id_dat, (void **)&id_cfg) == 0 &&
-            id_cfg != NULL && id_cfg->data_struct != NULL)
-        {
-            public_identity_t *pub = NULL;
-            identity_publish((const identity_t *)id_cfg->data_struct, &pub);
-            if (pub != NULL) {
-                memcpy(&accept_template.info.net_msg.from_whom, pub,
-                       sizeof(public_identity_t));
-                smrt_deref(pub);
-            }
+        public_identity_t *pub = NULL;
+        identity_publish(self, &pub);
+        if (pub != NULL) {
+            memcpy(&accept_template.info.net_msg.from_whom, pub,
+                   sizeof(public_identity_t));
+            smrt_deref(pub);
         }
     }
 
@@ -1311,12 +2598,23 @@ static int _announce_self_to_bundled_peers(const process_t *proc,
         generic_msg_t accept = accept_template;
         memcpy(&accept.info.net_msg.to_whom, &peers[i],
                sizeof(public_identity_t));
-        if (messaging_send("network", NET_MESSAGE, &accept, false) == 0) {
+        /* A fresh stamp per recipient: separate messages, and a receiver's
+         * mark is per (sender, verb), so reusing one sequence across the
+         * fanout would have every recipient after the first refuse it. */
+        json_t *accept_body = _accept_body(proc);
+        if (accept_body == NULL) {
+            probes_counter("peer.set", "self_announce", "no_sequence");
+            continue;
+        }
+        net_msg_pack_json(&accept.info.net_msg, accept_body);
+        json_decref(accept_body);
+        if (identity_send_to_network(proc, &accept, "a self-announcement", NULL) == 0) {
             sent++;
             probes_counter("peer.set", "self_announce", "sent");
         } else {
             probes_counter("peer.set", "self_announce", "queue_full");
         }
+        net_msg_free_obj(&accept.info.net_msg);
     }
     if (sent > 0)
         log_debug(proc->logger,
@@ -1352,20 +2650,17 @@ static int _populate_peers_from_history(process_t *proc,
     /* Resolve self uuid for the dedup check. */
     uuid_t self_uuid;
     uuid_clear(self_uuid);
-    data_t *id_dat = NULL;
-    char id_key[] = "identity";
-    if (map_get(proc->configs, id_key, &id_dat) == 0 && id_dat != NULL) {
-        config_t *id_cfg = NULL;
-        if (data_object_ptr(id_dat, (void **)&id_cfg) == 0 &&
-            id_cfg != NULL && id_cfg->data_struct != NULL) {
-            const public_identity_t *me =
-                (const public_identity_t *)id_cfg->data_struct;
-            uuid_copy(self_uuid, (unsigned char *)me->uuid);
-        }
-    }
+    const identity_t *me = identity_self_identity(proc);
+    if (me != NULL)
+        uuid_copy(self_uuid, (unsigned char *)me->uuid);
 
     /* Append new peers. peers_write_lock guards the array; the
-     * uniqueness check is similar to _add_peer's idempotent guard. */
+     * uniqueness check is similar to _add_peer's idempotent guard.
+     *
+     * The ones actually appended are recorded so the NETWORK process can be
+     * told about each after the lock is dropped — see the _remember_activity
+     * fan-out below, and the comment there for why it is not optional. */
+    public_identity_t *fresh = calloc(n, sizeof(public_identity_t));
     size_t added = 0;
     peers_write_lock(proc);
     for (size_t i = 0; i < n; i++) {
@@ -1387,6 +2682,8 @@ static int _populate_peers_from_history(process_t *proc,
         memcpy(&proc->protocol.peers[proc->protocol.num_peers],
                p, sizeof(public_identity_t));
         proc->protocol.num_peers++;
+        if (fresh != NULL)
+            memcpy(&fresh[added], p, sizeof(public_identity_t));
         added++;
     }
     peers_write_unlock(proc);
@@ -1404,9 +2701,30 @@ static int _populate_peers_from_history(process_t *proc,
          * already takes. Outside the peers lock. */
         identity_emit_all_peers(proc);
 
+        /* AND TELL THE SIBLING PROCESSES — the NETWORK process above all.
+         * net_proc keeps its OWN peer array and populates it only from a PEER
+         * message (net_proc.c "added peer"); find_peer_by_address consults that
+         * array, and a frame from an address missing from it is deferred as
+         * "no peer known at that address yet" and never delivered. Telling only
+         * the app left a peer VISIBLE IN THE ROSTER THAT WE COULD SEND TO BUT
+         * NEVER RECEIVE FROM — the two directions run off different tables.
+         *
+         * This is the path a node joining an established mesh learns most of
+         * the cohort through, so the gap is not an edge case: in a 3-node
+         * cohort it silently decided which single peer each node could hear.
+         * _add_peer and handle_acceptance always did this; these two paths did
+         * not. Outside the peers lock — messaging_send is a syscall. */
+        for (size_t i = 0; fresh != NULL && i < added; i++) {
+            generic_msg_t peer_msg = {0};
+            peer_msg.type = PEER;
+            memcpy(&peer_msg.info.peer, &fresh[i], sizeof(public_identity_t));
+            _remember_activity(proc, queues, &peer_msg);
+        }
+
         /* Bundled peers don't know about us yet — fix the asymmetry. */
         _announce_self_to_bundled_peers(proc, queues, peer_idents, n);
     }
+    free(fresh);
     return 0;
 }
 
@@ -1504,6 +2822,112 @@ static int _union_peers_from_histories(public_identity_t **out, size_t *out_coun
     return 0;
 }
 
+/* We were admitted into @p foreign_group (a group's JSON, slot 0 of a
+ * full_history) as well as into the group we hold, so its members and ours
+ * have never met: two founders that bootstrapped apart, bridged only by us.
+ * Nothing else would ever tell them. Send our current group's history to every
+ * member of the other group we hold as a peer; a founder that self-bootstrapped
+ * merges through handle_receive_history -> _merge_to_mesh, and the merge's
+ * tiebreak settles which group both keep. Once per foreign group. Returns how
+ * many histories were sent. */
+static size_t _tell_bridged_group(process_t *proc, const json_t *foreign_group)
+{
+    if (proc == NULL || foreign_group == NULL || !json_is_object(foreign_group))
+        return 0;
+    const char *guuid = json_string_value(json_object_get(foreign_group, "uuid"));
+    json_t *members = json_object_get(foreign_group, "address_map");
+    if (guuid == NULL || guuid[0] == '\0' || members == NULL || !json_is_object(members))
+        return 0;
+    char ours[UUID_STRING_LEN + 1];
+    peers_read_lock(proc);
+    uuid_unparse_lower(proc->protocol.group.uuid, ours);
+    peers_read_unlock(proc);
+    if (strcasecmp(guuid, ours) == 0)
+        return 0;
+
+    _ensure_id_init();
+    pthread_mutex_lock(&id_state.lock);
+    for (size_t i = 0; i < id_state.num_told_bridged; i++)
+        if (strcasecmp(id_state.told_bridged[i], guuid) == 0)
+        {
+            pthread_mutex_unlock(&id_state.lock);
+            return 0;
+        }
+    if (id_state.num_told_bridged == ID_TOLD_BRIDGED_MAX)
+    {
+        memmove(id_state.told_bridged[0], id_state.told_bridged[1],
+                (ID_TOLD_BRIDGED_MAX - 1) * sizeof(id_state.told_bridged[0]));
+        id_state.num_told_bridged--;
+    }
+    snprintf(id_state.told_bridged[id_state.num_told_bridged++],
+             UUID_STRING_LEN + 1, "%s", guuid);
+    pthread_mutex_unlock(&id_state.lock);
+
+    /* The recipients first, copied out under the peers lock: the send takes
+     * its own locks. A member of our group as well is no stranger to it. */
+    size_t cap = json_object_size(members);
+    public_identity_t *to = cap ? calloc(cap, sizeof(public_identity_t)) : NULL;
+    size_t n_to = 0;
+    const char *member;
+    json_t *addr;
+    peers_read_lock(proc);
+    json_object_foreach(members, member, addr)
+    {
+        (void)addr;
+        data_t *ours_dat = NULL;
+        if (map_get(&proc->protocol.group.address_map, (map_key_t)member,
+                    &ours_dat) == 0 && ours_dat != NULL)
+            continue;
+        uuid_t mu;
+        if (to == NULL || uuid_parse(member, mu) != 0)
+            continue;
+        for (size_t i = 0; i < proc->protocol.num_peers; i++)
+            if (uuid_compare(proc->protocol.peers[i].uuid, mu) == 0)
+            {
+                memcpy(&to[n_to++], &proc->protocol.peers[i],
+                       sizeof(public_identity_t));
+                break;
+            }
+    }
+    peers_read_unlock(proc);
+
+    if (n_to == 0)
+    {
+        log_info(proc->logger,
+                 "Identity: admitted by group %s as well as ours (%s), but we "
+                 "hold none of its members as peers\n", guuid, ours);
+        free(to);
+        return 0;
+    }
+    json_t *hist_arr = _history_payload(proc);
+    size_t sent = 0;
+    for (size_t i = 0; i < n_to && hist_arr != NULL; i++)
+    {
+        log_info(proc->logger,
+                 "Identity: admitted by group %s as well as ours (%s): sending "
+                 "our history to its member %s\n", guuid, ours, to[i].nickname);
+        generic_msg_t hist = {0};
+        hist.type = NET_MESSAGE;
+        strncpy(hist.info.net_msg.process, "identity", PROC_NAME_LEN);
+        hist.info.net_msg.function = ID_HISTORY;
+        hist.info.net_msg.encrypt = true;
+        memcpy(&hist.info.net_msg.to_whom, &to[i], sizeof(public_identity_t));
+        net_msg_pack_json(&hist.info.net_msg, hist_arr);
+        if (identity_send_to_network(proc, &hist, "full_history", to[i].nickname) == 0)
+            sent++;
+        net_msg_free_obj(&hist.info.net_msg);
+    }
+    if (hist_arr != NULL)
+        json_decref(hist_arr);
+    free(to);
+    return sent;
+}
+
+size_t identity_tell_bridged_group(process_t *proc, const json_t *foreign_group)
+{
+    return _tell_bridged_group(proc, foreign_group);
+}
+
 /****************************
  * Helper: _merge_to_mesh
  *
@@ -1582,6 +3006,13 @@ static int _merge_to_mesh(process_t *proc, directory_t *queues)
             continue;
 
         json_t *g_json = json_array_get(root, 0);
+        if (group_refuses_formatless(&proc->protocol.group, g_json)) {
+            /* Its peers still count; its group is not ours to take. Mirrors
+             * Python _merge_to_mesh. */
+            log_warn(proc->logger, "Identity: skipping a history whose group "
+                     "names no format: our group speaks proto\n");
+            continue;
+        }
         if (g_json && json_is_object(g_json)) {
             group_t parsed = {0};
             if (group_from_json(g_json, &parsed) == 0) {
@@ -1635,17 +3066,86 @@ static int _merge_to_mesh(process_t *proc, directory_t *queues)
      * proc->protocol.peers in the existing code). Mirrors Python's
      * `self.group = accepted_group` in idprocess.py:420. */
     if (have_group) {
-        char gid_str[UUID_STRING_LEN + 1];
-        uuid_unparse_lower(adopted_group.uuid, gid_str);
+        /* Deterministic convergence. Two nodes that self-bootstrap at the same
+         * time each receive the OTHER's group in a full_history and, adopting it
+         * unconditionally, SWAP groups — they stay split (different uuids + keys),
+         * so the first post can't decrypt until partition recovery breaks the tie
+         * much later. Instead pick ONE winner with the SAME rule handle_group_update
+         * uses (older `created` wins; uuid breaks the tie), which both nodes compute
+         * identically over the same two groups — so they converge on one group, with
+         * its key, at merge time. Keep ours when it wins; free the rejected candidate. */
+        char cand_u[UUID_STRING_LEN + 1], mine_u[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(adopted_group.uuid, cand_u);
         peers_write_lock(proc);
-        memcpy(&proc->protocol.group, &adopted_group, sizeof(group_t));
-        peers_write_unlock(proc);
-        log_info(proc->logger,
-                 "Identity: adopted mesh group %s during merge\n", gid_str);
+        uuid_unparse_lower(proc->protocol.group.uuid, mine_u);
+        double cand_created = adopted_group.created;
+        double mine_created = proc->protocol.group.created;
+        bool both_aged = (cand_created > 0.0 && mine_created > 0.0);
+        bool adopt_cand;
+        if (both_aged && cand_created < mine_created)
+            adopt_cand = true;                          /* candidate older -> absorbs us */
+        else if (both_aged && cand_created > mine_created)
+            adopt_cand = false;                         /* candidate younger -> keep ours */
+        else
+            adopt_cand = (strcmp(cand_u, mine_u) < 0);  /* equal/unknown age -> uuid tiebreak */
+        if (adopt_cand) {
+            memcpy(&proc->protocol.group, &adopted_group, sizeof(group_t));
+            peers_write_unlock(proc);
+            log_info(proc->logger,
+                     "Identity: adopted mesh group %s during merge\n", cand_u);
+        } else {
+            peers_write_unlock(proc);
+            /* Not adopting: release the parsed candidate's address_map (the
+             * adopt path transfers ownership via the memcpy; the reject path
+             * must not leak it). */
+            if (adopted_group.address_map.items != NULL)
+                map_free(&adopted_group.address_map);
+            log_info(proc->logger,
+                     "Identity: kept our group %s over merge candidate %s "
+                     "(deterministic tiebreak)\n", mine_u, cand_u);
+        }
     }
 
     _populate_peers_from_history(proc, queues, peer_bundle, bundle_n);
     free(peer_bundle);
+
+    /* Re-advertise our settled group to every peer. The merge path historically
+     * only re-announced our identity, so peers learned our post-merge group only
+     * via a later, sparse group_key_update — or never: the merge WINNER never
+     * adopts again, so a peer could be left holding only our PRE-merge
+     * advertisement (its "in your group" indicator then never lit, and a late
+     * joiner could stay on the wrong group). One fanout here converges both
+     * sides promptly; a receiver already on this group records it and no-ops
+     * (handle_group_update's same-group path returns before re-echoing), so
+     * there is no ID_UPDATE ping-pong. Mirrors handle_group_update's tail. */
+    if (have_group) {
+        /* Tell our OWN sibling processes first. _update_group only informs
+         * PEERS over the wire and the identity process itself; without this the
+         * NETWORK process keeps whatever group it was last handed — after a
+         * merge, its pre-merge group — and since net_proc is what actually
+         * encrypts a group multicast (net_proc.c, RECIPIENT_GROUP), every
+         * multicast goes out under the key the cohort just abandoned. Nothing
+         * reports it: group_encrypt succeeds, the send succeeds, and only the
+         * RECEIVER notices, as an undiagnosable "group decrypt failed".
+         *
+         * That is precisely how it failed: two nodes merged to one group in
+         * their identity processes while both network processes stayed on their
+         * own self-bootstrapped epoch-0 keys, so the first live group multicast
+         * the project ever sent (agora business ad, 2026-09-17) was encrypted
+         * under a key no peer held. Pairing the local GROUP broadcast with the
+         * peer fanout is what _confirm_group_membership and _rotate_group_key
+         * already do; the merge path was the one that only did half.
+         *
+         * Sent on the KEEP path too, not just the adopt: a rotation performed
+         * during self-bootstrap can have been broadcast before the sibling
+         * queues were live, so the winner's net_proc can be stale as well. The
+         * message is idempotent — processes.c just assigns protocol.group. */
+        generic_msg_t group_msg = {0};
+        group_msg.type = GROUP;
+        memcpy(&group_msg.info.group, &proc->protocol.group, sizeof(group_t));
+        _remember_activity(proc, queues, &group_msg);
+        _update_group(proc, queues);
+    }
 
     int rc = _announce_identity(proc, queues);
 
@@ -1668,6 +3168,78 @@ static int _merge_to_mesh(process_t *proc, directory_t *queues)
   requires \valid(msg);
   requires proc->logger == \null || \valid(proc->logger);
 */
+/* If @p payload carries a cohort we asked to join, adopt it as a CHILD group
+ * and return true (doc/architecture/gateway-reputation-tree.md).
+ *
+ * Gated on id_state.pending_joins, so an unsolicited history is never adopted
+ * this way — otherwise any peer could hand us a group and silently install
+ * itself in our tree. Returning true means the ordinary primary-group path is
+ * skipped, which is the point: the whole reason a gateway joins a child cohort
+ * is that its primary group stays what it was, and choose_group / _merge_to_mesh
+ * decide precisely that. Mirrors Python _adopt_solicited_group. */
+/* Frama-C: skipped — [solver-timeout] JSON/map/group preconditions */
+static bool _adopt_solicited_group(process_t *proc, const json_t *payload)
+{
+    if (proc == NULL || payload == NULL || !json_is_array(payload)
+        || json_array_size(payload) == 0)
+        return false;
+    json_t *gj = json_array_get((json_t *)payload, 0);
+    if (gj == NULL || !json_is_object(gj))
+        return false;
+    const char *guuid = json_string_value(json_object_get(gj, "uuid"));
+    if (guuid == NULL || guuid[0] == '\0')
+        return false;
+
+    pthread_mutex_lock(&id_state.lock);
+    data_t *pending = NULL;
+    bool solicited = (map_get(&id_state.pending_joins, (map_key_t)guuid,
+                              &pending) == 0 && pending != NULL);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!solicited)
+        return false;
+    if (group_refuses_formatless(&proc->protocol.group, gj)) {
+        log_warn(proc->logger, "Identity: join answer names no format and our "
+                 "group speaks proto; ignoring\n");
+        return false;
+    }
+
+    group_t *g = calloc(1, sizeof(group_t));
+    if (g == NULL)
+        return false;
+    if (group_from_json(gj, g) != 0) {
+        /* group_from_json map_init's the address map before it can fail on the
+         * encryptor, and g is calloc'd, so this is safe either way. */
+        map_free(&g->address_map);
+        free(g);
+        return false;
+    }
+    /* A public-only group cannot decrypt cohort traffic, so adopting it would
+     * leave us a member that can hear nothing. Refuse and stay pending rather
+     * than record a half-join. */
+    if (sodium_is_zero(g->encryptor.private, crypto_box_SECRETKEYBYTES)) {
+        log_warn(proc->logger,
+                 "Identity: join answer for %s carried no shared key; "
+                 "ignoring\n", guuid);
+        map_free(&g->address_map);
+        free(g);
+        return false;
+    }
+
+    size_t members = map_size(&g->address_map);
+    if (identity_add_child_group(proc, g, NULL) != 0) {
+        map_free(&g->address_map);
+        free(g);
+        return false;
+    }
+    pthread_mutex_lock(&id_state.lock);
+    map_remove(&id_state.pending_joins, (map_key_t)guuid);
+    pthread_mutex_unlock(&id_state.lock);
+    log_info(proc->logger,
+             "Identity: joined cohort %s at runtime (%zu member(s))\n",
+             guuid, members);
+    return true;
+}
+
 static bool handle_receive_history(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -1680,6 +3252,15 @@ static bool handle_receive_history(const process_t *proc, directory_t *queues, g
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
     {
         log_warn(proc->logger, "Identity: handle_receive_history: no JSON payload\n");
+        return true;
+    }
+
+    /* A history answering a cohort join WE solicited becomes a child group and
+     * goes no further — it must not reach choose_group / _merge_to_mesh, which
+     * decide which group is OUR primary one (doc/architecture/gateway-reputation-tree.md). */
+    if (_adopt_solicited_group((process_t *)proc, payload))
+    {
+        json_decref(payload);
         return true;
     }
 
@@ -1697,12 +3278,18 @@ static bool handle_receive_history(const process_t *proc, directory_t *queues, g
                          && !id_state.choosing_group);
     if (should_merge)
         id_state.merging = true;
+    /* A full_history is sent only on admission, so one for another group,
+     * arriving once ours is settled, means that group admitted us too. */
+    bool bridged = (!should_merge && !id_state.merging
+                    && !id_state.choosing_group && proc->protocol.phase == 3);
     pthread_mutex_unlock(&id_state.lock);
 
     log_debug(proc->logger, "Identity: stored history from %s\n", nmsg->from_whom.nickname);
 
     if (should_merge)
         _merge_to_mesh((process_t *)proc, queues);
+    else if (bridged && json_is_array(payload))
+        (void)_tell_bridged_group((process_t *)proc, json_array_get(payload, 0));
     return true;
 }
 
@@ -1740,7 +3327,8 @@ static void _vote_on_peer_send(vote_on_peer_args_t *args)
     net_msg_pack_json(&vote_msg.info.net_msg, vote_json);
     json_decref(vote_json);
 
-    messaging_send("network", NET_MESSAGE, &vote_msg, false);
+    (void)identity_send_to_network(NULL, &vote_msg, "an admission vote", NULL);
+    net_msg_free_obj(&vote_msg.info.net_msg);
     log_debug(args->logger, "Identity: sent approval vote for %s\n", args->proposed_uuid);
 }
 
@@ -1770,7 +3358,7 @@ static bool handle_vote_on_peer(const process_t *proc, directory_t *queues, gene
     if (proc->protocol.phase != 3)
         return false;
 
-    /* Policy B — border-guards-only voting (ISSUES.md §3.1-c). Mirrors the
+    /* Policy B — border-guards-only voting (doc/architecture/identity-protocol.md). Mirrors the
      * Python handle_vote_on_peer gate: a non-border-guard consumes the
      * proposal but abstains rather than voting on a candidate it has no
      * welcoming-committee validation context for. Default is border-guard
@@ -1822,8 +3410,28 @@ static bool handle_vote_on_peer(const process_t *proc, directory_t *queues, gene
 
         uuid_t proposed_uuid;
         bool have_uuid = (uuid_parse(proposed_uuid_raw, proposed_uuid) == 0);
+        /* A recorded contact asking to join is already in peers[], so it would
+         * collide with itself. It is exempt only as the keyholder it is known
+         * as, and only while not yet a member: the vote is the one route by
+         * which a contact joins (amnesia readmission is for members). Mirrors
+         * Python _process_id. */
+        bool contact = false;
+        if (have_uuid && proposed_sig != NULL && proposed_enc != NULL) {
+            char lower[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(proposed_uuid, lower);
+            data_t *member = NULL;
+            bool is_member = proc->protocol.group.address_map.items != NULL
+                && map_get((map_t *)&proc->protocol.group.address_map, lower,
+                           &member) == 0;
+            contact = !is_member && identity_ext_is_contact(proc, lower);
+        }
         for (size_t i = 0; i < proc->protocol.num_peers; i++) {
             const public_identity_t *peer = &proc->protocol.peers[i];
+            if (contact
+                && memcmp(peer->uuid, proposed_uuid, sizeof(uuid_t)) == 0
+                && strcmp((const char *)peer->signature.public_hex, proposed_sig) == 0
+                && strcmp((const char *)peer->encryptor.public_hex, proposed_enc) == 0)
+                continue;
             const char *reason = NULL;
             if (have_uuid && memcmp(peer->uuid, proposed_uuid,
                                     sizeof(uuid_t)) == 0) {
@@ -1991,14 +3599,14 @@ void identity_set_synchronous_dispatch(bool enabled)
 void identity_set_border_guard_mode(process_t *proc, bool enabled)
 {
     /* Per-process (not global id_state) — mirrors Python's per-instance
-     * IdentityProcess.border_guard_mode. See ISSUES.md §3.1-c. */
+     * IdentityProcess.border_guard_mode. See doc/architecture/identity-protocol.md. */
     if (proc != NULL)
         proc->protocol.border_guard_mode = enabled;
 }
 
 void identity_set_admission_quorum(process_t *proc, int quorum)
 {
-    /* Per-process two-phase admission quorum (ISSUES.md §3.1-a). Mirrors
+    /* Per-process two-phase admission quorum (doc/architecture/identity-protocol.md). Mirrors
      * Python's per-instance IdentityProcess._admission_quorum. */
     if (proc != NULL)
         proc->protocol.admission_quorum = quorum > 0 ? quorum : 1;
@@ -2018,10 +3626,17 @@ void identity_reset_state(void)
     map_init(&id_state.peer_potentials);
     map_free(&id_state.vote_collection);
     map_init(&id_state.vote_collection);
+    map_free(&id_state.vote_deadlines);
+    map_init(&id_state.vote_deadlines);
     map_free(&id_state.own_caps_by_proc);
     map_init(&id_state.own_caps_by_proc);
     map_free(&id_state.peer_caps_map);
     map_init(&id_state.peer_caps_map);
+    /* Cleared per scenario so no clock sample leaks from one corpus case into
+     * the next; each sample's heap payload goes with it. */
+    _free_clock_samples_locked();
+    map_free(&id_state.attest_sent_clock);
+    map_init(&id_state.attest_sent_clock);
     map_free(&id_state.peer_cap_descriptors_map);
     map_init(&id_state.peer_cap_descriptors_map);
     map_free(&id_state.peer_tiers);
@@ -2032,6 +3647,11 @@ void identity_reset_state(void)
     map_init(&id_state.partition_response_cooldown);
     map_free(&id_state.provisional_confirmations);
     map_init(&id_state.provisional_confirmations);
+    map_free(&id_state.peer_hierarchy);
+    map_init(&id_state.peer_hierarchy);
+    id_state.parent_gateway[0] = '\0';
+    id_state.last_hierarchy_claim[0] = '\0';
+    id_state.hierarchy_requested = false;
     id_state.partition_recovery_target[0] = '\0';
     id_state.partition_recovery_started_us = 0;
     id_state.self_tier = 0;
@@ -2039,7 +3659,138 @@ void identity_reset_state(void)
     id_state.self_bootstrapped = false;
     id_state.merging = false;
     id_state.synchronous_dispatch = was_sync;
+    /* Replay marks too, and the probe round they pair with. The harness
+     * derives participant uuids deterministically from their slugs, so
+     * "alice" is the same sender in every scenario; a mark left behind by one
+     * would refuse the next scenario's first stamped message as a replay. */
+    freshness_reset(&id_state.freshness);
+    id_state.probe_seq = 0;
+    for (size_t i = 0; i < id_state.num_held_group_updates; i++)
+        messaging_recv_release(&id_state.held_group_updates[i]);
+    id_state.num_held_group_updates = 0;
+    for (size_t i = 0; i < id_state.num_held_access_requests; i++)
+        messaging_recv_release(&id_state.held_access_requests[i]);
+    id_state.num_held_access_requests = 0;
+    id_state.num_told_bridged = 0;
     pthread_mutex_unlock(&id_state.lock);
+    _handoffs_reset();
+    at_send_retry_reset();
+    /* After the unlock: a feature resets its own state under its own lock. */
+    identity_ext_reset();
+}
+
+/* Accept the proposed peer @p uuid_key if @p count (our own vote included)
+ * is a majority of the whole group, @p num_peers (_admission_roster) plus this
+ * node. Shared by the two things that can decide an admission: an
+ * inbound vote (handle_count_vote) and the expiry of our own grace period
+ * (identity_periodic_vote_collection). Returns whether the peer was accepted.
+ *
+ * Kept in one place because the two callers must agree exactly on what a
+ * majority is; when only the vote-message path existed, the self-vote we had
+ * already recorded was never compared against it at all. */
+static bool _finalize_vote_if_majority(process_t *proc, directory_t *queues,
+                                       const char *uuid_key, int count,
+                                       size_t num_peers)
+{
+    if (count < ADMISSION_QUORUM(num_peers))
+        return false;
+
+    /* Find the proposed peer in peer_potentials */
+    pthread_mutex_lock(&id_state.lock);
+    data_t *peer_dat = NULL;
+    map_get(&id_state.peer_potentials, (map_key_t)uuid_key, &peer_dat);
+    public_identity_t *new_peer = NULL;
+    if (peer_dat != NULL)
+        data_object_ptr(peer_dat, (void **)&new_peer);
+    pthread_mutex_unlock(&id_state.lock);
+
+    if (new_peer == NULL)
+    {
+        log_warn(proc->logger,
+                 "Identity: majority reached but peer %s not in potentials\n",
+                 uuid_key);
+        return false;
+    }
+    log_info(proc->logger,
+             "Identity: majority vote reached for %s, accepting peer\n",
+             uuid_key);
+    /* Rank was captured at the potential-store (handle_welcoming_committee);
+     * pass 0 so _peer_accepted's non-zero gate leaves it. */
+    _peer_accepted(proc, queues, new_peer, 0, false);
+    return true;
+}
+
+/****************************
+ * Periodic: identity_periodic_vote_collection
+ *
+ * Decide any admission whose grace period for other members' votes has run
+ * out, using the votes in hand. This is C's stand-in for Python's per-proposal
+ * _vote_collection thread (idprocess.py:2227), which sleeps vote_timeout and
+ * then finalizes; the identity loop sweeps instead of spawning a thread per
+ * proposal.
+ *
+ * Why it must exist at all: a vote count was only ever COMPARED to the majority
+ * when an inbound vote message arrived. A proposer's own self-vote is recorded
+ * immediately and, in a cohort whose other members are unreachable, is already
+ * a majority — but nothing looked. So a node that had lost its peers could
+ * never admit anybody: it proposed, logged "proposed peer X for voting", and
+ * waited forever for a vote that no living member was left to send. Found
+ * 2026-09-17 when a late joiner could not enter a cohort whose only other
+ * member had been stopped.
+ *
+ * One shot per proposal, like Python's: the entry is dropped whether or not the
+ * majority was met. A peer that still wants in re-sends request_access (every
+ * ~5s), which re-proposes and re-arms.
+ ****************************/
+void identity_periodic_vote_collection(process_t *proc, directory_t *queues)
+{
+    if (proc == NULL)
+        return;
+
+    /* Collect what is due under the lock, then act outside it: _peer_accepted
+     * sends messages and takes the peers lock, and holding id_state.lock across
+     * that is the shape of a deadlock. */
+    char due_keys[ID_VOTE_SWEEP_MAX][UUID_STRING_LEN + 2];
+    int due_counts[ID_VOTE_SWEEP_MAX];
+    size_t n_due = 0;
+    double now = _vote_now_sec();
+
+    pthread_mutex_lock(&id_state.lock);
+    map_key_t key;
+    data_t *value;
+    map_entries_for_each(&id_state.vote_deadlines, key, value)
+        if (n_due >= ID_VOTE_SWEEP_MAX)
+            break;
+        double deadline = 0.0;
+        if (data_floating_pt_dbl(value, &deadline) != 0 || now < deadline)
+            continue;
+        int count = 0;
+        data_t *count_dat = NULL;
+        if (map_get(&id_state.vote_collection, key, &count_dat) == 0
+            && count_dat != NULL)
+            (void)data_integer(count_dat, &count);
+        snprintf(due_keys[n_due], sizeof(due_keys[0]), "%s", key);
+        due_counts[n_due] = count;
+        n_due++;
+    map_end_for_each
+    /* Disarm every key we are about to decide, so a sweep that overlaps the
+     * next cadence tick cannot decide the same proposal twice. */
+    for (size_t i = 0; i < n_due; i++)
+        map_remove(&id_state.vote_deadlines, due_keys[i]);
+    pthread_mutex_unlock(&id_state.lock);
+
+    peers_read_lock(proc);
+    size_t num_peers = _admission_roster(proc);
+    peers_read_unlock(proc);
+
+    for (size_t i = 0; i < n_due; i++)
+    {
+        log_debug(proc->logger,
+                  "Identity: vote grace period up for %s: %d vote(s) (need %d)\n",
+                  due_keys[i], due_counts[i], ADMISSION_QUORUM(num_peers));
+        _finalize_vote_if_majority(proc, queues, due_keys[i], due_counts[i],
+                                   num_peers);
+    }
 }
 
 /****************************
@@ -2102,38 +3853,13 @@ static bool handle_count_vote(process_t *proc, directory_t *queues, generic_msg_
     int count = vote_collection_increment(uuid_key);
 
     peers_read_lock(proc);
-    size_t num_peers = proc->protocol.num_peers;
+    size_t num_peers = _admission_roster(proc);
     peers_read_unlock(proc);
 
     log_debug(proc->logger, "Identity: vote count for %s: %d (need %d)\n",
-              uuid_key, count, MAJORITY(num_peers));
+              uuid_key, count, ADMISSION_QUORUM(num_peers));
 
-    /* If majority reached, accept the peer */
-    if (count >= MAJORITY(num_peers))
-    {
-        /* Find the proposed peer in peer_potentials */
-        pthread_mutex_lock(&id_state.lock);
-        data_t *peer_dat = NULL;
-        map_get(&id_state.peer_potentials, uuid_key, &peer_dat);
-        public_identity_t *new_peer = NULL;
-        if (peer_dat != NULL)
-            data_object_ptr(peer_dat, (void **)&new_peer);
-        pthread_mutex_unlock(&id_state.lock);
-
-        if (new_peer != NULL)
-        {
-            log_info(proc->logger, "Identity: majority vote reached for %s, accepting peer\n",
-                     uuid_key);
-            /* Rank was captured at the potential-store (handle_welcoming_
-             * committee); pass 0 so _peer_accepted's non-zero gate leaves it. */
-            _peer_accepted(proc, queues, new_peer, 0, false);
-        }
-        else
-        {
-            log_warn(proc->logger, "Identity: majority reached but peer %s not in potentials\n",
-                     uuid_key);
-        }
-    }
+    _finalize_vote_if_majority(proc, queues, uuid_key, count, num_peers);
 
     return true;
 }
@@ -2149,7 +3875,8 @@ static bool handle_count_vote(process_t *proc, directory_t *queues, generic_msg_
   requires \valid(msg);
   requires proc->logger == \null || \valid(proc->logger);
 */
-/* Two-phase admission bookkeeping (ISSUES.md §3.1-a). Record `confirmer_uuid`
+/* Two-phase admission bookkeeping (doc/architecture/identity-protocol.md). Record
+ * `confirmer_uuid`
  * as having confirmed `peer_uuid` for `proc`; return the count of DISTINCT
  * confirmers so far. Keyed "<proc>|<peer_uuid>" in id_state so per-participant
  * conformance runs don't collide. A NULL confirmer is stored as a distinct
@@ -2229,14 +3956,63 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
         return true;
     }
 
+    /* Envelope: {"peer": {...canonical...}, "seq": N}. The identity is parsed
+     * out of "peer"; the sequence is the confirmer's freshness token. */
+    json_t *peer_obj = json_object_get(payload, "peer");
+    json_t *j_seq = json_object_get(payload, "seq");
+    if (!json_is_object(peer_obj) || !json_is_integer(j_seq))
+    {
+        /* An unstamped confirm is REFUSED, not accepted as legacy: this verb
+         * re-admits a peer and can reissue the group key, so a lenient path is
+         * one an attacker selects by simply not stamping
+         * (doc/architecture/reputation.md, "Quorum attestation"). */
+        json_decref(payload);
+        log_warn(proc->logger,
+                 "Identity: handle_confirm_peer: unstamped or malformed "
+                 "envelope, refusing\n");
+        return true;
+    }
+    int64_t confirm_seq = (int64_t)json_integer_value(j_seq);
+
     public_identity_t new_peer;
-    if (public_identity_from_json(payload, &new_peer) != 0)
+    if (public_identity_from_json(peer_obj, &new_peer) != 0)
     {
         json_decref(payload);
         log_warn(proc->logger, "Identity: handle_confirm_peer: malformed peer identity\n");
         return true;
     }
+
+    /* A confirm that names THIS node is the cohort accepting US, not a new peer
+     * to admit. Skip it entirely: we must not add self to peers[] (belt to the
+     * _add_peer guard) nor fire the self-directed caps/position/profile queries
+     * below. In a 2-node bootstrap the welcomer's `peer_accepted` for us is
+     * broadcast and so echoes back here. */
+    const identity_t *confirm_self = identity_self_identity(proc);
+    if (confirm_self != NULL &&
+        uuid_compare(new_peer.uuid, confirm_self->uuid) == 0)
+    {
+        json_decref(payload);
+        return true;
+    }
     json_decref(payload);
+
+    /* Freshness per confirmer, credited to the AUTHENTICATED sender rather
+     * than anything the payload claims. */
+    char confirmer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, confirmer_str);
+    pthread_mutex_lock(&id_state.lock);
+    bool confirm_fresh = freshness_accept(&id_state.freshness, confirmer_str,
+                                          ID_CONFIRM, confirm_seq,
+                                          proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!confirm_fresh)
+    {
+        log_warn(proc->logger,
+                 "Identity: peer confirmation from %s refused: sequence %lld "
+                 "not above mark (replay)\n", confirmer_str,
+                 (long long)confirm_seq);
+        return true;
+    }
 
     char uuid_str_buf[UUID_STRING_LEN + 1];
     uuid_unparse_lower(new_peer.uuid, uuid_str_buf);
@@ -2269,9 +4045,10 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
                      nickname, uuid_str);
             _send_caps_query(proc, &new_peer);
         }
+        identity_ext_peer_confirmed(proc, &new_peer);
     }
 
-    /* Two-phase admission (ISSUES.md §3.1-a). Count DISTINCT confirmers; the
+    /* Two-phase admission (doc/architecture/identity-protocol.md). Count DISTINCT confirmers; the
      * group key is propagated only once the quorum is met. The confirmer is
      * the message sender (nmsg->from_whom, populated on receive / auto-stamped
      * by the net layer). Quorum 1 (default) promotes on the first confirm =
@@ -2380,7 +4157,7 @@ static bool handle_history_diff(const process_t *proc, directory_t *queues, gene
  *   different uuid:
  *     theirs > mine  → adopt
  *     theirs < mine  → push our group (we are larger; canonical winner)
- *     equal size     → older group wins (ISSUES.md §3.1-b): adopt iff
+ *     equal size     → older group wins (doc/architecture/identity-protocol.md): adopt iff
  *                      theirs.created < mine.created when both ages known
  *                      and differ; else adopt iff strcmp(theirs.uuid,
  *                      mine.uuid) < 0. Otherwise push our group (we win).
@@ -2396,6 +4173,160 @@ static bool handle_history_diff(const process_t *proc, directory_t *queues, gene
  * definition" cast warning that blocks discharge of valid_dest/valid_src/separation).
  * Helpers also touch filesystem/network/identity stubs.
  */
+/* Keep a private copy of @p msg (a group_key_update that arrived before
+ * phase 3) for identity_replay_held_group_updates. When full, the oldest goes:
+ * a later update from the same cohort carries at least as much. */
+/* A private copy of @p msg's function and payload into @p copy, so it can
+ * outlive the receive buffer. The payload keeps the NUL past `len` that every
+ * net_msg_t obj carries (net_msg_pack_json, the IPC decode): net_msg_unpack_json
+ * reads it as a C string, and without the terminator a replayed message parsed
+ * whatever followed it on the heap and was discarded as malformed (Agora
+ * business cohort biz-3930802: bob replayed ada's winning key and lost it).
+ * Returns false (and leaves nothing to release) when out of memory. */
+static bool _copy_held_message(const generic_msg_t *msg, generic_msg_t *copy)
+{
+    const net_msg_t *nmsg = &msg->info.net_msg;
+    *copy = *msg;
+    copy->info.net_msg.function = nmsg->function ? strdup(nmsg->function) : NULL;
+    copy->info.net_msg.obj = NULL;
+    if (nmsg->obj != NULL && nmsg->len > 0)
+    {
+        copy->info.net_msg.obj = malloc(nmsg->len + 1);
+        if (copy->info.net_msg.obj != NULL)
+        {
+            memcpy(copy->info.net_msg.obj, nmsg->obj, nmsg->len);
+            copy->info.net_msg.obj[nmsg->len] = '\0';
+        }
+    }
+    if ((nmsg->function != NULL && copy->info.net_msg.function == NULL)
+        || (nmsg->obj != NULL && nmsg->len > 0 && copy->info.net_msg.obj == NULL))
+    {
+        messaging_recv_release(copy);
+        return false;
+    }
+    return true;
+}
+
+bool identity_copy_held_message(const generic_msg_t *msg, generic_msg_t *copy)
+{
+    return _copy_held_message(msg, copy);
+}
+
+static void _hold_group_update(const process_t *proc, const generic_msg_t *msg)
+{
+    const net_msg_t *nmsg = &msg->info.net_msg;
+    generic_msg_t copy;
+    if (!_copy_held_message(msg, &copy))
+    {
+        log_warn(proc->logger, "Identity: could not hold group update from %s "
+                 "(out of memory); it is lost\n", nmsg->from_whom.nickname);
+        return;
+    }
+    _ensure_id_init();
+    pthread_mutex_lock(&id_state.lock);
+    if (id_state.num_held_group_updates == ID_HELD_GROUP_UPDATES)
+    {
+        messaging_recv_release(&id_state.held_group_updates[0]);
+        memmove(&id_state.held_group_updates[0], &id_state.held_group_updates[1],
+                (ID_HELD_GROUP_UPDATES - 1) * sizeof(generic_msg_t));
+        id_state.num_held_group_updates--;
+    }
+    id_state.held_group_updates[id_state.num_held_group_updates++] = copy;
+    pthread_mutex_unlock(&id_state.lock);
+    log_info(proc->logger,
+             "Identity: holding group update from %s until phase 3 (identity "
+             "phase %d)\n", nmsg->from_whom.nickname, proc->protocol.phase);
+}
+
+size_t identity_replay_held_group_updates(process_t *proc, directory_t *queues)
+{
+    _ensure_id_init();
+    generic_msg_t held[ID_HELD_GROUP_UPDATES];
+    pthread_mutex_lock(&id_state.lock);
+    size_t n = id_state.num_held_group_updates;
+    memcpy(held, id_state.held_group_updates, n * sizeof(generic_msg_t));
+    id_state.num_held_group_updates = 0;
+    pthread_mutex_unlock(&id_state.lock);
+    if (n > 0)
+        log_info(proc->logger, "Identity: replaying %zu group update(s) held "
+                 "until phase 3\n", n);
+    for (size_t i = 0; i < n; i++)
+    {
+        /* In arrival order, through the dispatcher, as if they arrived now. */
+        run_message_handlers(proc, queues, held[i].type, &held[i]);
+        messaging_recv_release(&held[i]);
+    }
+    return n;
+}
+
+/* Keep a private copy of @p msg (a request_access that arrived before phase 3)
+ * for identity_replay_held_access_requests. A later request from the same
+ * requester replaces its earlier one in place (a lone founder re-announces
+ * every ~5 s); when full, the oldest goes. */
+static void _hold_access_request(const process_t *proc, const generic_msg_t *msg)
+{
+    const net_msg_t *nmsg = &msg->info.net_msg;
+    generic_msg_t copy;
+    if (!_copy_held_message(msg, &copy))
+    {
+        log_warn(proc->logger, "Identity: could not hold access request from %s "
+                 "(out of memory); it is lost\n", nmsg->from_whom.nickname);
+        return;
+    }
+    _ensure_id_init();
+    pthread_mutex_lock(&id_state.lock);
+    size_t n = id_state.num_held_access_requests;
+    size_t at = n;
+    for (size_t i = 0; i < n; i++)
+        if (uuid_compare(id_state.held_access_requests[i].info.net_msg.from_whom.uuid,
+                         nmsg->from_whom.uuid) == 0)
+        {
+            at = i;
+            break;
+        }
+    if (at < n)
+    {
+        messaging_recv_release(&id_state.held_access_requests[at]);
+        id_state.held_access_requests[at] = copy;
+    }
+    else
+    {
+        if (n == ID_HELD_ACCESS_REQUESTS)
+        {
+            messaging_recv_release(&id_state.held_access_requests[0]);
+            memmove(&id_state.held_access_requests[0],
+                    &id_state.held_access_requests[1],
+                    (ID_HELD_ACCESS_REQUESTS - 1) * sizeof(generic_msg_t));
+            id_state.num_held_access_requests--;
+        }
+        id_state.held_access_requests[id_state.num_held_access_requests++] = copy;
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    log_info(proc->logger,
+             "Identity: holding access request from %s until phase 3 (identity "
+             "phase %d)\n", nmsg->from_whom.nickname, proc->protocol.phase);
+}
+
+size_t identity_replay_held_access_requests(process_t *proc, directory_t *queues)
+{
+    _ensure_id_init();
+    generic_msg_t held[ID_HELD_ACCESS_REQUESTS];
+    pthread_mutex_lock(&id_state.lock);
+    size_t n = id_state.num_held_access_requests;
+    memcpy(held, id_state.held_access_requests, n * sizeof(generic_msg_t));
+    id_state.num_held_access_requests = 0;
+    pthread_mutex_unlock(&id_state.lock);
+    if (n > 0)
+        log_info(proc->logger, "Identity: replaying %zu access request(s) held "
+                 "until phase 3\n", n);
+    for (size_t i = 0; i < n; i++)
+    {
+        run_message_handlers(proc, queues, held[i].type, &held[i]);
+        messaging_recv_release(&held[i]);
+    }
+    return n;
+}
+
 /*@
   requires \valid(proc);
   requires \valid(queues);
@@ -2405,7 +4336,12 @@ static bool handle_history_diff(const process_t *proc, directory_t *queues, gene
 static bool handle_group_update(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     if (proc->protocol.phase != 3)
-        return false;
+    {
+        /* The senders see us as already a member and will not resend, so the
+         * update is held and replayed once the group is chosen. */
+        _hold_group_update(proc, msg);
+        return true;
+    }
 
     net_msg_t *nmsg = &msg->info.net_msg;
     log_info(proc->logger, "Identity: received group update from %s\n",
@@ -2414,6 +4350,19 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
         return true; /* malformed payload — discard, do not echo */
+
+    /* A proto group never reads a group that names no format: it would read
+     * as JSON (doc/architecture/network-wire-format.md). Mirrors Python
+     * handle_group_update. */
+    if (group_refuses_formatless(&proc->protocol.group, payload))
+    {
+        log_warn(proc->logger,
+                 "Identity: refusing group update from %s: our group speaks "
+                 "proto and theirs names no format\n", nmsg->from_whom.nickname);
+        probes_counter("id.group", "formatless_refused", NULL);
+        json_decref(payload);
+        return true;
+    }
 
     /* Incoming group uuid + address_map size. */
     json_t *j_uuid = json_object_get(payload, "uuid");
@@ -2426,7 +4375,7 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
     size_t theirs_size = (j_addr_map != NULL && json_is_object(j_addr_map))
                          ? json_object_size(j_addr_map) : 0;
 
-    /* Group age (ISSUES.md §3.1-b): the size-tie tiebreaker. Absent/non-
+    /* Group age (doc/architecture/identity-protocol.md): the size-tie tiebreaker. Absent/non-
      * numeric defaults to 0 (unknown → uuid tiebreak). Mirrors Python
      * from_canonical's "created" default. */
     json_t *j_created = json_object_get(payload, "created");
@@ -2446,6 +4395,15 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
              "Identity: parsed incoming group update (uuid %s, addresses %zu)\n",
              theirs_uuid_str ? theirs_uuid_str : "?", theirs_size);
 
+    /* A feature following which group each peer advertised (identity/id_ext.h;
+     * social's "in your group" indicator). proc->protocol.group.uuid here is
+     * our PRE-adopt uuid -- the adopt for this update happens further below. */
+    if (theirs_uuid_valid && nmsg->from_whom.nickname[0] != '\0') {
+        char from_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(nmsg->from_whom.uuid, from_str);
+        identity_ext_group_update_seen(proc, from_str, theirs_uuid_str);
+    }
+
     /* Mine: snapshot uuid + address_map size. */
     size_t mine_size = map_size(&((process_t *)proc)->protocol.group.address_map);
     char mine_uuid_str[UUID_STRING_LEN + 1];
@@ -2453,6 +4411,153 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
 
     bool same_group = theirs_uuid_valid
                       && uuid_compare(theirs_uuid, proc->protocol.group.uuid) == 0;
+
+    /* A rotated key supersedes ours (doc/architecture/gateway-reputation-tree.md).
+     * Checked BEFORE the membership comparison because a rotation carries no membership
+     * change of its own, and a smaller-or-equal address map would otherwise take the
+     * quiet no-op path below and drop the new key on the floor.
+     *
+     * Only from a VERIFIED message: the epoch decides whether a key is newer, not
+     * whether its sender had any business rotating, and an unauthenticated update
+     * naming a higher epoch would be a way to hand a cohort a key of the attacker's
+     * choosing. Mirrors Python handle_group_update. */
+    if (same_group)
+    {
+        json_t *j_epoch = json_object_get(payload, "key_epoch");
+        int64_t theirs_epoch = (j_epoch != NULL && json_is_integer(j_epoch))
+                               ? json_integer_value(j_epoch) : 0;
+        /* Parsed BEFORE the epoch gate: whether the update carries a private
+         * seed is what makes it a rotation at all, and the EQUAL-epoch case
+         * needs to tell a rotation from an ordinary membership update. */
+        json_t *j_encr = json_object_get(payload, "encryptor");
+        json_t *j_po = j_encr ? json_object_get(j_encr, "public_only") : NULL;
+        const char *seed_hex = j_encr
+            ? json_string_value(json_object_get(j_encr, "hex_seed")) : NULL;
+        bool theirs_public = (j_po == NULL) ? true : json_boolean_value(j_po);
+        bool carries_key = (!theirs_public && seed_hex != NULL);
+        /* An EQUAL epoch is a rotation candidate, not a no-op: when two members
+         * rotate at the same instant they both mint THIS epoch, and
+         * group_accept_rotation settles which key the cohort keeps by a
+         * deterministic tiebreak. Refusing equality here would strand that fork
+         * no matter what group.c decides — the update would never reach it. An
+         * equal-epoch update that carries no key is an ordinary membership
+         * update and still falls through to the address-map logic below. */
+        bool same_epoch_tiebreak =
+            (theirs_epoch == proc->protocol.group.key_epoch) && carries_key;
+        /* A HIGHER epoch claims to supersede us, so an unverified one is
+         * refused AND the message is dropped: that claim is the attack surface,
+         * and letting the rest of such a message through would be trusting an
+         * envelope we just called a forgery. Unchanged behavior.
+         *
+         * An equal epoch makes no such claim, so it must NOT be dropped here —
+         * it is an ordinary membership update that happens to carry a key, and
+         * dropping it would lose the address-map convergence below. (It did,
+         * briefly: widening this drop to cover the tiebreak stalled the merge
+         * in the 2026-09-17 cohort.) The tiebreak simply does not fire unless
+         * the update is verified. */
+        if (theirs_epoch > proc->protocol.group.key_epoch && !nmsg->verified)
+        {
+            log_warn(proc->logger,
+                     "Identity: rejecting unverified group key rotation "
+                     "from %s\n", nmsg->from_whom.nickname);
+            json_decref(payload);
+            return true;
+        }
+        if ((theirs_epoch > proc->protocol.group.key_epoch || same_epoch_tiebreak)
+            && nmsg->verified)
+        {
+            /* Only the fields group_accept_rotation reads, on the stack, so no
+             * address_map is allocated to free here. */
+            group_t theirs = {0};
+            memcpy(theirs.uuid, proc->protocol.group.uuid, sizeof(uuid_t));
+            theirs.key_epoch = theirs_epoch;
+            bool seed_loaded = carries_key
+                && encryptor_init_from_private(&theirs.encryptor,
+                       (const unsigned char *)seed_hex, strlen(seed_hex)) == 0;
+            /* Why a refusal happened, decided once: the line below used to
+             * say "ours stands" for every failure in this chain, so a seed
+             * that did not load or a retired key read exactly like a lost
+             * tiebreak, and a forked cohort could not be told from one that
+             * settled (three-way boot rotation, rep-2368077). */
+            const char *refusal = !carries_key ? "it carries no key"
+                : !seed_loaded ? "its key seed did not load"
+                : group_rotation_refusal(&proc->protocol.group, &theirs);
+            if (refusal == NULL
+                && group_accept_rotation(&((process_t *)proc)->protocol.group,
+                                         &theirs))
+            {
+                char kfp[17] = {0};
+                sodium_bin2hex(kfp, sizeof(kfp),
+                               proc->protocol.group.encryptor.public, 8);
+                log_info(proc->logger,
+                         "Identity: adopted rotated group key, epoch %lld%s, key %s…\n",
+                         (long long)proc->protocol.group.key_epoch,
+                         same_epoch_tiebreak ? " (same-epoch tiebreak)" : "",
+                         kfp);
+                /* Hand the adopted key to our sibling processes NOW. The
+                 * membership comparison below returns silently on an
+                 * equal-or-smaller address map — the usual shape of a
+                 * rotation, which changes no membership — and that return
+                 * used to be the only exit, so identity held the new key
+                 * while the network process kept multicasting under the old
+                 * one and could not open the cohort's frames. Every member
+                 * then read every other as noise, permanently (partition
+                 * cohort part-3310971, 2026-09-28: three net-layer keys among
+                 * four nodes that all logged the same adoption). Mirrors the
+                 * minting path in _rotate_group_key. */
+                generic_msg_t group_msg = {0};
+                group_msg.type = GROUP;
+                memcpy(&group_msg.info.group, &proc->protocol.group,
+                       sizeof(group_t));
+                _remember_activity(proc, queues, &group_msg);
+            }
+            else
+            {
+                /* A lost tiebreak is normal for the WINNER of a simultaneous
+                 * rotation — it keeps its own key and the loser adopts.
+                 * Logged anyway: "who won" is otherwise invisible, and a
+                 * cohort where BOTH sides log "ours stands" is forked. Both
+                 * keys are named, so the two sides' lines can be compared. */
+                char tfp[17] = "?", ofp[17] = {0};
+                if (seed_loaded)
+                    sodium_bin2hex(tfp, sizeof(tfp), theirs.encryptor.public, 8);
+                sodium_bin2hex(ofp, sizeof(ofp),
+                               proc->protocol.group.encryptor.public, 8);
+                log_info(proc->logger,
+                         "Identity: rotation from %s not adopted (theirs epoch "
+                         "%lld, ours %lld, carries_key=%d) — %s; theirs %s…, "
+                         "ours %s…\n",
+                         nmsg->from_whom.nickname, (long long)theirs_epoch,
+                         (long long)proc->protocol.group.key_epoch,
+                         (int)carries_key, refusal ? refusal : "refused",
+                         tfp, ofp);
+            }
+        }
+        else if (carries_key
+                 && theirs_epoch >= proc->protocol.group.key_epoch
+                 && !nmsg->verified)
+        {
+            /* THE SILENT BRANCH, and the one that matters. An equal-epoch
+             * update carrying a key is a simultaneous-rotation fork waiting to
+             * be settled, and the tiebreak above only runs on a VERIFIED
+             * message — so an unverified one leaves the cohort split with
+             * nothing said. The higher-epoch case has warned since it was
+             * written; this one never did, and 25 preserved cohort runs show
+             * 107 rotations minted and NOT ONE adopted.
+             *
+             * has_signature distinguishes the two ways to be unverified: no
+             * signature at all (the sender never signed) versus a signature
+             * that did not check out against the key we hold for that peer
+             * (our peer table is stale, or it signed with another key). */
+            log_warn(proc->logger,
+                     "Identity: group key from %s NOT adopted — message "
+                     "unverified (has_signature=%d, theirs epoch %lld, ours "
+                     "%lld). The cohort stays FORKED until this verifies.\n",
+                     nmsg->from_whom.nickname, (int)nmsg->has_signature,
+                     (long long)theirs_epoch,
+                     (long long)proc->protocol.group.key_epoch);
+        }
+    }
 
     bool adopt = false;
     if (same_group)
@@ -2478,7 +4583,7 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
             adopt = false;
         else if (theirs_uuid_valid)
         {
-            /* Size tie (ISSUES.md §3.1-b): the OLDER group wins — the more-
+            /* Size tie (doc/architecture/identity-protocol.md): the OLDER group wins — the more-
              * established group absorbs the younger one — so adopt theirs iff
              * it is older. Only when both carry a known age (created > 0) that
              * differs; otherwise fall back to the deterministic uuid tiebreak
@@ -2545,11 +4650,22 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
                     incoming_addr, ADDR_LEN);
             ((process_t *)proc)->protocol.group.address[ADDR_LEN] = '\0';
         }
-        /* Inherit the adopted group's age (ISSUES.md §3.1-b) when known, so
-         * subsequent merges compare against the established group's creation
+        /* Inherit the adopted group's age (doc/architecture/identity-protocol.md) when
+         * known, so subsequent merges compare against the established group's creation
          * epoch, not ours. Mirrors Python Group.update_from. */
         if (theirs_created > 0.0)
             ((process_t *)proc)->protocol.group.created = theirs_created;
+        /* Its envelope format ("surviving group's format",
+         * doc/architecture/network-wire-format.md): an absorbed node that kept
+         * its own would speak a format its new group may not read. Absent or
+         * unrecognized reads as json, as group_from_json reads it.
+         * Never for the SAME group: a format does not change in place, since
+         * the update announcing it would reach members in the format they
+         * cannot read yet; a format change needs a new group.
+         * Mirrors Python Group.adopt_membership. */
+        if (!same_group)
+            ((process_t *)proc)->protocol.group.wire_format = net_wire_format_from_name(
+                json_string_value(json_object_get(payload, "wire_format")));
         /* Replace address_map: free any existing entries, then ingest theirs
          * by walking the JSON object so we never need map_priv.h here. */
         if (((process_t *)proc)->protocol.group.address_map.items != NULL)
@@ -2575,7 +4691,19 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
          * key) falls through and KEEPS our encryptor — Python's
          * adopt_membership. Mirrors group_from_json's encryptor reconstruction
          * (group.c:204-225). See [[dod-microdrone-targets-live-vs-playback]]. */
-        if (!theirs_public_only || !mine_owns_private)
+        /* NEVER from this path for OUR OWN group while we hold its key
+         * (ISSUES §2.31). A same-group key change is a rotation, and the
+         * rotation branch above already took every newer or tiebreak-winning
+         * key. What reaches here is a membership update, and its key is
+         * whatever the sender held when it built the frame, which can be an
+         * epoch behind: in partition cohort part-3637905 (2026-09-29) ben held
+         * epoch 4 and took ada's stale epoch-3 update because it listed five
+         * members to his four, installing the old key, and no frame from the
+         * cohort decrypted for him again. So a membership update grows the
+         * membership and never lowers the key. */
+        bool install_theirs = !mine_owns_private
+                              || (!same_group && !theirs_public_only);
+        if (install_theirs)
         {
             json_t *encr_obj = json_object_get(payload, "encryptor");
             const char *seed_hex = encr_obj
@@ -2592,6 +4720,27 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
                         &((process_t *)proc)->protocol.group.encryptor,
                         (const unsigned char *)seed_hex, strlen(seed_hex));
             }
+            /* Their key comes with THEIR epoch, and our retired keys go with
+             * the group we left, as Python's `self.group = theirs` does. Kept
+             * ours, a key from a stale membership update was relabelled with
+             * our higher epoch: in rep-4070096-11 (2026-10-16) carol held
+             * epoch 2, switched groups twice in one millisecond on two stale
+             * updates, and ended announcing bob's epoch-1 key as epoch 2. It
+             * sorted lowest, so it won every tiebreak, and alice and bob, who
+             * had retired it, refused it for good: a permanent fork. At its
+             * own epoch it is simply behind, and the next update lifts it. */
+            json_t *j_te = json_object_get(payload, "key_epoch");
+            ((process_t *)proc)->protocol.group.key_epoch =
+                (j_te != NULL && json_is_integer(j_te)) ? json_integer_value(j_te) : 0;
+            group_t *g = &((process_t *)proc)->protocol.group;
+            sodium_memzero(g->previous_keys, sizeof(g->previous_keys));
+            memset(g->previous_retired_at, 0, sizeof(g->previous_retired_at));
+            g->num_previous_keys = 0;
+            char kfp[17] = {0};
+            sodium_bin2hex(kfp, sizeof(kfp), g->encryptor.public, 8);
+            log_info(proc->logger,
+                     "Identity: took the adopted group's key %s… epoch %lld\n",
+                     kfp, (long long)g->key_epoch);
         }
         /* Mirror Python's _record_group: push GROUP state to local processes. */
         generic_msg_t group_msg = {0};
@@ -2656,9 +4805,31 @@ static bool handle_caps_query(const process_t *proc, directory_t *queues, generi
     memcpy(&response.info.net_msg.to_whom, &nmsg->from_whom,
            sizeof(public_identity_t));
     strncpy(response.info.net_msg.return_to, "identity", PROC_NAME_LEN);
-    net_msg_pack_json(&response.info.net_msg, caps_arr);
-    json_decref(caps_arr);
+    /* Envelope {caps: [...], seq: N}: the body is a LIST, so a sequence
+     * appended to it would be parsed as another descriptor. Capability
+     * registration is additive with no revocation, so unstamped this could be
+     * replayed to reinstall a capability the peer has since dropped. */
+    pthread_mutex_lock(&id_state.lock);
+    int64_t caps_seq = freshness_stamp(&id_state.freshness, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (caps_seq <= 0) {
+        json_decref(caps_arr);
+        log_warn(proc->logger,
+                 "Identity: no freshness sequence; not answering caps query\n");
+        return true;
+    }
+    json_t *caps_env = json_object();
+    if (caps_env == NULL) {
+        json_decref(caps_arr);
+        return true;
+    }
+    json_object_set_new(caps_env, "caps", caps_arr);
+    json_object_set_new(caps_env, "seq", json_integer((json_int_t)caps_seq));
+    net_msg_pack_json(&response.info.net_msg, caps_env);
+    json_decref(caps_env);
+    /* Bare on purpose (the querier re-queries on its caps resync): ISSUES §2.40. */
     messaging_send("network", NET_MESSAGE, &response, false);
+    net_msg_free_obj(&response.info.net_msg);
     return true;
 }
 
@@ -2781,7 +4952,6 @@ static json_t *_sanitize_descriptor(json_t *item)
 /* Frama-C: skipped — JSON parsing + map mutation. */
 static bool handle_caps_response(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
-    (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Identity: caps_response from %s\n",
               nmsg->from_whom.nickname);
@@ -2793,13 +4963,40 @@ static bool handle_caps_response(const process_t *proc, directory_t *queues, gen
                  "Identity: handle_caps_response: no JSON payload\n");
         return true;
     }
-    if (!json_is_array(payload))
+    /* Envelope {caps: [...], seq: N}. Unstamped is refused, not accepted as
+     * legacy (doc/architecture/reputation.md, "Quorum attestation"). */
+    json_t *caps_body = json_object_get(payload, "caps");
+    json_t *j_caps_seq = json_object_get(payload, "seq");
+    if (!json_is_array(caps_body) || !json_is_integer(j_caps_seq))
     {
         json_decref(payload);
         log_warn(proc->logger,
-                 "Identity: handle_caps_response: payload not a JSON array\n");
+                 "Identity: handle_caps_response: unstamped or malformed "
+                 "envelope, refusing\n");
         return true;
     }
+    {
+        char caps_sender[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(nmsg->from_whom.uuid, caps_sender);
+        int64_t caps_seq = (int64_t)json_integer_value(j_caps_seq);
+        pthread_mutex_lock(&id_state.lock);
+        bool caps_fresh = freshness_accept(&id_state.freshness, caps_sender,
+                                           ID_CAPS_RESPONSE, caps_seq,
+                                           proc->logger);
+        pthread_mutex_unlock(&id_state.lock);
+        if (!caps_fresh) {
+            json_decref(payload);
+            log_debug(proc->logger,
+                      "Identity: caps_response from %s refused: sequence %lld "
+                      "not above mark (replay)\n", caps_sender,
+                      (long long)caps_seq);
+            return true;
+        }
+    }
+    /* From here the array IS the body; the envelope is only unwrapped once. */
+    json_t *caps_envelope = payload;
+    payload = json_incref(caps_body);
+    json_decref(caps_envelope);
 
     array_t *arr = NULL;
     if (array_create(&arr) != 0 || arr == NULL)
@@ -2829,11 +5026,9 @@ static bool handle_caps_response(const process_t *proc, directory_t *queues, gen
         if (name == NULL) continue;   /* malformed item: skip */
 
         size_t len = strlen(name);
-        char *dup = smrt_create(len + 1);
-        if (dup == NULL) continue;
-        memcpy(dup, name, len + 1);
-        data_t *str_dat = string_data(dup, len + 1);
-        if (str_dat == NULL) { smrt_deref(dup); continue; }
+        /* string_data copies; no intermediate buffer to leak */
+        data_t *str_dat = string_data((char *)name, len + 1);
+        if (str_dat == NULL) continue;
         array_append(arr, str_dat);
 
         /* Object form: record the size-bounded descriptor keyed by cap name.
@@ -2849,22 +5044,14 @@ static bool handle_caps_response(const process_t *proc, directory_t *queues, gen
                 if (djson != NULL)
                 {
                     size_t dl = strlen(djson);
-                    char *ddup = smrt_create(dl + 1);
-                    if (ddup != NULL)
+                    /* string_data copies; no intermediate buffer to leak */
+                    data_t *ddat = string_data(djson, dl + 1);
+                    if (ddat != NULL)
                     {
-                        memcpy(ddup, djson, dl + 1);
-                        data_t *ddat = string_data(ddup, dl + 1);
-                        if (ddat != NULL)
-                        {
-                            pthread_mutex_lock(&id_state.lock);
-                            map_set(&id_state.peer_cap_descriptors_map,
-                                    (map_key_t)name, ddat);
-                            pthread_mutex_unlock(&id_state.lock);
-                        }
-                        else
-                        {
-                            smrt_deref(ddup);
-                        }
+                        pthread_mutex_lock(&id_state.lock);
+                        map_set(&id_state.peer_cap_descriptors_map,
+                                (map_key_t)name, ddat);
+                        pthread_mutex_unlock(&id_state.lock);
                     }
                     free(djson);   /* jansson json_dumps() uses malloc */
                 }
@@ -2875,14 +5062,168 @@ static bool handle_caps_response(const process_t *proc, directory_t *queues, gen
 
     char uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(nmsg->from_whom.uuid, uuid_str);
-    data_t *arr_dat = object_ptr_data(arr, sizeof(array_t));
+    data_t *arr_dat = owned_array_data(arr);
+    if (arr_dat == NULL)
+    {
+        array_free(arr);
+        return true;
+    }
     pthread_mutex_lock(&id_state.lock);
+    bool changed = !_same_caps_locked(uuid_str, arr);
     map_set(&id_state.peer_caps_map, uuid_str, arr_dat);
     pthread_mutex_unlock(&id_state.lock);
+    if (changed)
+        _publish_peer_capabilities(proc, queues);
 
     log_debug(proc->logger,
               "Identity: registered %zu cap(s) for peer %s\n",
               array_size(arr), uuid_str);
+    return true;
+}
+
+
+/****************************
+ * Handler: app_peer_standing (Phase 4 P4.1)
+ *
+ * An AUTHORITY FINDING the app decided — an Ethne expulsion, or a
+ * reinstatement — republished to reputation as a PEER_STANDING. Payload:
+ *   {"peer": "<uuid_str>", "standing": "proved"|"capped"|"failed",
+ *    "ceiling": <0..1, negative for none>, "source": "ethne",
+ *    "reason": "<=63 chars>"}
+ *
+ * A CEILING, NEVER A SCORE — see AT_APP_PEER_STANDING in utilities/message.h
+ * and the note at rep_proc.c's _handle_peer_standing.
+ *
+ * THE CORE VERIFIES NOTHING ABOUT THE FINDING ITSELF. An Ethne expulsion is
+ * proved by co-signatures inside a record this process cannot parse, exactly
+ * as a business page bundle is (handle_app_advertise_business takes the same
+ * stance). What is trusted is the CHANNEL, which is what the origin guard
+ * below establishes; and what is checked is the SHAPE.
+ ****************************/
+static bool handle_app_peer_standing(const process_t *proc,
+                                     directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+
+    /* GUARD 1 — origin. Without this the verb is a remote reputation-floor
+     * primitive: route_to_process forwards by process name with no function
+     * allowlist, so an admitted peer's encrypted frame would land here. */
+    if (!identity_is_local_app_verb(proc, nmsg))
+        return identity_refuse_remote_app_verb(proc, nmsg, AT_APP_PEER_STANDING);
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL) {
+        log_warn(proc->logger,
+                 "Identity: app_peer_standing: no JSON payload\n");
+        return true;
+    }
+    const char *peer_str = json_string_value(json_object_get(payload, "peer"));
+    const char *standing_str =
+        json_string_value(json_object_get(payload, "standing"));
+    const char *source_str =
+        json_string_value(json_object_get(payload, "source"));
+    const char *reason_str =
+        json_string_value(json_object_get(payload, "reason"));
+    json_t *j_ceiling = json_object_get(payload, "ceiling");
+
+    uuid_t peer_uuid;
+    if (peer_str == NULL || uuid_parse(peer_str, peer_uuid) != 0) {
+        log_warn(proc->logger,
+                 "Identity: app_peer_standing: bad or missing peer uuid\n");
+        json_decref(payload);
+        return true;
+    }
+
+    /* GUARD 2 — the authority must be one we know, and the app may NOT speak
+     * as ZTA. Otherwise an app forges a `proved` from the credential authority
+     * and clears a real certificate ceiling it knows nothing about. */
+    const char *source = peer_standing_source_or_default(source_str);
+    if (!peer_standing_source_valid(source)
+        || strcmp(source, PEER_STANDING_SOURCE_ZTA) == 0) {
+        log_warn(proc->logger,
+                 "Identity: app_peer_standing for %s refused: '%s' is not an "
+                 "authority the app may speak for\n", peer_str, source);
+        json_decref(payload);
+        return true;
+    }
+
+    int32_t standing = (int32_t)PEER_STANDING_CAPPED;
+    if (standing_str != NULL && strcmp(standing_str, "proved") == 0)
+        standing = (int32_t)PEER_STANDING_PROVED;
+    else if (standing_str != NULL && strcmp(standing_str, "failed") == 0)
+        standing = (int32_t)PEER_STANDING_FAILED;
+    else if (standing_str == NULL || strcmp(standing_str, "capped") != 0) {
+        log_warn(proc->logger,
+                 "Identity: app_peer_standing for %s refused: unknown standing "
+                 "'%s'\n", peer_str, standing_str ? standing_str : "(none)");
+        json_decref(payload);
+        return true;
+    }
+
+    /* GUARD 3 — a ceiling outside [0, 1] is not a bound on this scale. An
+     * absent ceiling means "no bound", which is what a reinstatement carries. */
+    double ceiling = PEER_NO_CEILING;
+    if (json_is_number(j_ceiling)) {
+        ceiling = json_number_value(j_ceiling);
+        if (ceiling < 0.0) {
+            ceiling = PEER_NO_CEILING;
+        } else if (ceiling > 1.0) {
+            log_warn(proc->logger,
+                     "Identity: app_peer_standing for %s refused: ceiling %.3f "
+                     "is off the [0, 1] scale\n", peer_str, ceiling);
+            json_decref(payload);
+            return true;
+        }
+    }
+
+    /* GUARD 4 — a finding about somebody this node has never admitted bounds
+     * nothing and is far more likely a mistake than a decision. */
+    public_identity_t known;
+    if (!identity_find_peer_pub(proc, peer_uuid, &known)) {
+        log_warn(proc->logger,
+                 "Identity: app_peer_standing for %s refused: not an admitted "
+                 "peer\n", peer_str);
+        json_decref(payload);
+        return true;
+    }
+
+    generic_msg_t out;
+    memset(&out, 0, sizeof(out));
+    out.type = PEER_STANDING;
+    out.size = sizeof(peer_standing_msg_t);
+    memcpy(out.info.peer_standing.peer_uuid, peer_uuid, sizeof(uuid_t));
+    out.info.peer_standing.standing = standing;
+    out.info.peer_standing.ceiling = ceiling;
+    at_strlcpy(out.info.peer_standing.reason, reason_str ? reason_str : "",
+               sizeof(out.info.peer_standing.reason));
+    at_strlcpy(out.info.peer_standing.source, source,
+               sizeof(out.info.peer_standing.source));
+    /* Everything logged below comes from these copies. peer_str, source and
+     * reason_str borrow from `payload`, and the log lines used to read them
+     * AFTER this decref (the moderation cohort's run 11 log printed garbage
+     * for all three). */
+    char peer_buf[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, peer_buf);
+    json_decref(payload);
+
+    /* Retried, as for the social score: run 11 lost the reinstatement here on
+     * a reputation queue full of catch-up traffic, and the cap it was meant to
+     * lift stayed in force. A queue full past 200 ms keeps it for the identity
+     * tick (ISSUES §2.40); only a hard fault, or no room to keep it, is lost,
+     * and identity_send_to says so. */
+    char what[96];
+    snprintf(what, sizeof(what), "%s standing (ceiling %.2f)",
+             out.info.peer_standing.source, ceiling);
+    if (identity_send_to(proc, "reputation", &out, what, peer_buf) != 0)
+        return true;
+    log_info(proc->logger,
+             "Identity: %s standing for %s -> %s (ceiling %.2f): %s\n",
+             out.info.peer_standing.source, peer_buf,
+             standing == (int32_t)PEER_STANDING_PROVED   ? "proved"
+             : standing == (int32_t)PEER_STANDING_FAILED ? "failed"
+                                                         : "capped",
+             ceiling, out.info.peer_standing.reason);
     return true;
 }
 
@@ -2932,20 +5273,12 @@ static bool handle_tier_update(const process_t *proc, directory_t *queues, gener
      * proc->configs["identity"]. Mirrors Python idprocess.py. */
     bool is_self = false;
     char self_str[UUID_STRING_LEN + 1] = {0};
-    data_t *id_dat = NULL;
-    char id_key[] = "identity";
-    if (map_get(proc->configs, id_key, &id_dat) == 0 && id_dat != NULL)
+    const identity_t *me = identity_self_identity(proc);
+    if (me != NULL)
     {
-        config_t *id_cfg = NULL;
-        if (data_object_ptr(id_dat, (void **)&id_cfg) == 0 &&
-            id_cfg != NULL && id_cfg->data_struct != NULL)
-        {
-            const public_identity_t *me =
-                (const public_identity_t *)id_cfg->data_struct;
-            uuid_unparse_lower(me->uuid, self_str);
-            if (strncmp(self_str, peer_uuid_str, UUID_STRING_LEN) == 0)
-                is_self = true;
-        }
+        uuid_unparse_lower(me->uuid, self_str);
+        if (strncmp(self_str, peer_uuid_str, UUID_STRING_LEN) == 0)
+            is_self = true;
     }
 
     /* map_set takes `char *const` for the key; copy into a writable
@@ -2982,6 +5315,22 @@ int identity_get_peer_tier(const uuid_t uuid)
     if (map_get(&id_state.peer_tiers, uuid_str, &dat) == 0 && dat != NULL)
         data_integer(dat, &tier);
     pthread_mutex_unlock(&id_state.lock);
+    /* A locally blocked peer is clamped to tier 0 for our own tier-gates.
+     * Purely local: nothing on the wire, no reputation transaction.
+     *
+     * KEPT, but no longer the whole story (Phase 4 P4.1). This clamp is a
+     * SECOND line of defence for the one other production consumer of this
+     * function — negotiation's capability gate (neg_proc.c), whose floors are
+     * always >= 1 so the clamp genuinely bites there. The inbound content
+     * paths now ask _is_blocked directly, because a floor of 0 makes a clamp
+     * to 0 a no-op and that is precisely how a blocked peer's public posts
+     * kept arriving.
+     *
+     * The block is the social feature's (identity/id_ext.h), asked after the
+     * unlock: no hook runs under id_state.lock. The tier and the block are
+     * independent maps, so each answer was true at some instant. */
+    if (identity_ext_peer_blocked(uuid_str))
+        tier = 0;
     return tier;
 }
 
@@ -3011,12 +5360,41 @@ size_t identity_get_partition_recovery_target(char *out, size_t out_len)
     return n;
 }
 
+void identity_clear_partition_cooldowns(void)
+{
+    _ensure_id_init();
+    pthread_mutex_lock(&id_state.lock);
+    map_free(&id_state.partition_probe_cooldown);
+    map_init(&id_state.partition_probe_cooldown);
+    map_free(&id_state.partition_response_cooldown);
+    map_init(&id_state.partition_response_cooldown);
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+void identity_set_partition_probe_round(int64_t seq)
+{
+    _ensure_id_init();
+    pthread_mutex_lock(&id_state.lock);
+    id_state.probe_seq = seq;
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+void identity_clear_partition_recovery(void)
+{
+    _ensure_id_init();
+    pthread_mutex_lock(&id_state.lock);
+    id_state.partition_recovery_target[0] = '\0';
+    id_state.partition_recovery_started_us = 0;
+    pthread_mutex_unlock(&id_state.lock);
+}
+
 int identity_partition_canonical_probe(const char *group_uuid,
-                                       int group_size,
+                                       int group_size, int64_t seq,
                                        char *out, size_t out_len)
 {
     if (group_uuid == NULL || out == NULL || out_len == 0) return -1;
-    int n = snprintf(out, out_len, "%s|%d", group_uuid, group_size);
+    int n = snprintf(out, out_len, "%s|%d|%lld", group_uuid, group_size,
+                     (long long)seq);
     if (n < 0 || (size_t)n >= out_len) return -1;
     return n;
 }
@@ -3024,12 +5402,13 @@ int identity_partition_canonical_probe(const char *group_uuid,
 int identity_partition_canonical_response(const char *group_uuid,
                                           int group_size,
                                           const char *in_response_to,
+                                          int64_t probe_seq, int64_t seq,
                                           char *out, size_t out_len)
 {
     if (group_uuid == NULL || in_response_to == NULL
         || out == NULL || out_len == 0) return -1;
-    int n = snprintf(out, out_len, "%s|%d|%s", group_uuid, group_size,
-                     in_response_to);
+    int n = snprintf(out, out_len, "%s|%d|%s|%lld|%lld", group_uuid, group_size,
+                     in_response_to, (long long)probe_seq, (long long)seq);
     if (n < 0 || (size_t)n >= out_len) return -1;
     return n;
 }
@@ -3045,9 +5424,10 @@ static int _acquire_capabilities(const process_t *proc, directory_t *queues)
      * exchange without tripping this deadline. See utilities/timeout.h. */
     int timeout_ms = at_timeout_scale_ms(10000, proc);
     int elapsed = 0;
+    generic_msg_t buf = {0};
     while (elapsed < timeout_ms)
     {
-        generic_msg_t buf = {0};
+        messaging_recv_release(&buf);   /* the previous pass's */
         int err = messaging_recv(&buf);
         if (err == 0)
             run_message_handlers((process_t *)proc, queues, buf.type, &buf);
@@ -3056,6 +5436,7 @@ static int _acquire_capabilities(const process_t *proc, directory_t *queues)
         usleep(100000);
         elapsed += 100;
     }
+    messaging_recv_release(&buf);
     return 0;
 }
 
@@ -3100,7 +5481,6 @@ static json_t *_operator_attestation_json(const public_identity_t *pub)
         free(kb64);
         free(bb64);
     }
-#ifdef AT_ZTA_ENABLED
     if (pub->zta_issuer[0] != '\0')
         json_object_set_new(att, "zta_issuer", json_string(pub->zta_issuer));
     if (pub->zta_credential_len > 0 && pub->zta_credential != NULL) {
@@ -3161,7 +5541,6 @@ static json_t *_operator_attestation_json(const public_identity_t *pub)
         }
         json_object_set_new(att, "zta_credentials", arr);
     }
-#endif
     return att;
 }
 
@@ -3204,7 +5583,6 @@ static void _apply_operator_attestation_json(const json_t *att, public_identity_
             }
         }
     }
-#ifdef AT_ZTA_ENABLED
     const char *iss = json_string_value(json_object_get(att, "zta_issuer"));
     if (iss != NULL)
         snprintf(pub->zta_issuer, sizeof(pub->zta_issuer), "%s", iss);
@@ -3279,450 +5657,11 @@ static void _apply_operator_attestation_json(const json_t *att, public_identity_
     /* Anchors are our finding, not the peer's claim: nothing is proved yet. */
     memset(pub->zta_anchors, 0, sizeof(pub->zta_anchors));
     pub->num_zta_anchors = 0;
-#endif
 }
 
-#ifdef AT_ZTA_ENABLED
-/* True iff the credential is operator-class: it chain-verifies against the
- * DISTINCT operator trust anchor AND its sha256 matches the advertised hash
- * (ethne D8/Q9). Non-forgeable (derived from verification, never the advertised
- * bool) and fail-safe (no anchor / no match / not verified -> false). Mirror of
- * Python IdentityProcess._is_operator_credential. Issuer-based markers are NOT
- * used (a distinct anchor is the agreed discriminator). */
-static bool _is_operator_credential(const zta_policy_t *policy,
-                                    const uint8_t *cred, size_t cred_len,
-                                    const uint8_t *advertised_hash)
-{
-    if (cred == NULL || cred_len == 0)
-        return false;
-    uint8_t actual[crypto_hash_sha256_BYTES];
-    crypto_hash_sha256(actual, cred, cred_len);
-    bool adv_present = false;
-    for (size_t i = 0; i < sizeof(actual); i++)
-        if (advertised_hash[i] != 0) { adv_present = true; break; }
-    if (adv_present && sodium_memcmp(actual, advertised_hash, sizeof(actual)) != 0)
-        return false;
-    zta_verifier_t *op = NULL;
-    if (zta_policy_create_operator_verifier(policy, &op) != 0 || op == NULL)
-        return false;
-    zta_result_t r;
-    memset(&r, 0, sizeof(r));
-    op->verify_credential(op, cred, cred_len, &r);
-    bool ok = (r.status == ZTA_VERIFIED);
-    op->destroy(op);
-    return ok;
-}
 
-/* True if this exact credential is already bound to a DIFFERENT network identity
- * — a harvested/replayed credential (ISSUES §1.5). C twin of Python
- * IdentityProcess._zta_credential_replayed.
- *
- * The chain-only verifier accepts a chain-valid certificate regardless of WHO
- * presents it, so one lifted from a peer's clear-text announce could be
- * re-announced under a different uuid and still pass. This enforces a
- * credential<->identity uniqueness invariant: first-use-wins, where "previously
- * seen" means present in our peer roster (rosters propagate, so this is the
- * "seen by other nodes" check) or on our own identity.
- *
- * Superseded by the binding for any credential that carries one; it stays
- * because it is the only defence left for an UNBOUND credential under
- * binding_mode prefer/off.
- *
- * Fingerprints are recomputed from the actual bytes, never the announcer-
- * controlled zta_credential_hash. Caller must NOT hold the peers lock. */
-static bool _zta_credential_replayed(const process_t *proc,
-                                     const public_identity_t *pub,
-                                     const uint8_t *cred, size_t cred_len)
-{
-    if (proc == NULL || pub == NULL || cred == NULL || cred_len == 0)
-        return false;
-    uint8_t fp[crypto_hash_sha256_BYTES];
-    crypto_hash_sha256(fp, cred, cred_len);
-
-    const identity_t *self = _partition_self_identity(proc);
-    if (self != NULL && uuid_compare(self->uuid, (unsigned char *)pub->uuid) != 0
-        && self->zta_credential != NULL && self->zta_credential_len > 0) {
-        uint8_t own[crypto_hash_sha256_BYTES];
-        crypto_hash_sha256(own, self->zta_credential, self->zta_credential_len);
-        if (memcmp(fp, own, sizeof(fp)) == 0)
-            return true;  /* our own credential, worn by somebody else */
-    }
-
-    bool found = false;
-    peers_read_lock((process_t *)proc);
-    for (size_t i = 0; i < proc->protocol.num_peers && !found; i++) {
-        const public_identity_t *peer = &proc->protocol.peers[i];
-        if (uuid_compare((unsigned char *)peer->uuid,
-                         (unsigned char *)pub->uuid) == 0)
-            continue;  /* same identity re-announcing its own credential: fine */
-        for (size_t j = 0; j < peer->num_zta_credentials && !found; j++) {
-            const zta_credential_t *c = &peer->zta_credentials[j];
-            if (c->der == NULL || c->der_len == 0)
-                continue;
-            uint8_t pfp[crypto_hash_sha256_BYTES];
-            crypto_hash_sha256(pfp, c->der, c->der_len);
-            if (memcmp(fp, pfp, sizeof(fp)) == 0)
-                found = true;
-        }
-    }
-    peers_read_unlock((process_t *)proc);
-    return found;
-}
-
-/* Credit a peer's OPT-IN guardian identity, if it advertised one and the binding
- * holds. Called only after the peer's credential has been classified
- * operator-class, because a binding signed by a credential with no standing to
- * name a guardian names nobody.
- *
- * Three outcomes, and the middle one is the point of the whole design:
- *   - no claim         -> silent. The default, and it must stay costless.
- *   - claim + binding verifies -> the key is written onto the peer. From here on,
- *     a stored peer with a key is one we verified.
- *   - claim + binding fails    -> the key stays zero and we say so. operator_bound
- *     is NOT demoted: it was earned independently, and a stale binding after node
- *     key rotation is an honest cause of this. */
-static void _verify_operator_key(const process_t *proc,
-                                 public_identity_t *pub,
-                                 const uint8_t *cred, size_t cred_len,
-                                 const uint8_t claimed_key[crypto_sign_PUBLICKEYBYTES])
-{
-    if (pub == NULL || claimed_key == NULL)
-        return;
-    bool claimed = !at_operator_pubkey_empty(claimed_key);
-    if (!claimed && (pub->operator_key_binding == NULL
-                     || pub->operator_key_binding_len == 0))
-        return;                      /* declined; the normal case */
-    if (!claimed || pub->operator_key_binding == NULL
-        || pub->operator_key_binding_len == 0) {
-        /* Half a claim is not a claim: a key with no binding is unverifiable and a
-         * binding with no key names nothing. Worth a word either way, because both
-         * halves are written by the same code path — one arriving without the
-         * other means something upstream is broken, not that a peer declined. */
-        log_warn(proc->logger,
-                 "Identity: %s advertised half an operator-key binding "
-                 "(key %s, binding %s); no guardian recorded\n",
-                 pub->nickname, claimed ? "present" : "absent",
-                 pub->operator_key_binding_len > 0 ? "present" : "absent");
-        return;
-    }
-
-    uint8_t preimage[OPERATOR_BINDING_PREIMAGE_LEN];
-    if (operator_binding_preimage(pub, claimed_key, preimage) != 0)
-        return;
-    /* Against the credential that actually verified operator-class, which with
-       several credentials in play need not be the primary in fields 6-8. */
-    if (x509_verify_data_signature(cred, cred_len,
-                                   preimage, sizeof(preimage),
-                                   pub->operator_key_binding,
-                                   pub->operator_key_binding_len)) {
-        memcpy(pub->operator_pubkey, claimed_key, crypto_sign_PUBLICKEYBYTES);
-        log_info(proc->logger,
-                 "Identity: %s guardian key bound and verified\n", pub->nickname);
-    } else {
-        log_warn(proc->logger,
-                 "Identity: %s advertised an operator key whose binding does not "
-                 "verify against its operator credential; no guardian recorded "
-                 "(operator_bound stands on its own)\n", pub->nickname);
-    }
-}
-
-/* The ZTA admission decision. C twin of Python IdentityProcess._zta_admit.
- *
- * ADMISSION IS ANY-OF (ISSUES §1.5): at least one credential must chain to some
- * configured anchor AND be bound to this identity. Each verified credential
- * records authority for its anchor on the peer (zta_anchors), and that — not a
- * self-declared role — is what lets a node gateway across an agency boundary.
- * Gatewayhood is emergent from group membership and nothing on the wire declares
- * it, so "a gateway must present N credentials" would rest on the peer's own
- * claim and buy nothing; an attacker just declines to claim.
- *
- * FAILURE IS GRADED, because forgery and ignorance are different things. A
- * binding that is present and fails, a credential already bound elsewhere, an
- * oversized blob, or an affirmative revocation all reject the identity — each is
- * evidence someone is lying. A credential merely expired, or chaining to no
- * anchor we hold, is SKIPPED: that says nothing about the peer's honesty, only
- * about our ability to evaluate it. For a single-credential node this collapses
- * to the previous behavior (nothing usable left => reject), which is why the
- * zta-x509-reject-* conformance pins still hold unchanged.
- *
- * Caller must already have neutralized pub->operator_bound and moved the claimed
- * guardian key aside; this function sets the authoritative operator_bound. */
-static zta_gate_t _zta_admit(const process_t *proc, const zta_policy_t *policy,
-                             public_identity_t *pub,
-                             const uint8_t claimed_key[crypto_sign_PUBLICKEYBYTES])
-{
-    if (policy == NULL || pub == NULL)
-        return ZTA_GATE_ADMIT;
-    if (!policy->enabled || !policy->require_at_admission)
-        return ZTA_GATE_ADMIT;
-    const char *nick = pub->nickname;
-
-    /* Working set. Normally the list, which sync_in/_apply_operator_attestation
-       seed with the primary; the fallback covers a caller that set only the
-       singular field (the conformance adapter attaches a live from_whom that way,
-       and so does any pre-list code path). */
-    zta_credential_t fallback;
-    const zta_credential_t *creds = pub->zta_credentials;
-    size_t n_creds = pub->num_zta_credentials;
-    if (n_creds == 0) {
-        memset(&fallback, 0, sizeof(fallback));
-        if (pub->zta_credential != NULL && pub->zta_credential_len > 0) {
-            fallback.der = pub->zta_credential;
-            fallback.der_len = pub->zta_credential_len;
-            at_strlcpy(fallback.issuer, pub->zta_issuer, sizeof(fallback.issuer));
-        }
-        /* Even when that leaves an EMPTY entry. A peer presenting nothing still
-           has to be evaluated, not silently skipped: the verifiers are what
-           distinguish "we cannot reach the PKI" (DDIL, admit capped) from "we can,
-           and there is no credential" (reject). x509 reports REJECTED "no
-           credential data"; the OIDC stub reports UNAVAILABLE. That is what the
-           zta-ddil-defer and zta-x509-reject-unsigned pins turn on. */
-        creds = &fallback;
-        n_creds = 1;
-    }
-
-    /* Size guard BEFORE handing any blob to a verifier: an oversized credential
-       is almost certainly hostile/corrupt and would let a remote cause an OOM or
-       parse-time DoS. Enforced here as well as at deserialization because the
-       conformance harness attaches a live from_whom with no wire round trip.
-       Keep ZTA_CRED_MAX in lockstep with Python. */
-    for (size_t i = 0; i < n_creds; i++) {
-        if (creds[i].der_len > ZTA_CRED_MAX) {
-            log_warn(proc->logger,
-                     "Identity: ZTA credential too large for %s (%zu > %u)\n",
-                     nick, creds[i].der_len, (unsigned)ZTA_CRED_MAX);
-            return ZTA_GATE_REJECT;
-        }
-    }
-    /* Credential<->identity uniqueness, before chain verification: the cert may
-       verify fine; the point is that it is already bound elsewhere. */
-    for (size_t i = 0; i < n_creds; i++) {
-        if (_zta_credential_replayed(proc, pub, creds[i].der, creds[i].der_len)) {
-            log_warn(proc->logger,
-                     "Identity: ZTA rejecting %s: credential bound to a different "
-                     "identity (replay)\n", nick);
-            return ZTA_GATE_REJECT;
-        }
-    }
-
-    /* One chain-walking verifier per resolved anchor. Mirrors Python
-       ZtaPolicy.create_anchor_verifiers, including both of its escape hatches:
-       an anchor IS a CA bundle, so for any non-x509 verifier_type (oidc, mfa)
-       there is nothing to enumerate and the single configured verifier stands in
-       under the name "default"; and an x509 policy with no bundle anywhere gets
-       the same treatment, because a verifier over an empty bundle reports
-       UNAVAILABLE, which is what drives the DDIL defer path. Resolving to zero
-       anchors there would silently turn a defer into a flat rejection. */
-    zta_anchor_t anchors[ZTA_POLICY_MAX_ANCHORS];
-    zta_verifier_t *verifiers[ZTA_POLICY_MAX_ANCHORS] = {0};
-    size_t n_anchors = 0;
-    if (strcmp(policy->verifier_type, "x509") == 0)
-        n_anchors = zta_policy_resolved_anchors(policy, anchors,
-                                                ZTA_POLICY_MAX_ANCHORS);
-    if (n_anchors == 0) {
-        memset(&anchors[0], 0, sizeof(anchors[0]));
-        at_strlcpy(anchors[0].name, "default", ZTA_ANCHOR_NAME_MAX);
-        anchors[0].is_operator = false;
-        n_anchors = 1;
-        zta_policy_create_verifier(policy, &verifiers[0]);
-    } else {
-        for (size_t a = 0; a < n_anchors; a++)
-            zta_policy_create_anchor_verifier(policy, &anchors[a], &verifiers[a]);
-    }
-
-    const char *san = policy->san_uri_template;
-    zta_gate_t decision;
-    bool any_usable = false;
-    bool any_unbound_usable = false;
-    bool have_failure = false, have_deferred = false;
-    zta_status_t failure_status = ZTA_REJECTED;
-    char failure_reason[ZTA_REASON_LEN] = {0};
-    zta_status_t deferred_status = ZTA_UNAVAILABLE;
-    char deferred_reason[ZTA_REASON_LEN] = {0};
-    /* Deferred outcomes are tracked separately from real failures so the
-       nothing-usable branch can tell "we could not evaluate" (DDIL, fallback
-       applies) from "we evaluated and did not like it" (reject). */
-
-    for (size_t i = 0; i < n_creds; i++) {
-        const uint8_t *cred = creds[i].der;
-        size_t cred_len = creds[i].der_len;
-        /* NOT skipped when empty — see the working-set note above: the verifiers
-           are what tell DDIL apart from an absent credential. */
-
-        bool matched = false, is_operator = false, revoked = false;
-        size_t first_match = 0;
-        uint8_t match_hash[ZTA_HASH_LEN] = {0};
-        for (size_t a = 0; a < n_anchors; a++) {
-            if (verifiers[a] == NULL || verifiers[a]->verify_credential == NULL)
-                continue;
-            zta_result_t r;
-            memset(&r, 0, sizeof(r));
-            verifiers[a]->verify_credential(verifiers[a], cred, cred_len, &r);
-            if (r.status == ZTA_VERIFIED) {
-                /* Every anchor is tried, deliberately not stopping at the first
-                   match: a credential may legitimately chain to more than one
-                   (the synthesized legacy pair is frequently the same CA), and
-                   both operator classification and gateway authority depend on
-                   the full set rather than whichever was checked first. */
-                if (!matched) { first_match = a; memcpy(match_hash, r.credential_hash,
-                                                        sizeof(match_hash)); }
-                matched = true;
-                is_operator = is_operator || anchors[a].is_operator;
-                if (!revoked && verifiers[a]->check_revocation != NULL) {
-                    /* A chain-valid certificate may nonetheless have been
-                       revoked; verify_credential walks only chain + expiry. Only
-                       an affirmative ZTA_REVOKED blocks — ZTA_UNAVAILABLE (the
-                       default with no CRL/OCSP source) keeps the peer admitted,
-                       so deployments without one are unchanged. */
-                    zta_result_t rev;
-                    memset(&rev, 0, sizeof(rev));
-                    verifiers[a]->check_revocation(verifiers[a],
-                                                   r.credential_hash, &rev);
-                    if (rev.status == ZTA_REVOKED) {
-                        revoked = true;
-                        at_strlcpy(failure_reason, rev.reason[0] ? rev.reason
-                                   : "credential revoked", ZTA_REASON_LEN);
-                    }
-                }
-            } else if (r.status == ZTA_REJECTED || r.status == ZTA_EXPIRED
-                       || r.status == ZTA_REVOKED) {
-                have_failure = true;
-                failure_status = r.status;
-                at_strlcpy(failure_reason, r.reason, ZTA_REASON_LEN);
-            } else {  /* DEFERRED / UNAVAILABLE — the verifier could not answer */
-                have_deferred = true;
-                deferred_status = r.status;
-                at_strlcpy(deferred_reason, r.reason, ZTA_REASON_LEN);
-            }
-        }
-        if (revoked) {
-            log_warn(proc->logger, "Identity: ZTA rejecting %s: %s\n",
-                     nick, failure_reason);
-            decision = ZTA_GATE_REJECT;
-            goto done;
-        }
-        if (!matched)
-            continue;  /* chains to no anchor we hold: ignorance, not forgery */
-
-        /* The credential is genuine. Is THIS node entitled to present it? */
-        bool bound = zta_identity_is_bound(pub, cred, cred_len,
-                                           creds[i].binding, creds[i].binding_len,
-                                           san, claimed_key,
-                                           pub->operator_key_binding,
-                                           pub->operator_key_binding_len);
-        if (creds[i].binding != NULL && creds[i].binding_len > 0 && !bound) {
-            /* A binding was offered and does not verify. Unlike absence, that is
-               affirmative evidence of forgery — somebody tried and failed to
-               prove entitlement — so it condemns the whole identity rather than
-               costing just this one credential. */
-            log_warn(proc->logger,
-                     "Identity: ZTA rejecting %s: credential binding does not "
-                     "verify for this identity\n", nick);
-            decision = ZTA_GATE_REJECT;
-            goto done;
-        }
-        if (!bound && policy->binding_mode == ZTA_BINDING_MODE_REQUIRE) {
-            /* Unbound is a provisioning state, not a lie. The credential earns no
-               authority; if nothing else survives the peer is refused below,
-               which for a single-credential node is exactly the old reject. */
-            log_warn(proc->logger,
-                     "Identity: %s presented an unbound ZTA credential and "
-                     "binding_mode is require; credential unusable\n", nick);
-            continue;
-        }
-
-        any_usable = true;
-        if (!bound)
-            any_unbound_usable = true;
-        for (size_t a = 0; a < n_anchors; a++) {
-            if (verifiers[a] == NULL)
-                continue;
-            /* Re-derive rather than cache a per-anchor verdict array: n_anchors
-               is <= 8 and the verifier caches parsed certs, so this is cheap and
-               keeps the match loop above from needing a parallel result buffer. */
-            zta_result_t r;
-            memset(&r, 0, sizeof(r));
-            if (verifiers[a]->verify_credential(verifiers[a], cred, cred_len, &r) == 0
-                && r.status == ZTA_VERIFIED)
-                public_identity_add_zta_anchor(pub, anchors[a].name);
-        }
-        if (!pub->operator_bound) {
-            /* Operator-class (ethne D8/Q9) by EITHER route, because a deployment
-               may express the operator anchor either way: as an anchor carrying
-               `operator: true`, or as the separate operator_ca_bundle_path that
-               _is_operator_credential consults. Both derive the answer from
-               verifying the actual credential against an operator trust anchor,
-               never from the peer-advertised operator_bound/zta_issuer. */
-            if (is_operator
-                || _is_operator_credential(policy, cred, cred_len,
-                                           pub->zta_credential_hash)) {
-                pub->operator_bound = true;
-                log_info(proc->logger,
-                         "Identity: %s is operator-attended (human guardian)\n",
-                         nick);
-                _verify_operator_key(proc, pub, cred, cred_len, claimed_key);
-            }
-        }
-        (void)first_match;
-        (void)match_hash;
-    }
-
-    if (any_usable) {
-        if (policy->binding_mode == ZTA_BINDING_MODE_PREFER && any_unbound_usable) {
-            /* `prefer` only: admitted on an unbound credential, so the
-               roster-based TOFU check is all that stood between us and a
-               harvested cert — cap it like any other deferred verification.
-               `off` deliberately does NOT cap: absence of a binding carries no
-               penalty there, which is what makes it the no-change setting for a
-               deployment that has not provisioned bindings yet. */
-            log_info(proc->logger,
-                     "Identity: %s admitted on an unbound ZTA credential "
-                     "(binding_mode prefer); reputation cap %.2f\n",
-                     nick, policy->ddil_fallback_reputation_cap);
-            decision = ZTA_GATE_ADMIT_CAPPED;
-            goto done;
-        }
-        decision = ZTA_GATE_ADMIT;
-        goto done;
-    }
-
-    /* Nothing usable. A verifier that could not answer is a DDIL condition and
-       gets the fallback; an answer we did not like is a rejection. */
-    if (have_deferred && !have_failure) {
-        if (policy->allow_ddil_fallback) {
-            log_info(proc->logger,
-                     "Identity: ZTA verification deferred (DDIL) for %s (%s); "
-                     "admitting with reputation cap %.2f\n",
-                     nick, zta_status_str(deferred_status),
-                     policy->ddil_fallback_reputation_cap);
-            decision = ZTA_GATE_ADMIT_CAPPED;
-            goto done;
-        }
-        log_warn(proc->logger,
-                 "Identity: ZTA unavailable for %s (%s) and DDIL fallback "
-                 "disabled; rejecting: %s\n", nick,
-                 zta_status_str(deferred_status), deferred_reason);
-        decision = ZTA_GATE_REJECT;
-        goto done;
-    }
-    if (have_failure)
-        log_warn(proc->logger, "Identity: ZTA credential %s for %s: %s\n",
-                 zta_status_str(failure_status), nick, failure_reason);
-    else
-        log_warn(proc->logger,
-                 "Identity: ZTA rejecting %s: no verifiable credential presented\n",
-                 nick);
-    decision = ZTA_GATE_REJECT;
-
-done:
-    for (size_t a = 0; a < n_anchors; a++)
-        if (verifiers[a] != NULL)
-            verifiers[a]->destroy(verifiers[a]);
-    return decision;
-}
-#endif
-
-static int _build_announcement(const process_t *proc, generic_msg_t *buf)
+static int _build_announcement_for(const process_t *proc, generic_msg_t *buf,
+                                  const char *target_group)
 {
     memset(buf, 0, sizeof(generic_msg_t));
     buf->type = NET_MESSAGE;
@@ -3731,20 +5670,15 @@ static int _build_announcement(const process_t *proc, generic_msg_t *buf)
     buf->info.net_msg.encrypt = false; /* Broadcast is unencrypted */
 
     /* Get own identity from config */
-    data_t *id_dat = NULL;
-    char id_key[] = "identity";
-    if (map_get(proc->configs, id_key, &id_dat) == 0)
+    const identity_t *self = identity_self_identity(proc);
+    if (self != NULL)
     {
-        config_t *id_cfg = NULL;
-        if (data_object_ptr(id_dat, (void **)&id_cfg) == 0 && id_cfg->data_struct != NULL)
+        public_identity_t *pub = NULL;
+        identity_publish(self, &pub);
+        if (pub != NULL)
         {
-            public_identity_t *pub = NULL;
-            identity_publish((const identity_t *)id_cfg->data_struct, &pub);
-            if (pub != NULL)
-            {
-                memcpy(&buf->info.net_msg.from_whom, pub, sizeof(public_identity_t));
-                smrt_deref(pub);
-            }
+            memcpy(&buf->info.net_msg.from_whom, pub, sizeof(public_identity_t));
+            smrt_deref(pub);
         }
     }
 
@@ -3755,13 +5689,14 @@ static int _build_announcement(const process_t *proc, generic_msg_t *buf)
      * Python's _broadcast_request_access (idprocess.py). Without a payload
      * Python's welcoming_committee (which does `ph, caps =
      * from_json_string(obj)`) would choke; emit the 2-element array so the
-     * two runtimes parse identically. The C node has no package-hash
-     * concept, so slot 0 is the empty string (Python treats an empty peer
-     * hash as "unknown" and skips its counterfeit check — see
-     * welcoming_committee). Slot 1 is this node's own capability names. */
+     * two runtimes parse identically. Slot 0 is this node's tagged package
+     * hash, "c:<hex>" (package_hash.h): a welcomer with an allowlist checks
+     * it, and one without treats another runtime's hash as unknown, as it
+     * always treated the empty one. Slot 1 is this node's own capability
+     * names. */
     json_t *payload = json_array();
     if (payload != NULL) {
-        json_array_append_new(payload, json_string(""));  /* package_hash */
+        json_array_append_new(payload, json_string(at_package_hash()));
         json_t *caps_arr = json_array();
         array_t *own = _id_own_caps_for(proc);
         if (own != NULL) {
@@ -3784,6 +5719,19 @@ static int _build_announcement(const process_t *proc, generic_msg_t *buf)
          * _broadcast_request_access appending _operator_attestation(). */
         json_array_append_new(payload,
                               _operator_attestation_json(&buf->info.net_msg.from_whom));
+        /* Slot 3 (optional): the cohort we are asking to join
+         * (doc/architecture/gateway-reputation-tree.md,
+         * runtime cross-group join). Absent -- the ordinary case -- this is the
+         * open request for a primary group and the payload is exactly what it
+         * always was, so a peer on an older build reads it unchanged; the same
+         * arity tolerance slot 2 already relies on.
+         *
+         * It is a HINT for routing, not authority: every recipient checks it
+         * against its OWN group, and a request naming somebody else's cohort is
+         * simply not theirs to answer. Nothing here grants anything. Mirrors
+         * Python _broadcast_request_access's target_group. */
+        if (target_group != NULL && target_group[0] != '\0')
+            json_array_append_new(payload, json_string(target_group));
         net_msg_pack_json(&buf->info.net_msg, payload);
         json_decref(payload);
     }
@@ -3793,31 +5741,42 @@ static int _build_announcement(const process_t *proc, generic_msg_t *buf)
     return 0;
 }
 
+/* Ordinary, untargeted announcement: no cohort named, so the payload keeps its
+ * historical 3-element shape. */
+/* Frama-C: skipped - delegates to _build_announcement_for. */
+static int _build_announcement(const process_t *proc, generic_msg_t *buf)
+{
+    return _build_announcement_for(proc, buf, NULL);
+}
+
 /* Parity wrapper for Python's `_broadcast_request_access`
  * (idprocess.py:219-227). Builds and emits the request_access envelope
  * on the open channel — used both by the Phase 1→2 initial announce
  * AND by the group-merge recovery path in `_merge_to_mesh` to
  * re-broadcast without a phase change. */
 /* Frama-C: skipped — [solver-timeout] logging/snprintf/json preconditions */
-static int _announce_identity(const process_t *proc, directory_t *queues)
+static int _announce_identity_for(const process_t *proc, directory_t *queues,
+                                 const char *target_group)
 {
     data_t net = STRING_DATA("network");
     if (!array_contains(queues, &net))
         return EXCEPTION(EID_NOQ);
 
     generic_msg_t buf = {0};
-    _build_announcement(proc, &buf);
+    _build_announcement_for(proc, &buf, target_group);
 
     /* Retry until network process IPC socket is ready */
     int ret = -1;
     for (int attempt = 0; attempt < 20; attempt++)
     {
+        /* Bare on purpose (retried above while net_proc starts; re-announced until admitted): ISSUES §2.40. */
         ret = messaging_send("network", NET_MESSAGE, &buf, false);
         if (ret == 0)
             break;
         log_debug(proc->logger, "Identity: network not ready, retrying (%d)...\n", attempt);
         usleep(100000); /* 100ms */
     }
+    net_msg_free_obj(&buf.info.net_msg);
 
     if (ret != 0)
     {
@@ -3827,6 +5786,12 @@ static int _announce_identity(const process_t *proc, directory_t *queues)
 
     log_info(proc->logger, "Identity: announced self to network\n");
     return 0;
+}
+
+/* Frama-C: skipped - delegates to _announce_identity_for. */
+static int _announce_identity(const process_t *proc, directory_t *queues)
+{
+    return _announce_identity_for(proc, queues, NULL);
 }
 
 /****************************
@@ -3852,9 +5817,20 @@ static int _announce_identity(const process_t *proc, directory_t *queues)
  * 2. The canonical signature inputs MUST byte-match Python's
  *    `IdentityProcess._partition_probe_canonical` /
  *    `_partition_response_canonical`. Python format:
- *      probe:    "{group_uuid}|{group_size}"           (no spaces)
+ *      probe:    "{group_uuid}|{group_size}|{seq}"     (no spaces)
  *      response: "{group_uuid}|{group_size}|{in_response_to}"
- *    Use `snprintf` with `"%s|%d"` / `"%s|%d|%s"` exactly.
+ *                "|{probe_seq}|{seq}"
+ *    Use `snprintf` with `"%s|%d|%lld"` / `"%s|%d|%s|%lld|%lld"` exactly.
+ *
+ *    The sequences are the freshness tokens (core/freshness.py). They are
+ *    INSIDE the signed bytes, so a stripped sequence is an invalid message
+ *    rather than an unstamped one. `seq` is the sender's own monotonic
+ *    counter; the response's `probe_seq` echoes the probe it answers, which
+ *    is what stops a genuine response being kept and re-presented to the
+ *    same prober later — `in_response_to` is only the prober's uuid and
+ *    never changes. An unstamped probe or response is REFUSED, not accepted
+ *    as legacy: see doc/architecture/reputation.md, "Quorum attestation",
+ *    for why there is no lenient mode.
  *
  * 3. Cooldown timestamps use `CLOCK_MONOTONIC` microseconds — not
  *    wall-clock — so NTP / DST adjustments don't invalidate them.
@@ -3923,7 +5899,7 @@ static bool _partition_recovery_active_locked(void)
  * failure (which the handlers treat as bootstrap-incomplete and
  * silently skip — same as Python's `self.identity is None` guard
  * implicit in choose_group). */
-static const identity_t *_partition_self_identity(const process_t *proc)
+const identity_t *identity_self_identity(const process_t *proc)
 {
     if (proc == NULL || proc->configs == NULL) return NULL;
     data_t *id_dat = NULL;
@@ -3931,7 +5907,8 @@ static const identity_t *_partition_self_identity(const process_t *proc)
     if (map_get(proc->configs, id_key, &id_dat) != 0 || id_dat == NULL)
         return NULL;
     config_t *id_cfg = NULL;
-    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0 || id_cfg == NULL)
+    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0 || id_cfg == NULL
+        || id_cfg->data_struct == NULL)
         return NULL;
     return (const identity_t *)id_cfg->data_struct;
 }
@@ -3976,6 +5953,7 @@ static int _partition_verify_hex(const public_identity_t *pub,
  * _announce_identity. */
 static int _partition_broadcast(const process_t *proc, generic_msg_t *buf)
 {
+    /* Bare on purpose (the partition probe repeats each sweep): ISSUES §2.40. */
     int ret = messaging_send("network", NET_MESSAGE, buf, false);
     if (ret != 0) {
         log_error(proc->logger,
@@ -4022,7 +6000,7 @@ void identity_periodic_caps_resync(const process_t *proc)
     pthread_mutex_unlock(&id_state.lock);
     if (choosing) return;
 
-    const identity_t *self = _partition_self_identity(proc);
+    const identity_t *self = identity_self_identity(proc);
 
     public_identity_t capless[CAPS_RESYNC_MAX_PER_SWEEP];
     size_t cnt = 0;
@@ -4048,6 +6026,9 @@ void identity_periodic_caps_resync(const process_t *proc)
                   "Identity: caps resync re-queried %zu cap-less peer(s)\n",
                   cnt);
     }
+
+    /* Features re-query what they hold nothing for (identity/id_ext.h). */
+    identity_ext_periodic_resync(proc);
 }
 
 /****************************
@@ -4103,7 +6084,7 @@ void identity_periodic_identity_resync(const process_t *proc)
     if (choosing) return;
 
     int group_size = (int)map_size(&((process_t *)proc)->protocol.group.address_map);
-    const identity_t *self = _partition_self_identity(proc);
+    const identity_t *self = identity_self_identity(proc);
 
     /* `have` = the uuids we hold an Identity for = our peers + self. */
     json_t *have = json_array();
@@ -4146,7 +6127,9 @@ void identity_periodic_identity_resync(const process_t *proc)
     strncpy(query.info.net_msg.return_to, "identity", PROC_NAME_LEN);
     net_msg_pack_json(&query.info.net_msg, payload);
     json_decref(payload);
+    /* Bare on purpose (this resync repeats every ~20 s): ISSUES §2.40. */
     messaging_send("network", NET_MESSAGE, &query, false);
+    net_msg_free_obj(&query.info.net_msg);
 
     char miss_str[16];
     snprintf(miss_str, sizeof(miss_str), "%d", group_size - have_count);
@@ -4190,7 +6173,7 @@ static bool handle_identity_query(const process_t *proc, directory_t *queues, ge
     }
 
     /* If the asker already has us, stay silent. */
-    const identity_t *self = _partition_self_identity(proc);
+    const identity_t *self = identity_self_identity(proc);
     if (self == NULL) { json_decref(payload); return true; }
     char self_uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(self->uuid, self_uuid_str);
@@ -4232,7 +6215,9 @@ static bool handle_identity_query(const process_t *proc, directory_t *queues, ge
     strncpy(reply.info.net_msg.return_to, "identity", PROC_NAME_LEN);
     net_msg_pack_json(&reply.info.net_msg, out);
     json_decref(out);
+    /* Bare on purpose (the requester repeats its resync): ISSUES §2.40. */
     messaging_send("network", NET_MESSAGE, &reply, false);
+    net_msg_free_obj(&reply.info.net_msg);
     probes_counter("peer.set", "identity_response_sent", "1");
     log_debug(proc->logger,
               "Identity resync: replied to identity_query from %s\n",
@@ -4251,7 +6236,6 @@ static bool handle_identity_query(const process_t *proc, directory_t *queues, ge
 /* Frama-C: skipped — JSON parsing + peers mutation. */
 static bool handle_identity_response(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
-    (void)queues;
     if (proc == NULL || msg == NULL) return true;
     net_msg_t *nmsg = &msg->info.net_msg;
     if (proc->protocol.group.uuid[0] == 0
@@ -4289,7 +6273,7 @@ static bool handle_identity_response(const process_t *proc, directory_t *queues,
     }
 
     /* Never add self. */
-    const identity_t *self = _partition_self_identity(proc);
+    const identity_t *self = identity_self_identity(proc);
     if (self != NULL && uuid_compare(parsed.uuid, self->uuid) == 0) {
         json_decref(payload);
         return true;
@@ -4329,6 +6313,14 @@ static bool handle_identity_response(const process_t *proc, directory_t *queues,
          * not a distinction a consumer of the feed should have to make.
          * Outside the peers lock. */
         identity_emit_peer_observed(proc, &parsed);
+        /* And the sibling processes, for the same reason as the history
+         * bundle: without the PEER message the network process cannot place
+         * this peer's address, so every encrypted frame from it is deferred
+         * as "no peer known at that address yet". */
+        generic_msg_t peer_msg = {0};
+        peer_msg.type = PEER;
+        memcpy(&peer_msg.info.peer, &parsed, sizeof(public_identity_t));
+        _remember_activity(proc, queues, &peer_msg);
     } else {
         probes_counter("peer.set", "identity_response_redundant", "1");
     }
@@ -4377,19 +6369,35 @@ static bool handle_partition_signal(const process_t *proc, directory_t *queues, 
         return true;
     }
 
-    /* Build canonical signing input: "{group_uuid_str}|{group_size}". */
+    /* Build canonical signing input:
+     * "{group_uuid_str}|{group_size}|{seq}". The sequence is INSIDE the
+     * signed bytes: the old pre-image covered only the uuid and size, neither
+     * of which changes between rounds, so a captured probe — plaintext
+     * multicast, no prior access needed — was replayable indefinitely. */
     char group_uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(proc->protocol.group.uuid, group_uuid_str);
     int group_size = (int)map_size(&((process_t *)proc)->protocol.group.address_map);
-    char canonical[UUID_STRING_LEN + 32];
-    int clen = snprintf(canonical, sizeof(canonical), "%s|%d",
-                        group_uuid_str, group_size);
-    if (clen < 0 || (size_t)clen >= sizeof(canonical)) {
+    pthread_mutex_lock(&id_state.lock);
+    int64_t probe_seq = freshness_stamp(&id_state.freshness, proc->logger);
+    /* Remembered so a response can be tied to THIS round. */
+    id_state.probe_seq = probe_seq;
+    pthread_mutex_unlock(&id_state.lock);
+    if (probe_seq <= 0) {
+        log_warn(proc->logger,
+                 "Identity: no freshness sequence; not probing\n");
+        json_decref(payload);
+        return true;
+    }
+    char canonical[UUID_STRING_LEN + 64];
+    int clen = identity_partition_canonical_probe(group_uuid_str, group_size,
+                                                 probe_seq, canonical,
+                                                 sizeof(canonical));
+    if (clen < 0) {
         json_decref(payload);
         return true;
     }
 
-    const identity_t *self = _partition_self_identity(proc);
+    const identity_t *self = identity_self_identity(proc);
     if (self == NULL) {
         json_decref(payload);
         return true;
@@ -4425,6 +6433,8 @@ static bool handle_partition_signal(const process_t *proc, directory_t *queues, 
                         json_string(group_uuid_str));
     json_object_set_new(probe_json, "my_group_size",
                         json_integer(group_size));
+    json_object_set_new(probe_json, "seq",
+                        json_integer((json_int_t)probe_seq));
     json_object_set_new(probe_json, "signature",
                         json_string(sig_hex));
 
@@ -4433,12 +6443,13 @@ static bool handle_partition_signal(const process_t *proc, directory_t *queues, 
     strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
     out.info.net_msg.function = ID_PARTITION_PROBE;
     out.info.net_msg.encrypt = false;  /* unsecured broadcast */
-    memcpy(&out.info.net_msg.from_whom, _partition_self_identity(proc),
+    memcpy(&out.info.net_msg.from_whom, identity_self_identity(proc),
            sizeof(public_identity_t));
     net_msg_pack_json(&out.info.net_msg, probe_json);
     json_decref(probe_json);
 
     _partition_broadcast(proc, &out);
+    net_msg_free_obj(&out.info.net_msg);
     log_debug(proc->logger,
               "Identity: partition_probe broadcast (group=%s size=%d trigger=%s)\n",
               group_uuid_str, group_size, from_addr);
@@ -4465,14 +6476,20 @@ static bool handle_partition_probe(const process_t *proc, directory_t *queues, g
     json_t *j_group_uuid = json_object_get(payload, "my_group_uuid");
     json_t *j_group_size = json_object_get(payload, "my_group_size");
     json_t *j_signature  = json_object_get(payload, "signature");
+    json_t *j_seq        = json_object_get(payload, "seq");
+    /* An unstamped probe is REFUSED, not accepted as legacy: a lenient path
+     * is the path an attacker picks (doc/architecture/reputation.md, "Quorum
+     * attestation"). */
     if (!json_is_object(j_from_id) || !json_is_string(j_group_uuid)
-        || !json_is_integer(j_group_size) || !json_is_string(j_signature)) {
+        || !json_is_integer(j_group_size) || !json_is_string(j_signature)
+        || !json_is_integer(j_seq)) {
         json_decref(payload);
         return true;
     }
     const char *sender_group_uuid = json_string_value(j_group_uuid);
     int sender_group_size = (int)json_integer_value(j_group_size);
     const char *sig_hex = json_string_value(j_signature);
+    int64_t sender_seq = (int64_t)json_integer_value(j_seq);
 
     /* Decode the sender's public identity. */
     public_identity_t sender_pub;
@@ -4483,10 +6500,12 @@ static bool handle_partition_probe(const process_t *proc, directory_t *queues, g
     }
 
     /* Verify signature. */
-    char canonical[UUID_STRING_LEN + 32];
-    int clen = snprintf(canonical, sizeof(canonical), "%s|%d",
-                        sender_group_uuid, sender_group_size);
-    if (clen < 0 || (size_t)clen >= sizeof(canonical)) {
+    char canonical[UUID_STRING_LEN + 64];
+    int clen = identity_partition_canonical_probe(sender_group_uuid,
+                                                 sender_group_size,
+                                                 sender_seq, canonical,
+                                                 sizeof(canonical));
+    if (clen < 0) {
         json_decref(payload);
         return true;
     }
@@ -4502,6 +6521,26 @@ static bool handle_partition_probe(const process_t *proc, directory_t *queues, g
     char sender_uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(sender_pub.uuid, sender_uuid_str);
 
+    /* Freshness, AFTER the signature check: the mark advances only for a probe
+     * the claimed prober actually signed, so a forged probe cannot burn a
+     * sequence and gag the real prober's next one. */
+    pthread_mutex_lock(&id_state.lock);
+    bool fresh = freshness_accept(&id_state.freshness, sender_uuid_str,
+                                  ID_PARTITION_PROBE, sender_seq, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!fresh) {
+        /* Mirrors Python's `_probes.counter('peer.set',
+         * 'partition_probe_replay')`; the deterministic count a test asserts
+         * is freshness_refusals(), this is the operational telemetry. */
+        probes_counter("peer.set", "partition_probe_replay", NULL);
+        log_debug(proc->logger,
+                  "Identity: partition_probe from %s refused: seq %lld not "
+                  "above mark (replay)\n", sender_uuid_str,
+                  (long long)sender_seq);
+        json_decref(payload);
+        return true;
+    }
+
     pthread_mutex_lock(&id_state.lock);
     bool may_send = _partition_cooldown_check(
         &id_state.partition_response_cooldown, sender_uuid_str,
@@ -4515,7 +6554,7 @@ static bool handle_partition_probe(const process_t *proc, directory_t *queues, g
     /* Build response: same shape as probe + in_response_to + group leader.
      * Leader heuristic: prefer a known peer; fall back to ourselves.
      * Mirrors Python's `_select_partition_leader` simplification path. */
-    const identity_t *self = _partition_self_identity(proc);
+    const identity_t *self = identity_self_identity(proc);
     if (self == NULL) {
         json_decref(payload);
         return true;
@@ -4536,11 +6575,23 @@ static bool handle_partition_probe(const process_t *proc, directory_t *queues, g
         leader_address = proc->protocol.peers[idx].address;
     }
 
-    char resp_canonical[UUID_STRING_LEN * 2 + 64];
-    int rclen = snprintf(resp_canonical, sizeof(resp_canonical),
-                         "%s|%d|%s", our_group_uuid_str, our_group_size,
-                         sender_uuid_str);
-    if (rclen < 0 || (size_t)rclen >= sizeof(resp_canonical)) {
+    pthread_mutex_lock(&id_state.lock);
+    int64_t resp_seq = freshness_stamp(&id_state.freshness, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (resp_seq <= 0) {
+        log_warn(proc->logger,
+                 "Identity: no freshness sequence; not responding to probe\n");
+        json_decref(payload);
+        return true;
+    }
+    char resp_canonical[UUID_STRING_LEN * 2 + 96];
+    /* Two sequences: `sender_seq` echoes the probe round being answered (so a
+     * genuine response cannot be kept and re-presented in a later round), and
+     * `resp_seq` is our own, bounding us to one answer inside this round. */
+    int rclen = identity_partition_canonical_response(
+        our_group_uuid_str, our_group_size, sender_uuid_str, sender_seq,
+        resp_seq, resp_canonical, sizeof(resp_canonical));
+    if (rclen < 0) {
         json_decref(payload);
         return true;
     }
@@ -4571,6 +6622,8 @@ static bool handle_partition_probe(const process_t *proc, directory_t *queues, g
                         json_string(self->address));
     json_object_set_new(resp_json, "in_response_to",
                         json_string(sender_uuid_str));
+    json_object_set_new(resp_json, "in_response_to_seq",
+                        json_integer((json_int_t)sender_seq));
     json_object_set_new(resp_json, "my_group_uuid",
                         json_string(our_group_uuid_str));
     json_object_set_new(resp_json, "my_group_size",
@@ -4579,6 +6632,8 @@ static bool handle_partition_probe(const process_t *proc, directory_t *queues, g
                         json_string(leader_uuid_str));
     json_object_set_new(resp_json, "my_group_leader_address",
                         json_string(leader_address));
+    json_object_set_new(resp_json, "seq",
+                        json_integer((json_int_t)resp_seq));
     json_object_set_new(resp_json, "signature",
                         json_string(resp_sig_hex));
 
@@ -4587,12 +6642,13 @@ static bool handle_partition_probe(const process_t *proc, directory_t *queues, g
     strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
     out.info.net_msg.function = ID_PARTITION_RESPONSE;
     out.info.net_msg.encrypt = false;
-    memcpy(&out.info.net_msg.from_whom, _partition_self_identity(proc),
+    memcpy(&out.info.net_msg.from_whom, identity_self_identity(proc),
            sizeof(public_identity_t));
     net_msg_pack_json(&out.info.net_msg, resp_json);
     json_decref(resp_json);
 
     _partition_broadcast(proc, &out);
+    net_msg_free_obj(&out.info.net_msg);
     log_debug(proc->logger,
               "Identity: partition_response broadcast (to=%s our_group=%s/%d)\n",
               sender_uuid_str, our_group_uuid_str, our_group_size);
@@ -4660,15 +6716,21 @@ static bool handle_partition_response(const process_t *proc, directory_t *queues
     json_t *j_group_size  = json_object_get(payload, "my_group_size");
     json_t *j_leader_addr = json_object_get(payload, "my_group_leader_address");
     json_t *j_signature   = json_object_get(payload, "signature");
+    json_t *j_seq         = json_object_get(payload, "seq");
+    json_t *j_echo_seq    = json_object_get(payload, "in_response_to_seq");
+    /* Unstamped: refused, not accepted as legacy. See handle_partition_probe. */
     if (!json_is_object(j_from_id) || !json_is_string(j_in_resp)
         || !json_is_string(j_group_uuid) || !json_is_integer(j_group_size)
-        || !json_is_string(j_leader_addr) || !json_is_string(j_signature)) {
+        || !json_is_string(j_leader_addr) || !json_is_string(j_signature)
+        || !json_is_integer(j_seq) || !json_is_integer(j_echo_seq)) {
         json_decref(payload);
         return true;
     }
+    int64_t resp_seq = (int64_t)json_integer_value(j_seq);
+    int64_t echo_seq = (int64_t)json_integer_value(j_echo_seq);
 
     /* Filter responses addressed to other peers' probes. */
-    const identity_t *self = _partition_self_identity(proc);
+    const identity_t *self = identity_self_identity(proc);
     if (self == NULL) {
         json_decref(payload);
         return true;
@@ -4677,6 +6739,21 @@ static bool handle_partition_response(const process_t *proc, directory_t *queues
     uuid_unparse_lower(self->uuid, self_uuid_str);
     if (strncmp(json_string_value(j_in_resp), self_uuid_str,
                 UUID_STRING_LEN) != 0) {
+        json_decref(payload);
+        return true;
+    }
+    /* ...and to a probe round we are STILL running. `in_response_to` is only
+     * our uuid, which never changes, so without this a genuine response could
+     * be captured and re-presented to us for the life of the node, each time
+     * driving a request_access toward a group the responder named. */
+    pthread_mutex_lock(&id_state.lock);
+    int64_t current_probe = id_state.probe_seq;
+    pthread_mutex_unlock(&id_state.lock);
+    if (current_probe <= 0 || echo_seq != current_probe) {
+        log_debug(proc->logger,
+                  "Identity: partition_response ignored: answers probe %lld, "
+                  "our current probe is %lld\n",
+                  (long long)echo_seq, (long long)current_probe);
         json_decref(payload);
         return true;
     }
@@ -4691,10 +6768,11 @@ static bool handle_partition_response(const process_t *proc, directory_t *queues
     int their_size = (int)json_integer_value(j_group_size);
     const char *sig_hex = json_string_value(j_signature);
 
-    char canonical[UUID_STRING_LEN * 2 + 64];
-    int clen = snprintf(canonical, sizeof(canonical), "%s|%d|%s",
-                        their_group_uuid, their_size, self_uuid_str);
-    if (clen < 0 || (size_t)clen >= sizeof(canonical)) {
+    char canonical[UUID_STRING_LEN * 2 + 96];
+    int clen = identity_partition_canonical_response(
+        their_group_uuid, their_size, self_uuid_str, echo_seq, resp_seq,
+        canonical, sizeof(canonical));
+    if (clen < 0) {
         json_decref(payload);
         return true;
     }
@@ -4703,6 +6781,25 @@ static bool handle_partition_response(const process_t *proc, directory_t *queues
                               (size_t)clen, sig_hex) != 0) {
         log_debug(proc->logger,
                   "Identity: partition_response: bad signature, dropping\n");
+        json_decref(payload);
+        return true;
+    }
+    /* Freshness per responder, after the signature check. The echoed round
+     * above bounds this to the current probe; this bounds a responder to one
+     * answer within it. */
+    char resp_sender_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(sender_pub.uuid, resp_sender_str);
+    pthread_mutex_lock(&id_state.lock);
+    bool resp_fresh = freshness_accept(&id_state.freshness, resp_sender_str,
+                                       ID_PARTITION_RESPONSE, resp_seq,
+                                       proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!resp_fresh) {
+        probes_counter("peer.set", "partition_response_replay", NULL);
+        log_debug(proc->logger,
+                  "Identity: partition_response from %s refused: seq %lld not "
+                  "above mark (replay)\n", resp_sender_str,
+                  (long long)resp_seq);
         json_decref(payload);
         return true;
     }
@@ -4846,7 +6943,7 @@ json_t *identity_enumerate_local_members(const process_t *proc)
 {
     json_t *by_uuid = json_object();
     if (proc != NULL) {
-        const identity_t *self = _partition_self_identity(proc);
+        const identity_t *self = identity_self_identity(proc);
         if (self != NULL) {
             char su[UUID_STRING_LEN + 1];
             uuid_unparse_lower(self->uuid, su);
@@ -4884,133 +6981,6 @@ static int _roster_member_rank(const process_t *proc, const char *uuid)
     return 0;
 }
 
-#ifdef AT_ZTA_ENABLED
-/* The anchor names OUR OWN credentials verify against. Mirrors Python
- * IdentityProcess._own_zta_anchors.
- *
- * Computed locally rather than read from our identity's zta_anchors, because
- * that field is what a PEER proved to us at admission and we never admit
- * ourselves. This walks our own credentials through the same anchor verifiers.
- *
- * Cached, because the alternative is re-reading every CA bundle off disk on each
- * roster query and the identity loop is single-threaded (see the other
- * handler-side reads in this file).
- *
- * KEYED ON THE IDENTITY, not a bare `computed` flag: the conformance runner hosts
- * every participant in ONE process, so a process-wide cache would answer for
- * whichever node asked first and silently hand its anchors to the others. A
- * production node has exactly one identity and hits the cache every time. */
-static size_t _own_zta_anchors(const process_t *proc, const zta_policy_t *policy,
-                               char out[][ZTA_ANCHOR_NAME_LEN], size_t max)
-{
-    static char cache[ZTA_MAX_ANCHORS][ZTA_ANCHOR_NAME_LEN];
-    static size_t cache_n = 0;
-    static const identity_t *cached_for = NULL;
-    const identity_t *self_key = _partition_self_identity(proc);
-    if (self_key == NULL || cached_for != self_key) {
-        cached_for = self_key;
-        cache_n = 0;
-        const identity_t *self = self_key;
-        if (self != NULL && policy != NULL) {
-            zta_anchor_t anchors[ZTA_POLICY_MAX_ANCHORS];
-            size_t n_anchors = zta_policy_resolved_anchors(policy, anchors,
-                                                           ZTA_POLICY_MAX_ANCHORS);
-            /* Our own credential list, with the singular field as the fallback —
-               the same working set the admission gate builds for a peer. */
-            for (size_t a = 0; a < n_anchors && cache_n < ZTA_MAX_ANCHORS; a++) {
-                zta_verifier_t *v = NULL;
-                if (zta_policy_create_anchor_verifier(policy, &anchors[a], &v) != 0
-                    || v == NULL)
-                    continue;
-                bool hit = false;
-                size_t n = self->num_zta_credentials;
-                for (size_t i = 0; i < n && !hit; i++) {
-                    const zta_credential_t *c = &self->zta_credentials[i];
-                    if (c->der == NULL || c->der_len == 0)
-                        continue;
-                    zta_result_t r;
-                    memset(&r, 0, sizeof(r));
-                    v->verify_credential(v, c->der, c->der_len, &r);
-                    hit = (r.status == ZTA_VERIFIED);
-                }
-                if (!hit && n == 0 && self->zta_credential != NULL
-                    && self->zta_credential_len > 0) {
-                    zta_result_t r;
-                    memset(&r, 0, sizeof(r));
-                    v->verify_credential(v, self->zta_credential,
-                                         self->zta_credential_len, &r);
-                    hit = (r.status == ZTA_VERIFIED);
-                }
-                v->destroy(v);
-                if (hit)
-                    at_strlcpy(cache[cache_n++], anchors[a].name,
-                               ZTA_ANCHOR_NAME_LEN);
-            }
-        }
-    }
-    size_t n_out = cache_n < max ? cache_n : max;
-    for (size_t i = 0; i < n_out; i++)
-        at_strlcpy(out[i], cache[i], ZTA_ANCHOR_NAME_LEN);
-    return n_out;
-}
-
-/* Whether this node may federate through @p uuid. Mirrors Python
- * IdentityProcess._gateway_authorized.
- *
- * The candidate must have PROVED, at admission, an anchor we also hold. That is
- * the derived-authority rule: crossing an agency boundary requires a credential
- * from an agency both sides recognize, and since nothing on the wire declares
- * gatewayhood, deriving the permission from verified credentials is the only form
- * of it a peer cannot simply assert. A candidate we never admitted has no proved
- * anchors and is refused — which is the point, not a side effect.
- *
- * Inert (true) when the policy is not enforcing at admission, or when we hold no
- * anchors ourselves: with nothing to compare against, refusing every candidate
- * would break federation for every non-ZTA deployment rather than protect
- * anything. */
-static bool _gateway_authorized(const process_t *proc, const char *uuid)
-{
-    if (proc == NULL || uuid == NULL || uuid[0] == '\0')
-        return true;
-    data_t *zta_dat = NULL;
-    config_t *zta_cfg = NULL;
-    const zta_policy_t *policy = NULL;
-    char zta_key[] = "zta_policy";
-    if (proc->configs != NULL
-        && map_get(proc->configs, zta_key, &zta_dat) == 0 && zta_dat != NULL
-        && data_object_ptr(zta_dat, (void **)&zta_cfg) == 0
-        && zta_cfg != NULL && zta_cfg->data_struct != NULL)
-        policy = (const zta_policy_t *)zta_cfg->data_struct;
-    if (policy == NULL || !policy->enabled || !policy->require_at_admission)
-        return true;
-
-    char own[ZTA_MAX_ANCHORS][ZTA_ANCHOR_NAME_LEN];
-    size_t n_own = _own_zta_anchors(proc, policy, own, ZTA_MAX_ANCHORS);
-    if (n_own == 0)
-        return true;
-
-    bool ok = false, seen = false;
-    peers_read_lock((process_t *)proc);
-    for (size_t i = 0; i < proc->protocol.num_peers && !ok; i++) {
-        const public_identity_t *peer = &proc->protocol.peers[i];
-        char pu[UUID_STRING_LEN + 1];
-        uuid_unparse_lower((const unsigned char *)peer->uuid, pu);
-        if (strcmp(pu, uuid) != 0)
-            continue;
-        seen = true;
-        for (size_t j = 0; j < peer->num_zta_anchors && !ok; j++)
-            for (size_t k = 0; k < n_own; k++)
-                if (strcmp(peer->zta_anchors[j], own[k]) == 0) { ok = true; break; }
-    }
-    peers_read_unlock((process_t *)proc);
-    if (!ok)
-        log_warn(proc->logger,
-                 "Identity: gateway: refusing to federate through %s (%s)\n",
-                 uuid, seen ? "shares no proved anchor with ours"
-                            : "no proved anchors — never admitted here");
-    return ok;
-}
-#endif /* AT_ZTA_ENABLED */
 
 /* Discover the recursion target for one child group = its highest-rank member
  * (excluding self), ties broken by the lexicographically greater uuid so the
@@ -5037,9 +7007,7 @@ static bool _roster_discover_child_gateway(const process_t *proc,
         const char *u = (const char *)key;
         if (u == NULL || u[0] == '\0') continue;
         if (self_uuid != NULL && strcmp(u, self_uuid) == 0) continue;
-#ifdef AT_ZTA_ENABLED
-        if (!_gateway_authorized(proc, u)) continue;
-#endif
+        if (identity_ext_gateway_refused(proc, u)) continue;
         int rank = _roster_member_rank(proc, u);
         /* key = (rank, uuid); greater wins (uuid tiebreak = strcmp > 0). */
         if (!have || rank > best_rank
@@ -5055,6 +7023,407 @@ static bool _roster_discover_child_gateway(const process_t *proc,
     return have;
 }
 
+/****************************  *
+ * Runtime hierarchy roots (protocol step 7,
+ * doc/architecture/gateway-reputation-tree.md)
+ *
+ * Mirrors Python idprocess._derive_parent_gateway / _hierarchy_claim /
+ * _advertise_hierarchy / handle_hierarchy / handle_hierarchy_request. Two halves: our
+ * own parent is DERIVED (never accepted from a peer), and every node ADVERTISES its own
+ * position so the mesh agrees on the tree. No group key ever moves — a runtime
+ * cross-group join is a separate question. ************************** */
+
+/* This node's own rank, read the same way a peer's is. */
+static int _own_rank(const process_t *proc)
+{
+    const identity_t *self = identity_self_identity(proc);
+    if (self == NULL) return 0;
+    char su[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(self->uuid, su);
+    int r = _roster_member_rank(proc, su);
+    if (r == 0)
+        r = self->rank;
+    return r;
+}
+
+/* The higher-rank node we federate through, or false if we are the root of our
+ * own primary cohort.
+ *
+ * Derived, never accepted from a peer: our parent is our own conclusion, and a
+ * node that could name itself our parent could insert itself into every rollup
+ * we perform. Same rule as _roster_discover_child_gateway with one difference
+ * that matters — a candidate must OUT-RANK us. One level down we pick somebody
+ * else's leader; here we ask who leads us, and the highest-rank member of a
+ * cohort we top is nobody's parent but its own. */
+static bool _derive_parent_gateway(const process_t *proc, char *out)
+{
+    if (proc == NULL || out == NULL) return false;
+    out[0] = '\0';
+    const identity_t *self = identity_self_identity(proc);
+    char self_uuid[UUID_STRING_LEN + 1] = {0};
+    if (self != NULL)
+        uuid_unparse_lower(self->uuid, self_uuid);
+    int own = _own_rank(proc);
+    bool have = false;
+    int best_rank = 0;
+    char best_uuid[UUID_STRING_LEN + 1] = {0};
+    map_key_t key;
+    data_t *value;
+    map_entries_for_each(&((process_t *)proc)->protocol.group.address_map, key, value)
+        (void)value;
+        const char *u = (const char *)key;
+        if (u == NULL || u[0] == '\0') continue;
+        if (self_uuid[0] != '\0' && strcmp(u, self_uuid) == 0) continue;
+        int rank = _roster_member_rank(proc, u);
+        if (rank <= own) continue;
+        if (identity_ext_gateway_refused(proc, u)) continue;
+        if (!have || rank > best_rank
+            || (rank == best_rank && strcmp(u, best_uuid) > 0)) {
+            have = true;
+            best_rank = rank;
+            strncpy(best_uuid, u, UUID_STRING_LEN);
+            best_uuid[UUID_STRING_LEN] = '\0';
+        }
+    map_end_for_each
+    if (have)
+        memcpy(out, best_uuid, UUID_STRING_LEN + 1);
+    return have;
+}
+
+/* This node's own place in the tree, as it goes on the wire: a claim about
+ * ourselves only. Caller owns the returned object. */
+static json_t *_hierarchy_claim(const process_t *proc)
+{
+    const identity_t *self = identity_self_identity(proc);
+    char su[UUID_STRING_LEN + 1] = {0};
+    if (self != NULL)
+        uuid_unparse_lower(self->uuid, su);
+    json_t *children = json_array();
+    if (proc->protocol.child_groups != NULL) {
+        /* Sorted, so the claim is byte-comparable with Python's (which sorts)
+         * and an unchanged claim compares equal across ticks. */
+        array_t *keys = map_keys(proc->protocol.child_groups);
+        size_t n = array_size(keys);
+        const char *sorted[ROSTER_MAX_NODES];
+        size_t n_sorted = 0;
+        for (size_t i = 0; i < n && n_sorted < ROSTER_MAX_NODES; i++) {
+            data_t *kd = NULL;
+            map_key_t k = NULL;
+            if (array_get(keys, (int)i, &kd) != 0
+                || data_string_ptr(kd, &k) != 0 || k == NULL)
+                continue;
+            sorted[n_sorted++] = k;
+        }
+        qsort(sorted, n_sorted, sizeof(sorted[0]), _roster_key_cmp);
+        for (size_t i = 0; i < n_sorted; i++)
+            json_array_append_new(children, json_string(sorted[i]));
+    }
+    return json_pack("{s:s, s:s, s:o, s:i}",
+                     "node", su,
+                     "parent", id_state.parent_gateway,
+                     "children", children,
+                     "rank", _own_rank(proc));
+}
+
+/* State our place in the tree. @p to_whom NULL broadcasts to the group (and is
+ * suppressed when the claim has not changed — echoing a topology broadcast is
+ * how it becomes a flood); non-NULL answers one asker. */
+static void _advertise_hierarchy(const process_t *proc, const public_identity_t *to_whom)
+{
+    if (proc == NULL) return;
+    json_t *claim = _hierarchy_claim(proc);
+    if (claim == NULL) return;
+    char *rendered = json_dumps(claim, JSON_COMPACT | JSON_SORT_KEYS);
+    json_decref(claim);
+    if (rendered == NULL) return;
+    if (to_whom == NULL
+        && strncmp(rendered, id_state.last_hierarchy_claim,
+                   sizeof(id_state.last_hierarchy_claim)) == 0) {
+        free(rendered);
+        return;   /* unchanged; a re-broadcast tells nobody anything */
+    }
+    generic_msg_t msg = {0};
+    msg.type = NET_MESSAGE;
+    strncpy(msg.info.net_msg.process, "identity", PROC_NAME_LEN);
+    msg.info.net_msg.function = ID_HIERARCHY;
+    msg.info.net_msg.encrypt = true;
+    json_error_t jerr;
+    json_t *payload = json_loads(rendered, 0, &jerr);
+    if (payload != NULL) {
+        /* Stamped onto the OUTGOING payload, not into the claim compared
+         * above: the claim doubles as the unchanged-since-last test, and a
+         * claim carrying a fresh sequence every time would never compare
+         * equal, turning the suppression off and the advertisement into the
+         * flood this function exists to avoid. */
+        pthread_mutex_lock(&id_state.lock);
+        int64_t hier_seq = freshness_stamp(&id_state.freshness, proc->logger);
+        pthread_mutex_unlock(&id_state.lock);
+        if (hier_seq <= 0) {
+            json_decref(payload);
+            free(rendered);
+            return;
+        }
+        json_object_set_new(payload, "seq",
+                            json_integer((json_int_t)hier_seq));
+        net_msg_pack_json(&msg.info.net_msg, payload);
+        json_decref(payload);
+        if (to_whom != NULL) {
+            memcpy(&msg.info.net_msg.to_whom, to_whom, sizeof(public_identity_t));
+            /* Bare on purpose (re-advertised on the hierarchy refresh): ISSUES §2.40. */
+            messaging_send("network", NET_MESSAGE, &msg, false);
+        } else {
+            peers_read_lock(proc);
+            for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+                generic_msg_t per = msg;
+                memcpy(&per.info.net_msg.to_whom, &proc->protocol.peers[i],
+                       sizeof(public_identity_t));
+                /* Bare on purpose (re-advertised on the hierarchy refresh): ISSUES §2.40. */
+                messaging_send("network", NET_MESSAGE, &per, false);
+            }
+            peers_read_unlock(proc);
+            snprintf(id_state.last_hierarchy_claim,
+                     sizeof(id_state.last_hierarchy_claim), "%s", rendered);
+        }
+        /* `per` copies share msg's obj; free once after the last send */
+        net_msg_free_obj(&msg.info.net_msg);
+    }
+    free(rendered);
+}
+
+/* Re-derive our parent and advertise if our position moved. Cheap and
+ * idempotent, so every input change can call it. */
+void identity_refresh_hierarchy(const process_t *proc)
+{
+    if (proc == NULL) return;
+    char parent[UUID_STRING_LEN + 1] = {0};
+    _derive_parent_gateway(proc, parent);
+    if (strncmp(parent, id_state.parent_gateway,
+                sizeof(id_state.parent_gateway)) != 0) {
+        snprintf(id_state.parent_gateway, sizeof(id_state.parent_gateway),
+                 "%s", parent);
+        log_info(proc->logger, "Identity: parent gateway is %s\n",
+                 parent[0] ? parent : "none (we are root)");
+    }
+    _advertise_hierarchy(proc, NULL);
+}
+
+/* Record a peer's claim about its own place in the tree.
+ *
+ * Gated on proved gateway authority: the recorded value is what a roster query
+ * recurses into, so a peer that could install itself there would receive
+ * queries for a cohort it has no standing in. The claim is about the SENDER
+ * only — one naming somebody else is refused rather than quietly recorded. */
+static bool handle_hierarchy(const process_t *proc, directory_t *queues,
+                             generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (nmsg->function == NULL || strcmp(nmsg->function, ID_HIERARCHY) != 0)
+        return false;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    char sender[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(nmsg->from_whom.uuid, sender);
+    const char *claimed = json_string_value(json_object_get(payload, "node"));
+    if (claimed != NULL && claimed[0] != '\0'
+        && strcmp(claimed, sender) != 0) {
+        log_warn(proc->logger,
+                 "Identity: hierarchy claim from %s names %s; refused\n",
+                 sender, claimed);
+        json_decref(payload);
+        return true;
+    }
+    if (identity_ext_gateway_refused(proc, sender)) {
+        log_debug(proc->logger,
+                  "Identity: hierarchy claim from %s not recorded: no proved "
+                  "shared anchor\n", sender);
+        json_decref(payload);
+        return true;
+    }
+    /* Freshness per claimant. The record below is last-writer-wins with no
+     * epoch of its own, so an unstamped claim was replayable to roll the
+     * recorded topology BACK to a superseded one -- and this map is what the
+     * child-gateway walk recurses into. Unstamped is refused, not accepted as
+     * legacy (doc/architecture/reputation.md, "Quorum attestation"). */
+    json_t *j_hier_seq = json_object_get(payload, "seq");
+    int64_t hier_seq = json_is_integer(j_hier_seq)
+        ? (int64_t)json_integer_value(j_hier_seq) : 0;
+    pthread_mutex_lock(&id_state.lock);
+    bool hier_fresh = freshness_accept(&id_state.freshness, sender,
+                                       ID_HIERARCHY, hier_seq, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!hier_fresh) {
+        log_debug(proc->logger,
+                  "Identity: hierarchy claim from %s refused: sequence %lld "
+                  "not above mark (replay or unstamped)\n", sender,
+                  (long long)hier_seq);
+        json_decref(payload);
+        return true;
+    }
+    if (id_state.peer_hierarchy.items == NULL)
+        map_init(&id_state.peer_hierarchy);
+    /* Store the claim verbatim (as rendered JSON) so the reader stays one
+     * parse away from whatever the sender said, and nothing is re-derived. */
+    char *rendered = json_dumps(payload, JSON_COMPACT | JSON_SORT_KEYS);
+    if (rendered != NULL) {
+        map_set(&id_state.peer_hierarchy, (map_key_t)sender,
+                string_data((string_t)rendered, strlen(rendered)));
+        free(rendered);
+    }
+    json_decref(payload);
+    return true;
+}
+
+/* Answer a hierarchy query with our own claim, addressed to the asker. The
+ * query exists so a late joiner converges at once. */
+static bool handle_hierarchy_request(const process_t *proc, directory_t *queues,
+                                     generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (nmsg->function == NULL
+        || strcmp(nmsg->function, ID_HIERARCHY_QUERY) != 0)
+        return false;
+    _advertise_hierarchy(proc, &nmsg->from_whom);
+    return true;
+}
+
+/* Read back what we RECORDED from a peer's hierarchy claim (protocol step 7).
+ *
+ * Exists for the conformance adapter: the recording is gated on proved gateway
+ * authority, on the claim naming its own sender, and on a freshness sequence
+ * above the mark, and not one of those refusals is visible in the traffic the
+ * node emits. Without a reader for this store a scenario could only assert
+ * that an answer was sent, never that it was believed. Mirrors the Python
+ * twin's `peer_hierarchy` dict, which the Python adapter reads directly.
+ *
+ * @return false when nothing is recorded for @p peer_uuid — which is the
+ *         observable a refusal produces, so the caller must be able to tell it
+ *         apart from a record holding zeros. */
+bool identity_get_peer_hierarchy(const char *peer_uuid, int *rank_out,
+                                 int *n_children_out)
+{
+    if (rank_out != NULL) *rank_out = 0;
+    if (n_children_out != NULL) *n_children_out = 0;
+    if (peer_uuid == NULL || id_state.peer_hierarchy.items == NULL)
+        return false;
+    data_t *vd = NULL;
+    string_t rendered = NULL;
+    if (map_get(&id_state.peer_hierarchy, (map_key_t)peer_uuid, &vd) != 0
+        || vd == NULL || data_string_ptr(vd, &rendered) != 0
+        || rendered == NULL)
+        return false;
+    json_error_t jerr;
+    json_t *claim = json_loads(rendered, 0, &jerr);
+    if (claim == NULL)
+        return false;
+    if (rank_out != NULL)
+        *rank_out = (int)json_integer_value(json_object_get(claim, "rank"));
+    if (n_children_out != NULL)
+    {
+        json_t *children = json_object_get(claim, "children");
+        *n_children_out = json_is_array(children)
+                              ? (int)json_array_size(children) : 0;
+    }
+    json_decref(claim);
+    return true;
+}
+
+/* Ask the group to state their positions (once). */
+void identity_request_hierarchy(const process_t *proc)
+{
+    if (proc == NULL || id_state.hierarchy_requested) return;
+    id_state.hierarchy_requested = true;
+    const identity_t *self = identity_self_identity(proc);
+    char su[UUID_STRING_LEN + 1] = {0};
+    if (self != NULL)
+        uuid_unparse_lower(self->uuid, su);
+    json_t *payload = json_pack("{s:s}", "requestor", su);
+    if (payload == NULL) return;
+    generic_msg_t msg = {0};
+    msg.type = NET_MESSAGE;
+    strncpy(msg.info.net_msg.process, "identity", PROC_NAME_LEN);
+    msg.info.net_msg.function = ID_HIERARCHY_QUERY;
+    msg.info.net_msg.encrypt = true;
+    net_msg_pack_json(&msg.info.net_msg, payload);
+    json_decref(payload);
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+        generic_msg_t per = msg;
+        memcpy(&per.info.net_msg.to_whom, &proc->protocol.peers[i],
+               sizeof(public_identity_t));
+        /* Bare on purpose (re-requested on the hierarchy refresh): ISSUES §2.40. */
+        messaging_send("network", NET_MESSAGE, &per, false);
+    }
+    peers_read_unlock(proc);
+    /* `per` copies share msg's obj; free once after the last send */
+    net_msg_free_obj(&msg.info.net_msg);
+}
+
+/* The peer that has ADVERTISED it gateways @p cg_uuid, or false.
+ *
+ * Direct evidence beats inference: a node saying "I gateway cohort X" outranks
+ * "it is the highest-rank member of X". Ties break by the same
+ * rank-then-greater-uuid rule discovery uses, so the choice is deterministic
+ * and identical in Python. */
+static bool _advertised_child_gateway(const process_t *proc,
+                                      const char *cg_uuid, char *out)
+{
+    if (proc == NULL || cg_uuid == NULL || out == NULL) return false;
+    out[0] = '\0';
+    if (id_state.peer_hierarchy.items == NULL) return false;
+    const identity_t *self = identity_self_identity(proc);
+    char self_uuid[UUID_STRING_LEN + 1] = {0};
+    if (self != NULL)
+        uuid_unparse_lower(self->uuid, self_uuid);
+    bool have = false;
+    int best_rank = 0;
+    char best_uuid[UUID_STRING_LEN + 1] = {0};
+    array_t *keys = map_keys(&id_state.peer_hierarchy);
+    size_t n = array_size(keys);
+    for (size_t i = 0; i < n; i++) {
+        data_t *kd = NULL;
+        map_key_t k = NULL;
+        if (array_get(keys, (int)i, &kd) != 0
+            || data_string_ptr(kd, &k) != 0 || k == NULL)
+            continue;
+        if (self_uuid[0] != '\0' && strcmp(k, self_uuid) == 0) continue;
+        data_t *vd = NULL;
+        string_t rendered = NULL;
+        if (map_get(&id_state.peer_hierarchy, k, &vd) != 0 || vd == NULL
+            || data_string_ptr(vd, &rendered) != 0 || rendered == NULL)
+            continue;
+        json_error_t jerr;
+        json_t *claim = json_loads(rendered, 0, &jerr);
+        if (claim == NULL) continue;
+        bool claims_it = false;
+        json_t *children = json_object_get(claim, "children");
+        if (json_is_array(children)) {
+            size_t ci;
+            json_t *cv;
+            json_array_foreach(children, ci, cv) {
+                const char *c = json_string_value(cv);
+                if (c != NULL && strcmp(c, cg_uuid) == 0)
+                    claims_it = true;
+            }
+        }
+        json_decref(claim);
+        if (!claims_it) continue;
+        int rank = _roster_member_rank(proc, k);
+        if (!have || rank > best_rank
+            || (rank == best_rank && strcmp(k, best_uuid) > 0)) {
+            have = true;
+            best_rank = rank;
+            strncpy(best_uuid, k, UUID_STRING_LEN);
+            best_uuid[UUID_STRING_LEN] = '\0';
+        }
+    }
+    if (have)
+        memcpy(out, best_uuid, UUID_STRING_LEN + 1);
+    return have;
+}
+
 /* The child gateways a full-subtree roster recurses into (deduped,
  * order-stable) as a NEW json array of node-uuid strings — one per gatewayed
  * child group, DISCOVERED by rank (highest-rank member excluding self), with an
@@ -5065,7 +7434,7 @@ static json_t *_roster_child_gateway_array(const process_t *proc)
 {
     json_t *arr = json_array();
     if (proc == NULL || proc->protocol.child_groups == NULL) return arr;
-    const identity_t *self = _partition_self_identity(proc);
+    const identity_t *self = identity_self_identity(proc);
     char self_uuid[UUID_STRING_LEN + 1] = {0};
     if (self != NULL) uuid_unparse_lower(self->uuid, self_uuid);
     const char *self_p = self != NULL ? self_uuid : NULL;
@@ -5082,7 +7451,14 @@ static json_t *_roster_child_gateway_array(const process_t *proc)
         string_t ov_s = NULL;
         if (ov != NULL && data_string_ptr(ov, &ov_s) == 0
             && ov_s != NULL && ov_s[0] != '\0') {
-            gw_p = ov_s;  /* explicit override */
+            gw_p = ov_s;  /* explicit override (tests / pinned topologies) */
+        } else if (_advertised_child_gateway(proc, cg_uuid, gw)) {
+            /* The peer's OWN claim to gateway this cohort (protocol step 7).
+             * Direct evidence beats inference: "I gateway X" outranks "it is
+             * the highest-rank member of X". Only claims from peers that proved
+             * a shared anchor are ever recorded, so this cannot inject a
+             * recursion target. */
+            gw_p = gw;
         } else {
             group_t *cg = NULL;
             if (data_object_ptr(value, (ptr_t *)&cg) == 0 && cg != NULL
@@ -5172,7 +7548,8 @@ bool handle_roster_request(const process_t *proc, directory_t *queues,
     strncpy(reply.info.net_msg.return_to, "identity", PROC_NAME_LEN);
     net_msg_pack_json(&reply.info.net_msg, out);
     json_decref(out);
-    messaging_send("network", NET_MESSAGE, &reply, false);
+    (void)identity_send_to_network(proc, &reply, "a roster reply", NULL);
+    net_msg_free_obj(&reply.info.net_msg);
     return true;
 }
 
@@ -5205,22 +7582,25 @@ static double _attest_now(const process_t *proc)
 static int _own_public_identity(const process_t *proc, public_identity_t *out)
 {
     if (proc == NULL || out == NULL) return -1;
-    data_t *id_dat = NULL;
-    char id_key[] = "identity";
-    if (map_get(proc->configs, id_key, &id_dat) != 0 || id_dat == NULL)
-        return -1;
-    config_t *id_cfg = NULL;
-    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0
-        || id_cfg == NULL || id_cfg->data_struct == NULL)
+    const identity_t *self = identity_self_identity(proc);
+    if (self == NULL)
         return -1;
     public_identity_t *pub = NULL;
-    if (identity_publish((const identity_t *)id_cfg->data_struct, &pub) != 0
-        || pub == NULL)
+    if (identity_publish(self, &pub) != 0 || pub == NULL)
         return -1;
     memcpy(out, pub, sizeof(public_identity_t));
     smrt_deref(pub);
     return 0;
 }
+
+/* Public wrapper over _own_public_identity, for the sibling translation units
+ * that need this node's own published identity (first_contact/first_contact.c has to
+ * check that an invitation was minted by US). Declared in id_proc_priv.h. */
+int identity_own_public_identity(const process_t *proc, public_identity_t *out)
+{
+    return _own_public_identity(proc, out);
+}
+
 
 /* This node's attested-now answer as a NEW json object (caller owns): the same
  * attestation shape the admission path carries — so the receiver re-verifies a
@@ -5232,7 +7612,97 @@ static int _own_public_identity(const process_t *proc, public_identity_t *out)
  *
  * Shared by handle_attest_request (the wire path) and the conformance adapter,
  * so both see identical content — mirroring identity_roster_response. */
-json_t *identity_attest_response(const process_t *proc, const char *nonce)
+/* --- Cohort clock skew (doc/architecture/cohort-clock-skew.md) -------------- *
+ * Measurement only, mirroring Python's IdentityProcess._record_clock_sample.
+ * Nothing here steers a clock and no offset is applied to our own time.       */
+
+/* Release the heap sample a stored data_t WRAPS, and only that.
+ *
+ * object_ptr_data wraps a pointer the map knows nothing about, so the sample
+ * is ours to free; the data_t around it belongs to the map, which adopted our
+ * reference at map_set (structures/map.h) and releases it in map_free and when
+ * an insert displaces it. Deref'ing here as well is a double free. */
+static void _free_clock_sample_obj(data_t *dat)
+{
+    if (dat == NULL)
+        return;
+    ptr_t obj = NULL;
+    if (data_object_ptr(dat, &obj) == 0 && obj != NULL)
+        free(obj);
+}
+
+static void _free_clock_samples_locked(void)
+{
+    map_key_t key = NULL;
+    data_t *value = NULL;
+    map_entries_for_each(&id_state.peer_clock_samples, key, value)
+        _free_clock_sample_obj(value);
+    map_end_for_each
+    /* map_free releases the data_t of every entry; the loop above released
+     * what those wrapped. */
+    map_free(&id_state.peer_clock_samples);
+    map_init(&id_state.peer_clock_samples);
+}
+
+/* Keep the NEWEST sample for one peer, releasing the one it replaces.
+ * Unlike peer_caps_map (whose values change rarely), a sample is replaced on
+ * every attest pull, so an unfreed predecessor would grow without bound in a
+ * long-running node. */
+static void _store_clock_sample(const char *uuid_str,
+                                const at_clock_sample_t *sample)
+{
+    if (uuid_str == NULL || sample == NULL || !sample->valid)
+        return;
+    at_clock_sample_t *heap = calloc(1, sizeof(*heap));
+    if (heap == NULL)
+        return;
+    *heap = *sample;
+    data_t *dat = object_ptr_data(heap, sizeof(*heap));
+    if (dat == NULL)
+    {
+        free(heap);
+        return;
+    }
+    pthread_mutex_lock(&id_state.lock);
+    data_t *old = NULL;
+    if (map_get(&id_state.peer_clock_samples, (map_key_t)uuid_str, &old) == 0)
+        _free_clock_sample_obj(old);
+    /* map_set derefs the data_t it displaces; the line above freed the sample
+     * that one wrapped, which the map does not own. */
+    map_set(&id_state.peer_clock_samples, (map_key_t)uuid_str, dat);
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+double identity_attest_clock(const process_t *proc)
+{
+    return _attest_now(proc);
+}
+
+bool identity_get_peer_clock_sample(const char *uuid_str,
+                                    at_clock_sample_t *out)
+{
+    if (uuid_str == NULL || out == NULL)
+        return false;
+    _ensure_id_init();
+    bool found = false;
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    if (map_get(&id_state.peer_clock_samples, (map_key_t)uuid_str, &dat) == 0
+        && dat != NULL)
+    {
+        ptr_t obj = NULL;
+        if (data_object_ptr(dat, &obj) == 0 && obj != NULL)
+        {
+            *out = *(at_clock_sample_t *)obj;
+            found = true;
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return found;
+}
+
+json_t *identity_attest_response(const process_t *proc, const char *nonce,
+                                 double received_at)
 {
     if (proc == NULL) return NULL;
     public_identity_t self;
@@ -5247,6 +7717,15 @@ json_t *identity_attest_response(const process_t *proc, const char *nonce)
     json_object_set_new(out, "operator_attested_at", json_real(attested));
     if (nonce != NULL)
         json_object_set_new(out, "nonce", json_string(nonce));
+    /* Our two clock readings for this exchange: when we took the pull in, and
+     * when we are answering it. Two readings rather than one because their
+     * difference is OUR processing time, which the puller subtracts so a slow
+     * responder is not reported as a skewed one. C answers inline so the gap is
+     * near zero; Python's defers to its main loop and is routinely
+     * milliseconds. Purely observational. */
+    if (received_at > 0.0)
+        json_object_set_new(out, "clock_recv_at", json_real(received_at));
+    json_object_set_new(out, "clock_sent_at", json_real(_attest_now(proc)));
     return out;
 }
 
@@ -5263,6 +7742,9 @@ bool handle_attest_request(const process_t *proc, directory_t *queues,
     (void)queues;
     if (proc == NULL || msg == NULL) return true;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* Taken before any parsing: this is the round trip's t2, and work done
+     * here would otherwise be charged to the network path. */
+    double received_at = _attest_now(proc);
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
@@ -5273,7 +7755,7 @@ bool handle_attest_request(const process_t *proc, directory_t *queues,
         return true;
     }
 
-    json_t *out = identity_attest_response(proc, nonce);
+    json_t *out = identity_attest_response(proc, nonce, received_at);
     json_decref(payload);
     if (out == NULL) return true;
 
@@ -5289,7 +7771,8 @@ bool handle_attest_request(const process_t *proc, directory_t *queues,
     strncpy(reply.info.net_msg.return_to, "identity", PROC_NAME_LEN);
     net_msg_pack_json(&reply.info.net_msg, out);
     json_decref(out);
-    messaging_send("network", NET_MESSAGE, &reply, false);
+    (void)identity_send_to_network(proc, &reply, "an attestation reply", NULL);
+    net_msg_free_obj(&reply.info.net_msg);
     return true;
 }
 
@@ -5318,6 +7801,12 @@ int identity_request_attestation(process_t *proc, const public_identity_t *peer,
     if (dat == NULL) return -1;
     if (map_set(&id_state.attest_sent, nonce, dat) != 0)
         return -1;
+    /* t1 of the round trip, kept locally alongside the pull. A failure to
+     * record it costs the clock sample, not the attestation, so it is not
+     * treated as an error. */
+    data_t *tx_dat = floating_pt_dbl_data(_attest_now(proc));
+    if (tx_dat != NULL)
+        (void)map_set(&id_state.attest_sent_clock, nonce, tx_dat);
 
     json_t *body = json_object();
     if (body == NULL) return -1;
@@ -5333,7 +7822,8 @@ int identity_request_attestation(process_t *proc, const public_identity_t *peer,
     strncpy(req.info.net_msg.return_to, "identity", PROC_NAME_LEN);
     net_msg_pack_json(&req.info.net_msg, body);
     json_decref(body);
-    messaging_send("network", NET_MESSAGE, &req, false);
+    (void)identity_send_to_network(proc, &req, "an attestation request", NULL);
+    net_msg_free_obj(&req.info.net_msg);
 
     if (out_nonce != NULL && nonce_len > 0) {
         strncpy(out_nonce, nonce, nonce_len - 1);
@@ -5375,6 +7865,8 @@ bool handle_attest_response(process_t *proc, directory_t *queues,
     if (proc == NULL || msg == NULL) return true;
     _ensure_id_init();
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* t4, before any parsing -- see handle_attest_request for why. */
+    double recv_epoch = _attest_now(proc);
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
@@ -5399,6 +7891,15 @@ bool handle_attest_response(process_t *proc, directory_t *queues,
         strncpy(expected, expect_uuid, UUID_STR_LEN);
     map_remove(&id_state.attest_sent, (map_key_t)nonce);
 
+    /* t1 for this pull, retired with it. Absent (an older pull, or a failed
+     * record) simply means no clock sample from this exchange. */
+    double sent_epoch = 0.0;
+    data_t *tx_dat = NULL;
+    if (map_get(&id_state.attest_sent_clock, (map_key_t)nonce, &tx_dat) == 0
+        && tx_dat != NULL)
+        (void)data_floating_pt_dbl(tx_dat, &sent_epoch);
+    map_remove(&id_state.attest_sent_clock, (map_key_t)nonce);
+
     char responder[UUID_STR_LEN + 1] = {0};
     uuid_unparse_lower(nmsg->from_whom.uuid, responder);
     if (expected[0] != '\0' && strcmp(expected, responder) != 0) {
@@ -5413,20 +7914,7 @@ bool handle_attest_response(process_t *proc, directory_t *queues,
     memset(&scratch, 0, sizeof(scratch));
     _apply_operator_attestation_json(payload, &scratch);
     bool verified = false;
-#ifdef AT_ZTA_ENABLED
-    {
-        zta_policy_t *zta_policy = NULL;
-        data_t *zta_dat = NULL;
-        char zta_key[] = "zta_policy";
-        if (map_get(proc->configs, zta_key, &zta_dat) == 0 && zta_dat != NULL)
-            data_object_ptr(zta_dat, (void **)&zta_policy);
-        if (zta_policy != NULL)
-            verified = _is_operator_credential(zta_policy,
-                                               scratch.zta_credential,
-                                               scratch.zta_credential_len,
-                                               scratch.zta_credential_hash);
-    }
-#endif
+    verified = identity_ext_operator_credential(proc, &scratch);
 
     /* (3) the stamp must be plausible against our clock. */
     double claimed = json_real_value(json_object_get(payload,
@@ -5436,6 +7924,43 @@ bool handle_attest_response(process_t *proc, directory_t *queues,
     if (delta < 0.0) delta = -delta;
     bool in_window = (claimed > 0.0) && (delta <= ATTEST_WINDOW_SEC);
     double attested = (verified && in_window) ? claimed : 0.0;
+
+    /* Cohort clock skew, measured from this same round trip. ADVISORY ALWAYS:
+     * a peer beyond the bound is logged and recorded, never refused, and the
+     * offset is never applied to anything. A peer that omits the readings (an
+     * older build) yields no sample -- absence is not an error. */
+    json_t *j_peer_recv = json_object_get(payload, "clock_recv_at");
+    json_t *j_peer_sent = json_object_get(payload, "clock_sent_at");
+    if (sent_epoch > 0.0 && json_is_number(j_peer_recv)
+        && json_is_number(j_peer_sent))
+    {
+        at_clock_sample_t sample = at_clock_sample_from_round_trip(
+            sent_epoch, json_number_value(j_peer_recv),
+            json_number_value(j_peer_sent), recv_epoch);
+        if (sample.valid)
+        {
+            _store_clock_sample(responder, &sample);
+            char sdesc[160];
+            at_clock_sample_describe(&sample, responder, sdesc, sizeof(sdesc));
+            bool from_env = false;
+            long bound_ms = at_clock_max_cohort_skew_ms(proc->logger, &from_env);
+            if (!sample.usable)
+                /* The peer's two readings span more than the whole round trip:
+                 * a stepped clock or a dishonest responder. Worth saying. */
+                log_warn(proc->logger,
+                         "Identity: clock sample from %s is impossible: %s\n",
+                         responder, sdesc);
+            else if (at_clock_sample_exceeds(&sample, bound_ms))
+                log_warn(proc->logger,
+                         "Identity: clock skew beyond bound: %s (bound %.3fs "
+                         "from %s) [advisory: timestamps from this peer are not "
+                         "comparable with ours]\n",
+                         sdesc, (double)bound_ms / 1000.0,
+                         from_env ? "env" : "default");
+            else
+                log_debug(proc->logger, "Identity: clock sample: %s\n", sdesc);
+        }
+    }
 
     /* Write the verified result onto the stored peer, so a consumer reading
      * the local peer mirror sees a LIVE value instead of the stamp captured
@@ -5533,6 +8058,73 @@ int identity_aggregate_subtree_roster(const char *top_uuid,
     return 0;
 }
 
+/* Ask a cohort we are NOT in to admit us, so a gateway can acquire a child
+ * cohort at runtime instead of from a seeded key file
+ * (doc/architecture/gateway-reputation-tree.md).
+ *
+ * The COHORT decides (user's call, 2026-08-13): this sends the ordinary
+ * request_access, its members run the ordinary welcoming-committee vote, and an
+ * admitting member delivers the group over the ordinary full_history.
+ * Membership authority stays where it belongs, and no node can talk its way
+ * into a cohort past a quorum that does not want it.
+ *
+ * What is recorded here is only that WE solicited it. Without that, the
+ * arriving group would meet handle_group_update's different-uuid branch, which
+ * treats a second group as a partition to CONVERGE and would replace our
+ * primary group with the cohort we just joined — exactly backwards for a
+ * gateway. See id_state.pending_joins. Mirrors Python request_cohort_join. */
+/* Frama-C: skipped — [solver-timeout] map/messaging preconditions */
+int identity_request_cohort_join(process_t *proc, directory_t *queues,
+                                 const char *group_uuid)
+{
+    if (proc == NULL || queues == NULL || group_uuid == NULL
+        || group_uuid[0] == '\0')
+        return -1;
+    _ensure_id_init();
+
+    char own[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(proc->protocol.group.uuid, own);
+    if (strcmp(group_uuid, own) == 0)
+        return -1;   /* already our primary group */
+    if (proc->protocol.child_groups != NULL) {
+        data_t *existing = NULL;
+        if (map_get(proc->protocol.child_groups, (map_key_t)group_uuid,
+                    &existing) == 0 && existing != NULL)
+            return -1;   /* already gatewaying it */
+    }
+
+    pthread_mutex_lock(&id_state.lock);
+    map_set(&id_state.pending_joins, (map_key_t)group_uuid,
+            string_data((string_t)group_uuid, strlen(group_uuid) + 1));
+    pthread_mutex_unlock(&id_state.lock);
+
+    int rc = _announce_identity_for(proc, queues, group_uuid);
+    if (rc != 0) {
+        pthread_mutex_lock(&id_state.lock);
+        map_remove(&id_state.pending_joins, (map_key_t)group_uuid);
+        pthread_mutex_unlock(&id_state.lock);
+        return rc;
+    }
+    log_info(proc->logger, "Identity: requested membership in cohort %s\n",
+             group_uuid);
+    return 0;
+}
+
+/* Whether we are still waiting to be admitted to @p group_uuid. Assertion
+ * surface for the conformance/unit tests, which cannot see id_state. */
+bool identity_join_pending(const char *group_uuid)
+{
+    if (group_uuid == NULL || group_uuid[0] == '\0')
+        return false;
+    _ensure_id_init();
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    bool found = (map_get(&id_state.pending_joins, (map_key_t)group_uuid,
+                          &dat) == 0 && dat != NULL);
+    pthread_mutex_unlock(&id_state.lock);
+    return found;
+}
+
 /* Seed a child cohort this node gateways (the C twin of Python's child_groups
  * seeding). `gateway_uuid` names the deeper gateway node to recurse into for
  * that child group (may be NULL for a 2-level gateway). Test/harness surface;
@@ -5559,6 +8151,53 @@ int identity_add_child_group(process_t *proc, group_t *group,
             || map_set(proc->protocol.child_gateways, cg_uuid, gwd) != 0)
             return -1;
     }
+    return 0;
+}
+
+int identity_propagate_child_groups(const process_t *proc, directory_t *queues)
+{
+    /* Fan the child-group set out to the sibling processes, one CHILD_GROUP
+     * message per cohort. The C twin of Python's _record_child_groups, and
+     * needed for the same reason: the REPUTATION process keeps a separate
+     * transaction chain per child group, and it cannot do that if only the
+     * identity process knows the groups exist
+     * (doc/architecture/gateway-reputation-tree.md).
+     *
+     * One message per group rather than a set, because generic_msg_t's union
+     * carries one group_t; the receiver accumulates them into its own map, so
+     * the effect matches Python's whole-set delivery.
+     *
+     * No-op on a leaf: child_groups is NULL/empty and no IPC is sent. */
+    if (proc == NULL || queues == NULL || proc->protocol.child_groups == NULL)
+        return 0;
+    int sent = 0;
+    map_key_t key = NULL;
+    data_t *val = NULL;
+    map_entries_for_each(proc->protocol.child_groups, key, val)
+    {
+        void *gp = NULL;
+        if (data_object_ptr(val, &gp) != 0 || gp == NULL)
+            continue;
+        generic_msg_t msg = {0};
+        msg.type = CHILD_GROUP;
+        memcpy(&msg.info.group, gp, sizeof(group_t));
+        _remember_activity(proc, queues, &msg);
+        sent++;
+    }
+    map_end_for_each
+    return sent;
+}
+
+int identity_get_parent_gateway(const process_t *proc, char *out, size_t cap)
+{
+    if (out == NULL || cap == 0) return -1;
+    out[0] = '\0';
+    /* Derive on demand rather than reporting a cached value: the conformance
+     * harness installs ranks and then asks, with no run loop to tick. */
+    char parent[UUID_STRING_LEN + 1] = {0};
+    if (proc != NULL)
+        _derive_parent_gateway(proc, parent);
+    snprintf(out, cap, "%s", parent);
     return 0;
 }
 
@@ -5660,7 +8299,14 @@ int identity_emit_peer_observed(const process_t *proc,
     if (peer->operator_bound)
         memcpy(msg.info.peer_observed.operator_pubkey, peer->operator_pubkey,
                crypto_sign_PUBLICKEYBYTES);
-    return messaging_send(AT_MAIN_QUEUE, PEER_OBSERVED, &msg, false);
+    /* Group co-membership and our block, both a feature's to answer
+     * (identity/id_ext.h); false without one. */
+    msg.info.peer_observed.in_group = identity_ext_peer_in_group(proc, pu);
+    msg.info.peer_observed.blocked = identity_ext_peer_blocked(pu);
+    /* One try, then kept for the tick (ISSUES §2.14): a roster replay is one
+     * of these per peer, so no 200 ms each. */
+    return at_send(proc, AT_MAIN_QUEUE, &msg, "a peer observation", "the app",
+                   AT_SEND_NOW, NULL, NULL, 0);
 }
 
 
@@ -5680,9 +8326,27 @@ int identity_emit_all_peers(const process_t *proc)
     peers_read_unlock(proc);
 
     int emitted = 0;
-    for (size_t i = 0; i < n; i++)
-        if (identity_emit_peer_observed(proc, &snapshot[i]) == 0)
+    char refused[256] = {0};
+    size_t rlen = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (identity_emit_peer_observed(proc, &snapshot[i]) == 0) {
             emitted++;
+        } else if (rlen < sizeof(refused) - 1) {
+            int w = snprintf(refused + rlen, sizeof(refused) - rlen, "%s%s",
+                             rlen ? ", " : "", snapshot[i].nickname);
+            if (w > 0)
+                rlen += (size_t)w;
+        }
+    }
+    /* Said out loud: the app's view of who is here is built from these, and
+     * a replay refused by a full supervisor queue is otherwise silent. The
+     * order is fixed, so the same tail peer can lose every time (a suspect in
+     * partition cohort part-3486847, 2026-09-29, where one founder's app never
+     * saw all four others in 120 s of asking). */
+    if ((size_t)emitted < n)
+        log_warn(proc->logger,
+                 "Identity: peer roster replay reached the app for %d of %zu "
+                 "peer(s); refused: %s\n", emitted, n, refused);
     return emitted;
 }
 
@@ -5692,10 +8356,14 @@ static bool handle_peer_roster_request(const process_t *proc,
                                        directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
-    (void)msg;
+    /* The local app's verb only, never a peer's (ISSUES §2.17). */
+    if (!identity_is_local_app_verb(proc, &msg->info.net_msg))
+        return identity_refuse_remote_app_verb(proc, &msg->info.net_msg, ID_APP_ROSTER);
     int n = identity_emit_all_peers(proc);
-    log_debug(proc->logger,
-              "Identity: peer roster request -> %d observation(s)\n", n);
+    /* A feature replays its own view and may log the request itself. */
+    if (!identity_ext_roster_replay(proc, n))
+        log_debug(proc->logger,
+                  "Identity: peer roster request -> %d observation(s)\n", n);
     return true;
 }
 
@@ -5789,9 +8457,9 @@ int identity_register_handlers(process_t *proc)
     /* Default to border-guard (mirrors Python IdentityProcess.border_guard_mode
      * = True). A deployment/harness may clear it via
      * identity_set_border_guard_mode to make this peer abstain from voting
-     * (Policy B, ISSUES.md §3.1-c). */
+     * (Policy B, doc/architecture/identity-protocol.md). */
     proc->protocol.border_guard_mode = true;
-    /* Two-phase admission quorum (ISSUES.md §3.1-a). Default 1 = promote on
+    /* Two-phase admission quorum (doc/architecture/identity-protocol.md). Default 1 = promote on
      * the first confirm (historical behavior); a deployment/harness sets it
      * higher via identity_set_admission_quorum for corroborated key handover. */
     proc->protocol.admission_quorum = 1;
@@ -5810,6 +8478,8 @@ int identity_register_handlers(process_t *proc)
     process_register_handler(proc, ID_IDENTITY_RESPONSE,
                              (handler_ptr_t)handle_identity_response);
     process_register_handler(proc, ID_TIER,          (handler_ptr_t)handle_tier_update);
+    process_register_handler(proc, ID_APP_PEER_STANDING,
+                             (handler_ptr_t)handle_app_peer_standing);
     process_register_handler(proc, ID_APP_ROSTER,
                              (handler_ptr_t)handle_peer_roster_request);
     process_register_handler(proc, ID_PARTITION_SIGNAL,
@@ -5818,6 +8488,10 @@ int identity_register_handlers(process_t *proc)
                              (handler_ptr_t)handle_partition_probe);
     process_register_handler(proc, ID_PARTITION_RESPONSE,
                              (handler_ptr_t)handle_partition_response);
+    process_register_handler(proc, ID_HIERARCHY,
+                            (handler_ptr_t)handle_hierarchy);
+    process_register_handler(proc, ID_HIERARCHY_QUERY,
+                            (handler_ptr_t)handle_hierarchy_request);
     process_register_handler(proc, ID_ROSTER_QUERY,
                              (handler_ptr_t)handle_roster_request);
     process_register_handler(proc, ID_ATTEST_QUERY,
@@ -5829,12 +8503,166 @@ int identity_register_handlers(process_t *proc)
      * (empty) until seeded — a leaf node then answers a roster query purely
      * locally, identical to today. See gateway-reputation-tree.md. */
     proc->protocol.roster_private = _roster_env_private();
+    /* Optional features (processes/extension.h) register their handlers here,
+     * each behind its own gate, so a normal node registers none of them.
+     * Mirrors Python IdentityProcess.__init__'s load_extensions. First contact
+     * (libat_first_contact), social (libat_social), ZTA (libat_zta) and the
+     * rest are their consumers' to keep in the link (at_first_contact_link(),
+     * at_social_link(), at_zta_link()). */
+    at_extensions_register_handlers(proc, "identity");
     return 0;
+}
+
+/* Adopt the mesh group (and its shared key) from the stashed full_histories:
+ * the entry with the most steps wins, else the first seeds adoption. Returns
+ * true when a group was adopted. Called by choose_group when histories arrived
+ * during its wait. */
+static bool _adopt_group_from_histories(process_t *proc,
+                                        directory_t *queues, logger_t *logger)
+{
+    /* Parse + adopt the shared group key from the welcomer's
+     * full_history (slot 0 = the DRY canonical group). Mirrors the
+     * selection in _merge_to_mesh: the entry with the most steps wins
+     * (most complete view), else the first entry seeds adoption.
+     * Without this the C node kept its own self-seeded group and never
+     * obtained the mesh key — full_history that arrives DURING the
+     * choose_group wait (the common case once box-decrypt works) hit a
+     * stub that only logged. Python's choose_group adopts here too
+     * (idprocess.py:248+). See [[project_group_key_sync]]. */
+    group_t adopted_group = {0};
+    bool have_group = false;
+    size_t best_steps_len = 0;
+    /* The members, UNIONED ACROSS EVERY history, not just the welcomer whose
+     * group wins (ISSUES.md §2.23, 2026-09-25). This path adopted the group and
+     * never the peers, so a joiner's identity and network processes learned
+     * only the members that happened to send it a history themselves: a member
+     * that learned of the admission by a confirm instead (a timing race) was in
+     * the joiner's address map but not its peer list, and every encrypted
+     * frame from it was deferred as "no peer known at that address yet" for the
+     * rest of the run (Agora partition cohort, part-3273140: ben never added
+     * amy). _merge_to_mesh always did this; Python's choose_group unions
+     * `unioned_peers` the same way (idprocess.py choose_group). */
+    public_identity_t *peer_bundle = NULL;
+    size_t bundle_n = 0;
+    pthread_mutex_lock(&id_state.lock);
+    _union_peers_from_histories(&peer_bundle, &bundle_n);
+    size_t n_hist = array_size(&id_state.histories);
+    for (size_t i = 0; i < n_hist; i++) {
+        data_t *h_dat = NULL;
+        if (array_get(&id_state.histories, (int)i, &h_dat) != 0 || h_dat == NULL)
+            continue;
+        ptr_t hptr = NULL;
+        if (data_object_ptr(h_dat, &hptr) != 0 || hptr == NULL)
+            continue;
+        json_t *root = (json_t *)hptr;
+        if (!json_is_array(root) || json_array_size(root) < 2)
+            continue;
+        json_t *s_json = json_array_get(root, 1);
+        size_t this_steps_len =
+            (s_json && json_is_array(s_json)) ? json_array_size(s_json) : 0;
+        bool pick = (!have_group && this_steps_len == 0)
+                    || (this_steps_len > best_steps_len);
+        if (!pick)
+            continue;
+        json_t *g_json = json_array_get(root, 0);
+        if (g_json && json_is_object(g_json)) {
+            group_t parsed = {0};
+            if (group_from_json(g_json, &parsed) == 0) {
+                adopted_group = parsed;
+                have_group = true;
+                best_steps_len = this_steps_len;
+            }
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+
+    if (have_group) {
+        char gid_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(adopted_group.uuid, gid_str);
+        peers_write_lock(proc);
+        proc->protocol.group = adopted_group;
+        peers_write_unlock(proc);
+        log_info(logger,
+                 "Identity: adopted mesh group %s during merge\n", gid_str);
+        /* TELL THE SIBLINGS, or the key never reaches the wire. net_proc holds
+         * its own protocol.group and decrypts with THAT; only a GROUP message
+         * updates it (processes.c assigns it). This path adopted into
+         * identity's copy alone, so a member rejoining after a restart
+         * (the one node that takes it: histories arrive during the choose
+         * wait) kept a network group with no mesh key and silently dropped
+         * every group frame. Nobody resends: to the others it is "already a
+         * group member", and their one key update landed before phase 3,
+         * where handle_group_update refuses it. Found by
+         * moderation_cohort.sh's restart phase. _merge_to_mesh already does
+         * this; Python's choose_group does it via _record_group. */
+        generic_msg_t group_msg = {0};
+        group_msg.type = GROUP;
+        group_msg.info.group = adopted_group;
+        _remember_activity(proc, queues, &group_msg);
+        /* Then every member from every history, told to the siblings (the
+         * network process above all) and announced to, as _merge_to_mesh
+         * does. Outside id_state.lock: it takes its own locks. */
+        _populate_peers_from_history(proc, queues, peer_bundle, bundle_n);
+        /* Every other group that admitted us: tell its members ours exists.
+         * Copied out under the lock; the send takes its own locks. */
+        json_t *others = json_array();
+        pthread_mutex_lock(&id_state.lock);
+        size_t n_now = array_size(&id_state.histories);
+        for (size_t i = 0; others != NULL && i < n_now; i++) {
+            data_t *h_dat = NULL;
+            ptr_t hptr = NULL;
+            if (array_get(&id_state.histories, (int)i, &h_dat) != 0 || h_dat == NULL
+                || data_object_ptr(h_dat, &hptr) != 0 || hptr == NULL)
+                continue;
+            json_t *g_json = json_is_array((json_t *)hptr)
+                ? json_array_get((json_t *)hptr, 0) : NULL;
+            if (g_json != NULL && json_is_object(g_json))
+                json_array_append(others, g_json);
+        }
+        pthread_mutex_unlock(&id_state.lock);
+        size_t k;
+        json_t *g_json;
+        json_array_foreach(others, k, g_json)
+            (void)_tell_bridged_group(proc, g_json);
+        json_decref(others);
+    } else {
+        log_warn(logger, "Identity: choose_group: histories present but "
+                 "no parseable group; keeping self-seeded group\n");
+    }
+    free(peer_bundle);
+    return have_group;
+}
+
+/* Test hooks for the above (id_proc_priv.h). */
+void identity_stash_history(json_t *history)
+{
+    pthread_mutex_lock(&id_state.lock);
+    array_append(&id_state.histories, object_ptr_data(history, sizeof(json_t)));
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+bool identity_adopt_group_from_histories(process_t *proc,
+                                         directory_t *queues)
+{
+    return _adopt_group_from_histories(proc, queues, proc->logger);
 }
 
 int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     _ensure_id_init();
+
+    /* A node told to publish its position or profile ($AT_OWN_*) with no
+     * social library would silently publish nothing; refuse instead. */
+    if (identity_ext_check_env(logger) != 0)
+        return -1;
+    /* Likewise a node whose zta_policy enables ZTA with no libat_zta. */
+    if (identity_ext_check_config(NULL, logger) != 0)
+        return -1;
+    /* And a plaintext-verbs file this node cannot honour: malformed, naming a
+     * verb no enabled extension declares, or missing one an enabled extension
+     * needs (processes/plaintext_verbs.h). The network process applies it. */
+    if (plaintext_verbs_configure(NULL, logger) != 0)
+        return -1;
 
     /* Daemonize first so messaging is available for pre-loop activity */
     process_ctx_t pctx = {0};
@@ -5844,18 +8672,43 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
 
     identity_register_handlers(proc);
 
+    /* What this node tells a welcomer it runs (package_hash.h), so an
+     * operator can put it on an allowlist. */
+    log_info(proc->logger, "Identity: package hash %s\n",
+             at_package_hash()[0] != '\0' ? at_package_hash() : "(unreadable)");
+
     /* Seed-assisted dual membership: adopt any group_child_*.cfg.json cohorts
      * this gateway holds (C twin of Python's _load_child_groups). A leaf with
      * no such files is unchanged. See gateway-reputation-tree.md. */
+    /* Features restore persisted state before the node takes traffic
+     * (identity/id_ext.h). */
+    identity_ext_run_start(proc);
+
     {
         char cfg_dir[CFG_PATH_LEN + 1];
         if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) > 0) {
             int adopted = identity_load_child_groups(proc, cfg_dir);
-            if (adopted > 0)
+            if (adopted > 0) {
                 log_info(proc->logger,
                          "Identity: seeded %d child group(s) from config\n",
                          adopted);
+                /* Hand them to the sibling processes: reputation keeps one
+                 * chain per child group and cannot without this. */
+                identity_propagate_child_groups(proc, queues);
+                /* The cohorts we gateway are half of what we advertise. */
+                identity_refresh_hierarchy(proc);
+            }
         }
+    }
+
+    /* What this node can do, for every caps_response and confirm it sends
+     * (ISSUES §2.63). Nothing else installs it in production, so a C node
+     * advertised no capabilities, and once negotiation filtered by the
+     * matrix (§2.56) no peer was invited to anything. */
+    {
+        size_t n_caps = identity_advertise_local_capabilities(proc);
+        log_info(proc->logger, "Identity: advertising %zu capabilit%s\n",
+                 n_caps, n_caps == 1 ? "y" : "ies");
     }
 
     /* Phase 0→1: Acquire capabilities */
@@ -5897,6 +8750,7 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
         id_state.choosing_group = true;
         pthread_mutex_unlock(&id_state.lock);
 
+        generic_msg_t pump = {0};
         while (keep_running(proc, &pctx.sig_q, logger))
         {
             gettimeofday(&now_tv, NULL);
@@ -5917,13 +8771,14 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
             }
 
             /* Pump inbound messages so handle_receive_history can run. */
-            generic_msg_t pump = {0};
+            messaging_recv_release(&pump);   /* the previous pass's */
             int rc = messaging_recv(&pump);
             if (rc == 0)
                 run_message_handlers(proc, queues, pump.type, &pump);
             else
                 sleep_until(proc, cadence);
         }
+        messaging_recv_release(&pump);
 
         /* Selection / self-bootstrap. The C history wire form is still a stub
          * (see _peer_accepted), so full history-parse + peer-union selection
@@ -5941,76 +8796,16 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
                      "selecting mesh group\n",
                      final_hcount, final_hcount == 1 ? "y" : "ies");
 
-            /* Parse + adopt the shared group key from the welcomer's
-             * full_history (slot 0 = the DRY canonical group). Mirrors the
-             * selection in _merge_to_mesh: the entry with the most steps wins
-             * (most complete view), else the first entry seeds adoption.
-             * Without this the C node kept its own self-seeded group and never
-             * obtained the mesh key — full_history that arrives DURING the
-             * choose_group wait (the common case once box-decrypt works) hit a
-             * stub that only logged. Python's choose_group adopts here too
-             * (idprocess.py:248+). See [[project_group_key_sync]]. */
-            group_t adopted_group = {0};
-            bool have_group = false;
-            size_t best_steps_len = 0;
-            pthread_mutex_lock(&id_state.lock);
-            size_t n_hist = array_size(&id_state.histories);
-            for (size_t i = 0; i < n_hist; i++) {
-                data_t *h_dat = NULL;
-                if (array_get(&id_state.histories, (int)i, &h_dat) != 0 || h_dat == NULL)
-                    continue;
-                ptr_t hptr = NULL;
-                if (data_object_ptr(h_dat, &hptr) != 0 || hptr == NULL)
-                    continue;
-                json_t *root = (json_t *)hptr;
-                if (!json_is_array(root) || json_array_size(root) < 2)
-                    continue;
-                json_t *s_json = json_array_get(root, 1);
-                size_t this_steps_len =
-                    (s_json && json_is_array(s_json)) ? json_array_size(s_json) : 0;
-                bool pick = (!have_group && this_steps_len == 0)
-                            || (this_steps_len > best_steps_len);
-                if (!pick)
-                    continue;
-                json_t *g_json = json_array_get(root, 0);
-                if (g_json && json_is_object(g_json)) {
-                    group_t parsed = {0};
-                    if (group_from_json(g_json, &parsed) == 0) {
-                        adopted_group = parsed;
-                        have_group = true;
-                        best_steps_len = this_steps_len;
-                    }
-                }
-            }
-            pthread_mutex_unlock(&id_state.lock);
-
-            if (have_group) {
-                char gid_str[UUID_STRING_LEN + 1];
-                uuid_unparse_lower(adopted_group.uuid, gid_str);
-                peers_write_lock(proc);
-                memcpy(&proc->protocol.group, &adopted_group, sizeof(group_t));
-                peers_write_unlock(proc);
-                log_info(logger,
-                         "Identity: adopted mesh group %s during merge\n", gid_str);
-            } else {
-                log_warn(logger, "Identity: choose_group: histories present but "
-                         "no parseable group; keeping self-seeded group\n");
-            }
+            (void)_adopt_group_from_histories(proc, queues, logger);
         }
         else
         {
             log_info(logger, "Identity: choose_group: no histories received; "
                      "self-bootstrapping a fresh group\n");
             public_identity_t *pub = NULL;
-            data_t *id_dat = NULL;
-            char id_key[] = "identity";
-            if (map_get(proc->configs, id_key, &id_dat) == 0)
-            {
-                config_t *id_cfg = NULL;
-                if (data_object_ptr(id_dat, (void **)&id_cfg) == 0
-                    && id_cfg->data_struct != NULL)
-                    identity_publish((const identity_t *)id_cfg->data_struct, &pub);
-            }
+            const identity_t *self = identity_self_identity(proc);
+            if (self != NULL)
+                identity_publish(self, &pub);
             char empty_addr[1] = {0};
             char *seed_addr = (pub != NULL) ? pub->address : empty_addr;
             if (group_init(NULL, seed_addr, &proc->protocol.group) == 0 && pub != NULL)
@@ -6018,7 +8813,7 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
                 char uuid_str[UUID_STRING_LEN + 1];
                 uuid_unparse_lower(pub->uuid, uuid_str);
                 group_add_address(&proc->protocol.group, uuid_str, pub->address);
-                /* Stamp a real creation epoch (ISSUES.md §3.1-b) so a group
+                /* Stamp a real creation epoch (doc/architecture/identity-protocol.md) so a group
                  * minted at genesis carries a comparable age for the merge
                  * size-tie tiebreaker. Unix epoch seconds, directly
                  * comparable to Python initialize's now().timestamp() on the
@@ -6027,6 +8822,15 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
                  * tiebreak), so the stamp lives here at the runtime genesis
                  * mint only. Mirrors Python Group.initialize. */
                 proc->protocol.group.created = (double)time(NULL);
+                /* Same reasoning for the envelope format
+                 * (doc/architecture/network-wire-format.md): AT_NET_WIRE_MODE applies
+                 * at the one moment a node DECIDES a format rather than adopting one.
+                 * Every other group this node holds arrived from a peer with its format
+                 * already set, so an operator stands up a proto cohort by setting the
+                 * knob on whichever node forms the group. group_init leaves it JSON,
+                 * which keeps the conformance adapters format-agnostic. Mirrors Python
+                 * Group.initialize. */
+                proc->protocol.group.wire_format = net_wire_mode_resolve(NULL, logger);
             }
             if (pub != NULL)
                 smrt_deref(pub);
@@ -6044,6 +8848,8 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
         pthread_mutex_unlock(&id_state.lock);
     }
     proc->protocol.phase = 3;
+    (void)identity_replay_held_group_updates(proc, queues);
+    (void)identity_replay_held_access_requests(proc, queues);
 
     /* Identity-specific loop: re-announce periodically until peers found */
     generic_msg_t announce_buf = {0};
@@ -6067,9 +8873,25 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
         if (no_peers && ++cycle >= announce_interval)
         {
             cycle = 0;
+            /* Bare on purpose (repeats every 10 ticks until admitted): ISSUES §2.40. */
             messaging_send("network", NET_MESSAGE, &announce_buf, false);
             log_debug(logger, "Identity: re-announcing (no peers yet)\n");
         }
+
+        /* Decide admissions whose vote grace period is up. Swept every tick
+         * (~0.5s, matching Python's vote_timeout) because the wait is short by
+         * design and a pending admission is somebody sitting at the door. A
+         * converged cohort has an empty map, so this is a no-op. */
+        identity_periodic_vote_collection(proc, queues);
+
+        /* Sibling hand-offs a full queue refused (GROUP / PEER / PEER_REMOVED):
+         * one try each per tick until they land. Empty, and free, once the
+         * cohort settles. */
+        identity_retry_sibling_handoffs(proc);
+
+        /* One-shot frames a full queue refused for longer than the inline
+         * 200 ms (DMs, joiner histories, ads; ISSUES §2.40) are drained by
+         * sleep_until at the top of this loop, as in every process. */
 
         /* Periodic late-joiner cap-loss backstop (interval-gated so the
          * fast loop doesn't sweep every iteration; a converged group
@@ -6083,17 +8905,37 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
              * missing Identities so consensus reputations can be named. A
              * converged node emits no query (have_count >= group_size). */
             identity_periodic_identity_resync(proc);
+            /* Runtime hierarchy roots (protocol step 7): ask the group to
+             * state their positions once (a node joining a settled mesh would
+             * otherwise wait for somebody's next change), and re-derive our
+             * own, which moves when ranks do. Both are quiet no-ops on a
+             * converged leaf. */
+            identity_request_hierarchy(proc);
+            identity_refresh_hierarchy(proc);
         }
 
+        /* TAKE EVERYTHING WAITING, not one per tick. The periodic work above
+         * still runs exactly once per cadence tick; only the number of
+         * messages consumed after it changes. net_proc hands this process
+         * every inbound identity frame, and at one-per-tick its queue
+         * overflowed during a cohort's admission burst — 'Failed to route
+         * message to process identity' on the network side, and a co-signing
+         * ask or signature simply gone on this one. See PROC_DRAIN_MAX. */
         generic_msg_t buf = {0};
-        err = messaging_recv(&buf);
-        if (err == -1 || err == ENOMSG)
-            continue;
-        if (!run_message_handlers(proc, queues, buf.type, &buf))
+        for (int taken = 0; taken < PROC_DRAIN_MAX; taken++)
         {
-            log_debug(logger, "Identity: unhandled message type %ld\n", buf.type);
+            messaging_recv_release(&buf);   /* the previous pass's */
+            err = messaging_recv(&buf);
+            if (err == -1 || err == ENOMSG)
+                break;
+            if (!run_message_handlers(proc, queues, buf.type, &buf))
+            {
+                log_debug(logger, "Identity: unhandled message type %ld\n", buf.type);
+            }
         }
+        messaging_recv_release(&buf);
     }
+    net_msg_free_obj(&announce_buf.info.net_msg);
 
     if (pctx.fd1 > 0)
         close(pctx.fd1);
@@ -6102,3 +8944,4 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
     return 0;
 }
 DECLARE_PROCESS(identity, id_proc, identity_run);
+

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import json
 import os
 import queue
 import tempfile
@@ -37,17 +38,42 @@ from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from autonomous_trust.core.algorithms.impl import AgreementImpl
 from autonomous_trust.core.capabilities import Capabilities, PeerCapabilities
-from autonomous_trust.core.config import Configuration, to_json_string
+from autonomous_trust.core.config import Configuration, from_json_string, to_json_string
 from autonomous_trust.core.identity import Group, Identity, Peers
 from autonomous_trust.core.identity.encrypt import Encryptor
 from autonomous_trust.core.identity.idprocess import IdentityProcess
 from autonomous_trust.core.identity.protocol import IdentityProtocol
+try:
+    # First contact is an extension (FEATURE_SPLIT_PLAN Phase 7): without it, a
+    # scenario with a first_contact or contacts fixture skips, as the C
+    # adapter's does without libat_first_contact.
+    from autonomous_trust.first_contact.fc_protocol import FirstContactProtocol
+    from autonomous_trust.first_contact.first_contact import _FLAG as FIRST_CONTACT_FLAG
+    from autonomous_trust.first_contact import FIRST_CONTACT_VERIFIED_SEED
+    FIRST_CONTACT_PRESENT = True
+except ImportError:
+    class _NoVerbs(type):
+        def __getattr__(cls, name):
+            return None
+
+    class FirstContactProtocol(metaclass=_NoVerbs):
+        """First contact is absent: no verb is its (each name is None, which
+        matches no function)."""
+
+    FIRST_CONTACT_PRESENT = False
+    FIRST_CONTACT_FLAG = 'AT_FIRST_CONTACT'
+    FIRST_CONTACT_VERIFIED_SEED = None
 from autonomous_trust.core.identity.sign import Signature
-from autonomous_trust.core.identity.zta import ZtaPolicy
+try:
+    # ZTA is an extension (FEATURE_SPLIT_PLAN Phase 6): without it, a scenario
+    # with a zta_policy fixture skips, as the C adapter's does without libat_zta.
+    from autonomous_trust.zta import ZtaPolicy
+except ImportError:
+    ZtaPolicy = None
 from autonomous_trust.core.network.message import Message
 from autonomous_trust.core.network.network import Network
 from autonomous_trust.core.processes import ProcessTracker
@@ -78,7 +104,27 @@ _TRIGGER_CAPS_RESYNC = 'trigger_caps_resync'
 # target participant (aggregate_subtree_roster over a fetch that asks each
 # gateway for its local members + child gateways). Used by
 # subtree-member-roster. The C adapter recognizes the same string.
+#: Namespace for the synthetic uuids these constructors mint -- the cohort ids
+#: in a hierarchy claim, and the "nobody" peer a tier update can name. Fixed
+#: so a replay produces the same bytes, and distinct from the participant-uuid
+#: namespace so a minted cohort can never collide with a participant.
+_HIER_NS = UUID('00000000-0000-0000-0000-000000000bbb')
+
 _TRIGGER_SUBTREE_ROSTER = 'trigger_subtree_roster'
+# Pseudo-function: re-derive this participant's place in the gateway tree
+# (protocol step 7). Observable via the `parent_gateway` expected_state key; the
+# advertisement it emits restates the derived value, so nothing wire-shaped is
+# asserted. Mirrors the C adapter's trigger_hierarchy.
+_TRIGGER_HIERARCHY = 'trigger_hierarchy'
+
+# Pseudo-function: solicit membership in a cohort this participant is NOT in (runtime
+# cross-group join, doc/architecture/gateway-reputation-tree.md). The step's payload
+# names the target cohort (`group_uuid`), which the scenario pins via fixtures.groups so
+# it is the same string in both harnesses. Unlike the other pseudo-functions this one
+# DOES emit wire traffic -- the ordinary request_access, now carrying the target in
+# payload slot 3 -- because the whole point is that a join is the ordinary admission and
+# not a private side channel. The C adapter recognizes the same string.
+_TRIGGER_COHORT_JOIN = 'trigger_cohort_join'
 
 # Pseudo-function: drive one operator-attended pull (ethne D8/Q9) from the
 # step's `from` participant against its `to` participant, end to end — mint the
@@ -95,6 +141,84 @@ _TRIGGER_ATTEST_PULL = 'trigger_attest_pull'
 # refused: its nonce is retired, and an attestation replayable at will would
 # say nothing about attendance NOW. The C adapter recognizes the same string.
 _TRIGGER_ATTEST_REPLAY = 'trigger_attest_replay'
+
+# Pseudo-function: drop the OPTIONAL first-contact handshake's in-memory
+# spent-nonce guard without touching the file it persists to -- the closest a
+# single-process harness gets to restarting the node. What the guard knows
+# afterwards it read back off disk, which is the whole point of
+# first-contact-nonce-survives-restart. The C adapter recognizes the same
+# string. See doc/architecture/first-contact.md.
+_TRIGGER_FC_RESTART = 'trigger_first_contact_restart'
+
+# Pseudo-function: drive the INITIATOR half of the 1:1 handshake through the
+# production call (first_contact.initiate) rather than handing the target a
+# hello the harness built. A pseudo-step because `initiate` is an API call, not
+# an inbound message -- there is nothing to dispatch. The C adapter recognizes
+# the same string. See first-contact-initiate-reaches-the-hint.
+_TRIGGER_FC_INITIATE = 'trigger_first_contact_initiate'
+
+# Pseudo-function: the participant's APP removes a contact ({peer: <pid>}),
+# through the production app verb. A pseudo-step because the scenario cannot
+# spell a peer's uuid -- the runtimes derive them differently -- so the adapter
+# resolves the participant id. The C adapter recognizes the same string. See
+# first-contact-remove-drops-the-direct-peer.
+_TRIGGER_FC_REMOVE = 'trigger_first_contact_remove'
+
+# Pseudo-functions for finding someone by handle (first_contact/directory_contact.py),
+# each through the production app verb or handler, because the entry, request
+# and invitation are signed by per-run keys the scenario cannot spell:
+#   trigger_directory_publish {handle}         -- our app publishes the handle,
+#       attested by the harness issuer (_DIR_ISSUER_SEED);
+#   trigger_directory_request {holder, handle} -- a lookup finds the holder's
+#       entry (a local dir_result) and our app asks to become a contact;
+#   trigger_directory_accept / _decline {ref}  -- our app answers a held request
+#       (its ref is the request's nonce);
+#   trigger_directory_clock {advance}          -- this node's directory clock
+#       moves `advance` seconds ahead (every directory deadline reads it; the
+#       invitation an accept carries keeps its own clock).
+# The C adapter recognizes the same strings. See identity/directory-*.yaml.
+_TRIGGER_DIR_PUBLISH = 'trigger_directory_publish'
+_TRIGGER_DIR_REQUEST = 'trigger_directory_request'
+_TRIGGER_DIR_ACCEPT = 'trigger_directory_accept'
+_TRIGGER_DIR_DECLINE = 'trigger_directory_decline'
+_TRIGGER_DIR_CLOCK = 'trigger_directory_clock'
+# Pseudo-functions for finding people nearby at an area hub
+# (first_contact/area_contact.py), through the production app verbs and handlers:
+#   trigger_area_publish {area, bucket}  -- our app lists us in the area;
+#   trigger_area_withdraw {area}         -- ...and stops;
+#   trigger_area_request {holder, area}  -- a lookup finds the holder's card (a
+#       local hub_result) and our app asks to become a contact.
+# The C adapter recognizes the same strings. See identity/area-*.yaml.
+_TRIGGER_AREA_PUBLISH = 'trigger_area_publish'
+_TRIGGER_AREA_WITHDRAW = 'trigger_area_withdraw'
+_TRIGGER_AREA_REQUEST = 'trigger_area_request'
+# The harness's handle issuer. Nothing checks the issuer on these paths (only a
+# registry does), but a fixed one keeps both runtimes minting the same bytes.
+_DIR_ISSUER_SEED = bytes([0x44]) * 32
+
+
+def _dir_entry_for(identity, handle, seq=1):
+    """The holder's issuer-attested directory entry for ``handle``, and the
+    attestation it embeds."""
+    import time
+    from nacl.signing import SigningKey
+    from autonomous_trust.first_contact._python import directory as _dir
+    key = _dir._public_hex(_dir._signing_key(identity))
+    att = _dir.attest(SigningKey(_DIR_ISSUER_SEED), handle, key, int(time.time()) + 3600)
+    return att, _dir.create_entry(identity, att, seq)
+
+
+def _app_verb(function, body):
+    """A request from this node's own app: no sender on the envelope."""
+    return Message(CfgIds.identity, function, to_json_string(body),
+                   to_whom=None, from_whom=None, encrypt=False)
+
+
+# The group public key each participant's `fixtures.groups` entry gave it,
+# keyed by participant id, for the `group_key_kept` check (ISSUES §2.31). Held
+# outside the Group because the failure it catches is the Group being replaced
+# wholesale. Reset on every scenario build.
+_FIXTURE_GROUP_PUB: dict[str, bytes] = {}
 
 
 @dataclass
@@ -117,6 +241,10 @@ class _Participant:
     # flattened member uuids (strings) of its cohort subtree. Filled by the
     # engine's _dispatch; read by the subtree_roster expected-state check.
     subtree_roster: list = field(default_factory=list)
+    # Result of trigger_hierarchy: the DERIVED parent gateway as a participant
+    # id, or '' for a node that tops its own cohort. Filled by _dispatch (which
+    # holds the uuid->pid registry) and read by the parent_gateway check.
+    parent_gateway_pid: str = ''
     # Results of trigger_attest_pull / trigger_attest_replay on this
     # participant (as the PULLER): the attested-now stamp the last accepted
     # pull yielded, and the accept/reject verdict of every pull in order.
@@ -125,19 +253,63 @@ class _Participant:
     attest_accepted: list = field(default_factory=list)
     # The last answer received, kept so trigger_attest_replay can re-present it.
     attest_last_answer: dict = field(default_factory=dict)
-    # Pinned attestation clock from the operator_session fixture (0 = unset).
+    # Pinned attestation clock from the operator_session / clocks fixture
+    # (0 = unset).
     attest_clock: float = 0.0
+    # Cohort clock samples this participant MEASURED as the puller, relabelled
+    # from the production handler's uuid key to the scenario's participant id so
+    # expected_state can name a peer language-agnostically. The values come
+    # straight out of IdentityProcess._peer_clock_samples -- the harness
+    # relabels, it does not compute. See doc/architecture/cohort-clock-skew.md.
+    attest_clock_samples: dict = field(default_factory=dict)
+    # participant id -> uuid string, for every participant in the scenario.
+    # Filled by the adapter at setup; see _uuid_for_pid.
+    pid_to_uuid: dict = field(default_factory=dict)
+    # participant id -> _Participant, for the few expected_state keys that read
+    # ANOTHER participant's state (social_tx_last's same_task_as). Filled with
+    # pid_to_uuid.
+    peers_by_pid: dict = field(default_factory=dict)
+    # Where trigger_first_contact_initiate actually addressed its hello: the
+    # host on the outbound to_whom. Read by the
+    # first_contact_hello_endpoint check, which pins that `initiate` prefers
+    # the invitation's rendezvous hint over the inviter's advertised address.
+    fc_hello_endpoint: str = ''
+    # A feature adapter's expected_state keys (IdentityAdapter.STATE_CHECKS):
+    # key -> fn(participant, key, expected). Set by the adapter at setup.
+    state_checks: dict = field(default_factory=dict)
+
+    def _uuid_for_pid(self, pid: str) -> str:
+        """Resolve a scenario participant id to its uuid string.
+
+        Raises rather than returning a miss: a state key naming a participant
+        that does not exist is a broken fixture, and silently comparing
+        against nothing would make the assertion pass vacuously.
+        """
+        try:
+            return self.pid_to_uuid[pid]
+        except KeyError:
+            raise AssertionError(
+                f'{self.id}: expected_state names unknown participant {pid!r}'
+            ) from None
 
     def drain_outbox(self) -> list[CapturedMessage]:
         captured: list[CapturedMessage] = []
+        # uuid -> participant id, inverted from the map every participant is
+        # handed at setup. See _pid_of for why uuid and not petname.
+        uuid_to_pid = {str(u): p for p, u in (self.pid_to_uuid or {}).items()}
         for msg in self.outbox_buffer:
-            captured.append(_to_captured(msg, emitter_id=self.id))
+            captured.append(_to_captured(msg, emitter_id=self.id,
+                                         uuid_to_pid=uuid_to_pid))
         self.outbox_buffer.clear()
         return captured
 
     def _check_expected_state(self, asserts: dict[str, Any]) -> None:
         """Implements the engine's optional per-participant state check."""
         for key, expected in asserts.items():
+            check = self.state_checks.get(key)
+            if check is not None:   # a feature's key (IdentityAdapter.STATE_CHECKS)
+                check(self, key, expected)
+                continue
             if key == 'phase':
                 actual = self.process.phase
                 if actual != expected:
@@ -159,6 +331,183 @@ class _Participant:
                         f'{self.id}: expected peer uuid {expected} in peer list, '
                         f'got {sorted(actual_uuids)}'
                     )
+            elif key == 'direct_peers':
+                # The OPTIONAL 1:1 first-contact handshake's admission, as
+                # {participant_id: bool}. True asserts BOTH halves of what a
+                # direct peer is: present in the peer list, and ABSENT from the
+                # group address map. The second half is the security property --
+                # a first-contact peer is directly reachable, not a group
+                # member, so the shared group key must not follow it in.
+                # False asserts the peer was not admitted at all (the refusal
+                # cases). C mirrors by scanning protocol.peers[] and
+                # protocol.group.address_map.
+                grp = self.process.group
+                # The address map's KEYS are the member uuids. Reached through
+                # the private attribute deliberately: `Group.addresses` yields
+                # the map's VALUES (the addresses), so comparing a uuid against
+                # it would never match and the group half of this assertion
+                # would pass vacuously -- which is exactly what a mutation test
+                # of "let the group key follow a direct peer in" caught. The
+                # map degrades to a non-dict in one legacy form (see
+                # Group.to_canonical), which carries no uuids at all.
+                raw = getattr(grp, '_address_map', None) if grp is not None else None
+                in_group = {str(u) for u in raw} if isinstance(raw, dict) else set()
+                have = {str(getattr(p, 'uuid', '')) for p in self.process.peers.all}
+                for pid, want in (expected or {}).items():
+                    peer_uuid = str(self._uuid_for_pid(pid))
+                    if not want:
+                        if peer_uuid in have:
+                            raise AssertionError(
+                                f'{self.id}: {pid} was admitted as a peer, '
+                                f'expected refusal')
+                        continue
+                    if peer_uuid not in have:
+                        raise AssertionError(
+                            f'{self.id}: {pid} is not a peer, expected a '
+                            f'direct-peer admission')
+                    if peer_uuid in in_group:
+                        raise AssertionError(
+                            f'{self.id}: {pid} landed in the GROUP address map; '
+                            f'a first-contact peer must not become a group '
+                            f'member (the group key would follow)')
+            elif key == 'member_address':
+                # {participant_id: address}: the address this participant's
+                # group address map holds for that member. C mirrors via
+                # map_get on protocol.group.address_map.
+                grp = self.process.group
+                raw = getattr(grp, '_address_map', None) if grp is not None else None
+                members = {str(u): a for u, a in raw.items()} if isinstance(raw, dict) else {}
+                for pid, want in (expected or {}).items():
+                    actual = members.get(str(self._uuid_for_pid(pid)))
+                    if actual != want:
+                        raise AssertionError(
+                            f'{self.id}: member_address[{pid}]={actual!r}, '
+                            f'expected {want!r}')
+            elif key == 'contacts':
+                # The durable address book the handshake leaves behind, as
+                # {participant_id: {field: value} | false}. Read from DISK, not
+                # from the process, because the file is the cross-runtime
+                # artifact: both runtimes write the same contacts.cfg.json, so
+                # a scenario that passes on both proves they agree on its
+                # contents and not merely on their own in-memory shape.
+                # C mirrors via contacts_load + contacts_get.
+                from autonomous_trust.first_contact import Contacts
+                store = Contacts.load()
+                for pid, want in (expected or {}).items():
+                    peer_uuid = str(self._uuid_for_pid(pid))
+                    contact = store.get(peer_uuid)
+                    if not want:
+                        if contact is not None:
+                            raise AssertionError(
+                                f'{self.id}: recorded a contact for {pid}, '
+                                f'expected none')
+                        continue
+                    if contact is None:
+                        raise AssertionError(
+                            f'{self.id}: no contact recorded for {pid}')
+                    for field, value in want.items():
+                        if field == 'verified':
+                            actual = bool(contact.verified)
+                            value = bool(value)
+                        elif field == 'provenance':
+                            actual = contact.provenance.value
+                            value = str(value)
+                        elif field == 'petname':
+                            actual = contact.petname
+                            value = str(value)
+                        elif field == 'nonce':
+                            actual = contact.nonce
+                            value = str(value)
+                        elif field == 'trust_seed':
+                            actual = round(float(contact.trust_seed), 6)
+                            value = round(float(value), 6)
+                        elif field == 'rendezvous_count':
+                            # COUNT, not contents: the two harnesses hand
+                            # participants different addresses (Python
+                            # 10.0.0.N, C 10.0.70.N), so the hint the handshake
+                            # just learned is not a value a cross-runtime case
+                            # can name. What both runtimes must agree on is how
+                            # MANY hints survive and what sits behind the new
+                            # one -- the dedup, the cap, and the "newest first"
+                            # order.
+                            actual = len(contact.rendezvous)
+                            value = int(value)
+                        elif field == 'reach_seq':
+                            actual = int(contact.reach_seq)
+                            value = int(value)
+                        elif field == 'rendezvous_head':
+                            # The newest hint: nameable when the scenario
+                            # supplied it (a reachability record's relay).
+                            actual = contact.rendezvous[0] if contact.rendezvous else ''
+                            value = str(value)
+                        elif field == 'rendezvous_tail':
+                            # Everything after the newest hint: fixture-supplied
+                            # values, so this is nameable. Pins that a refresh
+                            # PREPENDS rather than replaces.
+                            actual = list(contact.rendezvous[1:])
+                            value = [str(v) for v in value]
+                        else:
+                            raise AssertionError(
+                                f'{self.id}: unsupported contacts field '
+                                f'{field!r}')
+                        if actual != value:
+                            raise AssertionError(
+                                f'{self.id}: contact[{pid}].{field}={actual!r}, '
+                                f'expected {value!r}')
+            elif key == 'first_contact_hello_endpoint':
+                # Where trigger_first_contact_initiate addressed its hello.
+                # Pins the resolution ORDER: the invitation's rendezvous hint
+                # wins over the address the inviter's identity advertises.
+                # Both are well-formed addresses, so preferring the wrong one
+                # fails silently -- it works on a LAN and never reaches a
+                # remote friend. C mirrors via ic_impl_t.fc_hello_endpoint.
+                actual = self.fc_hello_endpoint
+                if actual != str(expected):
+                    raise AssertionError(
+                        f'{self.id}: first_contact_hello_endpoint={actual!r}, '
+                        f'expected {str(expected)!r}')
+            elif key == 'first_contact_acks_emitted':
+                # How many first_contact_hello_ack messages this participant
+                # emitted over the whole scenario. The observable for the
+                # single-use guard: the peer is legitimately admitted on the
+                # first redemption, so a replay that was honored twice differs
+                # ONLY in what went back out. C mirrors by scanning the
+                # engine's captured[] for the same function.
+                actual = self.emit_tally.get(FirstContactProtocol.hello_ack, 0)
+                if actual != int(expected):
+                    raise AssertionError(
+                        f'{self.id}: first_contact_acks_emitted={actual}, '
+                        f'expected {int(expected)}')
+            elif key in ('directory_requests_held', 'directory_accepts_emitted',
+                         'first_contact_hellos_emitted'):
+                # Requests held for our app to decide; and how many
+                # first_contact_accept / first_contact_hello messages this
+                # participant emitted over the whole scenario. A request that
+                # fails a gate is dropped silently, so what is held -- and what
+                # an answer puts on the wire -- are the only observables. C
+                # holds requests process-wide (at_dir_contact_held_count), so
+                # the cases asserting it have one holder.
+                if key == 'directory_requests_held':
+                    actual = len(getattr(self.process, '_dir_in', {}) or {})
+                else:
+                    actual = self.emit_tally.get(
+                        FirstContactProtocol.contact_accept if key == 'directory_accepts_emitted'
+                        else FirstContactProtocol.hello, 0)
+                if actual != int(expected):
+                    raise AssertionError(f'{self.id}: {key}={actual}, expected {int(expected)}')
+            elif key == 'first_contact_nonce_spent':
+                # The durable single-use guard itself, as {nonce: bool}. Read
+                # after a trigger_first_contact_restart, this is the only place
+                # the on-disk store is observed rather than inferred -- and the
+                # two runtimes read each other's file only if they agree on its
+                # shape. C mirrors via at_first_contact_nonce_spent.
+                guard = getattr(self.process, '_first_contact_nonces', None)
+                for nonce, want in (expected or {}).items():
+                    actual = bool(guard is not None and str(nonce) in guard)
+                    if actual != bool(want):
+                        raise AssertionError(
+                            f'{self.id}: first_contact_nonce_spent[{nonce!r}]='
+                            f'{actual}, expected {bool(want)}')
             elif key == 'peer_caps_count':
                 # Number of caps registered in self.peer_capabilities for
                 # any OTHER participant's uuid. With per-cap dedup in
@@ -212,6 +561,25 @@ class _Participant:
                         f'{self.id}: partition_responses_emitted={actual}, '
                         f'expected {expected}'
                     )
+            elif key == 'freshness_refusals':
+                # {verb: N} -- messages this participant refused as stale,
+                # per verb. The POSITIVE observable for the freshness guard:
+                # every other partition observable is an emission count, and a
+                # second delivery is already suppressed by the per-sender
+                # response cooldown (and adoption by the in-flight recovery
+                # marker), so "one response after two deliveries" is a number
+                # the cooldown alone produces. Only the mark can produce a
+                # refusal. C reads the same tally through
+                # identity_freshness_refusals(); note it is process-global
+                # there, so a case asserting this must have exactly one
+                # participant doing the refusing.
+                for verb, want in expected.items():
+                    actual = self.process.freshness.refusals(verb)
+                    if actual != int(want):
+                        raise AssertionError(
+                            f'{self.id}: freshness_refusals[{verb!r}]={actual}, '
+                            f'expected {want}'
+                        )
             elif key == 'caps_query_emitted':
                 # Number of directed `peer_caps_query` messages this participant
                 # emitted -- driven by the periodic caps-resync sweep (triggered
@@ -262,6 +630,21 @@ class _Participant:
                         f'{self.id}: group_owns_private_key={actual}, '
                         f'expected {bool(expected)}'
                     )
+            elif key == 'group_key_kept':
+                # True iff this participant still holds the group key its
+                # `fixtures.groups` entry gave it. Pins that a membership update
+                # never changes the key of our own group (ISSUES §2.31), which
+                # group_key_epoch alone cannot: C keeps the epoch while
+                # swapping the key. C mirrors via ic_impl_t.fixture_group_pub.
+                grp = self.process.group
+                want_pub = _FIXTURE_GROUP_PUB.get(self.id)
+                actual = bool(grp is not None and want_pub is not None
+                              and grp._encryptor.publish() == want_pub)
+                if actual != bool(expected):
+                    raise AssertionError(
+                        f'{self.id}: group_key_kept={actual}, '
+                        f'expected {bool(expected)}'
+                    )
             elif key == 'group_size':
                 # Number of addresses in this participant's group address map —
                 # proves the larger membership WAS adopted (not a no-op). C
@@ -272,9 +655,53 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: group_size={actual}, expected {int(expected)}'
                     )
+            elif key == 'group_wire_format':
+                # The group-carried declaration, after any merge: an absorbed
+                # node takes the surviving group's. C mirrors via
+                # group_t.wire_format.
+                grp = self.process.group
+                actual = str(grp.wire_format) if grp is not None else None
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: {key}={actual}, expected {expected}')
+            elif key == 'group_key_epoch':
+                # How many times this participant's group key has been rotated.
+                # Admission rotates (doc/architecture/gateway-reputation-tree.md), so a welcomer that admitted one
+                # peer sits at 1 -- that is what keeps cohort traffic recorded
+                # BEFORE a join closed to the joiner. C mirrors via
+                # group_t.key_epoch.
+                grp = self.process.group
+                actual = int(grp.key_epoch) if grp is not None else 0
+                if actual != int(expected):
+                    raise AssertionError(
+                        f'{self.id}: group_key_epoch={actual}, '
+                        f'expected {int(expected)}'
+                    )
+            elif key == 'group_uuid':
+                # This participant's PRIMARY group. Pinned by fixtures.groups,
+                # so the scenario can state it language-agnostically. The
+                # cross-group join asserts it is UNCHANGED: a gateway joining a
+                # child cohort must not have swapped its own group for the one
+                # it just joined. C mirrors via proc->protocol.group.uuid.
+                grp = self.process.group
+                actual = str(grp.uuid) if grp is not None else ''
+                if actual != str(expected):
+                    raise AssertionError(
+                        f'{self.id}: group_uuid={actual}, expected {expected}'
+                    )
+            elif key == 'child_group_count':
+                # Cohorts this participant gateways. A runtime join lands HERE
+                # and not in the primary group -- that separation is the whole
+                # observable. C mirrors via map_size(protocol.child_groups).
+                actual = len(getattr(self.process, 'child_groups', {}) or {})
+                if actual != int(expected):
+                    raise AssertionError(
+                        f'{self.id}: child_group_count={actual}, '
+                        f'expected {int(expected)}'
+                    )
             elif key == 'provisional_peer_count':
                 # Peers this participant is holding PROVISIONAL under two-phase
-                # admission (§3.1-a): confirm(s) received but the distinct-
+                # admission (doc/architecture/identity-protocol.md): confirm(s) received but the distinct-
                 # confirmer quorum not yet met, so the group key is withheld.
                 # Cleared on promotion. C mirrors via identity_provisional_count.
                 actual = len(getattr(self.process, '_provisional_confirmations', {}))
@@ -294,6 +721,82 @@ class _Participant:
                 if actual != want:
                     raise AssertionError(
                         f'{self.id}: subtree_roster={actual}, expected {want}')
+            elif key == 'hierarchy_of':
+                # What this participant RECORDED from a peer's hierarchy claim
+                # (protocol step 7), as {participant_id: {rank, children}}.
+                # The recording is gated -- proved gateway authority, the
+                # claim naming its own sender, and a freshness sequence above
+                # the mark -- and every one of those gates is invisible in the
+                # emitted traffic, so the store is the only place a refusal
+                # can be observed. `null` asserts nothing was recorded for
+                # that peer. C mirrors via identity_get_peer_hierarchy.
+                for pid, want in (expected or {}).items():
+                    peer_uuid = str(self._uuid_for_pid(pid))
+                    claim = (getattr(self.process, 'peer_hierarchy', {})
+                             or {}).get(peer_uuid)
+                    if want is None:
+                        if claim is not None:
+                            raise AssertionError(
+                                f'{self.id}: recorded a hierarchy claim from '
+                                f'{pid}, expected none')
+                        continue
+                    if claim is None:
+                        raise AssertionError(
+                            f'{self.id}: no hierarchy claim recorded from '
+                            f'{pid}, expected {want}')
+                    if 'rank' in want and int(claim.get('rank', 0)) != int(want['rank']):
+                        raise AssertionError(
+                            f'{self.id}: hierarchy_of[{pid}].rank='
+                            f'{claim.get("rank")}, expected {want["rank"]}')
+                    if 'children' in want:
+                        got_n = len(claim.get('children') or [])
+                        if got_n != int(want['children']):
+                            raise AssertionError(
+                                f'{self.id}: hierarchy_of[{pid}].children='
+                                f'{got_n}, expected {want["children"]}')
+            elif key == 'peer_tier':
+                # The reputation-derived trust tier this participant applied
+                # to a peer, as {participant_id: tier}. Distinct from rank:
+                # tier is the runtime, local-view trust attribute a
+                # negotiation tier-gate reads (doc/architecture/trust-tiers.md),
+                # and it arrives only over local IPC. C mirrors via
+                # identity_get_peer_tier.
+                for pid, want in (expected or {}).items():
+                    peer_uuid = self._uuid_for_pid(pid)
+                    actual = None
+                    if str(self.identity.uuid) == str(peer_uuid):
+                        # A node never blocks itself; read its own tier directly.
+                        actual = int(getattr(self.identity, '_tier', 0) or 0)
+                    else:
+                        # Confirm the peer is known here (else the assertion is
+                        # vacuous), then read the tier THROUGH get_peer_tier so a
+                        # locally blocked peer is clamped to 0 -- exactly as C's
+                        # peer_tier observable reads identity_get_peer_tier.
+                        known = any(
+                            str(getattr(peer, 'uuid', '')) == str(peer_uuid)
+                            for peer in self.process.peers.all)
+                        if known:
+                            actual = int(self.process.get_peer_tier(peer_uuid))
+                    if actual is None:
+                        raise AssertionError(
+                            f'{self.id}: peer_tier names {pid}, which is not '
+                            f'a known peer here')
+                    if actual != int(want):
+                        raise AssertionError(
+                            f'{self.id}: peer_tier[{pid}]={actual}, '
+                            f'expected {int(want)}')
+            elif key == 'parent_gateway':
+                # The higher-rank node this participant DERIVES as its parent (protocol
+                # step 7, doc/architecture/gateway-reputation-tree.md), as a participant
+                # id or '' for a node that tops its own cohort. Derived, never accepted
+                # from a peer, so the pin is on the arithmetic: rank among members that
+                # can prove a shared anchor, ties by greater uuid. C mirrors via
+                # identity_get_parent_gateway.
+                actual = self.parent_gateway_pid
+                if actual != (expected or ''):
+                    raise AssertionError(
+                        f'{self.id}: parent_gateway={actual!r}, '
+                        f'expected {(expected or "")!r}')
             elif key == 'attested_now':
                 # The attended-now stamp this participant's last ACCEPTED pull
                 # yielded: a pinned epoch when a human is at the target's
@@ -313,6 +816,37 @@ class _Participant:
                 if actual != float(expected):
                     raise AssertionError(
                         f'{self.id}: attested_now={actual}, expected {float(expected)}')
+            elif key in ('peer_clock_offset', 'peer_clock_delay',
+                         'peer_clock_usable'):
+                # Cohort clock skew measured from the attest round trip
+                # (cohort-clock-skew.md, Stage 0). expected = {peer_ref: value},
+                # peer_ref being a participant id.
+                #
+                # These read what the PRODUCTION handler recorded
+                # (_peer_clock_samples), not anything the harness computed --
+                # unlike attested_now/attest_accepted, which the harness derives
+                # itself and which therefore stayed green when
+                # handle_attest_response was half-broken by a signature change.
+                for peer_ref, want in (expected or {}).items():
+                    sample = self.attest_clock_samples.get(peer_ref)
+                    if sample is None:
+                        raise AssertionError(
+                            f'{self.id}: no clock sample for {peer_ref}')
+                    if key == 'peer_clock_usable':
+                        if bool(sample.usable) != bool(want):
+                            raise AssertionError(
+                                f'{self.id}: {peer_ref} clock_usable='
+                                f'{sample.usable}, expected {want}')
+                        continue
+                    actual = (sample.offset if key == 'peer_clock_offset'
+                              else sample.delay).total_seconds()
+                    # Tolerance, not equality: both runtimes reach this through
+                    # double arithmetic, and pinned clocks make the value exact
+                    # to well inside a microsecond.
+                    if abs(actual - float(want)) > 1e-6:
+                        raise AssertionError(
+                            f'{self.id}: {peer_ref} {key}={actual}, '
+                            f'expected {float(want)}')
             elif key == 'attest_accepted':
                 # Per-pull accept/reject verdicts, in step order. The nonce
                 # state machine: an answer counts only against the pull that
@@ -419,7 +953,7 @@ def _scenario_operator_binding(corpus_root: Path, ident: Identity,
     if variant == 'other-identity':
         # Correctly signed by the real operator, but naming a DIFFERENT node —
         # exactly what an attacker gets by harvesting a credential from a
-        # clear-text announce (ISSUES.md §1.5). Valid in every way except the
+        # clear-text announce (doc/architecture/zta-integration.md). Valid in every way except the
         # one that matters, which is why the pre-image names the node at all.
         bind_to = SimpleNamespace(
             uuid=UUID(bytes=bytes((b + 1) % 256 for b in _uuid_of(ident))),
@@ -437,7 +971,8 @@ def _scenario_operator_binding(corpus_root: Path, ident: Identity,
 
 def _scenario_zta_binding(corpus_root: Path, ident: Identity, cred: bytes,
                           variant: str) -> bytes:
-    """Mint a credential->identity binding for a scenario participant (ISSUES §1.5).
+    """Mint a credential->identity binding for a scenario participant
+    (doc/architecture/zta-integration.md).
 
     Signed AT SCENARIO TIME rather than pinned as a blob, for the same reason the
     operator binding is: pinning one recorded signature would let both
@@ -456,7 +991,7 @@ def _scenario_zta_binding(corpus_root: Path, ident: Identity, cred: bytes,
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
 
-    from autonomous_trust.core.identity.zta_binding import zta_binding_preimage
+    from autonomous_trust.core.identity.zta_fields import zta_binding_preimage
 
     bind_to = ident
     if variant == 'other-identity':
@@ -471,7 +1006,8 @@ def _scenario_zta_binding(corpus_root: Path, ident: Identity, cred: bytes,
     return priv.sign(preimage, padding.PKCS1v15(), hashes.SHA256())
 
 
-def _to_captured(msg: Any, emitter_id: str) -> CapturedMessage:
+def _to_captured(msg: Any, emitter_id: str,
+                 uuid_to_pid: dict | None = None) -> CapturedMessage:
     """Project a network-bound `Message` into the engine's CapturedMessage."""
     if not isinstance(msg, Message):
         # Non-Message items (Group, Peers, PeerCapabilities updates) are
@@ -481,7 +1017,7 @@ def _to_captured(msg: Any, emitter_id: str) -> CapturedMessage:
             from_id=emitter_id, to_id='internal',
             function=f'__ipc__/{type(msg).__name__}', payload=msg, raw=msg,
         )
-    to_id = _resolve_to_id(msg)
+    to_id = _resolve_to_id(msg, uuid_to_pid)
     return CapturedMessage(
         from_id=emitter_id,
         to_id=to_id,
@@ -491,7 +1027,24 @@ def _to_captured(msg: Any, emitter_id: str) -> CapturedMessage:
     )
 
 
-def _resolve_to_id(msg: Message) -> str:
+def _pid_of(ident, uuid_to_pid) -> str:
+    """One recipient -> participant id, by UUID first.
+
+    The petname is only a usable label for an identity the HARNESS built: it is
+    a local Zooko name, never transmitted, so an identity reconstructed from the
+    wire (a first-contact invitation carries the canonical public form, which is
+    petname-free) gets a locally-DERIVED petname instead, matching no
+    participant. Resolving by uuid first fixes that; the petname stays as the
+    fallback for a recipient that is not a participant at all. The C adapter's
+    _resolve_to_id has always matched on uuid.
+    """
+    uuid = str(getattr(ident, 'uuid', '') or '')
+    if uuid_to_pid and uuid in uuid_to_pid:
+        return uuid_to_pid[uuid]
+    return getattr(ident, 'petname', '') or uuid or str(ident)
+
+
+def _resolve_to_id(msg: Message, uuid_to_pid: dict | None = None) -> str:
     """Map a Message's to_whom into a scenario-level participant id."""
     to = msg.to_whom
     if to == Network.broadcast:
@@ -499,10 +1052,9 @@ def _resolve_to_id(msg: Message) -> str:
     if isinstance(to, Group):
         return 'broadcast'  # group-encrypted broadcast; engine treats both alike
     if isinstance(to, Identity):
-        return getattr(to, 'petname', '') or str(to.uuid)
+        return _pid_of(to, uuid_to_pid)
     if isinstance(to, list) and to:
-        first = to[0]
-        return getattr(first, 'petname', '') or str(getattr(first, 'uuid', first))
+        return _pid_of(to[0], uuid_to_pid)
     return 'broadcast'
 
 
@@ -534,6 +1086,19 @@ class _CapturingQueue:
 class IdentityAdapter:
     """Phase C scenario adapter for the identity protocol."""
 
+    # Extension points for a feature adapter that rides the identity process
+    # (FEATURE_SPLIT_PLAN Phase 5; loaded as a conformance plug-in, as Agora's
+    # social_adapter.py is). FIXTURE_HOOKS run per
+    # participant as fn(adapter, participant, pid, fixtures, identities);
+    # TRIGGERS map a pseudo-function to fn(adapter, participant, inbound) ->
+    # captured; INBOUND_BUILDERS map a function to fn(adapter, participants,
+    # sender, sender_identity, *, from_id, to_id, function, payload) -> obj;
+    # STATE_CHECKS map an expected_state key to fn(participant, key, expected).
+    FIXTURE_HOOKS: tuple = ()
+    TRIGGERS: dict = {}
+    INBOUND_BUILDERS: dict = {}
+    STATE_CHECKS: dict = {}
+
     def __init__(self, corpus_root: Path) -> None:
         self.corpus_root = corpus_root
         # Each scenario gets its own scratch dir for any on-disk side effects
@@ -544,13 +1109,76 @@ class IdentityAdapter:
         # in configs[PackageHash.key]; mirror that contract.
         self._package_hash = PackageHash().digest
 
+    @staticmethod
+    def _install_contacts(case: Case, participants) -> None:
+        """Pre-seed the durable address book from ``fixtures.contacts``.
+
+        Shape is ``{participant_id: {verified, petname, provenance,
+        rendezvous, trust_seed}}``, and the record is built from THAT
+        participant's own public identity -- the fixture cannot pin keys it
+        does not generate. One store per scenario (the harness gives the whole
+        scenario one data root), which is all the re-handshake cases need: they
+        assert what a SECOND handshake does to a record that already exists.
+
+        C mirrors this in its adapter; both runtimes must write the same
+        canonical file or the preserve rule would be tested against two
+        different starting states.
+        """
+        fixture = (case.data.get('fixtures', {}) or {}).get('contacts') or {}
+        if not fixture:
+            return
+        from autonomous_trust.first_contact import Contact, Contacts, Provenance
+        store = Contacts()
+        for pid, spec in fixture.items():
+            participant = participants.get(pid)
+            if participant is None:
+                raise AssertionError(
+                    f'fixtures.contacts names unknown participant {pid!r}')
+            spec = spec or {}
+            identity = participant.impl.process.identity.publish()
+            provenance = Provenance(spec.get('provenance', Provenance.token.value))
+            contact = Contact(identity, petname=spec.get('petname', ''),
+                              rendezvous=list(spec.get('rendezvous') or []),
+                              provenance=provenance,
+                              nonce=spec.get('nonce', ''),
+                              reach_seq=int(spec.get('reach_seq', 0) or 0))
+            if spec.get('verified'):
+                contact.mark_verified(float(spec['trust_seed'])
+                                      if 'trust_seed' in spec
+                                      else FIRST_CONTACT_VERIFIED_SEED)
+            store.add(contact)
+        store.save()
+
     def run_scenario(self, case: Case) -> None:
+        if (case.data.get('fixtures', {}) or {}).get('zta_delegation') is not None:
+            self._run_zta_delegation(case)
+            return
+        if ZtaPolicy is None and (case.data.get('fixtures', {}) or {}).get('zta_policy') is not None:
+            raise NotImplementedError('ZTA scenario skipped: autonomous-trust-zta is not '
+                                      'installed (put src/autonomous-trust-zta on the path '
+                                      'to run it symmetrically)')
+        fx = case.data.get('fixtures', {}) or {}
+        if not FIRST_CONTACT_PRESENT and ('first_contact' in fx or 'contacts' in fx):
+            raise NotImplementedError('first-contact scenario skipped: autonomous-trust-first-contact is not installed (put src/autonomous-trust-first-contact on the path to run it symmetrically)')
         self._scratch = tempfile.TemporaryDirectory(prefix='at-conformance-id-')
+        fc_fix = (case.data.get('fixtures', {}) or {}).get('first_contact') or {}
+        fc_prior = os.environ.get(FIRST_CONTACT_FLAG)
         try:
             os.environ[Configuration.ROOT_VARIABLE_NAME] = self._scratch.name
             os.makedirs(os.path.join(self._scratch.name, 'etc/at'), exist_ok=True)
+            # The 1:1 handshake is opt-in, and the opt-in is read when the
+            # IdentityProcess registers its handlers -- so it has to be set
+            # BEFORE the participants are built, and cleared after, or the
+            # next scenario inherits it. The durable spent-nonce store lands
+            # in the per-scenario scratch root above, so nonces cannot leak
+            # from one case into the next. Mirrors the C adapter.
+            if fc_fix.get('enabled'):
+                os.environ[FIRST_CONTACT_FLAG] = '1'
+            else:
+                os.environ.pop(FIRST_CONTACT_FLAG, None)
 
             participants = self._build_participants(case)
+            self._install_contacts(case, participants)
             ctx = ScenarioContext(
                 case=case,
                 participants=participants,
@@ -559,10 +1187,83 @@ class IdentityAdapter:
             )
             run_scenario(ctx)
         finally:
+            if fc_prior is None:
+                os.environ.pop(FIRST_CONTACT_FLAG, None)
+            else:
+                os.environ[FIRST_CONTACT_FLAG] = fc_prior
             self._scratch.cleanup()
             self._scratch = None
 
     # Phase C does not yet wire wire/crypto/negative kinds for identity.
+    def _run_zta_delegation(self, case: Case) -> None:
+        """Members' ZTA findings (scenarios ``zta-delegation-*``, ISSUES §2.20):
+        the fixture's event table offered to the delegation decisions, each
+        verdict and each standing published compared with the table. Every
+        answer the decisions ask for comes from the fixture. Mirrors C
+        run_zta_delegation."""
+        if ZtaPolicy is None:
+            raise NotImplementedError('ZTA scenario skipped: autonomous-trust-zta is not '
+                                      'installed (put src/autonomous-trust-zta on the path '
+                                      'to run it symmetrically)')
+        from autonomous_trust.zta import delegation
+        from autonomous_trust.zta.zta_verifier import ZtaStatus
+        fx = case.data['fixtures']['zta_delegation']
+        pol = fx['policy']
+        members = set(fx.get('members') or [])
+        records = fx.get('records') or {}
+        own_checks = fx.get('own_checks') or {}
+        reputations = dict(fx.get('reputations') or {})
+        published = []
+
+        def _status(name):
+            try:
+                return ZtaStatus(name)
+            except ValueError:
+                return ZtaStatus.REJECTED
+
+        ctx = delegation.DelegationContext(
+            is_member=lambda u: u in members,
+            recorded_hash=lambda p: bytes.fromhex(records[p]) if p in records else None,
+            reputation=lambda u: reputations.get(u),
+            own_check=lambda p: _status(own_checks[p]) if p in own_checks
+            else ZtaStatus.UNAVAILABLE,
+            standing=lambda p, st, ceiling, _reason: published.append(
+                {'peer': p, 'standing': st, 'ceiling': ceiling}),
+            min_reputation=float(pol['min_reputation']), quorum=int(pol['quorum']),
+            ddil_cap=float(pol['ddil_cap']),
+            revocation_penalty=float(pol['revocation_penalty']))
+        deleg = delegation.ZtaDelegation()
+        mismatched = []
+        for i, ev in enumerate(fx['events']):
+            published.clear()
+            if 'reputation' in ev:
+                reputations.update(ev['reputation'])
+                continue
+            if 'own_result' in ev:
+                deleg.own_result(ev['peer'], _status(ev['own_result']))
+                continue
+            kind = delegation.VOUCH if ev['kind'] == 'vouch' else delegation.ALERT
+            verdict = deleg.event(ctx, kind, ev['from'], ev['peer'],
+                                  bytes.fromhex(ev['hash']), _status(ev['status']))
+            want = ev.get('standings') or []
+            same = len(want) == len(published) and all(
+                w['peer'] == g['peer'] and w['standing'] == g['standing']
+                and ((w.get('ceiling') is None) == (g['ceiling'] is None))
+                and (w.get('ceiling') is None
+                     or abs(float(w['ceiling']) - g['ceiling']) <= 1e-9)
+                for w, g in zip(want, published))
+            if verdict != ev['verdict'] or not same:
+                mismatched.append((i, verdict, ev['verdict'], list(published)))
+        if mismatched:
+            print('zta-delegation mismatches:', mismatched)
+        want = ((case.data.get('expected_state') or {}).get('node') or {}).get(
+            'all_cases_match')
+        if not isinstance(want, bool):
+            raise AssertionError('scenario: expected_state.node.all_cases_match missing')
+        if want != (not mismatched):
+            raise AssertionError('node: all_cases_match mismatch: expected %s, got %s'
+                                 % (want, not mismatched))
+
     def run_wire_vector(self, case: Case) -> None:  # noqa: ARG002
         raise NotImplementedError('identity wire_vector kind not implemented (Phase C: scenarios only)')
 
@@ -613,7 +1314,7 @@ class IdentityAdapter:
                 with open(self.corpus_root / rel, 'rb') as fp:
                     identities[pid].zta_credential = fp.read()
 
-        # The credential->identity binding (ISSUES §1.5).
+        # The credential->identity binding (doc/architecture/zta-integration.md).
         # `zta_bindings: {<pid>: <variant>}` signs one at scenario time over the
         # credential attached just above — so this must run after that loop, not
         # beside it. The binding rides in the repeated `zta_credentials` field
@@ -715,6 +1416,7 @@ class IdentityAdapter:
         groups_fix: dict[str, Any] = fixtures.get('groups', {}) or {}
         distinct_groups = bool(groups_fix)
         group_by_pid: dict[str, Group] = {}
+        _FIXTURE_GROUP_PUB.clear()
         if distinct_groups:
             for gi, (pid, spec_g) in enumerate(groups_fix.items()):
                 group_by_pid[pid] = self._build_group_from_fixture(
@@ -752,13 +1454,20 @@ class IdentityAdapter:
             None,
         )
         existing_pids = [s['id'] for s in spec_participants if s['id'] != newcomer_pid]
+        # `direct_peers`: {pid: [pid, ...]} -- first-contact direct peers, in
+        # the peer lists and NOT in the group (R+D.md §13.5 D2). The group is
+        # shared, so a listed peer is left out of it for everyone; the first
+        # existing participant must not be one. Mirrors the C adapter.
+        direct_fix = (case.data.get('fixtures') or {}).get('direct_peers') or {}
+        direct = {str(d) for ds in direct_fix.values() for d in (ds or ())}
         group: Group | None = None
         if existing_pids and not distinct_groups:
             seed = identities[existing_pids[0]]
             group = Group(seed.uuid, {seed.uuid: seed.address}, 'conformance-grp',
                           Encryptor.generate(), False)
             for pid in existing_pids[1:]:
-                group.add_address(identities[pid].uuid, identities[pid].address)
+                if pid not in direct:
+                    group.add_address(identities[pid].uuid, identities[pid].address)
 
         # Pre-populate each existing participant's Peers with all OTHER
         # existing participants so the canonical scenario doesn't need an
@@ -766,6 +1475,16 @@ class IdentityAdapter:
         # `amnesia_known` opt-in adds the newcomer to existing peers up front,
         # which is what the amnesia scenario asserts on.
         amnesia_known = bool((case.data.get('fixtures') or {}).get('amnesia_known', False))
+        # `amnesia_member` goes one step further: the newcomer is also in the
+        # existing participants' group address map, i.e. a MEMBER that lost its
+        # state, which is the only node the amnesia branch readmits without a
+        # vote. Mirrors the C adapter.
+        amnesia_member = bool((case.data.get('fixtures') or {}).get('amnesia_member', False))
+        if amnesia_member:
+            amnesia_known = True
+            if group is not None and newcomer_pid is not None:
+                group.add_address(identities[newcomer_pid].uuid,
+                                  identities[newcomer_pid].address)
 
         handles: dict[str, ParticipantHandle] = {}
         for spec in spec_participants:
@@ -788,14 +1507,14 @@ class IdentityAdapter:
                 this_group = group
             participant = self._build_one(pid, role, identity, peers, this_group,
                                           zta_policy=zta_policy)
-            # Border-guard flag (ISSUES.md §3.1-c, Policy B). Optional
+            # Border-guard flag (doc/architecture/identity-protocol.md, Policy B). Optional
             # per-participant `border_guard: false` makes this peer abstain
             # from voting on received proposals; defaults true (set in
             # _build_one) so existing scenarios are unaffected. Mirrors the C
             # adapter's identity_set_border_guard_mode plumbing.
             if 'border_guard' in spec:
                 participant.process.border_guard_mode = bool(spec['border_guard'])
-            # Two-phase admission quorum (§3.1-a). fixtures.admission_quorum is
+            # Two-phase admission quorum. fixtures.admission_quorum is
             # {participant_id: int}; a member withholds the group key until that
             # many distinct border-guards confirm. Default 1 (no fixture) keeps
             # single-confirm admission. Mirrors the C adapter's
@@ -812,6 +1531,11 @@ class IdentityAdapter:
             for cap_name in cap_fix.get(pid, []):
                 participant.process.protocol.capabilities.register_ability(
                     cap_name, None, [], {})
+            # Features' own fixtures (the social adapter's positions,
+            # profiles, connections, customers, ...): FIXTURE_HOOKS.
+            participant.state_checks = self.STATE_CHECKS
+            for hook in self.FIXTURE_HOOKS:
+                hook(self, participant, pid, fixtures, identities)
             # Inject N synthetic cap-less peers (fixtures.capless_peers[pid])
             # directly into this participant's roster: present in self.peers but
             # absent from peer_capabilities -- exactly the state the periodic
@@ -839,13 +1563,73 @@ class IdentityAdapter:
             str(h.impl.identity.uuid): h.impl for h in handles.values()}
         self._roster_uuid_to_pid = {
             str(h.impl.identity.uuid): pid for pid, h in handles.items()}
+        # The reverse map, handed to every participant so an expected_state key
+        # can name a peer by participant id even when the store it reads is
+        # keyed by uuid (hierarchy_of, peer_tier). The relabel-at-dispatch
+        # trick the roster and clock-sample keys use does not work for those:
+        # a handler writes them into process state directly, and there is no
+        # adapter-side moment that sees both the uuid and the id.
+        pid_to_uuid = {pid: str(h.impl.identity.uuid)
+                       for pid, h in handles.items()}
+        for h in handles.values():
+            h.impl.pid_to_uuid = dict(pid_to_uuid)
+        peers_by_pid = {pid: h.impl for pid, h in handles.items()}
+        for h in handles.values():
+            h.impl.peers_by_pid = peers_by_pid
+        # ranks fixture: {pid: int} — the topology rank each participant HAS,
+        # applied both to its own identity and to every other node's view of it.
+        # Rank is what the hierarchy derivation reads (protocol step 7), so a
+        # scenario pinning a parent has to be able to state it. Mirrors the C
+        # adapter's ranks handling (identity_set_peer_rank + identity.rank).
+        ranks_fix: dict[str, int] = fixtures.get('ranks', {}) or {}
+        for pid, rank in ranks_fix.items():
+            h = handles.get(pid)
+            if h is None:
+                raise AssertionError(f'ranks names unknown participant {pid!r}')
+            h.impl.identity._rank = int(rank)
+            for other in handles.values():
+                # The peer_ranks seam, not the peer object: a cohort's
+                # membership is an address map, so a member's rank has to be
+                # knowable before its Identity is. Same seam C uses.
+                other.impl.process.set_peer_rank(h.impl.identity.uuid, rank)
+                try:
+                    peer = other.impl.process.peers.find_by_uuid(
+                        h.impl.identity.uuid)
+                except Exception:
+                    peer = None
+                if peer is not None:
+                    peer._rank = int(rank)
         # cohort_tree fixture: seed each gateway's child group + recursion
         # target so a subtree-roster enumeration spans the whole tree.
         self._apply_cohort_tree(handles, fixtures)
         # operator_session fixture: who has a human at the console, and the
         # pinned clock every stamp is taken from.
         self._apply_operator_session(handles, fixtures)
+        # clocks fixture: per-participant clocks, so a scenario can pin two
+        # nodes that DISAGREE. Applied after operator_session so it overrides
+        # that fixture's single shared clock.
+        self._apply_clocks(handles, fixtures)
         return handles
+
+    def _apply_clocks(self, handles, fixtures) -> None:
+        """Wire the ``clocks`` fixture: ``{<pid>: <epoch>}``.
+
+        ``operator_session.clock`` pins ONE clock for every participant, which
+        is all the attended-now scenarios need. Cohort skew is the difference
+        BETWEEN two nodes' clocks, so it needs a distinct value per node. With
+        constant pinned clocks the round trip's t1 and t4 are both the puller's
+        value and t2/t3 are both the target's, so the derived offset is exactly
+        the difference and the delay is exactly zero -- a comparison two
+        languages can agree on to the bit. C mirrors via
+        identity_set_attest_clock per participant.
+        """
+        clocks_fix = (fixtures or {}).get('clocks', {}) or {}
+        for pid, epoch in clocks_fix.items():
+            if pid not in handles:
+                continue
+            impl = handles[pid].impl
+            impl.attest_clock = float(epoch)
+            impl.process._now_epoch = lambda c=float(epoch): c
 
     def _apply_operator_session(self, handles, fixtures) -> None:
         """Wire the operator_session fixture (ethne D8/Q9 attended-now).
@@ -930,8 +1714,16 @@ class IdentityAdapter:
         enc = Encryptor.generate()
         if public_only:
             enc = Encryptor(enc.publish(), public_only=True)
+        # `key_epoch` pins how many rotations this participant's group key has
+        # been through, so a scenario can hand a member an update from a
+        # sender an epoch behind it (ISSUES §2.31).
+        # `wire_format` is the group-carried declaration a merge hands from
+        # the surviving group to the absorbed node (Group.adopt_membership).
         grp = Group(group_uuid, {identity.uuid: identity.address},
-                    f'grp-{pid}', enc, public_only)
+                    f'grp-{pid}', enc, public_only,
+                    _key_epoch=int(spec.get('key_epoch', 0)),
+                    _wire_format=spec.get('wire_format'))
+        _FIXTURE_GROUP_PUB[pid] = enc.publish()
         ns = UUID('00000000-0000-0000-0000-000000000aaa')
         for k in range(max(0, size - 1)):
             # str() the filler uuid: address-map keys must be strings (matches
@@ -1091,8 +1883,6 @@ class IdentityAdapter:
         On ``replay`` the previous answer is re-presented instead of a fresh
         pull: same nonce, already retired, and it must be refused.
         """
-        from autonomous_trust.core.operator.session import is_attended
-
         if replay:
             answer = dict(puller.attest_last_answer)
             if not answer:
@@ -1103,14 +1893,21 @@ class IdentityAdapter:
             # binds an answer to the pull that asked for it — and a fixed value
             # keeps the two runs identical.
             nonce = '%s-%d' % (puller.id, len(puller.attest_accepted))
+            # Third element is the round trip's t1 -- the puller's own clock at
+            # send. Production records it in handle_attest_trigger; here the
+            # pull is injected, so the harness must supply it or no clock sample
+            # can be measured (cohort-clock-skew.md).
             puller.process._attest_sent[nonce] = (
                 str(target.identity.uuid),
-                (puller.attest_clock or 0.0) + 10.0)
-            # The target answers. Its own session state decides the stamp.
+                (puller.attest_clock or 0.0) + 10.0,
+                puller.attest_clock or 0.0)
+            # The target answers. Its own session state decides the stamp, and
+            # its own clock supplies both of the readings it reports.
             session = getattr(target.process, '_operator_session', None)
-            attended = bool(session is not None and is_attended(session))
+            attended = bool(session is not None and session.is_attended())
             epoch = target.attest_clock if attended else 0.0
-            answer = target.process._attest_payload(nonce, epoch)
+            answer = target.process._attest_payload(nonce, epoch,
+                                                    target.attest_clock or 0.0)
             puller.attest_last_answer = dict(answer)
 
         before = dict(puller.process._attest_sent)
@@ -1124,10 +1921,19 @@ class IdentityAdapter:
         puller.attest_accepted.append(accepted)
         if accepted:
             puller.attest_stamp = float(answer.get('operator_attested_at') or 0.0)
+        # Relabel whatever the handler measured for this peer under the target's
+        # participant id. Absent (no readings in the answer) records nothing, so
+        # a scenario asserting on it fails loudly rather than reading a stale one.
+        sample = puller.process._peer_clock_samples.get(str(target.identity.uuid))
+        if sample is not None:
+            puller.attest_clock_samples[target.id] = sample
 
     def _dispatch(self, participant: _Participant, inbound: Any) -> list[CapturedMessage]:
         if not isinstance(inbound, Message):
             raise AssertionError(f'expected a Message, got {type(inbound).__name__}')
+        trigger = self.TRIGGERS.get(inbound.function)
+        if trigger is not None:   # a feature's pseudo-function
+            return trigger(self, participant, inbound)
         if inbound.function == _TRIGGER_CAPS_RESYNC:
             # Pseudo-function: invoke the periodic caps-resync sweep directly
             # (it is timer-gated in production, so there is no wire message to
@@ -1143,6 +1949,123 @@ class IdentityAdapter:
             self._run_attest_pull(
                 puller, participant,
                 replay=(inbound.function == _TRIGGER_ATTEST_REPLAY))
+            return participant.drain_outbox()
+        if inbound.function == _TRIGGER_COHORT_JOIN:
+            target = ''
+            if inbound.obj:
+                target = str(from_json_string(inbound.obj).get('group_uuid', ''))
+            participant.process.request_cohort_join(participant.queues, target)
+            return participant.drain_outbox()
+        if inbound.function == _TRIGGER_HIERARCHY:
+            participant.process._refresh_hierarchy(participant.queues)
+            uuid = participant.process.parent_gateway
+            participant.parent_gateway_pid = (
+                self._roster_uuid_to_pid.get(str(uuid), str(uuid))
+                if uuid else '')
+            return participant.drain_outbox()
+        if inbound.function == _TRIGGER_FC_INITIATE:
+            # `participant` is the INITIATOR. Mint the ticket from the
+            # participant the step names, then let the production call decide
+            # what to send and where -- the point is the decision, not the
+            # bytes the harness could have assembled itself.
+            from autonomous_trust.first_contact import create_invitation
+            from autonomous_trust.first_contact import first_contact as _fc
+            spec = from_json_string(inbound.obj) if inbound.obj else {}
+            minter_pid = str(spec.get('minted_by'))
+            minter_uuid = participant._uuid_for_pid(minter_pid)
+            minter = self._roster_by_uuid[str(minter_uuid)].identity
+            blob = create_invitation(
+                minter,
+                rendezvous=list(spec.get('rendezvous') or []),
+                expiry=int(spec.get('expiry', 0) or 0),
+                ttl_seconds=0,
+                nonce=str(spec.get('nonce', '')),
+            ).encode()
+            _fc.initiate(participant.process, participant.queues, blob)
+            emitted = participant.drain_outbox()
+            for cm in emitted:
+                if cm.function == FirstContactProtocol.hello:
+                    to_whom = cm.raw.to_whom
+                    target = to_whom[0] if isinstance(to_whom, list) else to_whom
+                    participant.fc_hello_endpoint = str(
+                        getattr(target, 'address', '') or '')
+            return emitted
+        if inbound.function == _TRIGGER_FC_REMOVE:
+            from autonomous_trust.first_contact import first_contact as _fc
+            spec = from_json_string(inbound.obj) if inbound.obj else {}
+            peer_uuid = participant._uuid_for_pid(str(spec.get('peer')))
+            request = Message(CfgIds.identity, _fc.APP_REMOVE,
+                              to_json_string({'ref': '', 'peer': str(peer_uuid)}),
+                              to_whom=None, from_whom=None, encrypt=False)
+            _fc.handle_app_remove(participant.process, participant.queues, request)
+            return participant.drain_outbox()
+        if inbound.function in (_TRIGGER_DIR_PUBLISH, _TRIGGER_DIR_REQUEST,
+                                _TRIGGER_DIR_ACCEPT, _TRIGGER_DIR_DECLINE,
+                                _TRIGGER_DIR_CLOCK):
+            from autonomous_trust.first_contact._python import directory_contact as _dc
+            spec = from_json_string(inbound.obj) if inbound.obj else {}
+            proc, queues = participant.process, participant.queues
+            if inbound.function == _TRIGGER_DIR_PUBLISH:
+                att, _entry = _dir_entry_for(proc.identity, str(spec.get('handle')))
+                _dc.handle_app_dir_publish(proc, queues, _app_verb(
+                    _dc.APP_DIR_PUBLISH, {'ref': 'pub', 'attestation': att.to_wire()}))
+            elif inbound.function == _TRIGGER_DIR_CLOCK:
+                proc._dir_clock_advance += float(spec.get('advance', 0) or 0)
+            elif inbound.function == _TRIGGER_DIR_REQUEST:
+                holder_uuid = participant._uuid_for_pid(str(spec.get('holder')))
+                holder = self._roster_by_uuid[str(holder_uuid)].process.identity
+                handle = str(spec.get('handle'))
+                _att, entry = _dir_entry_for(holder, handle)
+                _dc.handle_dir_result(proc, queues, _app_verb(
+                    FirstContactProtocol.dir_result,
+                    {'handle': handle, 'entry': entry.to_wire(), 'relay': '',
+                     'limited': False}))
+                _dc.handle_app_request(proc, queues, _app_verb(
+                    _dc.APP_REQUEST, {'ref': 'ask', 'handle': handle}))
+            else:
+                answer = (_dc.handle_app_accept if inbound.function == _TRIGGER_DIR_ACCEPT
+                          else _dc.handle_app_decline)
+                answer(proc, queues, _app_verb(
+                    _dc.APP_ACCEPT if inbound.function == _TRIGGER_DIR_ACCEPT
+                    else _dc.APP_DECLINE, {'ref': str(spec.get('ref', ''))}))
+            return participant.drain_outbox()
+        if inbound.function in (_TRIGGER_AREA_PUBLISH, _TRIGGER_AREA_WITHDRAW,
+                                _TRIGGER_AREA_REQUEST):
+            from autonomous_trust.first_contact._python import area_contact as _ac
+            from autonomous_trust.first_contact._python import directory_contact as _dc
+            from autonomous_trust.first_contact._python import area_card as _card
+            spec = from_json_string(inbound.obj) if inbound.obj else {}
+            proc, queues = participant.process, participant.queues
+            area = str(spec.get('area'))
+            if inbound.function == _TRIGGER_AREA_PUBLISH:
+                _ac.handle_app_area_publish(proc, queues, _app_verb(
+                    _ac.APP_AREA_PUBLISH, {'ref': 'pub', 'area': area,
+                                           'bucket': str(spec.get('bucket') or area)}))
+            elif inbound.function == _TRIGGER_AREA_WITHDRAW:
+                _ac.handle_app_area_withdraw(proc, queues, _app_verb(
+                    _ac.APP_AREA_WITHDRAW, {'ref': 'pub', 'area': area}))
+            else:
+                holder_uuid = participant._uuid_for_pid(str(spec.get('holder')))
+                holder = self._roster_by_uuid[str(holder_uuid)].process.identity
+                card = _card.create_card(holder, area, area, '', 1)
+                _ac.handle_hub_result(proc, queues, _app_verb(
+                    FirstContactProtocol.hub_result,
+                    {'area': area, 'cards': [{'card': card.to_wire(), 'relay': ''}],
+                     'limited': False}))
+                _dc.handle_app_request(proc, queues, _app_verb(
+                    _dc.APP_REQUEST, {'ref': 'ask', 'area': area,
+                                      'peer_uuid': str(holder_uuid).lower()}))
+            return participant.drain_outbox()
+        if inbound.function == _TRIGGER_FC_RESTART:
+            # Forget the in-memory spent-nonce guard, keep the file: a fresh
+            # SpentNonces re-reads <data_dir>/first_contact_nonces.cfg.json,
+            # which is exactly what a restarted node does. Pending hellos and
+            # minted refs live only in memory, so a restart forgets them too.
+            # C mirrors with at_first_contact_reset().
+            from autonomous_trust.first_contact import first_contact as _fc
+            participant.process._first_contact_nonces = _fc.SpentNonces()
+            participant.process._first_contact_pending = {}
+            participant.process._first_contact_minted = {}
             return participant.drain_outbox()
         if inbound.function == _TRIGGER_SUBTREE_ROSTER:
             # Pseudo-function: run the requestor-side subtree-roster walk on
@@ -1173,7 +2096,50 @@ class IdentityAdapter:
         # this is what makes votes_emitted symmetric across the two impls.
         if inbound.function == IdentityProtocol.propose:
             participant.process.vote_response(participant.queues)
+        # Same reason, one seam further out: the attest responder cannot answer
+        # inline either. handle_attest_request parks the pull and asks the MAIN
+        # loop, because only the main loop shares an address space with the
+        # console's OperatorSession; handle_operator_state_response is what
+        # finally emits the attestation. C reaches the answer in one hop from
+        # its own seam, so without a main loop here the Python responder half
+        # never runs at all and the two runtimes are compared on nothing.
+        if inbound.function == IdentityProtocol.attest_req:
+            self._answer_operator_state_query(participant)
         return participant.drain_outbox()
+
+    def _answer_operator_state_query(self, participant: _Participant) -> None:
+        """Stand in for the main loop's `_answer_operator_state`.
+
+        Consumes whatever operator_state_query the identity process just put on
+        its main queue and feeds back the reply that loop would send, deriving
+        attendance from the stub session through the SAME `is_attended` the
+        production loop uses -- so the two processes cannot drift apart here any
+        more than they can in the real node. The epoch is the participant's
+        fixture clock rather than `time.time()`: production stamps wall clock,
+        and a scenario has to be reproducible.
+        """
+        sink = participant.queues[CfgIds.main]._sink
+        queries = [m for m in sink
+                   if isinstance(m, Message)
+                   and m.function == IdentityProtocol.operator_state_req]
+        if not queries:
+            return
+        for m in queries:
+            sink.remove(m)
+        session = getattr(participant.process, '_operator_session', None)
+        attended = bool(session is not None and session.is_attended())
+        # One answer serves every pull in flight -- they all asked the same
+        # question of the same session -- which is exactly what the handler
+        # assumes when it drains the whole pending table.
+        reply = Message(CfgIds.identity, IdentityProtocol.operator_state_resp,
+                        to_json_string({
+                            'attended': attended,
+                            'epoch': (participant.attest_clock or 0.0) if attended else 0.0,
+                            'have_session': session is not None,
+                        }),
+                        from_whom=participant.identity)
+        participant.process.handle_operator_state_response(participant.queues,
+                                                           reply)
 
     # ------------------------------------------------------------------
     # Inbound construction
@@ -1185,8 +2151,14 @@ class IdentityAdapter:
         sender_identity = sender.identity
 
         # Translate the high-level YAML payload into the form the protocol
-        # expects on the wire. Each function gets its own constructor.
-        if function == IdentityProtocol.announce:
+        # expects on the wire. Each function gets its own constructor; a
+        # feature's functions are its INBOUND_BUILDERS.
+        builder = self.INBOUND_BUILDERS.get(function)
+        if builder is not None:
+            obj = builder(self, participants, sender, sender_identity,
+                          from_id=from_id, to_id=to_id, function=function,
+                          payload=payload)
+        elif function == IdentityProtocol.announce:
             # DRY request_access contract: identity rides the envelope from_*
             # fields (set via from_whom on the Message below — the canonical
             # cross-runtime sender representation); the payload carries only
@@ -1194,6 +2166,19 @@ class IdentityAdapter:
             # idprocess._broadcast_request_access and the C _build_announcement.
             caps_list = payload.get('capabilities', [])
             obj = to_json_string((self._package_hash, caps_list))
+            # `rekeyed: true` presents the sender's uuid under fresh signing
+            # and encryption keys; `address` presents it from another address
+            # (a node that moved networks). Both model a returning node.
+            if payload.get('rekeyed') or payload.get('address'):
+                sender_identity = Identity(
+                    sender_identity.uuid,
+                    payload.get('address') or sender_identity.address,
+                    sender_identity.nickname,
+                    Signature.generate() if payload.get('rekeyed')
+                    else sender_identity.signature,
+                    Encryptor.generate() if payload.get('rekeyed')
+                    else sender_identity.encryptor,
+                    _public_only=False).publish()
         elif function == IdentityProtocol.accept:
             caps_list = payload.get('capabilities', [])
             obj = to_json_string((sender_identity.publish(),
@@ -1203,7 +2188,14 @@ class IdentityAdapter:
             target = participants[target_pid].impl.identity
             from autonomous_trust.core.identity.history import IdentityObj
             blob = IdentityObj(target.publish(), target.uuid)
-            obj = blob.to_string()
+            # Envelope carrying the confirmer's freshness sequence beside the
+            # identity blob. `unstamped: true` omits it, modelling a
+            # pre-change sender or a stripped field; both runtimes must refuse
+            # that rather than fall back to a lenient path.
+            body = {'peer': blob.to_string()}
+            if not payload.get('unstamped'):
+                body['seq'] = int(payload.get('seq', 1))
+            obj = to_json_string(body)
         elif function == IdentityProtocol.propose:
             # A peer proposal for voting. `handle_vote_on_peer` reads
             # message.obj as the candidate's IdentityObj (Configuration
@@ -1227,7 +2219,170 @@ class IdentityAdapter:
             # exercises is the cross-runtime one. handle_group_update parses it
             # via Group.from_canonical. See [[project_group_key_sync]].
             target_group = sender.process.group
-            obj = to_json_string(target_group.to_canonical()) if target_group else ''
+            canonical = target_group.to_canonical() if target_group else None
+            if canonical is not None and payload.get('omit_wire_format'):
+                # The group as a peer that lost the field (or predates it)
+                # sends it. Mirrors the C adapter.
+                canonical.pop('wire_format', None)
+            obj = to_json_string(canonical) if canonical is not None else ''
+        elif function == IdentityProtocol.hierarchy_req:
+            # A late joiner asking the group to state their positions
+            # (protocol step 7). The handler answers from its own claim and
+            # reads nothing out of the payload, so the requestor field is
+            # informational -- carried anyway, because it is what production
+            # sends (_request_hierarchy) and a scenario should exercise the
+            # bytes the wire actually has.
+            obj = to_json_string({'requestor': str(sender_identity.uuid)})
+        elif function == IdentityProtocol.hierarchy:
+            # A node's claim about ITS OWN place in the tree. `node` is the
+            # sender by construction: handle_hierarchy refuses a claim naming
+            # anybody else, and `payload.claims` lets a scenario name another
+            # participant deliberately to exercise that refusal.
+            #
+            # `children` are the GROUP uuids of the cohorts the sender
+            # gateways (idprocess._hierarchy_claim reads self.child_groups),
+            # not peer uuids -- so a scenario gives a count-shaped list and
+            # the adapter mints stable uuid5s for it. That keeps the fixture
+            # from having to know a group uuid it never created.
+            claimant = payload.get('claims')
+            node = (str(participants[claimant].impl.identity.uuid)
+                    if claimant else str(sender_identity.uuid))
+            parent_pid = payload.get('parent')
+            n_children = int(payload.get('children', 0) or 0)
+            children = [str(uuid5(_HIER_NS, f'{node}:cohort:{i}'))
+                        for i in range(n_children)]
+            body = {
+                'node':     node,
+                'parent':   (str(participants[parent_pid].impl.identity.uuid)
+                             if parent_pid else ''),
+                'children': children,
+                'rank':     int(payload.get('rank', 0) or 0),
+            }
+            # `unstamped: true` omits the freshness sequence, modelling a
+            # replayable claim; both runtimes must refuse it rather than
+            # record it, because this dict is what child-gateway discovery
+            # recurses into.
+            if not payload.get('unstamped'):
+                body['seq'] = int(payload.get('seq', 1))
+            obj = to_json_string(body)
+        elif function == FirstContactProtocol.hello:
+            # The OPTIONAL 1:1 handshake's ticket. The scenario names WHO minted
+            # the invitation (`minted_by`) plus the nonce and expiry, and the
+            # adapter mints it here from that participant's own signable
+            # identity -- rather than pinning a blob in the fixture -- because
+            # the participants' keys are generated per run. ed25519 signing is
+            # deterministic, so both runtimes mint the same bytes from the same
+            # seed anyway; what the case compares is the inviter's DECISION.
+            #
+            # The obj is the raw base64url blob, exactly as production sends it
+            # (first_contact.initiate forwards the link untouched, and the
+            # signature covers those bytes).
+            from autonomous_trust.first_contact import create_invitation
+            minter_pid = payload.get('minted_by') or from_id
+            minter = participants[minter_pid].impl.identity
+            obj = create_invitation(
+                minter,
+                rendezvous=list(payload.get('rendezvous') or []),
+                expiry=int(payload.get('expiry', 0) or 0),
+                ttl_seconds=0,
+                nonce=str(payload.get('nonce', '')),
+            ).encode()
+        elif function == FirstContactProtocol.contact_request:
+            # A finder's signed request (first_contact/directory.py), minted here
+            # from the SIGNER's identity (default the sender) for the entry of
+            # the participant it is addressed `to` (default the recipient) --
+            # a signer or `to` other than those is the forgery under test. The
+            # nonce is spelled out so the app's accept can name it as its ref.
+            from autonomous_trust.first_contact._python import directory as _dir
+            signer = participants[payload.get('signer') or from_id].impl.process.identity
+            holder = participants[payload.get('to') or to_id].impl.process.identity
+            if 'area' in payload:
+                # Found at an area hub: the holder's area card, not an entry.
+                from autonomous_trust.first_contact._python import area_card as _card
+                area = str(payload.get('area'))
+                entry = _card.create_card(holder, area, area, '', 1)
+            else:
+                _att, entry = _dir_entry_for(holder, str(payload.get('handle')))
+            obj = _dir.create_request(signer, entry,
+                                      nonce=str(payload.get('nonce', '')) or None).to_json()
+        elif function == FirstContactProtocol.contact_accept:
+            # The holder's answer: the nonce of the request it answers (default
+            # the one the recipient has outstanding to the sender) and a
+            # single-use invitation minted by `minted_by` (default the sender).
+            # `expired` backdates the invitation.
+            import time
+            from autonomous_trust.first_contact import create_invitation
+            nonce = payload.get('nonce')
+            if nonce is None:
+                holder_uuid = str(sender.process.identity.uuid).lower()
+                out = participants[to_id].impl.process._dir_out.get(holder_uuid)
+                nonce = out.nonce if out is not None else ''
+            minter = participants[payload.get('minted_by') or from_id].impl.identity
+            expired = bool(payload.get('expired'))
+            invitation = create_invitation(
+                minter, expiry=int(time.time()) - 60 if expired else None,
+                ttl_seconds=0 if expired else 600, nonce='dir-accept-invitation')
+            obj = to_json_string({'nonce': str(nonce), 'invitation': invitation.encode()})
+        elif function == FirstContactProtocol.reach_record:
+            # A signed reachability record (rendezvous/reach.py), minted here
+            # from the SIGNER's own identity (keys are generated per run).
+            # `claim` names whose uuid the body carries -- default the signer;
+            # a different one is the "right uuid, wrong key" forgery.
+            from autonomous_trust.rendezvous._python import reach as _reach
+            signer = participants[payload.get('signer') or from_id].impl.process.identity
+            claim_pid = payload.get('claim')
+            expiry = int(payload.get('expiry', 0) or 0)
+            record = _reach.create_record(
+                signer, int(payload.get('seq', 1)),
+                [str(h) for h in payload.get('relays') or []],
+                [str(h) for h in payload.get('endpoints') or []],
+                expiry=expiry)
+            if claim_pid:
+                body = dict(record.body)
+                body['uuid'] = str(participants[claim_pid].impl.process.identity.uuid).lower()
+                body_str = json.dumps(body, sort_keys=True, separators=(',', ':'),
+                                      ensure_ascii=True)
+                sig = signer.sign((_reach.REACH_DOMAIN + body_str).encode('utf-8'))
+                record = _reach.ReachRecord(body, body_str, sig.signature.decode('ascii'))
+            obj = record.to_json()
+        elif function == FirstContactProtocol.hello_ack:
+            # The accept. The echoed nonce is informational -- what makes the
+            # ack trustworthy is that the initiator already holds the
+            # accepter's key from the invitation it redeemed -- so the handler
+            # reads no further, on either runtime.
+            obj = to_json_string({'nonce': str(payload.get('nonce', ''))})
+        elif function == IdentityProtocol.roster_req:
+            # Subtree-roster query. `requesting_process` is load-bearing: the
+            # answer is addressed to the process the requestor names, and the
+            # aggregation that consumes it lives in the main loop, not here.
+            obj = to_json_string({
+                'requestor': str(sender_identity.uuid),
+                'requesting_process': payload.get('proc', CfgIds.main),
+            })
+        elif function == IdentityProtocol.attest_req:
+            # Attended-now pull, as it arrives on the wire. The nonce is what
+            # binds an answer to the request that asked for it, so it is
+            # spelled out by the scenario rather than minted here; omitting it
+            # (`no_nonce`) is a distinct case, because an unnonced attestation
+            # is replayable forever and must be refused rather than answered.
+            body = {}
+            if not payload.get('no_nonce'):
+                body['nonce'] = str(payload.get('nonce', 'n1'))
+            obj = to_json_string(body)
+        elif function == IdentityProtocol.tier_update:
+            # Local IPC from the reputation process, not a wire message: the
+            # payload is the (peer_uuid, tier) pair _publish_tier_change
+            # emits. `peer` names a participant; `unknown_peer` sends a uuid
+            # for nobody, which both runtimes must drop quietly rather than
+            # apply to somebody.
+            target_pid = payload.get('peer')
+            if payload.get('unknown_peer'):
+                target_uuid = str(uuid5(_HIER_NS, 'tier:nobody'))
+            elif target_pid:
+                target_uuid = str(participants[target_pid].impl.identity.uuid)
+            else:
+                target_uuid = str(sender_identity.uuid)
+            obj = to_json_string((target_uuid, int(payload.get('tier', 0))))
         elif function == IdentityProtocol.diff:
             obj = to_json_string([])
         elif function == IdentityProtocol.history:
@@ -1253,15 +2408,22 @@ class IdentityAdapter:
             # is something parseable but unused.
             obj = ''
         elif function == IdentityProtocol.caps_response:
-            # handle_caps_response parses `from_json_string(message.obj)` as a
-            # list whose items are either bare capability names (legacy) or
+            # handle_caps_response parses an envelope {caps: [...], seq: N}
+            # whose items are either bare capability names (legacy) or
             # descriptor objects {name, required_tier, description, kind,
             # arg_schema}. `caps` -> names; `descriptors` -> objects.
+            # `seq` is the responder's freshness sequence; `unstamped: true`
+            # omits it, modelling a pre-change sender or a stripped field,
+            # which must be refused rather than accepted leniently.
             if isinstance(payload, dict) and payload.get('descriptors'):
-                obj = to_json_string(payload['descriptors'])
+                items = payload['descriptors']
             else:
-                caps_list = payload.get('caps', []) if isinstance(payload, dict) else []
-                obj = to_json_string(caps_list)
+                items = payload.get('caps', []) if isinstance(payload, dict) else []
+            body = {'caps': items}
+            if not (isinstance(payload, dict) and payload.get('unstamped')):
+                seq = int(payload.get('seq', 1)) if isinstance(payload, dict) else 1
+                body['seq'] = seq
+            obj = to_json_string(body)
         elif function == IdentityProtocol.id_query:
             # Identity-resync query (layer 3): {group_uuid, have:[uuids]}.
             # The group_uuid is the asker's group (== the responder's in a
@@ -1286,46 +2448,90 @@ class IdentityAdapter:
                 if isinstance(payload, dict) else 'mock-addr:0'
             obj = from_addr
         elif function == IdentityProtocol.partition_probe:
-            # Cross-group probe: structured JSON payload (see §4.1).
+            # Cross-group probe: structured JSON payload (see).
             # For conformance the harness builds a self-consistent
             # payload signed by the sender; the receiver verifies and
             # emits a partition_response.
             from nacl.encoding import HexEncoder
             group_uuid = payload.get('group_uuid', '00000000-0000-0000-0000-000000000000')
             group_size = int(payload.get('group_size', 1))
+            # `seq` is the prober's freshness sequence and is part of the
+            # SIGNED bytes. Defaults to 1 so existing single-probe scenarios
+            # are unchanged; `unstamped: true` drops the field, which is
+            # `group-partition-probe-unstamped-refused`.
+            #
+            # A probe-replay scenario delivers the same seq twice (via the
+            # engine's `repeat`), which the mark refuses -- but the per-sender
+            # response cooldown suppresses the second reply on its own, so an
+            # emission count cannot tell the two mechanisms apart. That case,
+            # `group-partition-probe-replay-refused`, asserts the
+            # `freshness_refusals` observable instead, which only the mark can
+            # move. The unit twins get the same isolation by clearing the
+            # cooldown: `test_replayed_probe_refused` and
+            # `test_replayed_response_refused_within_round` in
+            # tests/a_unit/test_partition_recovery.py.
+            seq = int(payload.get('seq', 1))
             from autonomous_trust.core.identity.idprocess import IdentityProcess
-            canon = IdentityProcess._partition_probe_canonical(group_uuid, group_size)
+            canon = IdentityProcess._partition_probe_canonical(
+                group_uuid, group_size, seq)
             signed = sender_identity.sign(canon)
-            obj = to_json_string({
+            probe_body = {
                 'from_identity':   sender_identity.publish(),
                 'from_address':    sender_identity.address,
                 'my_group_uuid':   group_uuid,
                 'my_group_size':   group_size,
+                'seq':             seq,
                 'signature':       signed.signature.decode('ascii'),
-            })
+            }
+            # `unstamped: true` models a sender from before the freshness
+            # change (or an attacker stripping the field): the seq is omitted
+            # entirely. Both runtimes must REFUSE it rather than fall back to
+            # a lenient path — see doc/architecture/reputation.md, "Quorum
+            # attestation", for why there is no lenient mode.
+            if payload.get('unstamped'):
+                probe_body.pop('seq')
+            obj = to_json_string(probe_body)
         elif function == IdentityProtocol.partition_response:
             from autonomous_trust.core.identity.idprocess import IdentityProcess
             group_uuid = payload.get('group_uuid', '00000000-0000-0000-0000-000000000000')
             group_size = int(payload.get('group_size', 1))
             in_response_to = payload.get('in_response_to', '00000000-0000-0000-0000-000000000000')
+            # `in_response_to_id` names the PROBING participant instead of
+            # hard-coding its uuid, which is runtime-derived and differs
+            # between the two harnesses. Only a source-step response needs it:
+            # an assertion step re-delivers the captured response, whose
+            # `in_response_to` the real handler already filled in. C resolves
+            # the same key the same way (its engine rebuilds every step from
+            # the payload, so it needs it on assertion steps too).
+            in_resp_pid = payload.get('in_response_to_id')
+            if in_resp_pid is not None:
+                in_response_to = str(participants[in_resp_pid].impl.identity.uuid)
+            # `probe_seq` names the probe round being answered; the receiver
+            # refuses an echo that does not match the probe it is currently
+            # running. `seq` is the responder's own sequence.
+            probe_seq = int(payload.get('probe_seq', 1))
+            seq = int(payload.get('seq', 1))
             canon = IdentityProcess._partition_response_canonical(
-                group_uuid, group_size, in_response_to)
+                group_uuid, group_size, in_response_to, probe_seq, seq)
             signed = sender_identity.sign(canon)
             obj = to_json_string({
                 'from_identity':           sender_identity.publish(),
                 'from_address':            sender_identity.address,
                 'in_response_to':          in_response_to,
+                'in_response_to_seq':      probe_seq,
                 'my_group_uuid':           group_uuid,
                 'my_group_size':           group_size,
                 'my_group_leader':         payload.get('leader_uuid', '00000000-0000-0000-0000-000000000000'),
                 'my_group_leader_address': payload.get('leader_address', sender_identity.address),
+                'seq':                     seq,
                 'signature':               signed.signature.decode('ascii'),
             })
         else:
             obj = to_json_string(payload)
 
         if function in (_TRIGGER_CAPS_RESYNC, _TRIGGER_SUBTREE_ROSTER,
-                        _TRIGGER_ATTEST_PULL, _TRIGGER_ATTEST_REPLAY):
+                        _TRIGGER_ATTEST_PULL, _TRIGGER_ATTEST_REPLAY,
+                        _TRIGGER_HIERARCHY):
             # Pseudo-function: no wire payload; _dispatch invokes the sweep /
             # roster enumeration directly instead of a handler.
             obj = ''
@@ -1334,6 +2540,10 @@ class IdentityAdapter:
                       from_whom=sender_identity,
                       to_whom=Network.broadcast if to_id == 'broadcast' else None,
                       encrypt=(function != IdentityProtocol.announce))
+        if function == FirstContactProtocol.reach_record and payload.get('local'):
+            # As the network process hands on a relay lookup's answer: no
+            # sender on the envelope.
+            msg.from_whom = None
         return msg
 
 
@@ -1348,14 +2558,18 @@ class _StubOperatorSession:
     """
 
     def __init__(self, active: bool):
-        from autonomous_trust.core.operator.session import SessionState
-        self.state = SessionState.ACTIVE if active else SessionState.LOCKED
+        self.active = active
 
     def poll(self):
-        return self.state
+        return self.active
 
     def needs_reverify(self) -> bool:
         return False
+
+    def is_attended(self) -> bool:
+        # What the core asks of a session (the real one, the operator
+        # distribution's, decides it from its state machine).
+        return self.active
 
 
 @dataclass

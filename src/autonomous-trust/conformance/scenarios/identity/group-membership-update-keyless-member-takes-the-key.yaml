@@ -1,0 +1,42 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-membership-update-keyless-member-takes-the-key
+byte_pinning: false
+description: |
+    The control for group-membership-update-stale-epoch-keeps-key (ISSUES
+    §2.31). A member holding only the PUBLIC view of its own group has no key
+    to defend and cannot read the cohort, so a larger-membership update that
+    carries the private key is taken, key and all. The rule that a membership
+    update never changes the key covers only a member that already holds one.
+
+participants:
+  - id: peer_a
+    role: group_member
+  - id: peer_b
+    role: group_member
+
+fixtures:
+  groups:
+    peer_a:
+      uuid: "0a000000-0000-4000-8000-0000000002f2"
+      size: 1
+      public_only: true
+    peer_b:
+      uuid: "0a000000-0000-4000-8000-0000000002f2"
+      size: 3
+
+steps:
+  - id: 1
+    from: peer_b
+    to: peer_a
+    function: group_key_update
+    payload: {}
+    description: |
+        peer_b's keyed, larger view of G reaches peer_a, which holds no key.
+
+expected_state:
+  peer_a:
+    group_size: 3
+    group_owns_private_key: true
+    group_key_kept: false

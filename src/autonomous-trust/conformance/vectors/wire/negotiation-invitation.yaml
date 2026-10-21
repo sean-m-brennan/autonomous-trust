@@ -1,0 +1,33 @@
+schema_version: "1"
+kind: wire_vector
+protocol: negotiation
+name: negotiation-invitation
+description: |
+    The `invitation` payload: Python's __type__-tagged Task, with `requestor`
+    carried as the flat DRY canonical PUBLIC identity.
+
+    Byte-pinned because this is the shape that silently diverged. Only the
+    message ENVELOPE was pinned (vectors/wire/message-envelope-*), per-verb
+    payload shapes were not, and each adapter built its own runtime's payload
+    from the scenario step -- so the whole corpus stayed green while a C worker
+    could not read a Python requestor's invitation and a Python requestor could
+    not read a C worker's result (doc/architecture/negotiation.md). C hand-built a flat object
+    mirroring negotiation/task.proto, a schema Python does not use; the two
+    shared no key but `seq`.
+
+    The fixture is both the input and the expectation, and the same file feeds
+    both adapters: each parses it, re-emits it through its own serializer, and
+    must land back on the fixture. Neither runtime can drift without failing.
+
+    `requestor` is deliberately NOT Python's tagged Identity dump. That form
+    serializes Signature.to_dict(), which returns the PRIVATE signing seed for
+    a non-public-only key -- and the requestor is the node's own private
+    identity -- plus the local-only petname. The canonical form carries public
+    keys only, and is what the two runtimes already exchange for
+    `peer_accepted` and `full_history`.
+byte_pinning: true
+constructor: Task
+input:
+  json_wire: testdata/wire/negotiation-invitation/expected.json
+expected:
+  json_wire: testdata/wire/negotiation-invitation/expected.json

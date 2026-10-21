@@ -48,7 +48,36 @@ typedef struct
     unsigned char public_hex[crypto_box_PUBLICKEYBYTES * 2 + 1];
 } encryptor_t;
 
-#define ADDR_LEN 32
+/* Maximum length of an address STRING, excluding the NUL: every declaration is
+ * `char address[ADDR_LEN + 1]`, so the buffer is 46 bytes = INET6_ADDRSTRLEN =
+ * network.h's IPV6_ADDR_LEN. 45 is the longest text form of an IP address
+ * ("ffff:...:255.255.255.255"), so a numeric address of either family now fits
+ * whole.
+ *
+ * It was 32 until 2026-09-10, which truncated a long IPv6 literal, and every
+ * consequence of that was silent because half an address is still a
+ * syntactically valid address:
+ *   - config/generate.c clipped this node's OWN discovered IPv6 address while
+ *     hand-rolling a memcpy specifically to keep the compiler quiet about it;
+ *   - net_proc.c's my_address feeds a self-filter (`strcmp(from_addr,
+ *     my_addr)`), so a clipped value stops a node recognising its own traffic
+ *     (see [[c-cidr-split-hardcoded-lengths]]: its three callers had already
+ *     been widened to IPV6_ADDR_LEN as a local workaround for THIS constant);
+ *   - first_contact/first_contact.c had to refuse an over-long rendezvous endpoint
+ *     outright rather than send a hello to a mangled host.
+ * Python has no bound on Identity.address at all, so 32 was also a live
+ * C-only divergence that the conformance corpus never exercised.
+ *
+ * NOT sized for more, deliberately:
+ *   - a scoped literal (`fe80::1%eth0`) needs up to ~55, but nothing here
+ *     accepts one: the transport resolves with inet_pton (net_transport_ip.c),
+ *     which rejects a zone id outright;
+ *   - a DNS name needs 253. Every writer of this field stores the output of
+ *     inet_ntop or a literal, so it holds a numeric address; a name-valued
+ *     address would be a separate design change, not a wider buffer.
+ * network/net_message.c carries a _Static_assert tying this to IPV6_ADDR_LEN so
+ * the two cannot drift apart again. */
+#define ADDR_LEN 45
 
 #define NAME_LEN 128
 
@@ -79,7 +108,8 @@ typedef struct
  * reasoning as ZTA_CRED_MAX, three orders of magnitude smaller. */
 #define OPERATOR_BINDING_MAX 1024u
 
-/* Domain separation for the CREDENTIAL->identity binding (ISSUES §1.5): which
+/* Domain separation for the CREDENTIAL->identity binding
+ * (doc/architecture/zta-integration.md): which
  * node a ZTA credential authorizes, and the holder's proof of it. Distinct from
  * OPERATOR_BINDING_TAG, which binds the *operator's* ed25519 key to the node
  * (WHICH human); this one binds the *credential* to the node (WHO may present
@@ -123,9 +153,7 @@ typedef struct
 #define ZTA_MAX_ANCHORS 8u
 #define ZTA_ANCHOR_NAME_LEN 64
 
-/* One credential a peer presents, mirroring proto `ZtaCredential`. Declared
- * unconditionally (a typedef costs nothing) even though only an AT_ZTA build has
- * a field of this type, so a header consumer sees one shape either way. */
+/* One credential a peer presents, mirroring proto `ZtaCredential`. */
 typedef struct
 {
     uint8_t *der;          /**< raw credential, heap-allocated; NULL = empty slot */
@@ -146,9 +174,9 @@ typedef struct
     signature_t signature;
     encryptor_t encryptor;
     /* Operator-attended signal (proto fields 12-13; parity with Python
-       Identity). Kept OUTSIDE the AT_ZTA_ENABLED guard so the fields always
-       exist and default false/0 even in non-ZTA builds (mirrors from_rank);
-       only the operator-class VERIFICATION is ZTA-gated. Advertises whether a
+       Identity). The fields always exist and default false/0 in a build
+       without ZTA (mirrors from_rank); only the operator-class VERIFICATION is
+       ZTA's. Advertises whether a
        node has a human behind it (ethne guardian edge, D8/Q9). operator_bound
        is durable ("has a human guardian", authoritative only after the receiver
        verifies the operator credential); operator_attended_at is a live
@@ -171,9 +199,9 @@ typedef struct
        identically, and serializes byte-for-byte as it does today (both fields
        are emitted only when non-default). Requiring one is a consumer's rule.
 
-       Outside the AT_ZTA_ENABLED guard, like operator_bound: the fields — and
-       therefore the app-facing carrier's ABI — must not depend on a build flag.
-       Only VERIFICATION is ZTA-gated.
+       Unconditional, like operator_bound: the fields — and therefore the
+       app-facing carrier's ABI — must not depend on a build flag. Only
+       VERIFICATION is ZTA's.
 
        There is deliberately NO `operator_key_verified` flag. On a STORED PEER a
        non-empty `operator_pubkey` *means* our receiver verified the binding: an
@@ -186,7 +214,10 @@ typedef struct
     uint8_t operator_pubkey[crypto_sign_PUBLICKEYBYTES];
     uint8_t *operator_key_binding;      /* heap-allocated, may be NULL */
     size_t operator_key_binding_len;
-#ifdef AT_ZTA_ENABLED
+    /* ZTA credentials (proto fields 6-8 and 16). Unconditional since
+       FEATURE_SPLIT_PLAN Phase 6 (D3), as the operator fields above are: a
+       build without ZTA carries and relays them, and only VERIFICATION (the
+       ZTA extension) gives them any meaning. */
     uint8_t zta_credential_hash[32];  /* SHA-256 of ZTA credential at admission */
     char zta_issuer[64];              /* Credential issuer identifier */
     uint8_t *zta_credential;          /* Raw credential bytes (heap-allocated) */
@@ -209,7 +240,6 @@ typedef struct
        our own view. */
     char zta_anchors[ZTA_MAX_ANCHORS][ZTA_ANCHOR_NAME_LEN];
     size_t num_zta_anchors;
-#endif
 } public_identity_t;
 
 #ifdef __FRAMAC__
@@ -357,7 +387,7 @@ int operator_binding_preimage(const public_identity_t *ident,
 
 /**
  * @brief Build the pre-image a ZTA credential's private key signs to authorize
- *        @p ident to present it (ISSUES §1.5).
+ *        @p ident to present it (doc/architecture/zta-integration.md).
  *
  *     ZTA_BINDING_TAG || uuid (16) || ident->signature.public (32)
  *                     || sha256(credential) (32)
@@ -589,17 +619,84 @@ void identity_free(identity_t *ident);
  * and were therefore dropped AND annoy-tracked toward blacklisting. This
  * predicate bounds the plaintext fallback to named verbs, so a peer already in
  * the table cannot downgrade an arbitrary message to plaintext and have it
- * honored. Mirrors Python's identity.protocol.UNENCRYPTED_VERBS.
+ * honored. Two halves: the core's verbs, compiled in
+ * (@ref identity_verb_is_core_unencrypted), and an extension's verbs that the
+ * node's unencrypted_verbs.cfg.json grants (processes/plaintext_verbs.h).
+ * Mirrors Python's plaintext_verbs.is_unencrypted.
  *
  * Receive-side policy, so it covers every verb a PEER may legitimately send
  * unencrypted, including ones this implementation never sends itself.
  *
  * MAINTENANCE: adding an encrypt=false send REQUIRES adding its verb to the
- * table in id_proc.c, on both sides of the language boundary.
+ * core table in id_proc.c (or to its extension's plaintext_verbs), on both
+ * sides of the language boundary.
  *
  * @param verb Wire function selector; NULL is safe and returns false.
  */
 bool identity_verb_is_unencrypted(const char *verb);
+
+/**
+ * @brief True if @p verb may arrive on the broadcast (discovery) channel.
+ *
+ * That channel is plaintext and open to anyone on the segment, so it carries
+ * only what a node must say before it shares a key with the listener: every
+ * plaintext verb (identity_verb_is_unencrypted), plus the identity verbs a
+ * node broadcasts with no recipient (group_key_update, peer_accepted,
+ * propose_peer). Anything else arriving there is refused before routing
+ * (ISSUES §2.17). Mirrors Python identity.protocol.is_broadcast_verb.
+ *
+ * MAINTENANCE: a new send with an empty recipient and no group multicast
+ * needs its verb here (or in the plaintext lists), on both sides.
+ *
+ * @param verb Wire function selector; NULL is safe and returns false.
+ */
+bool identity_verb_is_broadcast(const char *verb);
+
+/** @brief Is @p verb one of the CORE's plaintext verbs? Mirrors Python's
+ *  identity.protocol.CORE_UNENCRYPTED_VERBS. NULL is safe and returns false. */
+bool identity_verb_is_core_unencrypted(const char *verb);
+
+/** @brief How many core verbs are accepted in plaintext (nine). */
+size_t identity_core_unencrypted_verb_count(void);
+
+
+/**
+ * @brief How many verbs this node accepts in plaintext now: the core's and the
+ *        ones unencrypted_verbs.cfg.json grants.
+ *
+ * Exists so conformance can pin the SIZE of the list, not just its members: a
+ * verb added on one side of the language boundary and not the other is exactly
+ * the drift `network/unencrypted-verbs` is there to catch. A verb that gains
+ * plaintext acceptance on one runtime only is a downgrade opening on that
+ * runtime alone.
+ */
+size_t identity_unencrypted_verb_count(void);
+
+
+/**
+ * @brief True if @p verb is part of the pre-admission handshake.
+ *
+ * The three verbs that move MEMBERSHIP: request_access, access_granted and
+ * full_history. The gateway boundary refuses to carry these
+ * (doc/architecture/network-wire-format.md, "The gateway boundary"), because
+ * admitting across a gateway is the only way a group comes to span one.
+ *
+ * MAINTENANCE: mirrors Python identity.protocol.BOOTSTRAP_VERBS; a change here
+ * needs the same change there.
+ *
+ * @param verb Wire function selector; NULL is safe and returns false.
+ */
+bool identity_verb_is_bootstrap(const char *verb);
+
+
+/**
+ * @brief How many verbs are in the pre-admission set.
+ *
+ * Exists so conformance can pin the SIZE of the list, not just its members: a
+ * verb added on one side of the language boundary and not the other is exactly
+ * the drift `network/gateway-boundary-verbs` is there to catch.
+ */
+size_t identity_bootstrap_verb_count(void);
 
 
 /** @} */ /* end of internal_identity */

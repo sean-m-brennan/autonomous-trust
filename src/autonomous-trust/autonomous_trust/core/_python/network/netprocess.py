@@ -16,6 +16,7 @@
 
 import concurrent.futures
 import errno
+import json
 import socket
 import threading
 import time
@@ -29,14 +30,65 @@ import nacl
 
 from ..protocol import Protocol
 from ..identity import Identity
-from ..identity.protocol import IdentityProtocol, UNENCRYPTED_VERBS
+from ..identity.identity import public_identity_to_canonical
+from ..identity.protocol import IdentityProtocol, BOOTSTRAP_VERBS
+from ..plaintext_verbs import is_broadcast, is_unencrypted
+from ..app_verbs import is_local_app_verb, refuse_remote_app_verb
 from ..processes import Process, ProcMeta
+from ..extensions import (configure_plaintext_verbs, load_extensions,
+                          network_hooks, process_alias, run_post_fork)
 from .. import _probes
 from ..identity import Group
-from ..system import CfgIds, PortSource, comm_port, net_cadence, resolve_comm_port
+from ..identity.peers import strip_cidr
+from ..system import (CfgIds, PortSource, comm_port, net_cadence, resolve_comm_port,
+                      default_annoy_limit, default_mystery_max_age_s, default_recv_poll_ms,
+                      resolve_annoy_limit, resolve_mystery_max_age_s, resolve_recv_poll_ms)
+from ..config import NetWireFormat
 from .network import Network
-from .message import Message
+from .message import Message, WireFormatMismatch
 from .ping_at import PingATServer, ping_at
+from .presence import PRESENCE_FUNCTION, PRESENCE_PROCESS, PresenceTracker
+
+#: ReputationProtocol.app_roster_request (C AT_APP_ROSTER_REQUEST), spelled out:
+#: importing the reputation package from here would be circular.
+app_roster_request = 'app_roster_request'
+
+
+#: The receive paths _msg_to_queue tells apart (ISSUES §2.17). Mirrors C
+#: net_route_path_t.
+PATH_PEER = 'peer'
+PATH_STRANGER = 'stranger-plaintext'
+PATH_RELAY_STRANGER = 'relayed-stranger'
+PATH_BROADCAST = 'broadcast'
+PATH_GROUP = 'group'
+
+# Group frames held for a key change (NetProcess._hold_group_frame); the same
+# bounds as C's NET_HELD_GROUP_FRAMES / NET_HELD_GROUP_FRAME_SEC.
+NET_HELD_GROUP_FRAMES = 16
+NET_HELD_GROUP_FRAME_SEC = 10
+
+
+def wire_verb_admitted(process, function, path):
+    """``(True, None)`` when a wire frame for ``process`` / ``function`` may be
+    routed after arriving on ``path``, else ``(False, reason)``.
+
+    Never an ``app_*`` verb (the local app's commands, which never travel),
+    never a command to the network process but a remote stats_req, and from a
+    sender we do not hold only the plaintext verbs (or, on the broadcast
+    channel, the broadcast ones). Checked on the frame's NAMES, never on its
+    claimed sender, which a stranger chooses. Mirrors C net_wire_verb_admitted.
+    """
+    if not isinstance(process, str) or not isinstance(function, str):
+        return False, 'no process or function'
+    if function.startswith('app_'):
+        return False, "app verbs are the local app's and never travel"
+    if process == CfgIds.network and function != Network.stats_req:
+        return False, 'the network process takes only stats_req from the wire'
+    if path in (PATH_STRANGER, PATH_RELAY_STRANGER) and not is_unencrypted(function):
+        return False, 'not a plaintext verb, and the sender is not a peer we hold'
+    if path == PATH_BROADCAST and not is_broadcast(function):
+        return False, 'not a verb the broadcast channel carries'
+    return True, None
 
 
 class NetworkProtocol(Enum):
@@ -89,11 +141,26 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     Abstract class - subclasses must implement send_* and recv_* methods
     """
     enc = Network.encoding
-    annoy_limit = 5
     net_proto = NetworkProtocol.NONE
-    mystery_max_retries = 60  # 30 seconds
-    socket_timeout = 0.1
     unknown_peer = '0'
+
+    # The DEFAULTS layer for the three network tunables, not the tunables
+    # themselves. __init__ overwrites each with the env-resolved value, so an
+    # AT_NET_* override reaches every consumer; these class attributes remain so
+    # a subclass or a test can still pin one directly (several do), and so the
+    # names keep working for anything that reads them off the class.
+    #
+    # C carries the same three knobs with the same names, bounds and defaults
+    # (network.h, resolved in net_proc.c). Before 2026-08-10 these were Python
+    # class attributes with no C counterpart, so a deployment could tune one
+    # runtime and not the other (doc/architecture/networking.md).
+    annoy_limit = default_annoy_limit
+    socket_timeout = default_recv_poll_ms / 1000.0
+    # Wall-clock seconds, replacing the old mystery_max_retries count. The
+    # count approximated this bound (60 retries x ~0.5s) but drifted with load,
+    # because the loop's cadence is not the loop's period. C always bounded by
+    # age; both sides now agree on the quantity as well as the value.
+    mystery_max_age_s = default_mystery_max_age_s
 
     def __init__(self, configurations, subsystems, log_q, acceptance_func=None, **kwargs):
         super().__init__(configurations, subsystems, log_q, **kwargs)
@@ -108,14 +175,30 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             # The metaclass default is the same defaults layer; keep honoring an
             # explicit subclass override of `port=` in that case only.
             self.port = self.default_port  # noqa
-        self.logger.info('network base port %d from %s (group %d)'
-                         % (self.port, self.port_source, self.port + 1))
+        self.logger.info('network base port %d from %s (group %d)', self.port, self.port_source, self.port + 1)
+
+        # The three tunables, same two-layer resolution and refusal rules as
+        # C's net_knob_resolve. Assigned as INSTANCE attributes over the class
+        # defaults, so a subclass or test that pins one after construction
+        # still wins -- the env layer sits between the compile-time default and
+        # an explicit override, exactly where the port's does.
+        self.annoy_limit, annoy_src = resolve_annoy_limit(self.logger)
+        recv_poll_ms, poll_src = resolve_recv_poll_ms(self.logger)
+        self.socket_timeout = recv_poll_ms / 1000.0
+        self.mystery_max_age_s, myst_src = resolve_mystery_max_age_s(self.logger)
+        self.logger.info(
+            'network annoy limit %d from %s, recv poll %d ms from %s, '
+            'mystery max age %d s from %s', self.annoy_limit, annoy_src, recv_poll_ms, poll_src, self.mystery_max_age_s, myst_src)
+
         self.diplomat = True
         self.ping_at_server = None
         self.myself = configurations[CfgIds.identity]
         self.peer_messages = deque()
         self.encrypted_messages = deque()
         self.group_messages = deque()
+        # Group frames that did not open, kept for a key change
+        # (_hold_group_frame).
+        self._held_group_frames = deque()
         self.unknown_messages = deque()
         self.acceptance = acceptance_func
         self.pests = {}
@@ -126,15 +209,32 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         # the inbound-drop / outbound-forward gates below.
         self.protocol.register_handler(Network.exclude, self.handle_exclude)
         self.protocol.register_handler(Network.readmit, self.handle_readmit)
+        # The relay's local verbs (relay_route, reach_publish, the directory and
+        # area-hub verbs) are registered by the rendezvous extension
+        # (network/rendezvous.py) in load_extensions below.
+        # Who reputation has cut off, by uuid and by signing key (hex), so a
+        # distrusted relay or client gains nothing by claiming a new uuid.
+        self._excluded_uuids = set()
+        self._excluded_keys = set()
+        # Rendezvous (network/rdv_net.py) and first contact keep their own
+        # state here, set up as their extensions register.
+        load_extensions(self, self.name)
         self.stop = False
         self.statistics = {}
         self._rejected_addresses: set[str] = set()
         self._crypto_error_counts: dict[str, int] = {}
-        # Partition-recovery signal cooldown: per-source-address timestamp
-        # of the last signal we forwarded to IdentityProcess. Bounded at
-        # one signal per address per 5 seconds so a chatty rejected-group
-        # peer can't flood the identity queue.
-        #   See doc/architecture/partition-recovery.md §5.1.
+        # Per-address count of frames dropped for arriving in a wire format
+        # this context does not speak. Rate-limits the log the same way
+        # _crypto_error_counts does; the probe counter is unconditional.
+        self._foreign_format_counts: dict[str, int] = {}
+        # Per-(kind, address) count of frames refused by the gateway-boundary
+        # gate (_boundary_refuse). Rate-limits the log exactly as
+        # _foreign_format_counts does; the probe counter is unconditional.
+        self._boundary_counts: dict[str, int] = {}
+        # Partition-recovery signal cooldown: per-source-address timestamp of the last
+        # signal we forwarded to IdentityProcess. Bounded at one signal per address per
+        # 5 seconds so a chatty rejected-group peer can't flood the identity queue. See
+        # doc/architecture/partition-recovery.md §5.1.
         self._partition_signal_lru: dict[str, datetime] = {}
         # Lazily created in process(). ThreadPoolExecutor can't be
         # pickled, so creating it here would break the multiprocessing
@@ -192,6 +292,121 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             except Exception:
                 continue
         return None
+
+    # ---- The gateway boundary -------------------------------------------
+    #
+    # Two invariants, both normative
+    # (doc/architecture/network-wire-format.md, "The gateway boundary"):
+    #
+    #   G. A GROUP STOPS AT THE GATEWAY. A gateway is a full MEMBER of each
+    #      cohort it bridges; no group spans it. So no address other than the
+    #      gateway's own may appear in two of the groups it holds, and a
+    #      group-addressed frame never leaves the address map of the group that
+    #      addressed it.
+    #   B. BOOTSTRAP DOES NOT CROSS THE GATEWAY. The pre-admission handshake
+    #      (BOOTSTRAP_VERBS) is domain-local. This is what ENFORCES G: the only
+    #      way a group comes to span a gateway is for a node on one side to be
+    #      admitted by a cohort on the other, and those three verbs are the only
+    #      ones that move membership.
+    #
+    # Together these make wire-format detection unnecessary rather than merely
+    # risky: every frame is either from a member of a group we hold (so the
+    # format is a lookup) or local bootstrap (so the format is JSON by rule).
+    # Relaxing either one puts that back on the table -- R+D.md Sec 2.5.
+
+    def _held_groups(self):
+        """Every group whose address map this node holds: the primary plus any
+        child cohort it gateways. Empty-to-one-element on a leaf node."""
+        grps = []
+        if self.group is not None:
+            grps.append(self.group)
+        grps.extend(list(self.child_groups.values()))
+        return grps
+
+    def _groups_containing(self, addr):
+        """The held groups listing *addr*, excluding our own address.
+
+        A gateway is by construction a member of BOTH its primary group and
+        every child cohort it bridges, so its own address is in every map and
+        is never a violation. Any OTHER address in two maps means those two
+        groups have merged across this gateway -- invariant G above.
+        """
+        try:
+            if addr == self.myself.address:
+                return []
+        except AttributeError:
+            pass
+        found = []
+        for grp in self._held_groups():
+            try:
+                if addr in grp.addresses:
+                    found.append(grp)
+            except Exception:
+                continue
+        return found
+
+    def _boundary_refuse(self, kind, addr, detail):
+        """Count, rate-limited-log, and report a gateway-boundary refusal.
+
+        Always returns True, so call sites read ``if ...: continue`` /
+        ``return``. Logged at ERROR rather than WARNING for the same reason the
+        foreign-format drop is: a boundary violation presents downstream as a
+        peer having silently gone quiet, and this line is the only thing that
+        says why.
+        """
+        _probes.counter('net.boundary', 'drop', kind)
+        key = '%s|%s' % (kind, addr)
+        n = self._boundary_counts.get(key, 0) + 1
+        self._boundary_counts[key] = n
+        if n == 1 or n % 10 == 0:
+            self.logger.error(
+                'Gateway boundary: refusing %s involving %s -- %s (count: %d)',
+                kind, addr, detail, n)
+        return True
+
+    def _crosses_gateway(self, addr):
+        """True when *addr* sits on the far side of a gateway boundary from our
+        primary group: a member of a child cohort we bridge but NOT of our own
+        group. On a leaf node (no child groups) this is always False, so the
+        historical path is untouched."""
+        if not self.child_groups:
+            return False
+        holding = self._groups_containing(addr)
+        if not holding:
+            return False
+        primary = self.group
+        return all(grp is not primary for grp in holding)
+
+    @staticmethod
+    def _wire_format_for_group(grp):
+        """*grp*'s envelope format, or JSON when there is no group
+        (doc/architecture/network-wire-format.md). A node with no group yet is a
+        node that has not been admitted anywhere, and all of its traffic is
+        bootstrap traffic."""
+        return getattr(grp, 'wire_format', None) or NetWireFormat.json
+
+    def _wire_format_for_addr(self, addr):
+        """The envelope format traffic with *addr* rides in
+        (doc/architecture/network-wire-format.md).
+
+        The format belongs to the GROUP, so this is a group lookup: a peer we
+        can place in our primary group or in a child group we gateway speaks
+        that group's format. Anything we cannot place -- a stranger, a
+        pre-admission newcomer, a peer in a group we do not hold -- is JSON,
+        which is the format every AT node can read and therefore the only safe
+        answer when we have no group to consult. That is also why bootstrap is
+        JSON unconditionally: discovery happens before there is a group to ask.
+
+        Detecting the sender's actual format instead is deliberately not done;
+        see doc/architecture/network-wire-format.md.
+        """
+        grp = self._group_for_sender(addr)
+        # Delegate rather than reading grp.wire_format directly: the rule is the
+        # group's (Group.wire_format_for_address, mirrored by C's
+        # group_wire_format_for_address), and one copy is what keeps the
+        # production selection and the conformance-pinned one from drifting.
+        return (grp.wire_format_for_address(addr) if grp is not None
+                else NetWireFormat.json)
 
     def track_send_stats(self, uuid, num_bytes):
         if uuid not in self.statistics:
@@ -265,6 +480,20 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     # process(), which matters because threading primitives can't survive
     # the multiprocessing spawn pickle (see _ensure_ping_at_pool).
 
+    def rebind_socket_timeouts(self):
+        """Give the bound receive sockets their timeout again, in the worker
+        (see process()). A transport without them -- DTN, the hybrid -- has
+        nothing to rebind; reading them inside the loop's tuple, outside any
+        try, used to raise AttributeError there and end the network process."""
+        for name in ('recv_ptp_sock', 'recv_grp_sock', 'recv_cast_sock'):
+            sock = getattr(self, name, None)
+            if sock is None:
+                continue
+            try:
+                sock.settimeout(self.socket_timeout)
+            except OSError:
+                pass
+
     def _init_transport(self):
         """Per-worker transport setup that can't be pickled across the
         spawn handoff (e.g. locks). Called once before receiver threads
@@ -332,10 +561,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         from_addr seen at recv."""
         if address is None:
             return None
-        address = str(address)
-        if '/' in address:
-            address = address.split('/')[0]
-        return address
+        return strip_cidr(str(address))
 
     def reject_message(self, address):
         """Check if an address is excluded (reputation cut-off) or
@@ -346,24 +572,209 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         """Add an address to the rejection list."""
         self._rejected_addresses.add(self._norm_addr(address))
 
+    @staticmethod
+    def _exclusion_spec(message):
+        """``(address, uuid)`` from an exclude/readmit: ``{address, uuid}``,
+        or a bare address (the older form)."""
+        obj = getattr(message, 'obj', None)
+        if isinstance(obj, str) and obj.lstrip().startswith('{'):
+            try:
+                obj = json.loads(obj)
+            except ValueError:
+                pass
+        if isinstance(obj, dict):
+            uuid = obj.get('uuid')
+            return obj.get('address') or None, str(uuid).lower() if uuid else None
+        return obj, None
+
+    def _peer_key(self, uuid):
+        """The signing key (hex) this node holds for peer ``uuid``, or None."""
+        peer = self.peers.find_by_uuid(uuid) if self.peers is not None else None
+        if peer is None:
+            return None
+        try:
+            return public_identity_to_canonical(peer.publish())['signature']['hex_seed'].lower()
+        except Exception:
+            return None
+
+    def _inbound_group(self, queues, raw_msg, from_addr, retry=False):
+        """One group-channel frame. ``retry``: the frame was held after it did
+        not open and is being tried under a new key; one that still does not
+        open is dropped rather than held again. Twin of C _inbound_group."""
+        # Reputation cut-off: drop an excluded sender's group
+        # frame before decrypt/delivery (a gateway thus does
+        # not relay it onward either).
+        if self.reject_message(from_addr):
+            _probes.counter('net.group', 'drop', 'excluded')
+            return
+        # Resolve which group this sender belongs to. For a leaf node this
+        # is always the primary group (or None), so the path is identical to
+        # before. A gateway additionally matches its child groups,
+        # decrypting a cohort-below frame with that cohort's own key. See
+        # doc/architecture/gateway-reputation-tree.md.
+        # Gateway boundary, invariant G: an address in two of the
+        # groups we hold means those groups have merged across this
+        # gateway. Refuse rather than let _group_for_sender resolve
+        # it primary-first, which would pick a group -- and so a
+        # decrypt key AND a wire format -- on map-ordering alone.
+        if len(self._groups_containing(from_addr)) > 1:
+            self._boundary_refuse(
+                'group_spans_gateway', from_addr,
+                'sender is a member of more than one group we hold')
+            return
+        sender_group = self._group_for_sender(from_addr)
+        if sender_group is not None:
+            from_whom = self.peers.find_by_address(from_addr)
+            try:
+                decrypt_msg = sender_group.decrypt(raw_msg, sender_group)
+                if from_whom is not None:
+                    # The group that decrypted it names the format
+                    # it is encoded in (doc/architecture/network-wire-format.md) -- for a gateway that
+                    # is the child cohort's format, not its own.
+                    if retry:
+                        self.logger.info('A held group frame from %s opened under '
+                                         'the new key', from_addr)
+                    self._msg_to_queue(decrypt_msg, from_whom, queues, 'group',
+                                       wire_format=sender_group.wire_format)
+                else:
+                    _probes.counter('net.group', 'drop', 'sender_not_in_peers')
+                    self.logger.warning(
+                        'Recvd transmission from %s - not in peers. Ignoring.', from_addr)
+                    self.logger.debug('Ignored payload: %d bytes from %s', len(raw_msg), from_addr)
+            except nacl.exceptions.CryptoError as e:
+                _probes.counter('net.group', 'drop', 'crypto_error')
+                name = from_addr
+                if from_whom is not None:
+                    name = '%s (%s)' % (from_whom.nickname, name)
+                count = self._crypto_error_counts.get(name, 0) + 1
+                self._crypto_error_counts[name] = count
+                if count == 1 or count % 10 == 0:
+                    self.logger.error('CryptoError decrypting message from %s (count: %d)', name, count)
+                if retry:
+                    self.logger.info('Held group frame from %s still does not open '
+                                     'after a key change; dropped', name)
+                else:
+                    self._hold_group_frame(raw_msg, from_addr, sender_group)
+        else:
+            _probes.counter('net.group', 'drop', 'sender_not_in_group')
+            self.logger.error('Recvd transmission from %s - not in group. Ignoring.', from_addr)
+            self.logger.debug('Ignored payload: %d bytes from %s', len(raw_msg), from_addr)
+            # Forward a partition-recovery signal to IdentityProcess
+            # so it can probe the foreign group and, if larger,
+            # initiate a normal request_access against it. The
+            # actual merge runs through the existing _merge_to_mesh
+            # path; this signal only kicks the probe.
+            #   See doc/architecture/partition-recovery.md §5.1.
+            self._signal_partition(queues, from_addr)
+
+    @staticmethod
+    def _group_key_fp(group):
+        """Which key a group holds now: epoch and public key."""
+        return (group.key_epoch, group.encryptor.publish()) if group is not None else None
+
+    def _hold_group_frame(self, raw_msg, from_addr, group):
+        """Keep a group frame that did not open under the key we hold, for
+        NET_HELD_GROUP_FRAME_SEC, to try again once a different key is
+        installed. Identity adopts a rotated key before the network process
+        installs it, and a one-shot group send in that gap was lost for good
+        (Stele tm-3882043, the team roster). Twin of C _hold_group_frame;
+        oldest dropped past NET_HELD_GROUP_FRAMES."""
+        self._held_group_frames.append(
+            (raw_msg, from_addr, time.monotonic(), self._group_key_fp(group)))
+        while len(self._held_group_frames) > NET_HELD_GROUP_FRAMES:
+            self._held_group_frames.popleft()
+
+    def _retry_held_group_frames(self, queues) -> int:
+        """Try again every held group frame whose sender's group now holds a
+        different key; drop those held past NET_HELD_GROUP_FRAME_SEC. Called
+        every pass of the main loop. Returns how many were retried. Twin of C
+        net_retry_held_group_frames."""
+        if not self._held_group_frames:
+            return 0
+        now_s = time.monotonic()
+        due, kept, aged = [], deque(), 0
+        for held in self._held_group_frames:
+            raw_msg, from_addr, held_at, fp = held
+            if self._group_key_fp(self._group_for_sender(from_addr)) != fp:
+                due.append(held)
+            elif now_s - held_at >= NET_HELD_GROUP_FRAME_SEC:
+                aged += 1
+            else:
+                kept.append(held)
+        self._held_group_frames = kept
+        if aged:
+            self.logger.info('Dropped %d held group frame(s): no new key in %d s',
+                             aged, NET_HELD_GROUP_FRAME_SEC)
+        if due:
+            self.logger.info('Retrying %d held group frame(s) under a new key', len(due))
+        for raw_msg, from_addr, _at, _fp in due:
+            self._inbound_group(queues, raw_msg, from_addr, retry=True)
+        return len(due)
+
     def handle_exclude(self, queues, message):
-        """Exclude a peer's address (reputation cut-off): its inbound
-        frames are dropped and it is filtered out of outbound targets.
-        Fed by ReputationProcess._publish_exclusion. Local IPC only."""
-        addr = self._norm_addr(getattr(message, 'obj', None))
+        """Exclude a peer (reputation cut-off): its address's inbound frames
+        are dropped and it is filtered out of outbound targets; by uuid and
+        key it is refused as a relay client and as a relay. Fed by
+        ReputationProcess._publish_exclusion. Local IPC only."""
+        if getattr(message, 'from_whom', None) is not None and \
+                str(getattr(message.from_whom, 'uuid', '')) != str(getattr(self.myself, 'uuid', '')):
+            self.logger.warning('Refusing exclude from the wire')
+            return True
+        address, uuid = self._exclusion_spec(message)
+        addr = self._norm_addr(address) if address else None
         if addr:
             self._rejected_addresses.add(addr)
             _probes.counter('net.exclude', 'add')
-            self.logger.info('Reputation cut-off: excluding %s' % addr)
+            self.logger.info('Reputation cut-off: excluding %s', addr)
+        if uuid:
+            self._excluded_uuids.add(uuid)
+            key = self._peer_key(uuid)
+            if key:
+                self._excluded_keys.add(key)
+            self._tell_exclusion(uuid, True)
         return True
+
+    def is_excluded(self, uuid, pubkey_hex=None) -> bool:
+        """Whether reputation cut ``uuid`` off, or the peer holding the key
+        ``pubkey_hex``, and has not readmitted it. Recorded by uuid and by the
+        key held for the peer at the time, so a distrusted peer gains nothing
+        by claiming a new uuid. Mirrors C's net_is_excluded."""
+        key = str(pubkey_hex or '').lower()
+        return (str(uuid).lower() in self._excluded_uuids
+                or (key != '' and key in self._excluded_keys))
+
+    def _tell_exclusion(self, uuid, excluded) -> None:
+        for hooks in network_hooks(self):
+            if hooks.on_exclusion is not None:
+                hooks.on_exclusion(self, uuid, excluded)
+
+    def _unicast_carrier(self, peer_uuid):
+        """The NetworkHooks that carry a unicast to ``peer_uuid``, or None for
+        the transport."""
+        for hooks in network_hooks(self):
+            if hooks.reaches is not None and hooks.unicast is not None \
+                    and hooks.reaches(self, peer_uuid):
+                return hooks
+        return None
 
     def handle_readmit(self, queues, message):
         """Reverse an exclusion (explicit rehabilitation). Local IPC."""
-        addr = self._norm_addr(getattr(message, 'obj', None))
+        if getattr(message, 'from_whom', None) is not None and \
+                str(getattr(message.from_whom, 'uuid', '')) != str(getattr(self.myself, 'uuid', '')):
+            self.logger.warning('Refusing readmit from the wire')
+            return True
+        address, uuid = self._exclusion_spec(message)
+        addr = self._norm_addr(address) if address else None
         if addr:
             self._rejected_addresses.discard(addr)
             _probes.counter('net.exclude', 'remove')
-            self.logger.info('Reputation readmit: %s' % addr)
+            self.logger.info('Reputation readmit: %s', addr)
+        if uuid:
+            self._excluded_uuids.discard(uuid)
+            key = self._peer_key(uuid)
+            if key:
+                self._excluded_keys.discard(key)
+            self._tell_exclusion(uuid, False)
         return True
 
     _PARTITION_SIGNAL_COOLDOWN = 5.0  # seconds, per from_addr
@@ -429,16 +840,25 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         on no node at all.
         """
         try:
-            stats = ping_at(address, count=count)  # noqa
+            # Pass this node's own address: the reply socket must bind it, not
+            # the wildcard, or a co-located node separated only by address
+            # receives these replies instead (doc/architecture/networking.md). A wildcard
+            # my_address (the TCP listener's 0.0.0.0 fallback) is no address at
+            # all -- hand ping_at None and let it derive one from the route.
+            local = (getattr(self, 'my_address', None)
+                     or getattr(getattr(self, 'net_cfg', None), 'ip4', None))
+            if local in ('', '0.0.0.0', '::'):
+                local = None
+            stats = ping_at(address, count=count, local_address=local)  # noqa
             msg = Message(self.name, Network.ping_at, stats,  # noqa
                           from_whom=peer)
             return_queue.put(msg, block=True, timeout=self.q_cadence)
         except TransmissionError as err:
-            self.logger.error('Ping (async): %s' % err)
+            self.logger.error('Ping (async): %s', err)
         except Full:
             self.logger.warning('Ping (async): return queue full, dropping stats')
         except Exception as err:
-            self.logger.error('Ping (async) unexpected: %s' % err)
+            self.logger.error('Ping (async) unexpected: %s', err)
 
     def _encr_recv(self, method, msg_queue):
         # Tag counters by recv_peer/recv_group to distinguish ptp vs group.
@@ -456,11 +876,11 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 # Clean close before any framing bytes — routine during
                 # onboarding/teardown. Counter-only, no error log.
                 _probes.counter(layer, 'recv_error', 'peer_disconnect')
-                self.logger.debug('Network: %s' % err)
+                self.logger.debug('Network: %s', err)
                 continue
             except TransmissionError as err:
                 _probes.counter(layer, 'recv_error', 'transmission')
-                self.logger.error('Network: %s' % err)
+                self.logger.error('Network: %s', err)
                 self.track_recv_error()
                 continue
             except TimeoutError:
@@ -489,7 +909,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 # encrypted message because tcp._recv .decode'd raw
                 # bytes and crashed the thread.)
                 _probes.counter(layer, 'recv_error', err.__class__.__name__)
-                self.logger.error('Network recv crashed: %s' % err)
+                self.logger.error('Network recv crashed: %s', err)
                 self.track_recv_error()
                 continue
             if raw_msg is not None:
@@ -535,7 +955,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 raw_msg, from_addr, from_port = self.recv_any()
             except TransmissionError as err:
                 _probes.counter('net.recv.any', 'recv_error', 'transmission')
-                self.logger.error('Network: %s' % err)
+                self.logger.error('Network: %s', err)
                 continue
             except TimeoutError:
                 continue
@@ -552,7 +972,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 # Mirror _encr_recv: never let a malformed inbound kill
                 # the listener thread for the rest of the run.
                 _probes.counter('net.recv.any', 'recv_error', err.__class__.__name__)
-                self.logger.error('Network recv_any crashed: %s' % err)
+                self.logger.error('Network recv_any crashed: %s', err)
                 continue
             if raw_msg is not None:
                 self.unknown_messages.append((raw_msg, from_addr))
@@ -560,48 +980,86 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     def mystery_handler(self, queues):
         """
         Handle encrypted messages sent before the peer is known
+
+        A deferral whose sender never becomes a known peer is reclaimed once it
+        is `mystery_max_age_s` seconds old. This used to count retries instead
+        (60 of them, at a cadence that made it roughly 30 s), which meant the
+        real bound moved with load: the loop's cadence is not the loop's
+        period, so a busy node aged entries out later than a quiet one, and the
+        number in the config did not name a duration anyone could reason about.
+        C bounded the same queue by age from the start, because its retry is
+        event-driven rather than polled and a count there would have measured
+        peer admissions rather than time. Both sides now agree on the quantity
+        as well as the value (doc/architecture/networking.md).
         :return: None
         """
-        try_count = {}
         while not self.stop:
             remaining = deque()
+            now = time.monotonic()
             while True:
                 try:
-                    raw_msg, from_addr = self.encrypted_messages.popleft()
+                    raw_msg, from_addr, deferred_at = self.encrypted_messages.popleft()
                 except IndexError:
                     break
                 peer = self.peers.find_by_address(from_addr)
+                decrypt_msg = None
                 if peer is not None:
-                    decrypt_msg = self.myself.decrypt(raw_msg, peer)
-                    self._msg_to_queue(decrypt_msg, peer, queues, 'point-to-point')
+                    try:
+                        decrypt_msg = self.myself.decrypt(raw_msg, peer)
+                    except Exception as err:
+                        # Not this peer's ciphertext after all -- unrelated
+                        # noise from that address, a frame under a key that has
+                        # since rotated, or a plaintext frame that only looked
+                        # opaque. An unguarded decrypt here KILLED this thread
+                        # (both loops are inside the `while not self.stop`),
+                        # which silently retired the whole out-of-order queue
+                        # for the life of the node. Retained rather than
+                        # dropped, matching C's replay pass, which keeps a
+                        # deferred entry whose decrypt fails and lets the age
+                        # bound below reclaim it.
+                        _probes.counter('net.mystery', 'decrypt_failed')
+                        self.logger.debug(
+                            'Deferred message from %s still does not decrypt '
+                            '(%s); retaining until it ages out', from_addr, err)
+                if decrypt_msg is not None:
+                    self._msg_to_queue(decrypt_msg, peer, queues, 'point-to-point',
+                                       wire_format=self._wire_format_for_addr(from_addr))
                     _probes.counter('net.mystery', 'resolved')
                     _probes.emit('net.mystery', 'resolved',
                                  from_addr=from_addr,
                                  peer_uuid=str(peer.uuid),
-                                 retries=try_count.get(from_addr, 0))
-                    self.logger.debug('Out-of-order message from %s handled' % peer.nickname)
+                                 waited_s=round(now - deferred_at, 3))
+                    self.logger.debug('Out-of-order message from %s handled', peer.nickname)
                 else:
-                    if from_addr not in try_count:
-                        try_count[from_addr] = 0
-                    try_count[from_addr] += 1
-                    if try_count[from_addr] > self.mystery_max_retries:
-                        _probes.counter('net.mystery', 'drop', 'max_retries')
+                    age = now - deferred_at
+                    # >= matches C's _deferred_sweep_stale_locked, so a message
+                    # deferred at the same second on both sides is reclaimed on
+                    # the same side of the boundary.
+                    if age >= self.mystery_max_age_s:
+                        # Was ('drop', 'max_retries'); renamed with the switch to
+                        # an age bound so both runtimes emit the SAME probe for
+                        # the same event -- C already emitted this triple. The
+                        # `aged_out` emit below was always the aligned one, which
+                        # is why scripts/probe-flow.py keys on it.
+                        _probes.counter('net.mystery', 'aged_out', 'max_age')
                         _probes.emit('net.mystery', 'aged_out',
                                      from_addr=from_addr,
-                                     retries=try_count[from_addr])
-                        self.logger.debug('Spurious encrypted message from %s dropped' % from_addr)
+                                     age_s=round(age, 3))
+                        self.logger.debug('Spurious encrypted message from %s dropped', from_addr)
                     else:
-                        remaining.append((raw_msg, from_addr))
+                        remaining.append((raw_msg, from_addr, deferred_at))
             self.encrypted_messages.extend(remaining)
             time.sleep(self.cadence + self.q_cadence)  # curiously, does not sleep if exactly cadence
 
-    def _accept_unencrypted(self, raw_msg, from_whom, queues):
+    def _accept_unencrypted(self, raw_msg, from_whom, queues,
+                            wire_format=NetWireFormat.json):
         """Deliver a plaintext frame from a KNOWN peer, but only an allowlisted
         verb that declares itself unencrypted.
 
         Three conditions, all required: the bytes parse as an envelope, the
-        envelope's own `encrypt` flag is false, and the verb is in
-        UNENCRYPTED_VERBS. A frame that merely fails to decrypt is NOT accepted
+        envelope's own `encrypt` flag is false, and the verb is accepted in
+        plaintext (:func:`..plaintext_verbs.is_unencrypted`: the core's own, or
+        one unencrypted_verbs.cfg.json grants a loaded extension). A frame that merely fails to decrypt is NOT accepted
         -- corrupt ciphertext, a stale group key, or a forged frame all land in
         the caller's drop path as before.
 
@@ -610,7 +1068,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         branch, and the alternative is duplicating the dispatch logic.
         """
         try:
-            probe = Message.parse(raw_msg, from_whom, validate=False)
+            probe = Message.parse(raw_msg, from_whom, validate=False,
+                                  wire_format=wire_format)
         except Exception:
             # Not a parseable envelope -- almost certainly real ciphertext.
             _probes.counter('net.ptp', 'unencrypted_refused', 'unparseable')
@@ -621,27 +1080,118 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             _probes.counter('net.ptp', 'unencrypted_refused', 'claims_encrypted')
             return False
         verb = getattr(probe, 'function', None)
-        if verb not in UNENCRYPTED_VERBS:
+        if not is_unencrypted(verb):
             _probes.counter('net.ptp', 'unencrypted_refused', str(verb))
             self.logger.warning(
                 'Refusing plaintext %s from known peer %s: not an unencrypted '
-                'verb' % (verb, getattr(from_whom, 'nickname', from_whom)))
+                'verb', verb, getattr(from_whom, 'nickname', from_whom))
             return False
         self._msg_to_queue(raw_msg, from_whom, queues, 'point-to-point',
-                           validate=False)
+                           validate=False, wire_format=wire_format)
         _probes.counter('net.ptp', 'unencrypted_accepted', str(verb))
         return True
 
-    def _msg_to_queue(self, msg, from_whom, queues, rcvd_by, validate=True):
+    def _msg_to_queue(self, msg, from_whom, queues, rcvd_by, validate=True,
+                      wire_format=NetWireFormat.json, opaque=False):
+        """Parse *msg* in *wire_format* and route it.
+
+        *opaque* says the caller does not yet know whether these bytes are an
+        envelope at all -- the unknown-sender point-to-point path, where the
+        frame is just as likely to be ciphertext awaiting the sender's
+        admission. There, a format-marker refusal is NOT the diagnosis "a
+        misprovisioned cohort is talking proto at us": ciphertext is uniform
+        bytes, so one frame in 256 opens with NET_WIRE_PROTO_MAGIC by chance.
+        The refusal is re-raised instead of being counted and logged as a
+        foreign-format drop, so the caller defers the frame exactly as it does
+        for ciphertext that fails to decode -- which is what C's
+        handle_inbound_peer already does (every parse failure on that path
+        reaches defer_message).
+        """
         try:
-            message = Message.parse(msg, from_whom, validate=validate)
+            message = Message.parse(msg, from_whom, validate=validate,
+                                    wire_format=wire_format)
+        except WireFormatMismatch as err:
+            if opaque:
+                raise
+            # The frame is in a format this context does not speak (doc/architecture/network-wire-format.md). The
+            # parser for that format was never run over it, which is the point.
+            # Counted and logged rate-limited rather than silently dropped: a
+            # cohort misprovisioned into two formats presents as total silence
+            # from one peer, and this counter is the only thing that says why.
+            _probes.counter('net.wire', 'drop', 'foreign_format')
+            _addr = from_whom.address if isinstance(from_whom, Identity) else from_whom
+            _n = self._foreign_format_counts.get(str(_addr), 0) + 1
+            self._foreign_format_counts[str(_addr)] = _n
+            if _n == 1 or _n % 10 == 0:
+                self.logger.error(
+                    'Dropping %s frame from %s: %s (expected %s; count: %d)',
+                    rcvd_by, _addr, err, wire_format, _n)
+            return
         except TypeError as err:
             _probes.counter('net.parse', 'drop', 'type_error')
-            self.logger.error('Error parsing %s: %s' % (msg, err))
+            self.logger.error('Error parsing %s: %s', msg, err)
             return
         from_addr = from_whom
         if isinstance(from_whom, Identity):
             from_addr = from_whom.address
+
+        # Every frame from the wire is routed here, so this is where a peer is
+        # heard (doc/architecture/peer-presence.md). A uuid not on the roster
+        # is ignored by the tracker. A presence frame has said everything it
+        # carries by arriving: consumed here, never routed.
+        sender = from_whom if isinstance(from_whom, Identity) \
+            else getattr(message, 'from_whom', None)
+        presence = getattr(self, '_presence', None)
+        if presence is not None:
+            presence.heard(getattr(sender, 'uuid', None), time.time())
+        if message.process == PRESENCE_PROCESS and message.function == PRESENCE_FUNCTION:
+            self.logger.debug('Presence from %s', from_addr)
+            return
+
+        # ISSUES §2.17: what this frame may carry, by the path it came in on.
+        # A stranger's from_whom is an address (or 'relay:<uuid>'), never an
+        # Identity; on the multicast channel anyone may speak.
+        if rcvd_by == 'multicast':
+            path = PATH_BROADCAST
+        elif rcvd_by == 'group':
+            path = PATH_GROUP
+        elif isinstance(from_whom, Identity):
+            path = PATH_PEER
+        elif rcvd_by == 'relay':
+            path = PATH_RELAY_STRANGER
+        else:
+            path = PATH_STRANGER
+        admitted, why = wire_verb_admitted(message.process, message.function, path)
+        if not admitted:
+            _probes.counter('net.dispatch', 'refused', path)
+            self._route_refusals = getattr(self, '_route_refusals', 0) + 1
+            n = self._route_refusals
+            if n <= 20 or n % 100 == 0:
+                self.logger.info('Refusing %s.%s from %s on the %s path: %s '
+                                 '(%d refused)', message.process,
+                                 message.function, from_addr, path, why, n)
+            return
+
+        # Gateway boundary, invariant B (see the block above _held_groups):
+        # bootstrap is domain-local. Two refusals, and neither can fire on a
+        # leaf node -- the first because the pre-admission verbs are never
+        # group-addressed in the first place (announce is broadcast, accept and
+        # history are point-to-point to an unplaced identity), the second
+        # because _crosses_gateway is False without child groups.
+        if message.function in BOOTSTRAP_VERBS:
+            if rcvd_by == 'group':
+                self._boundary_refuse(
+                    'bootstrap_on_group_channel', from_addr,
+                    '%s arrived group-encrypted; the pre-admission handshake '
+                    'is never a group message' % message.function)
+                return
+            if self._crosses_gateway(from_addr):
+                self._boundary_refuse(
+                    'bootstrap_across_gateway', from_addr,
+                    '%s from a cohort we gateway; admitting across the boundary '
+                    'would make a group span it' % message.function)
+                return
+
         # Deliver to any known process queue, not just subsystems.
         # Cross-instance request/response patterns (e.g. an inspector
         # bridge soliciting peer-to-peer reputation: rep_req carries
@@ -650,6 +1200,13 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         # subsystems silently dropped those responses with "Recvd
         # message for unknown main process".
         target = message.process
+        if target not in queues:
+            # A C process Python runs inside another one (ZTA's zta_verify
+            # rides identity): renamed, since a handler answers only frames
+            # addressed to its own process.
+            alias = process_alias(target)
+            if alias in queues:
+                message.process = target = alias
         if target in queues:
             try:
                 queues[target].put(
@@ -657,18 +1214,72 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 _probes.counter('net.dispatch', 'delivered', target)
                 _probes.trace_msg(message, 'dispatched',
                                   target=target, rcvd_by=rcvd_by, from_addr=str(from_addr))
-                self.logger.debug('Recvd %s message for %s:%s from %s' %
-                                  (rcvd_by, target, message.function, from_addr))
+                self.logger.debug('Recvd %s message for %s:%s from %s', rcvd_by, target, message.function, from_addr)
             except Full:
                 _probes.counter('net.dispatch', 'queue_full', target)
                 _probes.trace_msg(message, 'queue_full', target=target)
-                self.logger.error('Network: %s queue is full' % target)
+                self.logger.error('Network: %s queue is full', target)
         else:
             _probes.counter('net.dispatch', 'unknown_target', target)
             _probes.trace_msg(message, 'unknown_target', target=target)
-            self.logger.error('Recvd message for unknown %s process from %s. Ignoring.' %
-                              (target, from_addr))
-            self.logger.debug('Message: %s' % str(message))
+            self.logger.error('Recvd message for unknown %s process from %s. Ignoring.', target, from_addr)
+            self.logger.debug('Message: %s', str(message))
+
+    def _emit_presence(self, queues, presence):
+        """Hand one :class:`PeerPresence` to negotiation (which stops or resumes
+        inviting the peer) and to main (which forwards it to the app, as for
+        any AppEvent). Best effort per queue, like :meth:`update`."""
+        for name in (CfgIds.negotiation, CfgIds.main):
+            if name not in queues:
+                continue
+            try:
+                queues[name].put(presence, block=True, timeout=self.q_cadence)
+            except Full:
+                _probes.counter('net.presence', 'queue_full', name)
+
+    def _emit_all_presence(self, queues):
+        """The presence half of the app's roster pull: every peer, to main."""
+        if CfgIds.main not in queues:
+            return
+        for row in self._presence.snapshot([p.uuid for p in self.peers.all]):
+            try:
+                queues[CfgIds.main].put(row, block=True, timeout=self.q_cadence)
+            except Full:
+                _probes.counter('net.presence', 'queue_full', CfgIds.main)
+
+    def _presence_step(self, queues):
+        """Once a second: evaluate presence, tell negotiation and the app what
+        changed, and when this node has been silent toward some member for the
+        heartbeat interval, queue one presence frame to the group. It goes out
+        through our own queue so it takes exactly the path of any other group
+        message. A node without the group's private key cannot send one, and
+        has nothing to say to a roster of none. Mirrors C net_presence_step."""
+        now_s = time.time()
+        if int(now_s) == self._presence_last_step:
+            return
+        self._presence_last_step = int(now_s)
+        members = list(self.peers.all)
+        due, changes = self._presence.tick([p.uuid for p in members], now_s)
+        for change in changes:
+            if change.present:
+                self.logger.info('Network: peer %s is present again', change.peer_uuid[:8])
+            else:
+                self.logger.info('Network: peer %s is absent: nothing heard for %.0f s (last %s)',
+                                 change.peer_uuid[:8], self._presence.absent_sec,
+                                 'frame recorded' if change.last_heard else 'none ever')
+            self._emit_presence(queues, change)
+        group = self.group
+        if not due or not members or group is None or getattr(group, '_public_only', True):
+            return
+        beat = Message(PRESENCE_PROCESS, PRESENCE_FUNCTION, '', to_whom=group)
+        try:
+            # One try: a full queue means traffic is going out anyway, and the
+            # next second asks again. Stamped on success so a slow drain cannot
+            # queue one heartbeat per second.
+            queues[self.name].put(beat, block=False)
+            self._presence.sent(None, now_s)
+        except Full:
+            pass
 
     def process(self, queues, signal):
         """
@@ -680,6 +1291,11 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         :param signal: IPC queue for signalling halt
         :return:
         """
+        run_post_fork(self)
+        # The receive policy's optional half (unencrypted_verbs.cfg.json): the
+        # node's start already checked it (extensions.check_config), but module
+        # state does not survive the forkserver, so apply it again here.
+        configure_plaintext_verbs(logger=self.logger)
         # Re-establish receiver-socket timeouts here, in the worker
         # subprocess. The sockets are created in __init__ (which runs
         # in the parent) and transferred via fd-passing during the
@@ -687,19 +1303,25 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         # but the Python-level timeout tracking does not — without
         # this rebinding, recvfrom raises BlockingIOError on the very
         # first call. (Surfaced 2026-05-01 by tests/diag/harness.py.)
-        for _sock in (self.recv_ptp_sock, self.recv_grp_sock,
-                      self.recv_cast_sock):
-            try:
-                _sock.settimeout(self.socket_timeout)
-            except (OSError, AttributeError):
-                pass
+        self.rebind_socket_timeouts()
         self._init_transport()
+        # Created here, in the worker, not in __init__: the instance is pickled
+        # across the fork and the tracker holds a lock.
+        self._presence = PresenceTracker()
+        self._presence_last_step = 0
         self.start_receivers(queues)
+        for hooks in network_hooks(self):
+            if hooks.on_start is not None:
+                hooks.on_start(self, queues)
         threading.Thread(target=self.unknown_receiver, daemon=True).start()
         threading.Thread(target=self.mystery_handler, args=(queues,), daemon=True).start()
         while self.keep_running(signal):
             try:
                 self.reap_idle_conns()
+                self._presence_step(queues)
+                for hooks in network_hooks(self):
+                    if hooks.periodic is not None:
+                        hooks.periodic(self, queues)
                 if self.diplomat:
                     if self.ping_at_server is None:
                         self.ping_at_server = PingATServer(self.net_cfg.ip4, self.logger)
@@ -737,9 +1359,19 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                           encrypt=message.encrypt,
                                           to_addr=to_addr,
                                           to=str(to_whom)[:80])
-                        self.logger.debug('Send network message: %s:%s' % (message.process, message.function))
+                        self.logger.debug('Send network message: %s:%s', message.process, message.function)
                         try:
-                            if message.function == Network.stats_req:
+                            if (message.function == app_roster_request
+                                    and message.process == CfgIds.network):
+                                # The app's roster pull, presence half. Local
+                                # only: never leaves on the wire, and never
+                                # taken from it (ISSUES §2.17).
+                                if is_local_app_verb(self, message):
+                                    self._emit_all_presence(queues)
+                                else:
+                                    refuse_remote_app_verb(self, message,
+                                                           message.function)
+                            elif message.function == Network.stats_req:
                                 msg = Message(CfgIds.network, Network.stats_resp, self.net_stats)
                                 queues[message.process].put(msg, block=True, timeout=self.q_cadence)
                             elif message.function == Network.ping_at:
@@ -755,8 +1387,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                 elif message.return_to not in queues:
                                     self.logger.warning(
                                         'Ping: unknown return_to %r '
-                                        '(expected a queue key); skipping' %
-                                        message.return_to)
+                                        '(expected a queue key); skipping', message.return_to)
                                 else:
                                     # Dispatch to a worker thread; ping_at()
                                     # is synchronous and sleeps 1 s per
@@ -768,12 +1399,17 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                         target.address, message.obj,
                                         queues[message.return_to], target)
                             elif message.to_whom == Network.broadcast:
+                                # Broadcast is discovery: it goes to nodes we
+                                # cannot place in any group, so JSON
+                                # unconditionally (doc/architecture/network-wire-format.md). `bytes(message)` IS
+                                # the JSON form.
                                 msg = bytes(message)
                                 try:
                                     self.send_any(msg)
                                     self.track_send_stats(self.unknown_peer, len(msg))
+                                    self._presence.sent(None, time.time())
                                 except TransmissionError as err:
-                                    self.logger.error('Network: %s' % err)
+                                    self.logger.error('Network: %s', err)
                                     self.track_send_error(self.unknown_peer)
                             elif isinstance(message.to_whom, Group):
                                 # Encrypt with the TARGET group's key when
@@ -790,12 +1426,30 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                         enc_grp = tgt
                                 except Exception:
                                     enc_grp = self.group
+                                # Format follows the ADDRESSED group, which
+                                # for a gateway is the child cohort, not our
+                                # own (doc/architecture/network-wire-format.md). Note this is a different question
+                                # from which key encrypts it (enc_grp above):
+                                # the key is about what we HOLD, the format
+                                # about what the recipients SPEAK.
+                                tgt_fmt = getattr(tgt, 'wire_format', None) or \
+                                    self._wire_format_for_group(self.group)
+                                wire = message.to_wire(tgt_fmt)
                                 if message.encrypt and enc_grp is not None:
-                                    msg = enc_grp.encrypt(bytes(message), enc_grp)
+                                    msg = enc_grp.encrypt(wire, enc_grp)
                                 else:
-                                    msg = bytes(message)
+                                    msg = wire
                                 for addr in message.to_whom.addresses:
                                     if addr == self.myself.address:
+                                        continue
+                                    # Gateway boundary, invariant G: a group's
+                                    # traffic never reaches an address that also
+                                    # belongs to another group we hold.
+                                    if len(self._groups_containing(addr)) > 1:
+                                        self._boundary_refuse(
+                                            'group_spans_gateway', addr,
+                                            'target is a member of more than one '
+                                            'group we hold')
                                         continue
                                     # Reputation cut-off: do not forward
                                     # to/for an excluded member (a gateway
@@ -806,36 +1460,67 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                     try:
                                         self.send_group(msg, addr)
                                         self.track_send_stats(self.unknown_peer, len(msg))
+                                        member = self.peers.find_by_address(addr)
+                                        if member is not None:
+                                            self._presence.sent(member.uuid, time.time())
                                     except TransmissionError as err:
-                                        self.logger.error('Network: %s' % err)
+                                        self.logger.error('Network: %s', err)
                                         self.track_send_error(self.unknown_peer)
                             else:  # defaults to pseudo-multicast
                                 for who in message.to_whom:  # Message ensures this is list  # noqa
-                                    address = who.address
-                                    if '/' in address:
-                                        address = address.split('/')[0]
+                                    address = strip_cidr(who.address)
+                                    # Gateway boundary, invariant B: the
+                                    # pre-admission handshake stays inside the
+                                    # domain it started in.
+                                    if (message.function in BOOTSTRAP_VERBS
+                                            and self._crosses_gateway(address)):
+                                        self._boundary_refuse(
+                                            'bootstrap_across_gateway', address,
+                                            'refusing to send %s to a cohort we '
+                                            'gateway' % message.function)
+                                        continue
                                     # Reputation cut-off: skip an excluded
                                     # recipient.
                                     if self.reject_message(address):
                                         _probes.counter('net.ptp', 'skip', 'excluded_target')
                                         continue
+                                    # A peer we can place speaks its group's
+                                    # format; one we cannot place gets JSON,
+                                    # which is what makes pre-admission traffic
+                                    # work in a proto cohort (doc/architecture/network-wire-format.md).
+                                    wire = message.to_wire(
+                                        self._wire_format_for_addr(address))
                                     if message.encrypt:
-                                        msg = self.myself.encrypt(bytes(message), who)
+                                        msg = self.myself.encrypt(wire, who)
                                     else:
-                                        msg = bytes(message)
+                                        msg = wire
+                                    # An extension that reaches `who` some
+                                    # other way (rendezvous: behind a relay)
+                                    # carries it; the frame is already sealed.
+                                    carrier = self._unicast_carrier(who.uuid)
                                     try:
-                                        self.send_peer(msg, address)
+                                        if carrier is not None:
+                                            carrier.unicast(self, who.uuid, msg)
+                                        else:
+                                            self.send_peer(msg, address)
                                         self.track_send_stats(who.uuid, len(msg))
+                                        self._presence.sent(who.uuid, time.time())
                                     except TransmissionError as err:
-                                        self.logger.error('Network: %s' % err)
+                                        self.logger.error('Network: %s', err)
+                                        self.track_send_error(who.uuid)
+                                    except (OSError, ConnectionError) as err:
+                                        # Only a carried send is caught here; a
+                                        # direct one raises as it always has.
+                                        if carrier is None:
+                                            raise
+                                        self.logger.error('Network: relay: %s', err)
                                         self.track_send_error(who.uuid)
                         except BrokenPipeError as err:
-                            self.logger.error('Network: %s' % err)
+                            self.logger.error('Network: %s', err)
                     else:
                         _probes.counter('net.outbound', 'drop', 'not_a_message')
-                        self.logger.error('Net process recvd message of type %s - Message required. Ignoring.' %
-                                          type(message))
-                        self.logger.debug('Ignored message: %s' % str(message))
+                        self.logger.error('Net process recvd message of type %s - Message required. Ignoring.', type(message))
+                        self.logger.debug('Ignored message: %s', str(message))
 
                 # Drain inbound deques. Each receiver thread can only
                 # push ~1 msg/0.1s per channel (recv-socket timeout),
@@ -870,7 +1555,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     if from_whom is not None:
                         try:
                             decrypt_msg = self.myself.decrypt(raw_msg, from_whom)
-                            self._msg_to_queue(decrypt_msg, from_whom, queues, 'point-to-point')
+                            self._msg_to_queue(decrypt_msg, from_whom, queues, 'point-to-point',
+                                               wire_format=self._wire_format_for_addr(from_addr))
                         except Exception:
                             # Decrypt failed. Some protocol verbs are sent in
                             # PLAINTEXT by design (encrypt=False), and once a
@@ -880,11 +1566,11 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                             # plaintext parse only for an allowlisted verb; a
                             # known peer must not be able to downgrade anything
                             # else. See identity.protocol.UNENCRYPTED_VERBS.
-                            if not self._accept_unencrypted(raw_msg, from_whom,
-                                                            queues):
+                            if not self._accept_unencrypted(
+                                    raw_msg, from_whom, queues,
+                                    wire_format=self._wire_format_for_addr(from_addr)):
                                 _probes.counter('net.ptp', 'drop', 'decrypt_failed_known_peer')
-                                self.logger.error('Decryption failed for known peer %s, rejecting message' %
-                                                  from_whom.nickname)
+                                self.logger.error('Decryption failed for known peer %s, rejecting message', from_whom.nickname)
                     else:
                         # Unknown sender — bootstrap (empty peers) or a
                         # late joiner welcoming us. Try unencrypted parse;
@@ -896,10 +1582,11 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                         # CHURN DIAGNOSTIC: attribution misses on ~every
                         # inbound (deferred_encrypted == accepted). Is it a
                         # format mismatch (from_addr shape != listing keys)
-                        # or a timing race (address registered a beat later)?
-                        # Categorize cheaply always, and capture a bounded
-                        # sample of from_addr vs listing keys to compare shapes.
-                        # See ISSUES.md (connection churn / attribution miss).
+                        # or a timing race (address registered a beat later)? Categorize
+                        # cheaply always, and capture a bounded sample of from_addr vs
+                        # listing keys to compare shapes. See
+                        # doc/architecture/network-connection-pooling.md (the
+                        # attribution-miss item).
                         _listing = getattr(self.peers, 'listing', None) or {}
                         _probes.counter('net.ptp', 'attrib_miss',
                                         'listing_empty' if not _listing
@@ -916,15 +1603,33 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                          listing_size=len(_listing),
                                          listing_keys=_keys)
                         try:
-                            self._msg_to_queue(raw_msg, from_addr, queues, 'point-to-point', validate=False)
+                            # JSON, not a lookup: we could not place this sender
+                            # in any group, and a frame from an unplaced sender
+                            # is bootstrap traffic by definition (doc/architecture/network-wire-format.md).
+                            # `opaque`: these bytes are as likely to be
+                            # ciphertext as an envelope, so a format-marker
+                            # refusal means "not a plaintext JSON envelope"
+                            # (defer it), not "foreign cohort" (drop it).
+                            self._msg_to_queue(raw_msg, from_addr, queues, 'point-to-point',
+                                               validate=False, opaque=True)
                             _probes.counter('net.ptp', 'unknown_sender', 'parsed_unencrypted')
-                        except UnicodeDecodeError:
+                        except (UnicodeDecodeError, WireFormatMismatch):
                             _probes.counter('net.ptp', 'unknown_sender', 'deferred_encrypted')
-                            self.logger.debug('Out-of-order message from %s detected, retry later' % from_addr)
-                            self.encrypted_messages.append((raw_msg, from_addr))
+                            self.logger.debug('Out-of-order message from %s detected, retry later', from_addr)
+                            # Stamp the deferral time here, as C does in
+                            # defer_message: the age-out window runs from when
+                            # the message was deferred, not from when the
+                            # handler happens to look at it. Monotonic, so a
+                            # clock step cannot age the queue out at once.
+                            self.encrypted_messages.append((raw_msg, from_addr, time.monotonic()))
                 total_inbound += drained_ptp
+                for hooks in network_hooks(self):
+                    if hooks.drain_inbound is not None:
+                        total_inbound += hooks.drain_inbound(self, queues,
+                                                             INBOUND_BUDGET)
 
-                # async recv group messages
+                # async recv group messages; first, any held for a key change
+                self._retry_held_group_frames(queues)
                 drained_grp = 0
                 while drained_grp < INBOUND_BUDGET:
                     if self.group is None:
@@ -934,50 +1639,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     except IndexError:
                         break
                     drained_grp += 1
-                    # Reputation cut-off: drop an excluded sender's group
-                    # frame before decrypt/delivery (a gateway thus does
-                    # not relay it onward either).
-                    if self.reject_message(from_addr):
-                        _probes.counter('net.group', 'drop', 'excluded')
-                        continue
-                    # Resolve which group this sender belongs to. For a
-                    # leaf node this is always the primary group (or
-                    # None), so the path is identical to before. A
-                    # gateway additionally matches its child groups,
-                    # decrypting a cohort-below frame with that cohort's
-                    # own key. See doc/architecture/gateway-reputation-tree.md.
-                    sender_group = self._group_for_sender(from_addr)
-                    if sender_group is not None:
-                        from_whom = self.peers.find_by_address(from_addr)
-                        try:
-                            decrypt_msg = sender_group.decrypt(raw_msg, sender_group)
-                            if from_whom is not None:
-                                self._msg_to_queue(decrypt_msg, from_whom, queues, 'group')
-                            else:
-                                _probes.counter('net.group', 'drop', 'sender_not_in_peers')
-                                self.logger.warning(
-                                    'Recvd transmission from %s - not in peers. Ignoring.' % from_addr)
-                                self.logger.debug('Ignored payload: %d bytes from %s' % (len(raw_msg), from_addr))
-                        except nacl.exceptions.CryptoError as e:
-                            _probes.counter('net.group', 'drop', 'crypto_error')
-                            name = from_addr
-                            if from_whom is not None:
-                                name = '%s (%s)' % (from_whom.nickname, name)
-                            count = self._crypto_error_counts.get(name, 0) + 1
-                            self._crypto_error_counts[name] = count
-                            if count == 1 or count % 10 == 0:
-                                self.logger.error('CryptoError decrypting message from %s (count: %d)' % (name, count))
-                    else:
-                        _probes.counter('net.group', 'drop', 'sender_not_in_group')
-                        self.logger.error('Recvd transmission from %s - not in group. Ignoring.' % from_addr)
-                        self.logger.debug('Ignored payload: %d bytes from %s' % (len(raw_msg), from_addr))
-                        # Forward a partition-recovery signal to IdentityProcess
-                        # so it can probe the foreign group and, if larger,
-                        # initiate a normal request_access against it. The
-                        # actual merge runs through the existing _merge_to_mesh
-                        # path; this signal only kicks the probe.
-                        #   See doc/architecture/partition-recovery.md §5.1.
-                        self._signal_partition(queues, from_addr)
+                    self._inbound_group(queues, raw_msg, from_addr)
                 total_inbound += drained_grp
 
                 # async recv stranger messages (separate channel)
@@ -993,6 +1655,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     if self.reject_message(from_addr):
                         _probes.counter('net.multicast', 'drop', 'excluded')
                         continue
+                    # The stranger/multicast channel is discovery, so JSON
+                    # unconditionally (doc/architecture/network-wire-format.md) -- there is no group to consult.
                     self._msg_to_queue(raw_msg, from_addr, queues, 'multicast', validate=False)
                 total_inbound += drained_unk
 
@@ -1004,3 +1668,15 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self.stop = True
         self.close_connections()
         self.close_listeners()
+        # The PingAT server holds a bound port too, and only the diplomat
+        # branch above ever stopped it -- so a node that was the diplomat at
+        # shutdown left it bound for the life of the process. That denies the
+        # port to the next node on this address (no SO_REUSEADDR on it, by
+        # design), which is only invisible when the process exits immediately
+        # afterward and the kernel cleans up.
+        # getattr, like close_listeners above: this runs on the way out of
+        # process(), which partial instances also reach.
+        ping_server = getattr(self, 'ping_at_server', None)
+        if ping_server is not None:
+            ping_server.stop()
+            self.ping_at_server = None

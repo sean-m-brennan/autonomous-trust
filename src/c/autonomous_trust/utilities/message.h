@@ -23,6 +23,7 @@
 
 #include <stdbool.h>
 #include <sys/socket.h>
+#include <sys/stat.h>   /* dev_t / ino_t: the bound socket's identity */
 
 #include "structures/map.h"
 #include "msg_types.h"
@@ -49,11 +50,44 @@
  * single shared switch that cannot reach process-specific code, whereas a
  * function string dispatches to whichever process registered it.
  *
- * This is the ONLY verb the daemon accepts from an app, and it is forwarded
- * to a fixed pair of processes — an app must not be able to inject arbitrary
- * internal verbs at an arbitrary process.
+ * One of a small, explicit allowlist of verbs the daemon accepts from an app,
+ * each forwarded to a fixed set of processes — an app must not be able to
+ * inject arbitrary internal verbs at an arbitrary process.
  */
 #define AT_APP_ROSTER_REQUEST "app_roster_request"
+
+/* The social app verbs (AT_APP_SET_POSITION ... AT_APP_REPORT_PEER) are the
+ * social feature's, in libat_social beside the registrations that route them
+ * (FEATURE_SPLIT_PLAN Phase 5; Agora's at-social/ since Phase 5b). */
+
+/* App→AT: hand the core an AUTHORITY FINDING about a peer's standing
+ * (Phase 4 P4.1). The payload is
+ *   {"peer": "<uuid_str>", "standing": "proved"|"capped"|"failed",
+ *    "ceiling": <0..1, or negative for none>, "source": "ethne",
+ *    "reason": "<=63 chars>"}
+ * and identity republishes it to reputation as a @ref PEER_STANDING.
+ *
+ * A CEILING, NEVER A SCORE. The app has just decided something AT's [0, 1]
+ * scale cannot express, and the answer is the one ZTA already arrived at:
+ * bound the value and let the tier machinery demote. rep_proc.c records why —
+ * the predecessor of that mechanism sent `score = -0.8` on a TRANSACTION_SCORE
+ * and was discarded at the boundary, so a revoked peer paid nothing.
+ *
+ * THE CORE VERIFIES NOTHING ABOUT THE FINDING. An Ethne expulsion is proved by
+ * co-signatures inside a record the core cannot parse, exactly as a business
+ * page bundle is. What the core trusts is the CHANNEL: that this arrived on
+ * the local app queue from the app on this device. Nothing peer-supplied may
+ * reach the handler — see identity_is_local_app_verb.
+ *
+ * `standing: "proved"` from the app means REINSTATED: it removes this source's
+ * ceiling and nothing else. That is what makes "revocation as a reputation
+ * event, not a hard cut" true in both directions.
+ *
+ * Core, not the social extension's: a governance tier bounding a peer is not an
+ * Agora-specific idea, and a deployment with some other authority is a
+ * legitimate consumer. Forwarded only to the identity process. Eighteenth verb
+ * on the app→AT allowlist. */
+#define AT_APP_PEER_STANDING "app_peer_standing"
 
 #define DEFAULT_MAX_MSG_SIZE 1024
 /* MAX_MSG_SIZE is configurable at runtime via messaging_set_max_size() */
@@ -75,6 +109,17 @@ typedef struct
 {
     int fd;
     char key[MSG_KEY_LEN+1];
+    /* WHICH socket file this queue actually bound, so that closing it can
+     * remove ITS OWN entry and no one else's. messaging_init unlinks before it
+     * binds — that is how a queue survives the crash of whoever held the name
+     * last — but it also means a LIVE holder can have the name taken out from
+     * under it. When that holder then closed, the old unconditional
+     * unlink(key) deleted the path the NEW owner was listening on: the new
+     * process kept polling a socket with no name while every sender got
+     * ENOENT, with nothing bound anywhere. Zero when the post-bind stat
+     * failed, in which case close falls back to the unconditional unlink. */
+    dev_t bound_dev;
+    ino_t bound_ino;
 } queue_t;
 
 /**
@@ -96,6 +141,24 @@ typedef struct
   disjoint behaviors;
 */
 int messaging_init(const char *id, queue_t *queue);
+
+/**
+ * @brief Initialize a queue that ANOTHER process sends to (the app link: the
+ *        daemon's inbound app queue, the app's event queue).
+ *
+ * Where processes have unix datagrams this is @ref messaging_init. Where they
+ * do not (Windows; $AT_IPC_STREAM=1 elsewhere) the queue is a stream socket
+ * instead, which senders reach through the same @ref messaging_send.
+ */
+int messaging_init_external(const char *id, queue_t *queue);
+
+/**
+ * @brief Do this node's subsystems run as threads of one process?
+ *
+ * True on Windows, which has no fork, and where $AT_IN_PROCESS=1. Their
+ * queues are then in-process FIFOs (@ref messaging_init), not sockets.
+ */
+bool messaging_in_process(void);
 
 /**
  * @brief Is a queue with this key actually bound — i.e. is somebody listening?
@@ -183,6 +246,14 @@ int messaging_recv_from(generic_msg_t *data, struct sockaddr_storage *their_addr
  * 
  */
 #define messaging_recv(data) messaging_recv_from(data, NULL, false)
+
+/** The other half of a successful receive: free what it allocated in @p msg
+ *  (a NET_MESSAGE's function and obj, a TASK_RESULT's result_data) and zero
+ *  the struct, ready to receive into again. NULL-safe, and safe on a zeroed or already-released struct, so
+ *  a loop may release unconditionally at the top of each pass. Never call it
+ *  on a message this code built to send -- its function is usually a static
+ *  string. */
+void messaging_recv_release(generic_msg_t *msg);
 
 /*@
   requires \valid(q);

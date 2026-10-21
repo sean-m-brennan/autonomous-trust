@@ -17,21 +17,15 @@
 #
 # Build protocol documentation using the AT sequence-diagram tool.
 #
-# Three things happen on each run (all idempotent):
-#   1. Discovery: every .md under doc/ that contains an
-#      `at_diagram:start` sentinel pair is refreshed via
-#      `at_diagram.py --embed`. Byte-stable when scenarios are
-#      unchanged.
-#   2. Generation: for every protocol that has a
-#      `<protocol>-canonical.yaml` scenario, a standalone
-#      `doc/architecture/_generated/<protocol>-sequence.md` file is
-#      (re)written. Each generated file itself carries an
-#      at_diagram:start/end marker pair so future runs keep it in
-#      sync via the same embed path.
-#   3. Drift check: `at_diagram.py --check` runs against every
-#      unique (protocol, scenario) seen in steps 1 and 2, surfacing
-#      handler-registry vs. corpus drift. Exits non-zero on any
-#      drift.
+# Three things happen on each run (all idempotent): 1. Discovery: every .md under doc/
+# that contains an `at_diagram:start` sentinel pair is refreshed via `at_diagram.py
+# --embed`. Byte-stable when scenarios are unchanged. 2. Generation: for every protocol
+# that has a `<protocol>-canonical.yaml` scenario, a standalone
+# `doc/architecture/_generated/<protocol>-sequence.md` file is (re)written. Each
+# generated file itself carries an at_diagram:start/end marker pair so future runs keep
+# it in sync via the same embed path. 3. Drift check: `at_diagram.py --check` runs
+# against every unique (protocol, scenario) seen in steps 1 and 2, surfacing
+# handler-registry vs. corpus drift. Exits non-zero on any drift.
 #
 # Usage:
 #   scripts/build-docs.sh                       # text only (mermaid in markdown)

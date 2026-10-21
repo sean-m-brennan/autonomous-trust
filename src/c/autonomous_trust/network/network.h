@@ -25,6 +25,7 @@
 #include <jansson.h>
 #include "utilities/allocation.h"
 #include "utilities/logger.h"
+#include "network/net_wire_format.h"
 
 /* Compile-time DEFAULT base port, not a fixed one. The port a node actually
  * uses is resolved by net_port_resolve() below; the transports derive the
@@ -45,13 +46,46 @@
 #define CIDR6_LEN (IPV6_ADDR_LEN + 4)
 #define MAC_ADDR_LEN 17
 
-/* Per-peer duplicate-broadcast threshold before demotion. Mirrors
- * Python NetworkProcess.annoy_limit (netprocess.py:90). The pest-tracking
- * map IS wired into the C receive path — net_proc.c:287 compares against
- * this constant to set over_limit. Note the tunability divergence: Python
- * exposes annoy_limit as an overridable class attribute, C has only this
- * macro (see ISSUES.md, tunable-on-one-side entry). */
+/* Per-peer duplicate-broadcast threshold before demotion — the DEFAULTS layer
+ * for the knob, not the knob itself. Mirrors Python NetworkProcess.annoy_limit.
+ * Read it through net_annoy_limit_resolve(), which applies AT_NET_ANNOY_LIMIT
+ * first; comparing against this macro directly ignores the override. */
 #define NET_ANNOY_LIMIT 5
+#define NET_ANNOY_LIMIT_MIN 1
+#define NET_ANNOY_LIMIT_MAX 10000
+
+/* Receive-poll timeout, in milliseconds: how long a receiver thread blocks in
+ * recv() before looking at the stop flag. Mirrors Python
+ * NetworkProcess.socket_timeout (0.1 s = 100 ms); the unit differs because the
+ * poll API does, the VALUE does not. Read via net_recv_poll_ms_resolve(). */
+#define NET_RECV_POLL_MS 100
+#define NET_RECV_POLL_MS_MIN 1
+#define NET_RECV_POLL_MS_MAX 60000
+
+/* How long a deferred ("mystery") encrypted message whose sender never became
+ * a known peer is held before it is reclaimed, in seconds. Mirrors Python
+ * NetworkProcess.mystery_max_age_s. Read via net_mystery_max_age_resolve(). */
+#define NET_MYSTERY_MAX_AGE_SEC 30
+#define NET_MYSTERY_MAX_AGE_SEC_MIN 1
+#define NET_MYSTERY_MAX_AGE_SEC_MAX 86400
+
+/* Persistent-connection bounds, shared with Python's AT_NET_CONN_IDLE_TTL /
+ * AT_NET_MAX_CONNS (system.py). A TCP sender with pooling on keeps its
+ * connection open, so the receiver holds one per active peer: the TTL closes
+ * a connection gone quiet, and the cap stops a hostile peer exhausting our
+ * descriptors by opening many. Read via net_conn_idle_ttl_resolve() /
+ * net_max_live_conns_resolve().
+ *
+ * Python's TTL default is 30.0 seconds; the value is the same, only the type
+ * differs (there is no sub-second use for it, and an integer keeps the knob
+ * parseable by the shared resolver). */
+#define NET_CONN_IDLE_TTL_SEC 30
+#define NET_CONN_IDLE_TTL_SEC_MIN 1
+#define NET_CONN_IDLE_TTL_SEC_MAX 86400
+
+#define NET_MAX_LIVE_CONNS 64
+#define NET_MAX_LIVE_CONNS_MIN 1
+#define NET_MAX_LIVE_CONNS_MAX 256
 
 /**
  * @brief Address family / link-layer family a transport operates on.
@@ -110,6 +144,14 @@ typedef struct
     char mcast4_addr[IPV4_ADDR_LEN + 1];
     char ip6_cidr[CIDR6_LEN + 1];
     char mcast6_addr[IPV6_ADDR_LEN + 1];
+    /* Gateway relay (libat_gateway; see network/net_filter.h). All false by
+     * default and written to JSON only when true. The envelope changes the
+     * wire format, so every node of a cohort must agree on it; the other two
+     * need it. A node asking for the envelope without the library refuses
+     * to start. */
+    bool envelope;       /**< Wrap every frame in the plaintext routing envelope. */
+    bool group_forward;  /**< As a gateway, forward group frames across legs. */
+    bool cross_cluster;  /**< Keep a forwarded broadcast's self-reported address. */
 } network_config_t;
 
 /** Which layer supplied the base port a node is running on. */
@@ -155,6 +197,102 @@ int net_port_resolve(int cfg_port, net_port_source_t *src, logger_t *logger);
   ensures \result != \null;
 */
 const char *net_port_source_name(net_port_source_t src);
+
+/** Which layer supplied a network tunable. */
+typedef enum {
+    KNOB_SRC_ENV     = 0,  /**< An AT_NET_* / AT_MYSTERY_* override supplied it. */
+    KNOB_SRC_DEFAULT = 1,  /**< Nothing did; the compile-time default. */
+} net_knob_source_t;
+
+/**
+ * @brief Human-readable name of a tunable's source, for logs.
+ */
+/*@
+  assigns \nothing;
+  ensures \result != \null;
+*/
+const char *net_knob_source_name(net_knob_source_t src);
+
+/**
+ * @brief Resolve the three network tunables from the environment.
+ *
+ * Resolution order is env → compile-time default, the same two-layer shape and
+ * the same refusal rules as net_port_resolve's env layer: read once and cached,
+ * strictly parsed (no trailing garbage), range-checked, and a bad value refused
+ * with a warning while the default is kept. These exist because the knobs used
+ * to be overridable class attributes in Python and bare macros in C, so a
+ * deployment could tune one runtime and not the other (doc/architecture/networking.md).
+ *
+ * There is deliberately NO config layer: unlike the base port, these are
+ * operational tuning rather than provisioned identity, and adding them to
+ * network.cfg.json would widen the config wire form for a knob an operator sets
+ * on a node, not on a fleet.
+ *
+ * @param src     Optional out-param: which layer supplied the result.
+ * @param logger  Optional; used to report a refused override.
+ * @return the resolved value, always within the knob's documented range.
+ */
+/*@
+  requires src == \null || \valid(src);
+  ensures \result >= NET_ANNOY_LIMIT_MIN && \result <= NET_ANNOY_LIMIT_MAX;
+*/
+int net_annoy_limit_resolve(net_knob_source_t *src, logger_t *logger);
+
+/*@
+  requires src == \null || \valid(src);
+  ensures \result >= NET_RECV_POLL_MS_MIN && \result <= NET_RECV_POLL_MS_MAX;
+*/
+int net_recv_poll_ms_resolve(net_knob_source_t *src, logger_t *logger);
+
+/*@
+  requires src == \null || \valid(src);
+  ensures \result >= NET_MYSTERY_MAX_AGE_SEC_MIN &&
+          \result <= NET_MYSTERY_MAX_AGE_SEC_MAX;
+*/
+int net_mystery_max_age_resolve(net_knob_source_t *src, logger_t *logger);
+
+/*@
+  requires src == \null || \valid(src);
+  ensures \result >= NET_CONN_IDLE_TTL_SEC_MIN &&
+          \result <= NET_CONN_IDLE_TTL_SEC_MAX;
+*/
+int net_conn_idle_ttl_resolve(net_knob_source_t *src, logger_t *logger);
+
+/*@
+  requires src == \null || \valid(src);
+  ensures \result >= NET_MAX_LIVE_CONNS_MIN &&
+          \result <= NET_MAX_LIVE_CONNS_MAX;
+*/
+int net_max_live_conns_resolve(net_knob_source_t *src, logger_t *logger);
+
+/** Default envelope encoding for a group this node MINTS (doc/architecture/network-wire-format.md).
+ *  JSON, because a group's format is what all its members must speak and JSON
+ *  is the one every AT node can read; a deployment opts a new cohort into proto
+ *  with AT_NET_WIRE_MODE=proto. Mirrors Python system.default_net_wire_mode. */
+#define NET_WIRE_MODE_DEFAULT NET_WIRE_JSON
+
+/**
+ * @brief Envelope encoding for a group this node mints, from AT_NET_WIRE_MODE.
+ *
+ * This knob does NOT decide what goes on the wire for an existing group -- that
+ * comes from the group itself (@c group_t::wire_format), which is what keeps a
+ * cohort consistent and why there is no per-message override. It decides only
+ * what a NEW group is stamped with, so an operator stands up a proto cohort by
+ * setting it on the node that forms the group; every joiner adopts it at
+ * admission.
+ *
+ * Named values rather than numbers ("json" / "proto"), matching Python's
+ * AT_NET_WIRE_MODE. Refusal discipline is the numeric knobs': an unrecognized
+ * value is reported and the default kept. Case-insensitive, because an operator
+ * writing "Proto" means proto and silently falling back to JSON there would
+ * look like this whole path simply not happening.
+ *
+ * Mirrors Python system.resolve_net_wire_mode.
+ */
+/*@
+  requires src == \null || \valid(src);
+*/
+net_wire_format_t net_wire_mode_resolve(net_knob_source_t *src, logger_t *logger);
 
 /**
  * @brief Split a CIDR string into its address and prefix-length parts.
@@ -271,9 +409,9 @@ int network_from_json(const json_t *obj, void *data_struct);
 
 #include "utilities/exception.h"
 
-#define ENET_INVALID_MASK 220
+#define ENET_INVALID_MASK 234   /* was 220, which EDAG_INVALID_BRANCH holds */
 DECLARE_ERROR(ENET_INVALID_MASK, "CIDR prefix length exceeds maximum for address family");
-#define ENET_ADDR_TOO_LONG 221
+#define ENET_ADDR_TOO_LONG 235  /* was 221, which EDAG_BRANCH_EXISTS holds */
 DECLARE_ERROR(ENET_ADDR_TOO_LONG, "CIDR address or prefix does not fit the caller's buffer");
 
 

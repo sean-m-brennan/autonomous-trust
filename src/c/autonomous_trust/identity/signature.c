@@ -70,7 +70,10 @@ unsigned char *signature_generate()
 {
     unsigned char key[crypto_sign_SEEDBYTES];
     randombytes(key, crypto_sign_SEEDBYTES);
-    unsigned char *hex = malloc(crypto_sign_SEEDBYTES * 2);
+    /* +1 for the NUL hexlify writes at result[len*2] (see hexlify.c, whose
+     * own assert states it). Without it every identity creation overflowed
+     * this block by one byte. */
+    unsigned char *hex = malloc(crypto_sign_SEEDBYTES * 2 + 1);
     if (hex == NULL)
     {
         EXCEPTION(ENOMEM);

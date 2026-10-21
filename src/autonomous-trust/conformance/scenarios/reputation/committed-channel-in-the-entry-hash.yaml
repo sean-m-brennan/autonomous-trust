@@ -1,0 +1,79 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: committed-channel-in-the-entry-hash
+byte_pinning: false
+description: |
+    The evidence channel is part of the COMMITTED FACT, and both runtimes
+    hash it identically (R+D.md §12.8, doc/verification_oracle.md "Keep the
+    channels separate").
+
+    This is the cross-language half of §12.8's second response. A
+    transaction score says how well a peer did; the channel says how we
+    know. The reason has to survive to every acceptor, because the response
+    to a poor score is that every peer sees it WITH ITS REASON and judges
+    for itself -- there is no accusation mechanism and no adjudicator, by
+    the user's decision (2026-09-02), so a reason that stopped at the chain
+    boundary would leave nothing to judge on. Before this it did stop
+    there: the `committed` broadcast carried a bare score, and every
+    acceptor's persisted history kept the number and dropped the reason.
+
+    bob holds one bilateral entry, carol's half untagged and alice's tagged
+    `physical`, written through the chain's own writer (TransactionHistory.update
+    / tx_history_update). Since every group places its order a `tx committed`
+    goes to the pool and is hashed only when placed, so the entry is staged
+    whole and the step (`update needed`) leaves bob's chain as it is. The pin is
+    bob's `window_root` -- the ordered RFC 6962 Merkle root over his committed
+    window, which is what a checkpoint is quorum-signed over:
+
+      - the channel reached the entry (a dropped channel changes the root);
+      - Python and C serialize it into the canonical bytes identically (a
+        divergence in field order, spelling or the default's treatment
+        changes the root on one side only);
+      - the conditional rule holds.
+
+    The conditional rule is the reason this was not a chain migration.
+    `|p1_channel|p2_channel` is appended to the canonical bytes only when at
+    least one side carries a channel other than `task_outcome`. Absence and
+    an explicit `task_outcome` are the same claim, so they are the same
+    bytes, and every entry committed before this field keeps its hash. What
+    the rule does NOT excuse is stripping: removing a real channel drops the
+    block, changes the bytes, and breaks both the chain link and the window
+    root.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: proposer
+
+fixtures:
+  # The whole entry, carol's half untagged (an ordinary task outcome) and
+  # alice's refuted on physics.
+  tx_history:
+    bob:
+      - task_id: t-1
+        p1: carol
+        p1_score: 0.9
+        p2: alice
+        p2_score: 0.2
+        p2_channel: physical
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: update needed
+    payload: {}
+    description: |
+        A request that leaves bob's chain as it is, so the assertion reads the
+        staged entry.
+
+expected_state:
+  bob:
+    # The bilateral entry exists (a dropped commit would leave 0)...
+    committed_tx_count: 1
+    # ...and both runtimes hash its channel into the same root.
+    window_root: "d2900d8d9ed3fcf3a1750238bb572fbb7792bef07fd997d256cc313831225cb1"

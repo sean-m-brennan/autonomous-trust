@@ -29,7 +29,7 @@ from uuid import uuid4
 
 from autonomous_trust.core.reputation.repprocess import ReputationProcess
 from autonomous_trust.core.reputation.reputation import (
-    Reputation, Reputations, TransactionHistory,
+    Reputation, Reputations, Transaction, TransactionHistory, placement_entry,
 )
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
 from autonomous_trust.core.network.message import Message
@@ -165,17 +165,10 @@ class TestSubtreeRoster:
         cg = _fake_group([child, cohort_peer])
         cg_uuid = str(cg.uuid)
         rp.protocol.child_groups = {cg_uuid: cg}
-        # Record a committed bilateral tx for `child` in the CHILD chain
-        # via the wire path (4-tuple committed carrying the child group).
+        # A placed bilateral tx for `child` in the CHILD chain.
         task = uuid4()
-        rp.handle_committed(None, Message(
-            CfgIds.reputation, ReputationProtocol.committed,
-            _tuple_json((task, child, 0.9, cg_uuid)), None,
-            from_whom=rp.identity))
-        rp.handle_committed(None, Message(
-            CfgIds.reputation, ReputationProtocol.committed,
-            _tuple_json((task, cohort_peer, 0.9, cg_uuid)), None,
-            from_whom=rp.identity))
+        rp._chain_for_group(cg_uuid).apply_placed(0, [placement_entry(
+            Transaction(task, child, 0.9, cohort_peer, 0.9))])
         roster = rp._subtree_roster(gw)
         child_rep = next(r for r in roster if str(r.peer_id) == str(child))
         # EMA over a single 0.9 counterparty score == 0.9, well above the
@@ -233,16 +226,27 @@ def _tuple_json(tpl):
     return to_json_string(tpl)
 
 
+def _commit_from(rp, tpl):
+    """A `committed` as its proposer sends it: signed, from the peer whose
+    half it writes (ISSUES.md §2.16, shape 2), and certified. tpl = (task,
+    peer, score[, group]). The certificate is a stand-in `rp` accepts: routing
+    is the subject here, certificates are test_commit_certificates'."""
+    tpl = tuple(tpl) + (None,) * (5 - len(tpl)) + ({'signer': 'ab'},)
+    rp._commit_cert_ok = lambda *a, **k: True
+    msg = Message(CfgIds.reputation, ReputationProtocol.committed,
+                  _tuple_json(tpl), None, from_whom=rp.identity)
+    msg.verified = True
+    msg.from_whom = SimpleNamespace(uuid=tpl[1], nickname='proposer')
+    return msg
+
+
 class TestCommittedWireCompat:
     def test_legacy_3tuple_routes_to_primary(self):
         rp = _make_rep_process()
         peer = uuid4()
         task = uuid4()
-        rp.handle_committed(None, Message(
-            CfgIds.reputation, ReputationProtocol.committed,
-            _tuple_json((task, peer, 0.8)), None, from_whom=rp.identity))
-        assert len(rp.history) >= 0  # half-tx until counterparty arrives
-        assert task in rp.history._task_mapping
+        rp.handle_committed(None, _commit_from(rp, (task, peer, 0.8)))
+        assert rp.history.pooled(task) is not None  # until it is placed
         assert rp.child_histories == {}
 
     def test_4tuple_with_child_uuid_routes_to_child(self):
@@ -252,22 +256,16 @@ class TestCommittedWireCompat:
         rp.protocol.child_groups = {cg_uuid: cg}
         peer = uuid4()
         task = uuid4()
-        rp.handle_committed(None, Message(
-            CfgIds.reputation, ReputationProtocol.committed,
-            _tuple_json((task, peer, 0.8, cg_uuid)), None,
-            from_whom=rp.identity))
+        rp.handle_committed(None, _commit_from(rp, (task, peer, 0.8, cg_uuid)))
         # Routed to the child chain, NOT the primary one.
         assert cg_uuid in rp.child_histories
-        assert task in rp.child_histories[cg_uuid]._task_mapping
-        assert task not in rp.history._task_mapping
+        assert rp.child_histories[cg_uuid].pooled(task) is not None
+        assert rp.history.pooled(task) is None
 
     def test_4tuple_unknown_group_falls_back_to_primary(self):
         rp = _make_rep_process()
         peer = uuid4()
         task = uuid4()
-        rp.handle_committed(None, Message(
-            CfgIds.reputation, ReputationProtocol.committed,
-            _tuple_json((task, peer, 0.8, str(uuid4()))), None,
-            from_whom=rp.identity))
-        assert task in rp.history._task_mapping
+        rp.handle_committed(None, _commit_from(rp, (task, peer, 0.8, str(uuid4()))))
+        assert rp.history.pooled(task) is not None
         assert rp.child_histories == {}

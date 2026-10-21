@@ -1,0 +1,174 @@
+/********************
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *******************/
+
+/**
+ * update_proc_helpers.c — pure, dependency-free helper functions for update_proc.
+ *
+ * Kept in a separate translation unit so that unit tests can link only
+ * update_proc_helpers.c + update_selftest.c without pulling in the full
+ * process/messaging infrastructure that update_proc.c depends upon.
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+#include <jansson.h>
+
+#include "fleet/update_proc.h"
+#include "utilities/at_jansson.h"
+#include "utilities/util.h"
+
+/* ------------------------------------------------------------------ */
+/* State file I/O                                                      */
+/* ------------------------------------------------------------------ */
+
+/* Frama-C: skipped — [serialization] JSON file write via jansson */
+int update_state_write(const char *data_dir, const update_state_t *state)
+{
+    /* Ensure <data_dir>/fleet_update/ exists */
+    char dir_path[512];
+    if (path_join(dir_path, sizeof(dir_path), data_dir, "fleet_update") < 0)
+        return -1;
+
+    struct stat st;
+    if (stat(dir_path, &st) != 0) {
+        if (mkdir(dir_path, 0755) != 0 && errno != EEXIST)
+            return -1;
+    }
+
+    /* Build JSON object with all 7 fields */
+    json_t *root = json_object();
+    if (!root)
+        return -1;
+
+    json_object_set_new(root, "state",       json_string(state->state));
+    json_object_set_new(root, "version",     json_string(state->version));
+    json_object_set_new(root, "hash_hex",    json_string(state->hash_hex));
+    json_object_set_new(root, "backup_path", json_string(state->backup_path));
+    json_object_set_new(root, "binary_path", json_string(state->binary_path));
+    json_object_set_new(root, "timestamp",   json_integer(state->timestamp));
+    json_object_set_new(root, "attempt",     json_integer(state->attempt));
+    json_object_set_new(root, "type",        json_string(state->type));
+
+    char file_path[512];
+    if (path_join(file_path, sizeof(file_path), data_dir, "fleet_update/state.json") < 0) {
+        json_decref(root);
+        return -1;
+    }
+
+    int ret = json_dump_file(root, file_path, JSON_INDENT(2));
+    json_decref(root);
+    return ret;
+}
+
+/* Frama-C: skipped — [serialization] JSON file read via jansson */
+int update_state_read(const char *data_dir, update_state_t *state)
+{
+    char file_path[512];
+    if (path_join(file_path, sizeof(file_path), data_dir, "fleet_update/state.json") < 0)
+        return -1;
+
+    json_error_t err;
+    json_t *root = json_load_file(file_path, 0, &err);
+    if (!root)
+        return -1;
+
+    AT_JSON_STRING(root, "state",       state->state);
+    AT_JSON_STRING(root, "version",     state->version);
+    AT_JSON_STRING(root, "hash_hex",    state->hash_hex);
+    AT_JSON_STRING(root, "backup_path", state->backup_path);
+    AT_JSON_STRING(root, "binary_path", state->binary_path);
+
+    state->timestamp = (long)json_integer_value(json_object_get(root, "timestamp"));
+    state->attempt   = (int)json_integer_value(json_object_get(root, "attempt"));
+
+    AT_JSON_STRING(root, "type",        state->type);
+
+    json_decref(root);
+    return 0;
+}
+
+/* Frama-C: skipped — [syscall] unlink requires valid_string(path); path_join's
+ * assigns-only clause doesn't establish NUL-termination. */
+int update_state_delete(const char *data_dir)
+{
+    char file_path[512];
+    if (path_join(file_path, sizeof(file_path), data_dir, "fleet_update/state.json") < 0)
+        return -1;
+
+    if (unlink(file_path) != 0) {
+        if (errno == ENOENT)
+            return 0;  /* already absent is fine */
+        return -1;
+    }
+    return 0;
+}
+
+/* Frama-C: skipped — [syscall] stat requires valid_pathname(path); path_join's
+ * assigns-only clause doesn't establish NUL-termination. */
+bool update_state_exists(const char *data_dir)
+{
+    char file_path[512];
+    if (path_join(file_path, sizeof(file_path), data_dir, "fleet_update/state.json") < 0)
+        return false;
+
+    struct stat st;
+    return stat(file_path, &st) == 0;
+}
+
+bool update_should_abort(const update_state_t *state)
+{
+    return state->attempt > 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Path helpers                                                        */
+/* ------------------------------------------------------------------ */
+
+int update_staging_dir(const char *data_dir, char *buf, size_t buflen)
+{
+    return path_join(buf, buflen, data_dir, "fleet_update") >= 0 ? 0 : -1;
+}
+
+int update_staging_path(const char *data_dir, char *buf, size_t buflen)
+{
+    return path_join(buf, buflen, data_dir, "fleet_update/at_demo.new") >= 0 ? 0 : -1;
+}
+
+int update_backup_path(const char *data_dir, char *buf, size_t buflen)
+{
+    return path_join(buf, buflen, data_dir, "fleet_update/at_demo.backup") >= 0 ? 0 : -1;
+}
+
+int update_current_binary_path(char *buf, size_t buflen)
+{
+#ifdef __APPLE__
+    /* Darwin has no /proc; dyld knows the path the program was started from. */
+    uint32_t cap = (uint32_t)buflen;
+    return _NSGetExecutablePath(buf, &cap) == 0 ? 0 : -1;
+#else
+    ssize_t len = readlink("/proc/self/exe", buf, buflen - 1);
+    if (len < 0)
+        return -1;
+    buf[len] = '\0';
+    return 0;
+#endif
+}

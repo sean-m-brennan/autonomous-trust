@@ -15,12 +15,15 @@
  *******************/
 
 #include <errno.h>
+#include <stdio.h>
+#include <string.h>
 
 #include <jansson.h>
 
 #include "processes/process_tracker_priv.h"
 #include "config/configuration_priv.h"
 #include "utilities/util.h"
+#include "structures/data.h"
 #include "utilities/exception.h"
 #include "process_table_priv.h"
 
@@ -44,6 +47,108 @@ handler_ptr_t find_process(const char *name)
             return entry->runner;
     }
     return NULL;
+}
+
+int process_table_append(const char *type, const char *name, handler_ptr_t runner)
+{
+    const size_t cap = sizeof(process_table) / sizeof(process_table[0]);
+    if (name == NULL || name[0] == '\0' || runner == NULL)
+    {
+        fprintf(stderr, "process_table_append: refusing an unnamed or runnerless process\n");
+        return -1;
+    }
+    for (size_t i = 0; i < process_table_size; i++)
+        if (strcmp(process_table[i].name, name) == 0)
+        {
+            fprintf(stderr, "process_table_append: refusing %s: already in the table\n",
+                    name);
+            return -1;
+        }
+    if (process_table_size >= cap)
+    {
+        fprintf(stderr, "process_table_append: refusing %s: table full (%zu)\n",
+                name, cap);
+        return -1;
+    }
+    process_table[process_table_size].type = type;
+    process_table[process_table_size].name = name;
+    process_table[process_table_size].runner = runner;
+    process_table_size++;
+    return 0;
+}
+
+static struct {
+    const char *key;
+    const char *impl;
+} _subsystems[AT_SUBSYSTEM_EXT_MAX];
+static size_t _subsystems_len = 0;
+
+int subsystem_default_register(const char *key, const char *impl)
+{
+    if (key == NULL || impl == NULL || key[0] == '\0' || impl[0] == '\0') {
+        fprintf(stderr, "subsystem_default_register: refusing an unnamed subsystem\n");
+        return -1;
+    }
+    for (size_t i = 0; i < _subsystems_len; i++)
+        if (strcmp(_subsystems[i].key, key) == 0) {
+            fprintf(stderr, "subsystem_default_register: %s already registered\n", key);
+            return -1;
+        }
+    if (_subsystems_len >= AT_SUBSYSTEM_EXT_MAX) {
+        fprintf(stderr, "subsystem_default_register: table full, %s refused\n", key);
+        return -1;
+    }
+    _subsystems[_subsystems_len].key = key;
+    _subsystems[_subsystems_len].impl = impl;
+    _subsystems_len++;
+    return 0;
+}
+
+size_t subsystem_defaults(const char **keys, const char **impls, size_t max)
+{
+    size_t n = 0;
+    for (; n < _subsystems_len && n < max; n++) {
+        if (keys != NULL)
+            keys[n] = _subsystems[n].key;
+        if (impls != NULL)
+            impls[n] = _subsystems[n].impl;
+    }
+    return n;
+}
+
+/* The subsystems a feature library provides, and the library: what a node
+ * configured with one needs linked (FEATURE_SPLIT_PLAN Phase 8). */
+static const struct { const char *key; const char *lib; } subsystem_libraries[] = {
+    { "fleet", "libat_fleet" },
+    { "artifact", "libat_fleet" },
+    { "update", "libat_fleet" },
+    { "config", "libat_fleet" },
+    { "data-source", "libat_data_source" },
+    { "zta_verify", "libat_zta" },
+};
+
+int tracker_check_subsystem_libraries(const tracker_t *tracker, logger_t *logger)
+{
+    if (tracker == NULL || tracker->registry == NULL)
+        return 0;
+    int missing = 0;
+    map_key_t key = NULL;
+    data_t *impl_val = NULL;
+    map_entries_for_each(tracker->registry, key, impl_val)
+    {
+        char *impl;
+        if (data_string_ptr(impl_val, &impl) != 0 || find_process(impl) != NULL)
+            continue;
+        for (size_t i = 0; i < sizeof(subsystem_libraries) / sizeof(subsystem_libraries[0]); i++) {
+            if (strcmp(subsystem_libraries[i].key, key) != 0)
+                continue;
+            log_error(logger, "The configuration starts subsystem %s (%s), but %s is not "
+                              "linked; refusing to start\n", key, impl, subsystem_libraries[i].lib);
+            missing++;
+        }
+    }
+    map_end_for_each
+    return missing > 0 ? -1 : 0;
 }
 
 /* Frama-C: skipped —
@@ -238,7 +343,7 @@ int tracker_from_file(const char *filename, logger_t *logger, tracker_t **tracke
 int tracker_config(char *config_file, size_t destlen)
 {
     /* Both bounds come from the caller now. This function had the same shape as
-     * the defect in ISSUES.md §2.1.1 — an unsized `char config_file[]` parameter
+     * the socket-path overflow — an unsized `char config_file[]` parameter
      * with `CFG_PATH_LEN` hardcoded as its length — and was safe only because its
      * one caller happened to pass a buffer that big. */
     if (config_file == NULL || destlen == 0)

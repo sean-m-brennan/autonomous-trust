@@ -1,0 +1,62 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: cohort-clock-skew-peer-behind
+byte_pinning: false
+description: |
+    The sign convention, pinned. Companion to cohort-clock-skew-peer-ahead: same
+    exchange, but the target's clock is BEHIND the puller's, so the measured
+    offset must be negative.
+
+    This exists because a sign error is the classic way two implementations of
+    the same formula diverge while both look right in isolation -- each is
+    self-consistent, and only a signed comparison between them catches it. The
+    contract is: offset = peer clock minus ours, so a peer behind us reads
+    negative on BOTH sides.
+
+    It also pins that the bound is applied to the MAGNITUDE. A peer 30 s behind
+    is exactly as unusable for ordering as one 30 s ahead, so a node whose
+    exceeds-check forgot the absolute value would pass the peer-ahead scenario
+    and fail here. The check is advisory either way: the skew is recorded and
+    logged, and the attestation below is still accepted.
+
+    Stage 0 of doc/architecture/cohort-clock-skew.md. Measurement only -- no
+    clock is steered and no offset is applied to either node's own time.
+
+participants:
+  - id: consumer
+    role: border_guard
+  - id: node
+    role: border_guard
+
+fixtures:
+  # 30 s behind: past the 2000 ms default skew bound, so this also covers the
+  # advisory path -- beyond-bound skew is reported, never refused.
+  clocks:
+    consumer: 1721800030.0
+    node: 1721800000.0
+  operator_session:
+    clock: 1721800030.0
+    node: active
+
+steps:
+  - id: 1
+    from: consumer
+    to: node
+    function: trigger_attest_pull
+    description: |
+        consumer pulls node's attended-now state; the node's clock is half a
+        minute behind, which the puller must report as a NEGATIVE offset.
+
+expected_state:
+  consumer:
+    peer_clock_offset:
+      node: -30.0
+    peer_clock_delay:
+      node: 0.0
+    peer_clock_usable:
+      node: true
+    # Unaffected by the skew: the node stamps with its own clock, and 30 s is
+    # still inside the 120 s acceptance window.
+    attested_now: 1721800000.0
+    attest_accepted: [true]

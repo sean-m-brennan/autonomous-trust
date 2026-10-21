@@ -16,7 +16,7 @@
 
 /**
  * @file peer_rtt_update_test.c
- * @brief PEER_RTT_UPDATE propagation (at-over-dtn §4.3 B-followup).
+ * @brief PEER_RTT_UPDATE propagation (at-over-dtn B-followup).
  *
  * Drives run_message_handlers() with a PEER_RTT_UPDATE message and
  * asserts that the target peer's peer_rtt_ms[] slot is updated. No real

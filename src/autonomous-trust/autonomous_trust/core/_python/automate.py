@@ -44,20 +44,26 @@ except ImportError:
     version = '?.?.?'
 from .config import Configuration, to_json_string, from_json_string, ConfigMap
 from .config.discover import get_cfg_type, load_configs
-from .processes import Process, LogLevel, ProcessTracker
+from .processes import Process, LogLevel, ProcessTracker, LOG_FORMAT, LOG_DATEFMT
 from .identity import Peers
 from .identity.protocol import IdentityProtocol
 from .bootstrap_capabilities import (
     register_bootstrap_capabilities,
-    BOOTSTRAP_CAPABILITY_NAMES,
+    BOOTSTRAP_CAPABILITY_NAMES, is_probe_capability, verify_bootstrap_result,
 )
 from .capabilities import Capabilities, Capability, PeerCapabilities
 from .system import CfgIds, PackageHash, queue_cadence, max_concurrency, now, preferred_proto_ver, QueueType
 from .protocol import Protocol
 from .negotiation import Task, TaskParameters, TaskStatus, Status, TaskResult, NegotiationProtocol
 from .network import Message, require_synced_clock
-from .reputation import TransactionScore, ReputationProtocol
+from .reputation import (TransactionScore, ReputationProtocol, PeerReputation,
+                         TX_CHANNEL_CERTIFICATE, TX_CHANNEL_TASK_OUTCOME,
+                         TX_CHANNEL_PHYSICAL, TX_CHANNEL_PROBE)
+from .reputation.reputation import Reputation, pair_task_id
+from . import oracles
+from .negotiation.certified import split_certified
 from .queue_pool import QueuePool
+from .app_verbs import AppRequest, AppEvent, app_verb_target
 from .._zkp import ZKP_AVAILABLE
 from . import _probes
 
@@ -85,6 +91,130 @@ class Ctx(str, Enum):
 ################################################################################
 
 
+def _subject_key(executor_uuid) -> 'str | None':
+    """Stable string key for the peer a result is attributed to.
+
+    ``None`` stays ``None`` and means "not attributable to one peer" -- a
+    fan-out, where only the last reply carries the object that gets scored.
+    The physics layer treats that as "run the checks that need no identity",
+    never as an anonymous peer, because filing several peers' claims under one
+    key would manufacture conflicts between a peer and itself.
+    """
+    return None if executor_uuid is None else str(executor_uuid)
+
+
+def competence_weight(capability_name, subject_uuid) -> float:
+    """The learned EMA weight multiplier for this peer on this capability.
+
+    Read where the ``TransactionScore`` is BUILT rather than inside
+    :func:`score_task_result`, because the layer that learns it contributes no
+    score and no channel: it changes how much a peer's evidence counts, not
+    what the evidence says (R+D.md §12.5,
+    doc/architecture/prequential-competence.md). Keeping it out of the scoring
+    function also keeps that function's arms exactly the set of things that can
+    *speak*.
+
+    :data:`~.oracles.NEUTRAL_COMPETENCE` -- 1.0, the authored
+    ``transaction_weight`` verbatim -- with no competence provider, and whenever
+    the provider has nothing to say.
+    """
+    return oracles.competence(capability_name, _subject_key(subject_uuid))
+
+
+def score_task_result(task, logger=None, name: str = '',
+                      now_sec: float = None, seed: int = None
+                      ) -> tuple[float, str]:
+    """Score a returned :class:`TaskResult` and name its evidence channel.
+
+    Returns ``(score, channel)``. The channel is one of ``TX_CHANNELS``
+    (R+D.md §12.8) and says how the number was arrived at, which is what makes
+    a tamper signal distinguishable downstream from a dud task when both are
+    0.3.
+
+    ``verify_proof()`` is tri-state: True (proof verified), False (proof
+    present but INVALID -> a genuine tamper signal), or None (indeterminate:
+    no proof attached, or ZKP unavailable in this process).
+
+    None must NOT be scored as a defection. Split by cause:
+
+    * ZKP unavailable process-wide -> proofs cannot attest anything, so score
+      on the fact the task completed with a result; missing infrastructure is
+      not the peer's fault.
+    * ZKP available but proof absent -> suspicious; score as a defection, like
+      an invalid proof.
+
+    Previously ``0.8 if zkp_valid else 0.3`` collapsed None into the defection
+    bucket, so with the ZKP extension unshipped every requestor scored 0.3 and
+    honest reputation cratered.
+
+    Physical consistency (R+D.md §12.2) runs after the probe check and before
+    every other arm. It is a falsification layer, so it speaks only to refute:
+    ``(0.1, 'physical')`` for a claim that is impossible or that no consistent
+    story leaves honest, ``(0.3, 'swarm_disagreement')`` for a peer implicated
+    by a conflict that does not name it uniquely, and silence otherwise. A
+    claim that survives it is not thereby good, which is why passing does not
+    short-circuit to a high score. It sits above the certificate arms because a
+    proof attests that a computation ran, not that its answer is coherent.
+
+    A known-answer probe is checked FIRST (R+D.md §12.7) and subsumes the ZKP
+    question: for a capability whose right answer is already in hand, "it came
+    back" is not the question. A result tampered in transit will not match the
+    expected value either, and it scores 0.1 here rather than the ZKP path's
+    0.3. The expected value comes from ``requested_kwargs``, which the
+    requestor's own negotiation process stamped on from its retained Task --
+    never from the responder's reply.
+    """
+    probe_score = None
+    cap_name = getattr(task, 'requested_capability_name', None)
+    if is_probe_capability(cap_name):
+        probe_score = verify_bootstrap_result(
+            cap_name, task.result, getattr(task, 'requested_kwargs', None),
+            sent_at=getattr(task, 'requested_at', None))
+    if probe_score is not None:
+        if logger is not None:
+            logger.info('%s: probe %s scored %.2f for task %s',
+                        name, cap_name, probe_score, task.uuid)
+        return probe_score, TX_CHANNEL_PROBE
+
+    # The verification layers (R+D.md §12.2-12.5), as the arms they registered
+    # (see ``oracles``): physics check, calibration settle, prequential
+    # settle + observe, certificate check, calibration assess, in that order.
+    # All of them sit before the ZKP arms: a proof attests that a computation
+    # was performed and its bytes not altered, not that its answer is coherent,
+    # proved right, or honestly calibrated. The first verdict ends scoring.
+    verdict = oracles.score(oracles.ScoreInput(
+        task=task, cap=cap_name,
+        subject=_subject_key(getattr(task, 'executor_uuid', None)),
+        now=now_sec if now_sec is not None else time.monotonic(),
+        seed=seed, logger=logger, name=name))
+    if verdict is not None:
+        return verdict
+
+    zkp_valid = task.verify_proof()
+    if zkp_valid is True:
+        return 0.8, TX_CHANNEL_CERTIFICATE
+    if zkp_valid is False:
+        if logger is not None:
+            logger.warning('%s: ZKP verification FAILED for task %s',
+                           name, task.uuid)
+        return 0.3, TX_CHANNEL_CERTIFICATE
+    if ZKP_AVAILABLE:
+        # Proof missing despite ZKP being available -> suspicious.
+        if logger is not None:
+            logger.warning(
+                '%s: task %s result carried no ZKP proof despite ZKP being '
+                'available', name, task.uuid)
+        # Still the certificate channel: a certificate-carrying interface was
+        # expected here and nothing was presented, which is a fact about the
+        # proof, not about the work.
+        return 0.3, TX_CHANNEL_CERTIFICATE
+    # ZKP unavailable: score on successful completion. No certificate was in
+    # play, so this is an ordinary task outcome -- and saying so is the point:
+    # it keeps an infrastructure gap from reading as a failed proof. This is
+    # also the only arm the C twin has, since that runtime attaches no proofs.
+    return (0.8 if task.result is not None else 0.3), TX_CHANNEL_TASK_OUTCOME
+
+
 class AutonomousTrust(Protocol):
     """
     Creates an AutonomousTrust machine
@@ -104,6 +234,9 @@ class AutonomousTrust(Protocol):
                  logfile: str = None, log_classes: list[str] = None, syslog: bool = False,
                  context: str = Ctx.DEFAULT, testing: bool = False, silent: bool = False):
         self._stopped_procs: list[str] = []
+        # Set once a quit has been sent to the subprocesses; their returns
+        # after that are the shutdown, not a fault.
+        self._quitting = False
         if multiproc:
             # Multiprocessing
             self._pool_type = ProcessPool
@@ -164,14 +297,33 @@ class AutonomousTrust(Protocol):
             # rely on this staying quiet, so the discard is deliberate, not a bug.
             handlers.append(logging.NullHandler())
         for handler in handlers:
-            handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d - %(levelname)s %(message)s',
-                                                   '%Y-%m-%d %H:%M:%S'))
+            handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATEFMT))
             handler.setLevel(log_level)
             self._logger.addHandler(handler)
         if syslog:
             syslog_handler = SysLogHandler(address='/dev/log')
             self._logger.addHandler(syslog_handler)
         super().__init__(CfgIds.main, self._logger, None)
+        # Load the verification layers this install has (the separate
+        # autonomous-trust-oracle distribution, found by extensions), then
+        # refuse a node whose environment declares one it lacks ($AT_PHYSICS,
+        # ...), before anything starts: a node declared to test physics that
+        # silently did not would accept results physics refutes. Raises
+        # oracles.OracleMissingError after an ERROR per missing layer (the C
+        # twin refuses in negotiation_run).
+        oracles.load()
+        oracles.check_env(self._logger)
+        # Features' own declarations ($AT_OWN_* for social) get the same
+        # treatment, and the node says which features it has.
+        from .extensions import (all_extensions, check_env as extensions_check_env,
+                                 check_config as extensions_check_config)
+        extensions_check_env(self._logger)
+        # And configuration only a feature acts on: a zta_policy that turns ZTA
+        # on with no ZTA extension, or one ZTA cannot honour (FEATURE_SPLIT_PLAN
+        # Phase 6). Both refuse the start rather than run with ZTA silently off.
+        extensions_check_config(logger=self._logger)
+        self._logger.info('Extensions: %s',
+                          ', '.join(ext.name for ext in all_extensions()) or 'none')
         self.identity = None  # of type Identity (can't import)
 
         self.process_names: list[str] = []
@@ -179,8 +331,8 @@ class AutonomousTrust(Protocol):
         # AT-core bootstrap corpus: register at.handshake /
         # at.time-attest / at.echo-challenge unless explicitly
         # disabled (AT_BOOTSTRAP_DISABLED=1). These are tier-0,
-        # weight-1 — the baby-steps signal documented in
-        # doc/architecture/trust-tiers.md §6.
+        # weight-1 — the baby-steps signal documented in doc/architecture/trust-tiers.md
+        # §6.
         if not os.environ.get('AT_BOOTSTRAP_DISABLED'):
             register_bootstrap_capabilities(self.capabilities)
         self._output: QueueType = self.queue_type()  # subsystem logging
@@ -313,15 +465,16 @@ class AutonomousTrust(Protocol):
                     self.peer_count = len(self.peers.all)  # noqa
                     self._random_task(queues)
                     # check reputation for all known peers on first sighting
-                    for peer in list(self.peers.all) + [self.identity]:
+                    # (never self: a node does not score itself)
+                    for peer in list(self.peers.all):
                         query = Message(CfgIds.reputation, ReputationProtocol.rep_req,
                                         to_json_string((peer, self.proc_name)), self.identity,
                                         from_whom=self.identity)
                         queues[CfgIds.reputation].put(query, block=True, timeout=queue_cadence)
                 elif self.tasking_tick(0):
                     self._random_task(queues)
-                    # check reputation for all known peers (including self)
-                    for peer in list(self.peers.all) + [self.identity]:
+                    # check reputation for all known peers
+                    for peer in list(self.peers.all):
                         query = Message(CfgIds.reputation, ReputationProtocol.rep_req,
                                         to_json_string((peer, self.proc_name)), self.identity,
                                         from_whom=self.identity)
@@ -393,6 +546,87 @@ class AutonomousTrust(Protocol):
         self._roster_visited.add(str(target.uuid))
         self._send_roster_req(queues, target)
 
+    @staticmethod
+    def _reputation_entry(entry):
+        """One rep_resp entry as a Reputation, or None if it is not one.
+
+        A reply may arrive already deserialized (a `Reputation`, because the
+        sender is this runtime and the payload carried its `__type__` tag) or as
+        a bare mapping. The mapping case is real: a peer running the C library
+        answered with plain JSON fields, and reaching for `.peer_id` on the dict
+        that produced raised `AttributeError` out of the message loop — so a
+        C peer's view of the cohort reached nothing, and the failure did not
+        name its cause. Accepting the mapping here means one runtime's reply
+        shape cannot silence the other's; C now sends the tagged form, and this
+        keeps a mixed-version cohort working while it catches up.
+
+        Both spellings of the key are read: `peer_id` is the Reputation field
+        name, `peer_uuid` was the C wire name.
+
+        The test is what an entry ANSWERS, not what class it is: anything already
+        carrying a usable `peer_id` and `score` is passed through untouched. A
+        stricter isinstance check would reject a stand-in that behaves like a
+        Reputation for no gain — the two attributes are the entire contract the
+        caller relies on.
+        """
+        peer_id = getattr(entry, 'peer_id', None)
+        score = getattr(entry, 'score', None)
+        if peer_id is not None and score is not None:
+            try:
+                float(score)
+            except (TypeError, ValueError):
+                return None     # answers the right names with the wrong value
+            return entry
+        if isinstance(entry, dict):
+            peer_id = entry.get('peer_id', entry.get('peer_uuid'))
+            score = entry.get('score')
+            if peer_id is None or score is None:
+                return None
+            try:
+                return Reputation(peer_id, float(score))
+            except (TypeError, ValueError):
+                return None
+        # Anything else (a bare score, a string, None) is not an observation and
+        # must not be guessed at.
+        return None
+
+    def _reputation_entries(self, payload, observer=None):
+        """Every usable Reputation in a rep_resp payload.
+
+        A rep_resp carries either a single Reputation (the classic rep_req /
+        leaf path) or a subtree roster from a gateway, which arrives as a JSON
+        array. Normalising to a list here lets the caller run its per-entry body
+        once per entry; the maps it writes are keyed per-uuid, so a gateway's
+        reply populates one entry for every peer in its subtree.
+
+        Unusable entries are dropped with a warning rather than raised on. This
+        loop services every message the node receives, so one malformed reply
+        must not be able to stop the rest — and the warning names the sender,
+        because "which peer is sending me nonsense" is the only actionable part.
+        """
+        if isinstance(payload, str):
+            try:
+                payload = from_json_string(payload)
+            except Exception as err:  # noqa - malformed or foreign payload
+                self.logger.warning(
+                    'rep_resp from %s could not be deserialized: %s',
+                    getattr(observer, 'nickname', observer), err)
+                return []
+        entries = payload if isinstance(payload, list) else [payload]
+        usable = []
+        for entry in entries:
+            rep = self._reputation_entry(entry)
+            if rep is None:
+                self.logger.warning(
+                    'rep_resp from %s carried an unusable entry (%s); ignoring '
+                    'it. Expected a Reputation or a mapping with '
+                    'peer_id/peer_uuid and score.',
+                    getattr(observer, 'nickname', observer),
+                    type(entry).__name__)
+                continue
+            usable.append(rep)
+        return usable
+
     def _consume_roster_resp(self, queues, message):
         """Merge one roster_resp and pursue any newly-named child gateways —
         the per-tick unroll of the requestor-side breadth-first walk."""
@@ -448,7 +682,8 @@ class AutonomousTrust(Protocol):
     def _operator_attended(self):
         """Current attended state as ``(attended, epoch, have_session)``.
 
-        Attended is decided by :func:`operator.session.is_attended` — the one
+        Attended is decided by the session's own ``is_attended()``
+        (autonomous_trust.operator.node.session) — the one
         definition, shared with IdentityProcess so the two processes cannot
         drift apart. No session (a drone, or a node with no console attached) is
         honestly reported as have_session=False, which the puller reads as
@@ -457,8 +692,8 @@ class AutonomousTrust(Protocol):
         if session is None:
             return False, 0.0, False
         try:
-            from .operator.session import is_attended  # operator pkg is optional
-            return bool(is_attended(session)), time.time(), True
+            # The session is the operator distribution's; it knows the rule.
+            return bool(session.is_attended()), time.time(), True
         except Exception:
             # Never let a session read break the loop; unknown reads as absent.
             self.logger.debug('operator session poll failed', exc_info=True)
@@ -482,7 +717,7 @@ class AutonomousTrust(Protocol):
             # confirm" — a dropped answer degrades to not-attended, never hangs.
             self.logger.error('_answer_operator_state: identity queue full')
         except Exception as err:
-            self.logger.error('_answer_operator_state: %s' % err)
+            self.logger.error('_answer_operator_state: %s', err)
 
     def request_peer_attestation(self, queues, peer):
         """Ask for a freshly-stamped operator attestation from one peer.
@@ -528,8 +763,7 @@ class AutonomousTrust(Protocol):
         peer_uuid = str(peer_uuid)
         if peer_uuid not in self._attest_sent:
             _probes.counter('proc.automate', 'attest_unsolicited')
-            self.logger.warning('_consume_attest_resp: unsolicited report for %s'
-                                % peer_uuid)
+            self.logger.warning('_consume_attest_resp: unsolicited report for %s', peer_uuid)
             return
         del self._attest_sent[peer_uuid]
         attested = payload.get('operator_attested_at') or 0.0
@@ -557,15 +791,18 @@ class AutonomousTrust(Protocol):
                     if not self._handle_messages(queues, pool, results):
                         break
                     self._handle_results(queues, results)
+                    if self._quitting and all(name in self._stopped_procs
+                                              for name in self.process_names):
+                        break  # every subprocess has answered the quit
                     self.autonomous_tasking(queues)
                     time.sleep(Process.cadence)
                 except KeyboardInterrupt:
+                    self._quitting = True
                     for sig in signals.values():
                         sig.put_nowait(Process.sig_quit)
                     break
                 except Exception as err:
-                    self.logger.error(self.name + ':  ' +
-                                      ''.join(traceback.TracebackException.from_exception(err).format()))
+                    self.logger.error('%s:  %s', self.name, ''.join(traceback.TracebackException.from_exception(err).format()))
         self.cleanup()
 
     def run_forever(self, q_in: QueueType = None, q_out: QueueType = None):
@@ -584,11 +821,10 @@ class AutonomousTrust(Protocol):
         procs: list[Process] = configs[Process.key]
         if self._log_level <= LogLevel.WARNING:
             self._banner()
-        self.logger.info(self.name + ':  Package signature %s' % configs[PackageHash.key])
-        self.logger.info(self.name + ":  Configuring '%s' at %s for %s" %
-                         (self.identity.nickname, self.identity.address, '(unknown domain)'))
-        self.logger.info(self.name + ':  Signature: %s' % self.identity.signature.publish())
-        self.logger.info(self.name + ':  Public key: %s' % self.identity.encryptor.publish())
+        self.logger.info('%s:  Package signature %s', self.name, configs[PackageHash.key])
+        self.logger.info("%s:  Configuring '%s' at %s for %s", self.name, self.identity.nickname, self.identity.address, '(unknown domain)')
+        self.logger.info('%s:  Signature: %s', self.name, self.identity.signature.publish())
+        self.logger.info('%s:  Public key: %s', self.name, self.identity.encryptor.publish())
 
         if procs is None:
             return
@@ -604,12 +840,12 @@ class AutonomousTrust(Protocol):
 
         with self._pool_type(len(procs)) as pool:
             for proc in system_procs:
-                self.logger.info(self.name + ':  Starting system %s ...' % proc.name)
+                self.logger.info('%s:  Starting system %s ...', self.name, proc.name)
                 self.process_names.append(proc.name)
                 signals[proc.name] = self.queue_type()
                 results[proc.name] = pool.apply_async(proc.process, (queues, signals[proc.name]))
             for proc in additional_procs:
-                self.logger.info(self.name + ':  Starting worker %s ...' % proc.name)
+                self.logger.info('%s:  Starting worker %s ...', self.name, proc.name)
                 self.process_names.append(proc.name)
                 signals[proc.name] = self.queue_type()
                 results[proc.name] = pool.apply_async(proc.process, (queues, signals[proc.name]))
@@ -628,10 +864,10 @@ class AutonomousTrust(Protocol):
             # cleanly and run its tail-of-loop persistence.
             def _graceful_shutdown(signum, _frame):
                 try:
-                    self.logger.info(self.name + ':  SIGTERM received, '
-                                     'propagating quit to subprocesses')
+                    self.logger.info('%s:  SIGTERM received, propagating quit to subprocesses', self.name)
                 except Exception:
                     pass
+                self._quitting = True
                 for sig in signals.values():
                     try:
                         sig.put_nowait(Process.sig_quit)
@@ -652,11 +888,11 @@ class AutonomousTrust(Protocol):
                     break  # all still running means they started successfully
                 time.sleep(Process.cadence)
                 _ready_wait += Process.cadence
-            self.logger.info(self.name + ':                                          Ready.')
+            self.logger.info('%s:                                          Ready.', self.name)
 
             self.autonomous_loop(results, queues, signals)
 
-        self.logger.info(self.name + ':  Shutdown')
+        self.logger.info('%s:  Shutdown', self.name)
 
     ####################
     # Protected methods
@@ -683,7 +919,7 @@ class AutonomousTrust(Protocol):
                 if cfg_name in defaultable:
                     defaultable[cfg_name]().to_file(os.path.join(cfg_dir, cfg_name + Configuration.file_ext))
                 else:
-                    self.logger.error('%s:  Required %s configuration missing' % (self.name, cfg_name))
+                    self.logger.error('%s:  Required %s configuration missing', self.name, cfg_name)
                     return None
 
         # load configs
@@ -694,6 +930,15 @@ class AutonomousTrust(Protocol):
         configs[Process.level] = self._log_level
 
         net_cfg = configs[CfgIds.network]
+        # A config directory can outlive the address it recorded -- a container
+        # restarted onto a different subnet keeps its var/at but not its IP --
+        # and an address we no longer hold is one we cannot bind. The stored
+        # address stays authoritative while it is still present on this host.
+        try:
+            if net_cfg.refresh():
+                net_cfg.to_file(os.path.join(cfg_dir, CfgIds.network + Configuration.file_ext))
+        except OSError as err:
+            self.logger.warning('%s:  Could not re-derive the network address: %s', self.name, err)
         self.identity = configs[CfgIds.identity]
         self.identity.address = net_cfg.ip4
         if preferred_proto_ver == 6:
@@ -763,12 +1008,11 @@ class AutonomousTrust(Protocol):
                 self._last_ipc_drop_log = now
                 if alive:
                     self.logger.warning(
-                        '%s: IPC queue connection dropped (%s); reconnecting'
-                        % (self.name, type(ex).__name__))
+                        '%s: IPC queue connection dropped (%s); reconnecting', self.name, type(ex).__name__)
                 else:
                     self.logger.error(
                         '%s: manager server process is down; IPC lost, '
-                        'awaiting restart' % self.name)
+                        'awaiting restart', self.name)
             raise queue.Empty from ex
 
     def _monitor_processes(self, proc_results: dict[str, AsyncResult], show_output: bool = True):
@@ -783,15 +1027,14 @@ class AutonomousTrust(Protocol):
                 continue
             if result.ready():
                 try:
-                    self.logger.debug('Check process %s' % name)
+                    self.logger.debug('Check process %s', name)
                     result.get(0)
                 except mp.TimeoutError:
                     pass
                 except KeyboardInterrupt:
                     pass
                 except Exception as ex:
-                    self.logger.error(self.name + ':  ' +
-                                      ''.join(traceback.TracebackException.from_exception(ex).format()))
+                    self.logger.error('%s:  %s', self.name, ''.join(traceback.TracebackException.from_exception(ex).format()))
                     self._stopped_procs.append(name)
 
         if show_output:
@@ -806,10 +1049,31 @@ class AutonomousTrust(Protocol):
                     break
         return True
 
+    def _route_app_request(self, queues: dict[str, QueueType], request: AppRequest):
+        """Forward an app's request to the one process that declared its verb.
+
+        The allowlist is every enabled extension's ``app_verbs``
+        (:mod:`.app_verbs`), as C's is ``at_app_verb_target``. The forwarded
+        Message is rebuilt here with no ``from_whom`` and no ``to_whom``: the
+        app is not a peer, and the empty sender is what the handler's
+        ``is_local_app_verb`` guard reads as "local"."""
+        target = app_verb_target(request.function)
+        if target is None or target not in queues:
+            self.logger.warning('%s: refused app request %r (no enabled '
+                                'extension declares it)', self.name,
+                                request.function)
+            return
+        forward = Message(target, request.function, request.payload,
+                          to_whom=None, from_whom=None, encrypt=False)
+        try:
+            queues[target].put(forward, block=True, timeout=queue_cadence)
+        except queue.Full:
+            self.logger.error('%s: %s queue full; app request %r dropped',
+                              self.name, target, request.function)
+
     def _failed_task_cb(self, task: Task):
         def report_error(err: Exception):
-            self.logger.error('Task %s failed: %s' %
-                              (task.capability.name, '\n'.join(traceback.format_exception(type(err), err))))
+            self.logger.error('Task %s failed: %s', task.capability.name, '\n'.join(traceback.format_exception(type(err), err)))
 
         return report_error
 
@@ -820,13 +1084,36 @@ class AutonomousTrust(Protocol):
                 if isinstance(cmd, Task):
                     message = Message(CfgIds.negotiation, NegotiationProtocol.start, cmd)
                     queues[CfgIds.negotiation].put(message, block=True, timeout=queue_cadence)
+                elif cmd == ReputationProtocol.app_roster_request:
+                    # The app asked for the current peer view
+                    # (doc/architecture/app-peer-carrier.md). Exactly ONE verb is
+                    # accepted from an app and forwarded to a fixed destination, as the
+                    # C daemon does: forwarding an app-supplied message to whatever
+                    # process it names would hand an app AT's whole internal verb
+                    # surface. This pull is also
+                    # the only path on which `rated=False` can cross.
+                    query = Message(CfgIds.reputation,
+                                    ReputationProtocol.app_roster_request, '',
+                                    to_whom=None, from_whom=self.identity)
+                    queues[CfgIds.reputation].put(query, block=True,
+                                                  timeout=queue_cadence)
+                    # The presence half (doc/architecture/peer-presence.md),
+                    # as the C daemon also asks its network process.
+                    if CfgIds.network in queues:
+                        queues[CfgIds.network].put(
+                            Message(CfgIds.network,
+                                    ReputationProtocol.app_roster_request, '',
+                                    to_whom=None, from_whom=self.identity),
+                            block=True, timeout=queue_cadence)
+                elif isinstance(cmd, AppRequest):
+                    self._route_app_request(queues, cmd)
                 elif cmd == Process.sig_quit:
-                    self.logger.debug(self.name + ": External signal to quit")
+                    self.logger.debug('%s: External signal to quit', self.name)
                     return False
             except queue.Empty:
                 pass
             except queue.Full:
-                self.logger.error(self.name + ': Negotiation queue full')
+                self.logger.error('%s: Negotiation queue full', self.name)
 
         message = None
         try:
@@ -843,51 +1130,68 @@ class AutonomousTrust(Protocol):
                     else:
                         message.status = Status.unknown
                     queues[CfgIds.negotiation].put(message, block=True, timeout=queue_cadence)
-                    self.logger.debug('Handled status: %s' % message.status)
+                    self.logger.debug('Handled status: %s', message.status)
                 elif isinstance(message, TaskResult):
                     task = message
-                    self.logger.debug(self.name + ': Task result recvd: %s' % task.result)
-                    # Requestor-side score for a returned TaskResult. verify_proof()
-                    # is tri-state: True (proof verified), False (proof present but
-                    # INVALID -> genuine tamper signal), or None (indeterminate: no
-                    # proof attached, or ZKP unavailable in this process).
-                    #
-                    # None must NOT be scored as a defection. Split by cause:
-                    #   * ZKP unavailable process-wide -> proofs cannot attest
-                    #     anything, so score on the fact the task completed with a
-                    #     result; missing infrastructure is not the peer's fault.
-                    #   * ZKP available but proof absent -> suspicious; score as a
-                    #     defection, like an invalid proof.
-                    # Previously `0.8 if zkp_valid else 0.3` collapsed None into the
-                    # defection bucket, so with the ZKP extension unshipped every
-                    # requestor scored 0.3 and honest reputation cratered.
-                    zkp_valid = task.verify_proof()
-                    if zkp_valid is True:
-                        score = 0.8
-                    elif zkp_valid is False:
-                        self.logger.warning(
-                            self.name + ': ZKP verification FAILED for task %s'
-                            % task.uuid)
-                        score = 0.3
-                    elif ZKP_AVAILABLE:
-                        # Proof missing despite ZKP being available -> suspicious.
-                        self.logger.warning(
-                            self.name + ': task %s result carried no ZKP proof '
-                            'despite ZKP being available' % task.uuid)
-                        score = 0.3
-                    else:
-                        # ZKP unavailable: score on successful completion.
-                        score = 0.8 if task.result is not None else 0.3
-                    tx = TransactionScore(task.uuid, score)
+                    self.logger.debug('%s: Task result recvd: %s', self.name, task.result)
+                    # Requestor-side score, plus the evidence channel that says
+                    # how it was arrived at. The rules live in
+                    # `score_task_result` (module level, just above) rather than
+                    # here so the C twin's
+                    # `negotiation_score_task_result` can be pinned against the
+                    # same behaviour from the conformance corpus -- C scores in
+                    # its negotiation process, which is where its requestor-side
+                    # record of the task lives, so the two runtimes cannot share
+                    # a call site, only the rules.
+                    score, channel = score_task_result(
+                        task, logger=self.logger, name=self.name)
+                    cap_name = getattr(task, 'requested_capability_name', None)
+                    # subject_uuid: who the score is ABOUT, stamped on the
+                    # requestor side by negprocess.handle_results from the
+                    # verified sender. None for a fan-out (not attributable
+                    # to one peer). Local-only and never serialized; it is
+                    # what lets a hard-channel refutation propose a slash
+                    # against the right peer (R+D.md §12.8).
+                    # competence: the learned multiplier on this score's EMA
+                    # weight (R+D.md §12.5). Local-only and never serialized,
+                    # like subject_uuid above -- a peer that could stamp its
+                    # own would hold a lever on every EMA it appears in, which
+                    # is the same reason a remote score's channel does not
+                    # weigh (R+D.md §12.8).
+                    executor = getattr(task, 'executor_uuid', None)
+                    # One transaction per executor, under the pair task id
+                    # (ISSUES §2.50); the executor's own half uses the same.
+                    tx_id = (pair_task_id(task.uuid, executor)
+                             if executor is not None else task.uuid)
+                    tx = TransactionScore(tx_id, score,
+                                          capability_name=cap_name,
+                                          channel=channel,
+                                          subject_uuid=executor,
+                                          competence=competence_weight(
+                                              cap_name, executor))
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
-                    if self.external_feedback in queues:
+                    # The application sees one answer per task; the other
+                    # executors' results are scored only (negprocess).
+                    if self.external_feedback in queues \
+                            and not getattr(task, 'score_only', False):
                         queues[self.external_feedback].put(task, block=True, timeout=queue_cadence)
+                elif isinstance(message, (PeerReputation, AppEvent)):
+                    # AT -> app: the outward hop the reputation process cannot
+                    # make itself, mirroring the C daemon's forward off
+                    # AT_MAIN_QUEUE. `rated` rides along; see PeerReputation.
+                    if self.external_feedback in queues:
+                        try:
+                            queues[self.external_feedback].put(
+                                message, block=True, timeout=queue_cadence)
+                        except queue.Full:
+                            self.logger.error(
+                                '%s: external feedback queue full', self.name)
                 elif isinstance(message, Task):
                     task = message
                     if task.capability in self.capabilities:
                         capability = self.capabilities[task.capability.name]
                         pq = self.queue_type()
-                        self.logger.debug(self.name + ': Running task')
+                        self.logger.debug('%s: Running task', self.name)
                         self.active_tasks[str(task.uuid)] = task
                         results[task.uuid] = pool.apply_async(capability.execute, (task, pq))
                         try:
@@ -896,8 +1200,7 @@ class AutonomousTrust(Protocol):
                         except queue.Empty:
                             self.logger.error(
                                 '%s: Process failed to start for task %s (capability=%s, task_uuid=%s). '
-                                'No PID received within timeout.' %
-                                (self.name, task.capability.name, capability.name, task.uuid))
+                                'No PID received within timeout.', self.name, task.capability.name, capability.name, task.uuid)
                 elif isinstance(message, Message) and message.function == ReputationProtocol.rep_resp:
                     # A rep_resp carries either a single Reputation (the
                     # classic rep_req / leaf path) or a subtree roster
@@ -907,12 +1210,9 @@ class AutonomousTrust(Protocol):
                     # the per-Reputation body once per entry — the maps
                     # below are keyed per-uuid, so a gateway's reply
                     # populates one entry for every peer in its subtree.
-                    rep = message.obj
-                    if isinstance(rep, str):
-                        rep = from_json_string(rep)
-                    reps = rep if isinstance(rep, list) else [rep]
                     observer = getattr(message, "from_whom", None)
                     observer_uuid = getattr(observer, "uuid", None)
+                    reps = self._reputation_entries(message.obj, observer)
                     for rep in reps:
                         if rep.peer_id == self.identity.uuid:
                             self.print('My current reputation score:\033[32m %s\033[00m' % rep.score)
@@ -964,10 +1264,10 @@ class AutonomousTrust(Protocol):
             if isinstance(message, Message):
                 _probes.counter('proc.automate', 'unhandled', message.function)
                 _probes.trace_msg(message, 'unhandled', proc='automate')
-                self.logger.error(self.name + ': Unhandled message %s' % message.function)
+                self.logger.error('%s: Unhandled message %s', self.name, message.function)
             else:
                 _probes.counter('proc.automate', 'unhandled', 'type:' + message.__class__.__name__)
-                self.logger.error(self.name + ': Unhandled message of type %s' % message.__class__.__name__)  # noqa
+                self.logger.error('%s: Unhandled message of type %s', self.name, message.__class__.__name__)  # noqa
 
     def _handle_results(self, queues: dict[str, QueueType], results: dict[str, AsyncResult]):
         for key in list(results.keys()):
@@ -981,17 +1281,27 @@ class AutonomousTrust(Protocol):
                     # _monitor_processes runs earlier in the same iteration, so
                     # any exception traceback is already on the record; a clean
                     # return leaves no traceback and only this line.
-                    self.logger.error('unexpected termination of process %s' % key)
+                    if self._quitting:
+                        self.logger.debug('process %s stopped', key)
+                    else:
+                        self.logger.error('unexpected termination of process %s', key)
                     if key not in self._stopped_procs:
                         self._stopped_procs.append(key)
                     del results[key]
                     continue
                 try:
-                    self.logger.debug(self.name + ': %s Task' % key)
+                    self.logger.debug('%s: %s Task', self.name, key)
                     result = results[key].get()
-                    self.logger.debug(self.name + ': %s Task completed %s' % (key, result))
+                    self.logger.debug('%s: %s Task completed %s', self.name, key, result)
                     orig_task = self.active_tasks[str(key)]
-                    tr = TaskResult(orig_task, result)
+                    # A certifying capability returns `Certified(answer,
+                    # witness)`; anything else is an ordinary answer with no
+                    # witness (R+D.md §12.3). Unwrapped here so the two travel
+                    # in separate fields of the reply rather than as a shape
+                    # the requestor would have to know about to read the
+                    # answer at all.
+                    result, certificate = split_certified(result)
+                    tr = TaskResult(orig_task, result, certificate=certificate)
                     tr.generate_proof()
                     queues[CfgIds.negotiation].put(tr, block=True, timeout=queue_cadence)
                     # Tag the TS with the capability that produced it so the
@@ -1004,17 +1314,22 @@ class AutonomousTrust(Protocol):
                     # falls back to weight 1, the prior behavior.
                     cap_name = getattr(
                         getattr(orig_task, 'capability', None), 'name', None)
-                    tx = TransactionScore(tr.uuid, 0.9, capability_name=cap_name)
+                    # Under the pair task id (ISSUES §2.50): pairs only with
+                    # the requestor's half about THIS executor.
+                    me = getattr(self.identity, 'uuid', None)
+                    tx = TransactionScore(
+                        pair_task_id(tr.uuid, me) if me is not None else tr.uuid,
+                        0.9, capability_name=cap_name)
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
                 except KeyboardInterrupt:
                     pass
                 except Exception:
-                    self.logger.error('Task Exception - ' + traceback.format_exc())
+                    self.logger.error('Task Exception - %s', traceback.format_exc())
                     try:
                         error_result = TaskResult(self.active_tasks[str(key)], None)
                         queues[CfgIds.negotiation].put(error_result, block=True, timeout=queue_cadence)
                     except Exception:
-                        self.logger.error('Failed to report task error: ' + traceback.format_exc())
+                        self.logger.error('Failed to report task error: %s', traceback.format_exc())
                 del results[key]
 
     def _random_task(self, queues: dict[str, QueueType]):
@@ -1039,6 +1354,6 @@ class AutonomousTrust(Protocol):
             task = Task(TaskParameters(cap, args=args), self.identity)
             msg = Message(CfgIds.negotiation, NegotiationProtocol.start, task)
             queues[CfgIds.negotiation].put(msg, block=True, timeout=queue_cadence)
-            self.logger.debug(self.name + ': Send task to %d peers' % len(self.peers.all))
+            self.logger.debug('%s: Send task to %d peers', self.name, len(self.peers.all))
         except queue.Full:
-            self.logger.error(self.name + ': Test task: negotiation queue full')
+            self.logger.error('%s: Test task: negotiation queue full', self.name)

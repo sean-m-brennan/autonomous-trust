@@ -25,7 +25,7 @@ from __future__ import annotations
 import atexit
 import logging
 import queue as _queue
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 from typing import Callable, Optional
 
 from .playback_engine import PlaybackEngine, PlaybackMode
@@ -278,7 +278,7 @@ class PlaybackInterface(ScenarioInterface):
         here."""
         if self._bridge_queue is None:
             return
-        wall = datetime.utcnow().isoformat()
+        wall = datetime.now(UTC).isoformat()
         while True:
             try:
                 ev = self._bridge_queue.get_nowait()

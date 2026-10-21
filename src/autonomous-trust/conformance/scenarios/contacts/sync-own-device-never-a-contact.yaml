@@ -1,0 +1,77 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: sync-own-device-never-a-contact
+description: This node and its siblings are never taken as contacts.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: sync
+    now: 1800000000.0
+    store:
+      typename: contacts
+      version: 1
+      contacts: {}
+    payload:
+      v: 1
+      typename: at-contacts-sync
+      contacts:
+        eeeeeeee-0000-4000-8000-000000000006:
+          identity:
+            typename: identity
+            uuid: eeeeeeee-0000-4000-8000-000000000006
+            address: ''
+            nickname: me
+            signature:
+              hex_seed: 511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a
+            encryptor:
+              hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+          petname: me-pet
+          verified: false
+          provenance: token
+          trust_seed: 0.0
+          rendezvous: []
+          nonce: ''
+          added_at: 1000.0
+          verified_at: 0.0
+        eeeeeeee-0000-4000-8000-000000000007:
+          identity:
+            typename: identity
+            uuid: eeeeeeee-0000-4000-8000-000000000007
+            address: ''
+            nickname: other
+            signature:
+              hex_seed: 31debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc
+            encryptor:
+              hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+          petname: other-pet
+          verified: false
+          provenance: token
+          trust_seed: 0.0
+          rendezvous: []
+          nonce: ''
+          added_at: 1000.0
+          verified_at: 0.0
+      tombstones: {}
+    exclude:
+    - eeeeeeee-0000-4000-8000-000000000006
+    - eeeeeeee-0000-4000-8000-000000000007
+steps:
+- id: 1
+  from: host
+  to: host
+  function: sync
+  description: 'trigger: sync'
+expected_state:
+  host:
+    changes: []
+    contacts:
+      eeeeeeee-0000-4000-8000-000000000006:
+      eeeeeeee-0000-4000-8000-000000000007:

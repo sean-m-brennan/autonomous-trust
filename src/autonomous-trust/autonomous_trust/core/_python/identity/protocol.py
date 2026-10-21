@@ -51,7 +51,21 @@ class IdentityProtocol(Protocol):
        a. add as branch to history
        b. merge if ok
     6. listen on closed broadcast channel for group updates (address list additions) <- Group
-    7. listen for hierarchy roots # FIXME
+    7. listen for hierarchy roots (hierarchy / hierarchy_query)
+       - Each node ADVERTISES its own place in the gateway tree (which cohorts
+         it gateways, which higher-rank node it federates through) on the
+         encrypted group channel when that view changes, and on request so a
+         late joiner converges immediately. Receivers record a peer's claim
+         only if that peer can prove a shared trust anchor.
+       - Our OWN parent is DERIVED, never accepted from others: the
+         highest-rank member of our primary group whose rank exceeds ours and
+         which can prove gateway authority (_derive_parent_gateway). Same rule
+         _discover_child_gateway already applies one level down.
+       - What this does NOT do: hand over a cohort's group key. Child-group
+         KEYS remain operator-provisioned; a runtime cross-group join is a
+         separate question (doc/architecture/gateway-reputation-tree.md) because the group
+         key is the
+         confidentiality boundary.
 
     Items 3, 4, & 5 are concurrent
     """
@@ -70,6 +84,10 @@ class IdentityProtocol(Protocol):
     # messages flow via reliable group/TCP, not UDP broadcast.
     caps_query = 'peer_caps_query'  # msg.obj <- '' (sender just asks)
     caps_response = 'peer_caps_response'  # msg.obj <- caps list (json)
+    # The social verbs (position, profile, connection, dm, post, reaction,
+    # report, business ad/post, cosign, proximity) are SocialProtocol in
+    # autonomous_trust.social (Agora's at-social/python,
+    # FEATURE_SPLIT_PLAN Phase 5). Their strings are unchanged.
     # Identity backfill for a node that holds a group member's address (in
     # group.addresses) but never received its full Identity — the cold/late
     # joiner case (e.g. the dod_mission coordinator: group.addresses grows via
@@ -88,6 +106,21 @@ class IdentityProtocol(Protocol):
     # See doc/architecture/gateway-reputation-tree.md.
     roster_req = 'subtree_roster_query'  # msg.obj <- json {'requestor': uuid_str}
     roster_resp = 'subtree_roster_response'  # msg.obj <- json {'members': [...], 'child_gateways': [uuid_str]}
+    # Runtime hierarchy roots (protocol step 7,
+    # doc/architecture/gateway-reputation-tree.md). A node states
+    # its own position in the gateway tree -- which cohorts it gateways, and
+    # which higher-rank node it federates through -- so the mesh AGREES on the
+    # topology instead of each node inferring it privately. Sent on the
+    # encrypted group channel when our own view changes, and on request so a
+    # late joiner converges without waiting for the next change.
+    #
+    # Deliberately carries NO group key and confers no membership: a peer's
+    # advertisement is a claim about ITSELF, recorded only when that peer can
+    # prove a shared trust anchor (_gateway_authorized). Acquiring a second
+    # cohort's key at runtime is a separate, bigger question (doc/architecture/gateway-reputation-tree.md) and is not
+    # this message.
+    hierarchy = 'hierarchy_root'      # msg.obj <- json {'node','parent','children','rank'}
+    hierarchy_req = 'hierarchy_query'  # msg.obj <- json {'requestor': uuid_str}
     # Local-only IPC (no wire egress). ReputationProcess emits these to
     # CfgIds.identity when a peer's reputation crosses a TIER_FLOORS
     # boundary so IdentityProcess can update the peer's trust tier on
@@ -96,9 +129,9 @@ class IdentityProtocol(Protocol):
     tier_update = 'tier_update'  # msg.obj <- (peer_uuid_str, new_tier_int)
     # Local-only IPC (no wire egress). ReputationProcess emits this to
     # CfgIds.negotiation when a peer's trust tier drops (demotion).
-    # NegotiationProcess.handle_tier_lost cancels any in-flight tasks
-    # whose capability.required_tier exceeds new_tier. See
-    # doc/architecture/trust-tiers.md §7.2.
+    # NegotiationProcess.handle_tier_lost cancels any in-flight tasks whose
+    # capability.required_tier exceeds new_tier. See doc/architecture/trust-tiers.md
+    # §7.2.
     tier_lost = 'tier_lost'  # msg.obj <- (peer_uuid_str, new_tier_int)
     # Group partition recovery (doc/architecture/partition-recovery.md).
     # partition_signal: local-only IPC. NetProcess emits this when it
@@ -121,15 +154,14 @@ class IdentityProtocol(Protocol):
     partition_response = 'group_partition_response'
     # Operator-attended pull (ethne D8 guardian edge, attended-now half).
     # A consumer asks a node whether a human is at its console RIGHT NOW;
-    # the node answers with a freshly stamped, independently verifiable
-    # attestation (the same payload shape the admission path carries, so the
-    # receiver re-verifies the real operator credential rather than trusting
-    # an asserted bool). Pull-on-demand by design: there is no periodic
-    # keepalive re-announce, so an idle network carries no attestation
-    # traffic at all. The requestor's nonce is echoed back and is
-    # load-bearing — without it a signed attestation could be replayed
-    # forever, which would defeat the whole point of attended-NOW.
-    # See doc/architecture/operator-attended.md.
+    # the node answers with a freshly stamped, independently verifiable attestation (the
+    # same payload shape the admission path carries, so the receiver re-verifies the
+    # real operator credential rather than trusting an asserted bool). Pull-on-demand by
+    # design: there is no periodic keepalive re-announce, so an idle network carries no
+    # attestation traffic at all. The requestor's nonce is echoed back and is
+    # load-bearing — without it a signed attestation could be replayed forever, which
+    # would defeat the whole point of attended-NOW. See
+    # doc/architecture/operator-attended.md.
     attest_req = 'operator_attest_query'  # msg.obj <- json {'nonce': hex_str}
     attest_resp = 'operator_attest_response'  # msg.obj <- json {'nonce': hex_str, ...attestation}
     # Local-only IPC (no wire egress). A consumer (ethne's guardian edge, the
@@ -141,14 +173,13 @@ class IdentityProtocol(Protocol):
     # mints the nonce, emits the query, verifies the reply, and reports the
     # verified stamp back for consumers to read.
     attest_trigger = 'operator_attest_trigger'  # msg.obj <- json {'target': uuid_str}
-    # Local-only IPC (no wire egress). The live OperatorSession lives in the
-    # console app's address space, which the node's MAIN LOOP shares (the
-    # bridge runs run_forever in a daemon thread) — but IdentityProcess runs
-    # in its own subprocess and cannot see it. So on an inbound attest_req
-    # the identity process asks the main loop for the current session state
-    # and answers the pull once it replies. A round trip per pull, rather
-    # than a cached mirror: nothing is stored, so nothing can go stale.
-    # See doc/architecture/operator-attended.md.
+    # Local-only IPC (no wire egress). The live OperatorSession lives in the console
+    # app's address space, which the node's MAIN LOOP shares (the bridge runs
+    # run_forever in a daemon thread) — but IdentityProcess runs in its own subprocess
+    # and cannot see it. So on an inbound attest_req the identity process asks the main
+    # loop for the current session state and answers the pull once it replies. A round
+    # trip per pull, rather than a cached mirror: nothing is stored, so nothing can go
+    # stale. See doc/architecture/operator-attended.md.
     operator_state_req = 'operator_state_query'  # msg.obj <- '' (identity asks main)
     operator_state_resp = 'operator_state_response'  # msg.obj <- json {'attended', 'epoch', 'have_session'}
 
@@ -171,7 +202,37 @@ class IdentityProtocol(Protocol):
 # the receiver will drop it once the peer is known -- silently, on a path that
 # only shows up in multi-peer convergence. test_unencrypted_verbs.py pins the
 # set against the identity process's actual send sites.
-UNENCRYPTED_VERBS = frozenset({
+#: The pre-admission handshake: the verbs that place a node INTO a group.
+#: These are "bootstrap" in the wire-format sense (always JSON, because they
+#: run before there is a group to consult -- see
+#: doc/architecture/network-wire-format.md), and they are the verbs the gateway
+#: boundary refuses to carry.
+#:
+#: WHY these three and not the wider unencrypted set: a gateway boundary exists
+#: to keep a group from spanning it, and the only way a group spans a gateway is
+#: if a node on one side is ADMITTED by a cohort on the other. `announce` asks,
+#: `accept` grants, and `history` hands over the group (and its key) -- those
+#: three, and nothing else, move membership. `partition_probe` /
+#: `partition_response` deliberately span a group-key boundary
+#: (doc/architecture/partition-recovery.md) but do so WITHIN a domain and confer
+#: no membership, so they are not bootstrap and must keep working.
+#:
+#: See doc/architecture/network-wire-format.md, "The gateway boundary".
+BOOTSTRAP_VERBS = frozenset({
+    IdentityProtocol.announce,           # request_access -- asks to be admitted
+    IdentityProtocol.accept,             # access_granted -- grants admission
+    IdentityProtocol.history,            # full_history -- hands over the group + key
+})
+
+
+#: The CORE verbs this protocol legitimately puts on the wire in PLAINTEXT
+#: (Message encrypt=False), and so the core verbs a receiver accepts
+#: unencrypted from a peer it already knows. Compiled in: no configuration adds
+#: to or removes from them. An optional feature's plaintext verbs (first
+#: contact's hello, ...) come from unencrypted_verbs.cfg.json instead, and the
+#: receive policy is ..plaintext_verbs.is_unencrypted. Mirrors C's
+#: ID_UNENCRYPTED_VERBS one-for-one.
+CORE_UNENCRYPTED_VERBS = frozenset({
     IdentityProtocol.announce,           # request_access, pre-admission broadcast
     IdentityProtocol.accept,             # access_granted, sent before the key lands
     IdentityProtocol.id_query,           # identity backfill, both directions
@@ -181,6 +242,17 @@ UNENCRYPTED_VERBS = frozenset({
     IdentityProtocol.roster_resp,        # subtree roster answer
     IdentityProtocol.partition_probe,    # partition recovery, by definition
     IdentityProtocol.partition_response, # spans a group-key boundary
+})
+
+
+#: The identity verbs sent with no recipient and no group multicast, so they go
+#: out on the broadcast (stranger/multicast) channel and are let in there beside
+#: the plaintext verbs (..plaintext_verbs.is_broadcast, ISSUES §2.17). Mirrors
+#: C's ID_BROADCAST_ONLY_VERBS one-for-one.
+BROADCAST_ONLY_VERBS = frozenset({
+    IdentityProtocol.update,             # group_key_update
+    IdentityProtocol.confirm,            # peer_accepted
+    IdentityProtocol.propose,            # propose_peer
 })
 
 

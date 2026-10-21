@@ -1,0 +1,164 @@
+schema_version: "1"
+kind: scenario
+protocol: physics
+name: claim-refuted-by-physics
+byte_pinning: false
+description: |
+    A peer's claim is checked against physics before any reputation math runs,
+    and a claim that cannot be true is REFUTED rather than merely scored badly
+    (R+D.md §12.2; doc/verification_oracle.md layer 1;
+    doc/architecture/physical-consistency.md).
+
+    Why this has to agree across runtimes. Both grade the same peers off the
+    same `physics.json`, and `physical` is the hardest evidence AT produces —
+    it carries three times the channel weight of an ordinary task outcome
+    (R+D.md §12.8). A claim one runtime refutes and the other waves through
+    would make a peer's reputation depend on which implementation happened to
+    ask, and it would do so on the channel where that matters most.
+
+    What each row pins:
+
+      - Rows 1-2: the layer is OPT-IN and SILENT on success. An undeclared
+        capability yields no verdict at all, and a claim inside the feasible
+        set yields no verdict EITHER. That second one is the important
+        asymmetry: passing physics earns a peer nothing. A claim outside the
+        set is refuted; a claim inside it is merely not-refuted, and returning
+        a good score here would turn a falsification layer into a plausibility
+        grade.
+      - Rows 3-4: range feasibility, and a declared quantity answered with
+        prose. The second is a refutation rather than a dud task — the peer
+        claimed something that is not a quantity at all — which is exactly the
+        distinction the channel exists to carry, since a dud scores 0.3 on
+        `task_outcome` and this scores 0.1 on `physical`.
+      - Rows 5-7: dimensional coherence. Kilograms of power is refuted;
+        `furlong` is refused rather than guessed at; half a kilowatt is five
+        hundred watts and passes. A prefix is a conversion, a dimension
+        mismatch is a refutation, and the units table is CODE in both runtimes
+        — physics.json says which quantity a capability reports, never what a
+        newton is.
+      - Rows 8-10: kinematic feasibility against the peer's OWN previous claim.
+        58 degC/s against a declared 2 is a conflict of size one, so it is
+        refuted outright rather than implicated: no consistent story leaves
+        that peer honest.
+      - Row 11: the refuted observation was NOT stored. A return to 23 degC one
+        second after the refuted 80 is fine, where storing 80 would have made
+        it a 57 degC/s drop. This is load-bearing rather than tidy — the store
+        feeds the conflict machinery in the sibling scenario, so admitting a
+        claim already known to be impossible would let one liar manufacture
+        conflicts against honest peers.
+      - Rows 12-14: a vector quantity. The rate bound is on the magnitude of
+        the change (a speed limit is on the vector), while the range bound is
+        componentwise (a declared range is a bounding box). Wrong arity is
+        refuted.
+      - Rows 15-17: an unattributed result — a fan-out, where only the last
+        reply carries the object that gets scored. The checks needing no
+        identity still run, and nothing is stored, so the wild swing in row 17
+        is NOT a rate violation. Filing several peers' claims under one key
+        would manufacture conflicts between a peer and itself.
+
+    Shape. Non-message-driven, like the bootstrap scenarios: each adapter loads
+    `fixtures.physics` into its own runtime's checker and feeds
+    `fixtures.claims` through it in order, asserting the verdict, the score and
+    the evidence channel per row. A `null` score and channel is the no-verdict
+    case. The two runtimes cannot share a call site — Python checks from its
+    main process (`automate.score_task_result`), C from its negotiation process
+    — so what is pinned is the rules, which is the part a peer's reputation
+    depends on.
+
+    `t` is the observation time in seconds, supplied by the fixture rather than
+    read from a clock, so a replay produces the verdicts the live path did.
+
+    A result is spelled naturally in the fixture and reaches each runtime the
+    way that runtime carries it: Python takes the decoded value, C the text its
+    `report results` payload holds. A fixture STRING is delivered as its
+    contents, not as a quoted JSON string, so `"lots"` is prose to both and a
+    numeric string would be a number to both.
+
+participants:
+  - id: requestor
+    role: new_node
+  - id: worker
+    role: peer
+
+fixtures:
+  physics:
+    version: 1
+    window_sec: 60.0
+    quantities:
+      sat.solar-power:
+        capability: sat.solar
+        unit: W
+        min: 0.0
+        max: 2000.0
+        tolerance: 5.0
+        max_rate: 250.0
+      sat.bus-temp:
+        capability: sat.temp
+        unit: degC
+        min: -80.0
+        max: 120.0
+        max_rate: 2.0
+        tolerance: 1.0
+      sat.position:
+        capability: sat.pos
+        unit: m
+        components: 3
+        max_rate: 8000.0
+        max_accel: 50.0
+  claims:
+    #  1 undeclared capability: no declaration, no verdict
+    - {capability: other.thing, result: 42,   subject: A, t: 0.0}
+    #  2 in the feasible set: still no verdict. Passing earns nothing.
+    - {capability: sat.solar, result: 500.0,  subject: A, t: 0.0}
+    #  3 below the declared minimum
+    - {capability: sat.solar, result: -5.0,   subject: A, t: 1.0}
+    #  4 a declared quantity answered with prose
+    - {capability: sat.solar, result: "lots", subject: A, t: 2.0}
+    #  5 kilograms of power
+    - {capability: sat.solar, result: {value: 500, unit: kg},      subject: A, t: 3.0}
+    #  6 a unit that is not in the table
+    - {capability: sat.solar, result: {value: 500, unit: furlong}, subject: A, t: 4.0}
+    #  7 half a kilowatt is five hundred watts
+    - {capability: sat.solar, result: {value: 0.5, unit: kW},      subject: A, t: 5.0}
+    #  8-9 two feasible temperature claims from one peer
+    - {capability: sat.temp, result: 20.0, subject: A, t: 100.0}
+    - {capability: sat.temp, result: 22.0, subject: A, t: 101.0}
+    # 10 58 degC/s against a declared 2
+    - {capability: sat.temp, result: 80.0, subject: A, t: 102.0}
+    # 11 the refuted 80 was not stored, so 23 is a 1 degC/s change from 22
+    - {capability: sat.temp, result: 23.0, subject: A, t: 103.0}
+    # 12-13 a position, then 1 km in a second
+    - {capability: sat.pos, result: [0.0, 0.0, 0.0],    subject: A, t: 300.0}
+    - {capability: sat.pos, result: [1000.0, 0.0, 0.0], subject: A, t: 301.0}
+    # 14 1000 km in a second, and then the wrong number of components
+    - {capability: sat.pos, result: [1000000.0, 0.0, 0.0], subject: A, t: 302.0}
+    - {capability: sat.pos, result: [1.0, 2.0],           subject: A, t: 303.0}
+    # 16-18 unattributed: bounds still apply, nothing is stored
+    - {capability: sat.solar, result: -5.0, subject: null, t: 400.0}
+    - {capability: sat.temp,  result: 20.0, subject: null, t: 400.0}
+    - {capability: sat.temp,  result: 119.0, subject: null, t: 401.0}
+
+steps:
+  - id: 1
+    from: requestor
+    to: requestor
+    function: check_claims
+    description: |
+        Trigger. The requestor feeds each row of `fixtures.claims` through its
+        own runtime's physical-consistency checker, in order, carrying the
+        observation store from row to row.
+
+expected_state:
+  requestor:
+    claim_verdicts: [none, none, refuted, refuted, refuted, refuted, none,
+                     none, none, refuted, none,
+                     none, none, refuted, refuted,
+                     refuted, none, none]
+    claim_scores:   [null, null, 0.1, 0.1, 0.1, 0.1, null,
+                     null, null, 0.1, null,
+                     null, null, 0.1, 0.1,
+                     0.1, null, null]
+    claim_channels: [null, null, physical, physical, physical, physical, null,
+                     null, null, physical, null,
+                     null, null, physical, physical,
+                     physical, null, null]

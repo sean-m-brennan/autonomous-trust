@@ -14,6 +14,8 @@
 #   limitations under the License.
 # ******************
 
+import json
+import math
 import os
 import threading
 import time
@@ -23,15 +25,44 @@ from queue import Empty, Full
 from uuid import UUID
 from dataclasses import dataclass
 
+from nacl.encoding import HexEncoder
+from nacl.exceptions import BadSignatureError
+from nacl.signing import VerifyKey
+
 from ..network import Message, Network
 from ..processes import Process, ProcMeta
-from ..config import Configuration, from_json_string, to_json_string
+from ..extensions import (identity_hooks, load_extensions, reputation_hooks,
+                          run_post_fork)
+from ..config import (Configuration, atomic_write, from_json_string,
+                      to_json_string)
 from ..identity.protocol import IdentityProtocol
+from ..identity.identity import (public_identity_to_canonical,
+                                 public_identity_from_canonical)
+from ..identity.peer_standing import STANDING_PROVED, STANDING_FAILED
 from .protocol import ReputationProtocol
-from .reputation import (TransactionHistory, Reputation, Reputations,
+from .placement import PlacementMixin
+from .reputation import (TransactionHistory, ReconcileResult, Reputation, Reputations,
                          TransactionScore, SlashAttestation, SignedSlash,
-                         Checkpoint, SignedCheckpoint)
+                         AttestedScore, SignedAttestation,
+                         Checkpoint, SignedCheckpoint, validate_tx_score,
+                         validate_tx_channel, commit_designation,
+                         window_root_of, _hex_str,
+                         PeerReputation, EVIDENCE_FILE, SLASH_MARKS_FILE,
+                         evidence_to_dict, place_value_digest, placement_entry,
+                         place_designation,
+                         evidence_from_dict, evidence_attest_certs,
+                         attested_record, ATTESTED_DIR,
+                         RESOLVE_TTL_DEFAULT,
+                         resolve_query_to_dict, resolve_query_from_dict,
+                         resolved_to_dict, resolved_from_dict, verify_resolved,
+                         consensus_score_from_window, tx_channel_weight,
+                         TX_CHANNEL_REPLICATION,
+                         # The one shared rounding rule for a composed EMA
+                         # weight (R+D.md §12.5), `floor(x + 0.5)` as the C
+                         # twin's at_tx_weight_round.
+                         weight_round)
 from ..system import CfgIds, now, encoding, proc_idle_floor
+from ..app_verbs import is_local_app_verb, refuse_remote_app_verb
 from .. import _probes
 
 
@@ -53,40 +84,154 @@ def _env_float(name, default):
         return default
 
 
-# Reputation save gate: only peers strictly above this threshold survive
-# a process restart. Self is always persisted regardless. See
-# doc/architecture/persistent-cohort.md for the rationale.
-# Override: AT_REP_PERSIST_THRESHOLD.
+# Reputation save gate: only peers strictly above this threshold survive a process
+# restart. Self is always persisted regardless. See
+# doc/architecture/persistent-cohort.md for the rationale. Override:
+# AT_REP_PERSIST_THRESHOLD.
 REPUTATION_PERSIST_THRESHOLD = _env_float('AT_REP_PERSIST_THRESHOLD', 0.5)
 
+# Upper bound on how many subjects one `consensus_rep_batch_req` may name. The
+# batch verb exists so an observer-by-subject sweep costs N messages instead of
+# N**2, but each named subject costs a chain walk on the responder, so an
+# unbounded list would let one small message ask for arbitrary work. 256 is far
+# above any cohort this runs on and far below anything that hurts. Mirrored in C
+# as AT_MAX_REP_BATCH_SUBJECTS.
+MAX_REP_BATCH_SUBJECTS = 256
 
-@dataclass
-class TxCount(object):
-    score: TransactionScore
-    count: int
+# Catch-up quorum, both runtimes (rep_proc.c REP_CATCHUP_QUORUM). It was 3,
+# counted as updates stored one per sender, so a node with two peers never
+# reached it, nothing was merged, chain lengths drifted, and Paxos stopped
+# granting (moderation cohort run 7, 2026-09-23; very likely ISSUES.md §2.15).
+# One is safe because catchup verifies the segment's hash links and appends
+# only past _next_index; a commit already lands on one member's word (§2.16).
+REP_CATCHUP_QUORUM = 1
+
+# A catch-up reply carries the whole resident window (§2.51), and with commit
+# and placement certificates an entry runs about 1.4 KB, so a window soon
+# outgrows one UDP datagram: 57 entries came to 104 KB and the transport cut
+# every reply to 65,507 bytes, which then failed to decrypt (partition cohort
+# part-3629127, ISSUES §2.67). A window whose JSON exceeds this many bytes goes
+# as pages {page, of, head, chain[, group]}; the receiver collects every page
+# of one head from one sender and then handles the window as if it came whole.
+# Mirrors rep_proc.c REP_UPDATE_PAGE_BYTES / _PAGES_MAX / REP_PAGE_BUFS.
+UPDATE_PAGE_BYTES = 24000
+UPDATE_PAGES_MAX = 64
+UPDATE_PAGE_BUFS = 8
 
 
-class ReputationProcess(Process, metaclass=ProcMeta,
+class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                         proc_name=CfgIds.reputation, description='Reputation tracking', cfg_name=CfgIds.reputation):
-    protocol_timeout = 30
-    backoff_mult = 1.5
-    backoff_max = 90
     expiration = 300
     # Reputation-derived trust-tier elevation. Each entry is
     # (score_floor, tier); scores below the lowest floor map to tier 0.
     # Sorted ascending so _trust_tier can iterate and pick the highest
     # matching tier. Tunable, but keep monotonically increasing.
     #
-    # NOTE: trust tier is distinct from network rank (peer._rank) —
-    # rank is topology / one-hop reachability, populated from
-    # identity.json. See doc/architecture/trust-tiers.md §1 for the
-    # disambiguation.
+    # NOTE: trust tier is distinct from network rank (peer._rank) — rank is topology /
+    # one-hop reachability, populated from identity.json. See
+    # doc/architecture/trust-tiers.md §1 for the disambiguation.
     TIER_FLOORS = (
         (0.50, 1),
         (0.65, 2),
         (0.80, 3),
         (0.90, 4),
     )
+
+    # --- Verifiable warm start (doc/architecture/reputation.md) ----------------------
+    # Restoration is GRADED by whether the persisted score has evidence
+    # behind it. `reputation.cfg.json` is a conclusion; on its own it says
+    # only that some process with write access to the config directory
+    # believed a number, which is exactly as true of a tampered file as of
+    # an earned one. The evidence is `reputation-history.cfg.json`: the
+    # hash-linked committed window plus the quorum-signed Merkle checkpoint
+    # over it (_rebuild_from_evidence).
+    #
+    # Verified -> the peer's score is restored as persisted (still subject to
+    # staleness decay, the orthogonal time axis). Unverified -> the score is
+    # clamped so the peer holds no more than UNVERIFIED_RESTORE_TIER, and has
+    # to earn elevation back through fresh in-session transactions.
+    #
+    # Tier 1 (presence/communication) is the clamp because an
+    # authenticated-but-COMPROMISED asset passes ZTA admission by definition --
+    # credentials are exactly what it holds -- so restoring a historically-earned high
+    # tier the instant it is admitted re-opens the hole the system exists to close, and
+    # for a short-lived asset there is no time for behavioural re-evaluation to catch it
+    # first. See doc/architecture/reputation.md ("Hardening: floor, not full
+    # restoration").
+    UNVERIFIED_RESTORE_TIER = 1
+    # Committed bilateral transactions a peer needs INSIDE the attested window
+    # before the evidence bounds its score at all. Below this it is treated as
+    # uncovered and clamped to the unverified tier.
+    RESTORE_EVIDENCE_MIN_TX = 1
+    # Pseudo-count shrinking the evidence-derived ceiling toward
+    # PREREP_NEUTRAL (see _evidence_ceilings). This is the security parameter
+    # of the whole mechanism: it sets how MUCH attested history a peer needs
+    # before the window can justify an elevated restored tier, and so it is
+    # what stops a forger from minting a two-entry window of perfect scores.
+    # Larger -> more history required. Override: AT_REP_RESTORE_SHRINKAGE_K.
+    RESTORE_SHRINKAGE_K = _env_float('AT_REP_RESTORE_SHRINKAGE_K', 3.0)
+
+    # Seconds between checkpoint proposals this node originates (0 disables).
+    # Checkpointing was previously reactive only -- a Checkpoint had to be put
+    # on the reputation queue by something outside this process -- and nothing
+    # ever did, so in a live deployment no checkpoint existed, which meant no
+    # warm start could ever verify: the mechanism above would have been
+    # unreachable in practice. Override: AT_REP_CHECKPOINT_SEC.
+    #
+    # The interval trades evidence freshness against protocol traffic (each
+    # proposal draws a co-signature from every member). It also bounds what a
+    # restart can attest: entries committed after the last checkpoint are
+    # persisted but unattested, so they restore clamped.
+    CHECKPOINT_INTERVAL = _env_float('AT_REP_CHECKPOINT_SEC', 300.0)
+    #: After an attested entry commits, a checkpoint is due within this many
+    #: seconds, so the entry is under a quorum-signed window (and archived,
+    #: _archive_attested) before a busy chain evicts it. Mirrors C
+    #: REP_ATTEST_CHECKPOINT_SEC.
+    ATTEST_CHECKPOINT_SEC = _env_float('AT_REP_ATTEST_CHECKPOINT_SEC', 10.0)
+    # Seconds between rescore sweeps (_rescore_sweep). Mirrors C
+    # REP_RESCORE_INTERVAL. Override: AT_REP_RESCORE_SEC.
+    RESCORE_INTERVAL = _env_float('AT_REP_RESCORE_SEC', 60.0)
+    # Tenure (doc/architecture/reputation.md, "Tenure"): the highest tier a
+    # member this node has held for less than AT_REP_MIN_TENURE_SEC may hold.
+    # Below the replication tier (3). Mirrors C REP_TENURE_TIER.
+    TENURE_TIER = 2
+    # How long OUR half of a task may go uncommitted before it is proposed
+    # again, and how many times (ISSUES §2.24): a half whose co-signing round
+    # is lost on the way is otherwise lost for good. Mirrors C
+    # REP_COMMIT_TIMEOUT / REP_COMMIT_RETRIES. Override:
+    # AT_REP_COMMIT_TIMEOUT_SEC.
+    COMMIT_TIMEOUT = _env_float('AT_REP_COMMIT_TIMEOUT_SEC', 15.0)
+    COMMIT_RETRIES = 5
+    # A woken half is unparked with twice a fresh half's retries: the heal is
+    # its contended moment (part-2272442). Mirrors C REP_WAKE_RETRIES.
+    WAKE_RETRIES = 2 * COMMIT_RETRIES
+    # A half that used up its COMMIT_RETRIES is PARKED, not dropped (ISSUES
+    # §2.60): a minority island cannot commit under the majority rule (§2.13)
+    # and waits out a partition far longer than five retries. A parked half
+    # is re-proposed when the chain grows from a peer (_wake_parked), and
+    # otherwise every PARK_RETRY seconds, until PARK_TTL. Mirrors C
+    # REP_PARK_RETRY / REP_PARK_TTL. Overrides: AT_REP_PARK_RETRY_SEC,
+    # AT_REP_PARK_TTL_SEC.
+    PARK_RETRY = _env_float('AT_REP_PARK_RETRY_SEC', 120.0)
+    PARK_TTL = _env_float('AT_REP_PARK_TTL_SEC', 86400.0)
+    # Only a half that could not REACH a majority is parked; one lost to
+    # contention is given up as before. Parking those too swamped the heal
+    # (part-2123724). Reach is measured per PEER: a majority of the group,
+    # counting us, must have sent us any reputation frame within
+    # REACH_WINDOW_TIMEOUTS commit timeouts. Counting answers to the half's
+    # own rounds undercounted (part-2136648): a retired round's late answer
+    # landed nowhere. Mirrors C REP_REACH_WINDOW_TIMEOUTS.
+    REACH_WINDOW_TIMEOUTS = 2.0
+    # PROBE BACKPRESSURE (§2.60, part-2314213): AT's own probe halves carry an
+    # "at." capability. A node follows at most MAX_PROBE_HALVES of them (a new
+    # one past that is dropped), and while an app half of its own is pending it
+    # proposes no probe at all: new ones are dropped, overdue ones wait.
+    # Mirrors C REP_MAX_PROBE_HALVES. Override: AT_REP_MAX_PROBE_HALVES.
+    PROBE_CAP_PREFIX = 'at.'
+    MAX_PROBE_HALVES = _env_float('AT_REP_MAX_PROBE_HALVES', 4.0)
+    # A wake spreads its halves over WAKE_SPREAD seconds, by task. Mirrors C
+    # REP_WAKE_SPREAD_SEC.
+    WAKE_SPREAD = 5.0
 
     # Hysteresis band for the CTFT ↔ pure-reputation dispatch in
     # _compute_reputation. A single 0.5 threshold made peers hovering
@@ -142,6 +287,65 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # 20 txs gives α ≈ 0.034 — a hacked peer falls visibly within
     # a few seconds of demo time while honest peers recover gradually.
     CONSENSUS_EMA_HALF_LIFE = 20
+
+    # --- Slashing: OFF unless armed (R+D.md §12.8) ---------------------
+    # Slashing pins a peer's reputation from outside the EMA, on one
+    # detector's say-so plus a quorum co-signature. Nothing arms it
+    # automatically any more: the evidence-channel accusation that used to
+    # (a hard-falsification channel scoring defection-grade) was removed at
+    # the user's direction, because a transaction scored poorly WITH ITS
+    # REASON is something every peer can see and judge for itself, and the
+    # EMA plus the tier machinery is already graduated discipline.
+    #
+    # What remains is the behaviour governor's path (SOW Task 3), which is
+    # human-on-the-loop by its own default (`auto_slash=False`), and an
+    # operator's explicit exclude/rehabilitate. Both are deliberate acts, so
+    # the protocol they use is deliberate too: with SLASH_ENABLED off this
+    # node originates nothing, declines to co-sign a peer's proposal, and
+    # ignores a finalized slash rather than applying its floor.
+    #
+    # The knob is read once per process, like the rest of this block. Set
+    # AT_SLASH_ENABLED=1 fleet-wide to arm it -- a group where only some
+    # members are armed will disagree about the floor, which is inherent to
+    # the mechanism being a policy rather than a fact.
+    SLASH_ENABLED = bool(os.environ.get('AT_SLASH_ENABLED'))
+
+    # Verifier-attested scores (doc/architecture/reputation.md): the EFFECTIVE
+    # tier a verifier must hold in a co-signer's OWN view (score bounded by any
+    # standing ceiling; tier 0 once excluded) before that co-signer vouches the
+    # attestation is admissible. Tier 1 for probe/certificate/self_consistency:
+    # a verifier this node does not yet trust cannot place a score its subject
+    # cannot veto. Tier 3 for replication, so a sybil the subject spins up
+    # cannot be the second voice that confirms a finding. AT_ATTEST_MIN_REP, the
+    # older raw-score knob, still sets the non-replication floor when given
+    # (cohorts lower it on purpose). Mirrors _attest_admissible in rep_proc.c.
+    ATTEST_MIN_TIER = int(_env_float('AT_ATTEST_MIN_TIER', 1))
+    ATTEST_REPLICATION_TIER = int(_env_float('AT_ATTEST_REPLICATION_TIER', 3))
+    ATTEST_MIN_REP = (_env_float('AT_ATTEST_MIN_REP', 0.5)
+                      if os.environ.get('AT_ATTEST_MIN_REP') else None)
+    # How long a verifier's attestation round may stay short of a quorum
+    # before its propose goes out again, and how many times (ISSUES §2.40):
+    # the propose is a one-shot fan-out, and a lost copy left the round pending
+    # forever. The task id is derived from (verifier, subject, digest), so a
+    # repeat is the same round. After the last try the round is abandoned.
+    # Mirrors C REP_ATTEST_RETRY / REP_ATTEST_RETRIES.
+    ATTEST_RETRY_SEC = _env_float('AT_REP_ATTEST_RETRY_SEC', 15.0)
+    ATTEST_RETRIES = 5
+
+    # --- Deep resolution (doc/architecture/gateway-reputation-tree.md) ----------------------------
+    # How long a relayed query stays in the pending table, and how long a
+    # query we originated stays outstanding. A deep answer crosses several
+    # hops and each may be a busy process loop, so this is generous; it is
+    # a garbage-collection bound, not a latency target.
+    RESOLVE_PENDING_TTL = _env_float('AT_REP_RESOLVE_TTL_SECS', 30.0)
+    # Query-ids retained for loop detection. Bounded like every other FIFO
+    # dedup ring here (_slashed_seen, _checkpoint_seen).
+    RESOLVE_SEEN_MAX = 256
+    # Distinct verified-and-trusted co-signers an answer must carry. This is
+    # NOT a quorum test: quorum is a fraction of a membership that an opaque
+    # subtree deliberately does not disclose (see verify_resolved). It is the
+    # floor below which an answer is not evidence at all.
+    RESOLVE_MIN_SIGNERS = int(_env_float('AT_REP_RESOLVE_MIN_SIGNERS', 1))
 
     # --- Idle reputation decay (warm-start staleness) -----------------
     # A peer's earned operational reputation is a *memory* of past
@@ -205,19 +409,24 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                          dependencies=[CfgIds.network, CfgIds.identity, CfgIds.negotiation], **kwargs)
         self.identity = self.configs[CfgIds.identity]
         self.protocol = ReputationProtocol(self.name, self.logger, configurations)
-        self.protocol.register_handler(ReputationProtocol.request, self.handle_request)
-        self.protocol.register_handler(ReputationProtocol.grant, self.handle_grant)
-        self.protocol.register_handler(ReputationProtocol.nack, self.handle_nack)
-        self.protocol.register_handler(ReputationProtocol.backdate, self.handle_backdate)
+        for verb in ReputationProtocol.retired:
+            self.protocol.register_handler(verb, self.handle_retired)
         self.protocol.register_handler(ReputationProtocol.transaction, self.handle_transaction)
         self.protocol.register_handler(ReputationProtocol.accepted, self.handle_accepted)
         self.protocol.register_handler(ReputationProtocol.committed, self.handle_committed)
         self.protocol.register_handler(ReputationProtocol.outdated, self.handle_outdated)
         self.protocol.register_handler(ReputationProtocol.update, self.handle_update)
         self.protocol.register_handler(ReputationProtocol.rep_req, self.handle_reputation_request)
+        self.protocol.register_handler(ReputationProtocol.local_rep_query,
+                                       self.handle_local_rep_query)
+        self.protocol.register_handler(ReputationProtocol.app_roster_request,
+                                       self.handle_app_roster_request)
         self.protocol.register_handler(
             ReputationProtocol.consensus_rep_req,
             self.handle_consensus_reputation_request)
+        self.protocol.register_handler(
+            ReputationProtocol.consensus_rep_batch_req,
+            self.handle_consensus_reputation_batch_request)
         self.protocol.register_handler(
             ReputationProtocol.slash_propose, self.handle_slash_propose)
         self.protocol.register_handler(
@@ -225,32 +434,73 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(
             ReputationProtocol.slash_final, self.handle_slash_final)
         self.protocol.register_handler(
+            ReputationProtocol.attest_propose, self.handle_attest_propose)
+        self.protocol.register_handler(
+            ReputationProtocol.attest_sign, self.handle_attest_sign)
+        self.protocol.register_handler(
+            ReputationProtocol.attest_final, self.handle_attest_final)
+        self.protocol.register_handler(
             ReputationProtocol.checkpoint_propose, self.handle_checkpoint_propose)
         self.protocol.register_handler(
             ReputationProtocol.checkpoint_sign, self.handle_checkpoint_sign)
         self.protocol.register_handler(
             ReputationProtocol.checkpoint_final, self.handle_checkpoint_final)
+        self.protocol.register_handler(
+            ReputationProtocol.rep_resolve, self.handle_resolve)
+        self.protocol.register_handler(
+            ReputationProtocol.rep_resolved, self.handle_resolved)
+        self.protocol.register_handler(
+            ReputationProtocol.place_request, self.handle_place_request)
+        self.protocol.register_handler(
+            ReputationProtocol.place, self.handle_place)
+        self.protocol.register_handler(
+            ReputationProtocol.placed, self.handle_placed)
+        self.protocol.register_handler(
+            ReputationProtocol.place_grant, self.handle_place_grant)
+        self.protocol.register_handler(
+            ReputationProtocol.place_accepted, self.handle_place_accepted)
+        self.protocol.register_handler(
+            ReputationProtocol.place_nack, self.handle_place_nack)
+        load_extensions(self, self.name)
         self.history = TransactionHistory()
-        # Gateway reputation tree: one child chain per child group this
-        # node gateways (keyed by group-uuid string). Empty on rank-1
-        # leaf nodes — every code path below degrades to the single
-        # self.history chain when this is empty, so leaves are
-        # byte-for-byte unchanged. Lazily populated by _chain_for_group
-        # the first time a commit routes to a known child group. See
+        # Gateway reputation tree: one child chain per child group this node gateways
+        # (keyed by group-uuid string). Empty on rank-1 leaf nodes — every code path
+        # below degrades to the single self.history chain when this is empty, so leaves
+        # are byte-for-byte unchanged. Lazily populated by _chain_for_group the first
+        # time a commit routes to a known child group. See
         # doc/architecture/gateway-reputation-tree.md.
         self.child_histories: dict[str, TransactionHistory] = {}
         # Per-paxos-round group binding (idx -> group-uuid string). Set
-        # by the proposer in _start_paxos so handle_grant / handle_accepted
-        # / _paxos_timeout size the quorum and route the commit against
+        # by the proposer in _start_paxos so handle_accepted sizes the
+        # quorum and routes the commit against
         # the round's own group rather than the conflated self.peers.all.
         self.round_group: dict[tuple, str] = {}
-        self.my_requests: dict[tuple[int, int], TxCount] = {}
-        self.requests: list[tuple[int, int]] = []
+        # task-id str -> [score, deadline, attempts]: OUR halves proposed and
+        # not yet in the chain, followed by task because the round is what gets
+        # lost (ISSUES §2.24). _retry_uncommitted_halves reads it.
+        self.awaiting_commit: dict[str, list] = {}
+        # peer uuid str -> epoch seconds: when that peer last sent us any
+        # reputation frame. Read when a half's retries run out, to park it
+        # only if no majority is reachable (§2.60, _members_reachable).
+        self.heard: dict[str, float] = {}
+        # peer uuid str -> [first seen (epoch seconds), passes done]: when a
+        # peer first appeared in the roster and how many times our pending
+        # halves have been handed to it (ISSUES §2.62,
+        # _hand_off_pending_halves). A peer that leaves is forgotten, so one
+        # that comes back is handed them again.
+        self.handoff: dict[str, list] = {}
         self.proposals: dict[tuple[int, int], TransactionScore] = {}
-        self.acceptances: dict[UUID, list[TransactionScore]] = {}
+        # Proposer side: round (id1, id2) -> uuid strs of the members that
+        # accepted it. Per round, one vote per member.
+        self.acceptances: dict[tuple[int, int], set[str]] = {}
+        # Proposer side: task id -> {acceptor uuid str: its signature over the half's
+        # commit_designation}, holding only signatures that verified. Becomes
+        # the certificate on `committed` once it clears the round's quorum.
+        self.commit_sigs_pending: dict = {}
+        # The highest ballot this node has used, so the next outranks it.
         self.last_id = None
-        self.last_value = None
-        self.backoff = {}
+        # peer uuid str: senders already told their retired verb was dropped.
+        self._retired_from: set[str] = set()
         # Prime from the persisted/seeded reputation snapshot when present
         # (warm-start). Previously this was always a fresh empty
         # Reputations, so reputation.cfg.json (written by
@@ -270,10 +520,29 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # snapshot's mtime and applies the offline-gap decay at start-up.
         self._last_interaction: dict[str, float] = {}
         self._last_decay_sweep = 0.0
+        # Peers whose chain advanced since they were last scored; filled by
+        # _note_interaction, emptied by _rescore_sweep. Mirrors C rescore_due.
+        self._rescore_due = set()
+        self._last_rescore_sweep = None
+        # Tenure (doc/architecture/reputation.md, "Tenure"): uuid-str ->
+        # (signing key hex or None, when this node first held it as a member);
+        # the peers the gate holds at TENURE_TIER; whether roster.cfg.json's
+        # first_seen has been read. Mirrors C member_since / member_key /
+        # tenure_capped / tenure_seeded.
+        self._member_since: dict = {}
+        self._tenure_capped: set = set()
+        self._tenure_seeded = False
+        # The minimum set by a conformance fixture, or None for
+        # AT_REP_MIN_TENURE_SEC. Mirrors C tenure_min_override.
+        self._tenure_min_override = None
         # Debug instrument (AT_REP_DUMP_SEC): throttle clock for the
         # per-node reputation-view dump emitted from process(). See
         # _dump_reputation_trace. 0 == last dump not yet taken.
         self._last_rep_dump = 0.0
+        # Extensions' trust seeds (first contact's verified contacts,
+        # FIRST_CONTACT_PLAN.md §10.5). Applied AFTER the warm-start snapshot
+        # above, so a persisted value always wins -- see _apply_seeds.
+        self._apply_seeds()
         self._seed_idle_from_snapshot()
         # Communication-cut-off exclusion set (peer-uuid-str). A peer whose
         # aggregate reputation is below COMM_CUTOFF is excluded from the
@@ -310,7 +579,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self._consensus_folded_idx: dict[str, int] = {}
         self.requested_reps = []
         self.updates = {}
-        self.num_updates = 3
+        # Paged catch-up replies being collected: (sender uuid, chain key)
+        # -> {'head', 'of', 'pages', 'seq'} (UPDATE_PAGE_BYTES).
+        self.page_bufs = {}
+        self._page_seq = 0
+        self.update_page_bytes = UPDATE_PAGE_BYTES
+        self.num_updates = REP_CATCHUP_QUORUM
         # Last published trust tier per peer uuid-string. Suppresses
         # redundant tier_update IPC when the tier hasn't changed.
         self.peer_tiers: dict[str, int] = {}
@@ -370,35 +644,151 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # short-circuit (forcing re-earn from the punished regime) is lost on
         # restart; the exclusion itself survives.
         self._slashed: dict[str, tuple] = {}
-        # Proposer-side co-signature accumulation: slash-key -> set of
-        # voter-uuid-str. Seeded with the slasher itself on initiation.
-        self._slash_sigs: dict[tuple, set] = {}
+        # ZTA hardening (doc/architecture/zta-integration.md). Volatile, like _slashed:
+        # a restart re-derives standing from the admission gate rather than trusting a
+        # file for it. _peer_proved_index: peer -> chain index at its last PROVED
+        #     verification; the point a later failure unwinds back TO.
+        #   _peer_acted:        peer -> the standing already acted on, so the
+        #     hourly re-verification of an unchanged verdict is a no-op.
+        self._peer_proved_index: dict[str, int] = {}
+        self._peer_acted: dict[str, tuple] = {}
+        # Proposer-side co-signature accumulation: slash-key -> {voter-uuid-str:
+        # detached hex signature over the attestation's designation}. Seeded
+        # with the slasher's OWN signature on initiation. Signatures, not bare
+        # uuids: the map is what travels on slash_final, and a receiver that
+        # cannot verify a co-signature must not count it (see
+        # _verified_cosigners).
+        self._slash_sigs: dict[tuple, dict] = {}
         # Proposer-side pending attestations awaiting quorum: key -> attestation.
         self._slash_pending: dict[tuple, SlashAttestation] = {}
+        # Verifier-attested scores this node proposed and is collecting
+        # co-signatures for: task id str -> AttestedScore / {voter: sig}.
+        self._attest_pending: dict[str, AttestedScore] = {}
+        self._attest_sigs: dict[str, dict] = {}
+        # Their re-propose clocks: task id str -> [due, attempts] (§2.40).
+        self._attest_retry: dict[str, list] = {}
         # Dedup for finalized slashes (FIFO bounded), so a re-broadcast
         # slash_final is a cheap no-op. Mirrors committed_paxos_rounds.
+        #
+        # Kept as a cheap first-line filter only. It is a RING, so on a busy
+        # node an old key ages out -- and a slash whose key has aged out could
+        # be replayed to re-floor a peer that had since been rehabilitated,
+        # back into an exclusion that is sticky by design. _slash_hw below is
+        # what actually bounds that; this stays because it is O(1) and stops
+        # the common re-broadcast before any of the work below.
         self._slashed_seen: 'OrderedDict[tuple, None]' = OrderedDict()
+        # Per-(target, slasher) high-water mark: the highest slash epoch this
+        # node has ever APPLIED for that pair. Never evicted, unlike the ring
+        # above -- it is sized by the cohort (targets x slashers), not by how
+        # many rounds have passed, so there is no window for an old slash to
+        # come back through. Persisted, because the guard is only as good as
+        # its memory: see _persist_slash_marks.
+        #
+        # Keyed by slasher as well as target because the epoch is a
+        # per-SLASHER counter (see forward_slash), so two detectors' epoch
+        # sequences are independent and a single per-target mark would refuse
+        # one detector's legitimate slash on the strength of the other's.
+        self._slash_hw: dict[tuple, int] = {}
         # Monotonic epoch for slashes this node originates (distinguishes a
         # re-slash of the same target). Phase 2 will tie this to checkpoint
         # epochs; standalone counter suffices for Phase 0.
+        #
+        # Resumed from the persisted marks below rather than restarting at 0.
+        # Receivers hold high-water marks that our own restart does not reset,
+        # so a node that began again at epoch 1 would have its next several
+        # slashes refused as replays -- the same trap the checkpoint counter
+        # documents in _rebuild_from_evidence.
         self._slash_epoch = 0
 
         # --- Phase 2: quorum-signed Merkle checkpoints --------------------
-        # Latest finalized checkpoint of OUR window (the agreed commitment a
-        # gateway parent / slash adjudicator verifies inclusion proofs
-        # against). None until the first checkpoint finalizes. Volatile.
-        self._checkpoint: 'Checkpoint | None' = None
-        # Proposer-side co-signature accumulation: checkpoint-key -> set of
-        # voter-uuid-str (only members whose own window_root matched). Seeded
-        # with the proposer itself on initiation.
-        self._checkpoint_sigs: dict[tuple, set] = {}
+        # The finalized checkpoint per chain lives in self._checkpoints below;
+        # `self._checkpoint` is a read-only property naming the primary one.
+        # Proposer-side co-signature accumulation: checkpoint-key ->
+        # {voter-uuid-str: detached hex signature over the checkpoint's
+        # designation}, holding only members whose own window_root matched.
+        # Seeded with the proposer's own signature on initiation; the map
+        # travels on checkpoint_final and is re-verified by each receiver.
+        self._checkpoint_sigs: dict[tuple, dict] = {}
         # Proposer-side pending checkpoints awaiting quorum: key -> Checkpoint.
         self._checkpoint_pending: dict[tuple, Checkpoint] = {}
+        # Signer-side: proposals that arrived before our chain held their
+        # range, re-checked every pass (ISSUES §2.29).
+        # (proposer-str, group-str) -> (Checkpoint, proposer identity, parked-at).
+        # One per proposer and chain, so a newer epoch replaces an older one.
+        self._cosigns_parked: dict[tuple, tuple] = {}
+        # --- Per-chain finalized checkpoint state -------------------------
+        # A gateway keeps one chain per child group beside its primary one, and
+        # each chain gets its own checkpoints: its own epoch counter, its own
+        # quorum (sized against that group's members), its own evidence file.
+        # These are keyed by CHAIN KEY -- '' for the primary chain, a
+        # group-uuid string for a child -- so a leaf node simply has a
+        # one-entry dict and behaves exactly as before.
+        #
+        # The co-signatures are kept beyond the live round because they travel
+        # in the persisted evidence: a boot-time rebuild has to verify the same
+        # quorum a live receiver does, and a root with no signatures beside it
+        # is a number anyone with write access to the file could have chosen.
+        self._checkpoints: dict[str, Checkpoint] = {}
+        # The latest PRIMARY checkpoint a quorum attested, kept apart from
+        # _checkpoints because that also holds our own proposals, stored with
+        # only our signature before anyone has co-signed. Reconciliation treats
+        # this window as final, and only while our own entries over it still
+        # hash to its root (ISSUES.md §2.15). Mirrors C's rep_state.final_*.
+        self._finalized: 'Checkpoint | None' = None
+        self._checkpoint_sigs_final: dict[str, dict] = {}
+        self._checkpoint_epochs: dict[str, int] = {}
         # Dedup for finalized checkpoints (FIFO bounded) so a re-broadcast
         # checkpoint_final is a cheap no-op. Mirrors _slashed_seen.
         self._checkpoint_seen: 'OrderedDict[tuple, None]' = OrderedDict()
-        # Monotonic epoch for checkpoints this node originates.
-        self._checkpoint_epoch = 0
+        # Periodic-origination clocks (see _maybe_checkpoint). 0.0 == the
+        # phase offset has not been taken yet. The head map is per chain, so a
+        # busy child group is checkpointed while an idle primary chain is not.
+        self._next_checkpoint_at = 0.0
+        self._last_checkpoint_heads: dict[str, int] = {}
+        # Child-group chains already attempted by _restore_child_evidence, and
+        # the persisted score each clamped peer was clamped away FROM -- the
+        # upper bound on any later lift, so late evidence restores standing
+        # instead of inventing it.
+        self._child_evidence_tried: set[str] = set()
+        self._restore_clamped: dict[str, float] = {}
+
+        # --- Deep resolution: one peer, on demand
+        # (doc/architecture/gateway-reputation-tree.md) --------
+        # A query we are RELAYING: query-id -> (answer-to uuid-str, deadline,
+        # requesting_process). This is the only state the whole capability
+        # adds anywhere, and it exists because the answer travels back along
+        # the path the query took -- nobody outside a boundary ever exchanges
+        # a message with anybody inside it, so each hop has to remember which
+        # neighbour to hand the answer to. Entries expire (they are not
+        # cleared by an answer that never comes), which is what keeps a
+        # gateway's table bounded when a subtree goes dark.
+        self._resolve_pending: 'OrderedDict[str, tuple]' = OrderedDict()
+        # Query-ids already seen, as a FIFO ring. The loop guard: a tree that
+        # is briefly cyclic (a stale hierarchy claim naming a peer that is
+        # actually above us) would otherwise circulate a query until its TTL
+        # burned down at every node it touched.
+        self._resolve_seen: 'OrderedDict[str, None]' = OrderedDict()
+        # Queries WE originated: query-id -> (peer-uuid-str, deadline).
+        self._resolve_outstanding: dict[str, tuple] = {}
+        # Answers we accepted, peer-uuid-str -> (score, verified, reason).
+        # `reason` is kept beside the boolean deliberately: an operator
+        # reading "unverified" needs to know which gate failed, and a caller
+        # may knowingly accept a weaker answer (feedback_operator_diagnostics).
+        self.resolved_reps: dict[str, tuple] = {}
+
+        # Slash replay marks, before any message can be handled. Also resumes
+        # our own slash epoch, so this has to precede the first forward_slash.
+        self._load_slash_marks()
+
+        # Verifiable warm start: adopt the persisted committed history if its
+        # checkpoint verifies, and clamp every restored score the evidence
+        # does not cover. LAST in __init__ deliberately -- it reads the
+        # loaded reputation snapshot, the peer roster and the checkpoint
+        # state above, and it revises self.history.
+        self._rebuild_from_evidence()
+        # Ordered placement's pending pool, after the chain it waits on.
+        self._reset_pre_roster_chain('')
+        self._restore_pool('')
 
     @property
     def peers(self):
@@ -407,6 +797,58 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     @property
     def group(self):
         return self.protocol.group
+
+    @property
+    def _checkpoint(self):
+        """The finalized checkpoint over the PRIMARY chain, or None.
+
+        Kept as a property because most of this class only ever cares about
+        the primary chain (slash evidence, the app-facing observables, the
+        conformance adapters), and because it keeps every prior reader working
+        unchanged now that the store is per chain."""
+        return self._checkpoints.get('')
+
+    @_checkpoint.setter
+    def _checkpoint(self, ckpt):
+        """Assigning the primary checkpoint directly is a fixture / test path.
+        The live path goes through ``_store_checkpoint``, which also retains
+        the co-signatures and writes the evidence file."""
+        if ckpt is None:
+            self._checkpoints.pop('', None)
+        else:
+            self._checkpoints[''] = ckpt
+        # A fixture checkpoint stands for a finalized one.
+        self._finalized = ckpt
+
+    def _chain_key(self, group_uuid) -> str:
+        """The per-chain bookkeeping key for a group-uuid: '' for the primary
+        chain, the group-uuid string for a child chain.
+
+        Resolves through the same rules as ``_chain_for_group``, so a None or
+        unrecognized group-uuid -- and the node's own primary group's uuid --
+        all land on the primary chain. Anything else is only a child key if we
+        actually gateway that group; an unknown uuid must not mint a chain."""
+        if group_uuid is None:
+            return ''
+        key = str(group_uuid)
+        if not key:
+            return ''
+        if self.group is not None and key == str(self.group.uuid):
+            return ''
+        if key in self.child_groups:
+            return key
+        return ''
+
+    def _chain_for_key(self, chain_key: str):
+        """The TransactionHistory a chain key names."""
+        if not chain_key:
+            return self.history
+        return self._chain_for_group(chain_key)
+
+    def _chain_keys(self):
+        """Every chain this node maintains: the primary, then any child-group
+        chains a gateway has materialized."""
+        return [''] + [k for k in self.child_histories]
 
     @property
     def child_groups(self):
@@ -428,29 +870,64 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     def _members_of_group(self, group):
         """Peers (from self.peers.all) whose address is in this group's
         address map. Used to size per-group Paxos quorum on a gateway
-        whose self.peers.all spans several groups."""
+        whose self.peers.all spans several groups. No group means this
+        node's own: ``_roster_peers``."""
         if group is None:
-            return list(self.peers.all)
+            return self._roster_peers()
         try:
             addrs = set(group.addresses)
         except Exception:
-            return list(self.peers.all)
+            return self._roster_peers()
         return [p for p in self.peers.all
                 if getattr(p, 'address', None) in addrs]
 
+    def _roster_peers(self):
+        """The peers that count in consensus: those in the address map of
+        this node's group or of a child group it gateways. A first-contact
+        direct peer is a peer but a member of neither, so it never sizes a
+        quorum, signs into one, or enters a logged roster (R+D.md §13.5 D2).
+        Before this node holds a group with a member map, every peer counts,
+        as before. Mirrors C processes_peer_is_member."""
+        keys = set()
+        for grp in [self.group] + list(self.child_groups.values()):
+            members = getattr(grp, '_address_map', None) \
+                if grp is not None else None
+            if isinstance(members, dict):
+                keys |= {str(k).lower() for k in members}
+        if not keys:
+            return list(self.peers.all)
+        return [p for p in self.peers.all if str(p.uuid).lower() in keys]
+
     def _quorum_for_group(self, group_uuid):
-        """Majority threshold (floor(N/2)) for a round in the given group.
+        """floor(roster/2), the bar slashing and the co-signature quorum test
+        (`_quorum_met`) clear with `>`. Paxos rounds use _round_quorum.
 
         Back-compat: a non-gateway node (no child_groups) always uses the
-        historical len(self.peers.all)//2, so leaf quorum math is
-        unchanged. Only a gateway — whose self.peers.all conflates the
-        members of every group it belongs to — sizes per-group."""
+        historical roster // 2 over its own members (_roster_peers). Only a
+        gateway — whose self.peers.all conflates the members of every group
+        it belongs to — sizes per-group."""
         if not self.child_groups:
-            return len(self.peers.all) // 2
+            return len(self._roster_peers()) // 2
         grp = self._group_by_uuid(group_uuid)
         if grp is None:
-            return len(self.peers.all) // 2
+            return len(self._roster_peers()) // 2
         return len(self._members_of_group(grp)) // 2
+
+    def _round_quorum(self, group_uuid):
+        """Other members a Paxos round needs, grants and acceptances alike.
+        With the proposer's own vote that is a strict majority of the group:
+        N // 2 of the others, where N is the roster plus this node. The
+        checkpoint sizing, compared with `>=` over the others rather than `>`
+        over everyone. Mirrors C _round_quorum_for_group."""
+        return (self._checkpoint_roster(group_uuid) + 1) // 2
+
+    def _expire_rounds(self, present):
+        """Forget Paxos rounds older than ``expiration`` seconds. A round's
+        id1 is in milliseconds and `present` in seconds."""
+        horizon = (present - self.expiration) * 1000
+        for rounds in (self.proposals, self.round_group, self.acceptances):
+            for rnd in [r for r in rounds if r[0] < horizon]:
+                del rounds[rnd]
 
     def _chain_for_group(self, group_uuid):
         """Return the TransactionHistory for a group-uuid, defaulting to
@@ -476,148 +953,76 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     def _paxos_id_index(id1, id2):
         return (id1, id2)  # use tuple key to avoid float equality issues
 
-    def handle_request(self, queues, message):
-        if message.function == ReputationProtocol.request:
-            id1, id2, peer_id = from_json_string(message.obj)
-            if peer_id in [p.uuid for p in self.peers.all]:
-                try:
-                    if self.last_id is None or self.last_id < id1:
-                        if len(self.history) + 1 == id2:
-                            self.requests.append(self._paxos_id_index(id1, id2))
-                            # Ack carries the PRIOR last_id so the proposer
-                            # sees the state-before-this-grant; matches C's
-                            # `*out_last_id = inst->last_id;` capture in
-                            # paxos.c:114 (before the update at :123).
-                            ack = ((id1, id2, peer_id), (self.last_id, len(self.history)), self.last_value)
-                            msg = Message(self.name, ReputationProtocol.grant,
-                                          to_json_string(ack), message.from_whom,
-                                          from_whom=self.identity)
-                            queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
-                            self.logger.debug('Request granted')
-                            # Pin the ballot — second-grant guard. Without
-                            # this, a duplicate (id1, id2) ask would re-pass
-                            # the `last_id is None or last_id < id1` check
-                            # and grant again, double-appending to
-                            # self.requests. C's paxos_handle_request sets
-                            # `inst->last_id = id1` here (paxos.c:123); the
-                            # missing update was the cross-language
-                            # asymmetry tracked as BUGS.md P6.
-                            self.last_id = id1
-                        else:
-                            msg = Message(self.name, ReputationProtocol.backdate,
-                                          message.obj, message.from_whom,
-                                          from_whom=self.identity)
-                            queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
-                            self.logger.debug('Request backdated')
-                    else:
-                        msg = Message(self.name, ReputationProtocol.nack,
-                                      message.obj, message.from_whom,
-                                      from_whom=self.identity)
-                        queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
-                        self.logger.debug('Request refused')
-                except Full:
-                    self.logger.error('handle_request: Network queue full')
-            else:
-                self.logger.debug('Reputation request from non-peer: %s' % peer_id)
-            return True
-        return False
+    def handle_retired(self, queues, message):
+        """A verb of the retired half round (ReputationProtocol.retired) from a
+        node on a build that still runs it. Nothing here answers it; it is
+        dropped, and logged once per sender so a mixed-version cohort shows
+        in the log."""
+        if message.function not in ReputationProtocol.retired:
+            return False
+        sender = str(getattr(message.from_whom, 'uuid', '') or '?')
+        if sender not in self._retired_from:
+            self._retired_from.add(sender)
+            self.logger.info(
+                "retired reputation verb '%s' from %s (a build from before "
+                "every group placed its order); dropped",
+                message.function,
+                getattr(message.from_whom, 'nickname', None) or sender[:8])
+        return True
 
-    def _paxos_timeout(self, queues, pax_id):
-        retry = True
-        idx = self._paxos_id_index(pax_id[0], pax_id[1])
-        quorum = self._quorum_for_group(self.round_group.get(idx))
-        start = now()
-        while (now() - start).total_seconds() < self.protocol_timeout:
-            if idx not in self.my_requests:
-                retry = False  # already completed by handle_grant
-                break
-            if self.my_requests[idx].count >= quorum:
-                retry = False
-                break
-            time.sleep(self.cadence)
-        if retry and idx in self.my_requests:
-            try:
-                self._start_paxos(queues, self.my_requests[idx].score)
-            except (Full, KeyError):
-                self.logger.error('paxos_timeout: Network queue full')
+    def _propose_half(self, queues, pax_id, score, group_uuid):
+        """Send our half to the group to co-sign. The proposal asks each
+        acceptor to sign what it accepts (the third element) and names its
+        group (the fourth), which is what an acceptor checks before it takes
+        the half (handle_transaction)."""
+        obj = (tuple(pax_id), score, True, str(group_uuid or ''))
+        msg = Message(self.name, ReputationProtocol.transaction,
+                      to_json_string(obj), self.group, from_whom=self.identity)
+        queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+        self.logger.debug('Submit transaction score')
 
-    def handle_grant(self, queues, message):
-        if message.function == ReputationProtocol.grant:
-            (id1, id2, peer_id), (last_id, last_idx), last_val = from_json_string(message.obj)
-            if peer_id != self.identity.uuid:  # ignore not-mine
-                self.logger.debug('Grant not for me')
-                return True
-            if (last_id is not None and last_id >= id1) or last_idx != len(self.history):  # peer is faulty
-                self.peers.demote(message.from_whom)
-                self.logger.debug('Grant from faulty peer')
-                self._spawn(self._paxos_timeout, args=(queues, (id1, id2, peer_id)))
-                return True
-            idx = self._paxos_id_index(id1, id2)
-            if idx not in self.my_requests:
-                self.logger.debug('Grant for already-completed request')
-                return True
-            self.my_requests[idx].count += 1
-            if self.my_requests[idx].count >= self._quorum_for_group(
-                    self.round_group.get(idx)):
-                try:
-                    score = (id1, id2, peer_id), self.my_requests[idx].score
-                    msg = Message(self.name, ReputationProtocol.transaction,
-                                  to_json_string(score), self.group,
-                                  from_whom=self.identity)
-                    queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
-                    self.logger.debug('Submit transaction score')
-                    if idx in self.backoff:
-                        del self.backoff[idx]
-                    del self.my_requests[idx]
-                except Full:
-                    self.logger.error('handle_grant: Network queue full')
-            return True
-        return False
+    def note_heard(self, peer, when=None):
+        """``peer`` sent us a reputation frame at ``when`` (§2.60). Any
+        frame counts: reach is a property of the island, not of one round.
+        Mirrors C reputation_note_heard."""
+        uuid = getattr(peer, 'uuid', None)
+        if uuid is None:
+            return
+        self.heard[str(uuid)] = (now().timestamp() if when is None
+                                 else when)
 
-    def _try_again(self, wait, queues, score):
-        start = now()
-        while (now() - start).total_seconds() < wait:
-            time.sleep(self.cadence)
-        try:
-            self._start_paxos(queues, score)
-        except Full:
-            self.logger.error('try_again: Network queue full')
+    def _members_reachable(self, present):
+        """(reached, members): how many members of the group, us included,
+        were heard within REACH_WINDOW_TIMEOUTS commit timeouts of
+        ``present``. Mirrors C _members_reachable_locked."""
+        since = present - self.REACH_WINDOW_TIMEOUTS * self.COMMIT_TIMEOUT
+        members = self._roster_peers()
+        reached = 1 + sum(1 for p in members
+                          if self.heard.get(str(p.uuid), float('-inf')) >= since)
+        return reached, len(members) + 1
 
-    def handle_nack(self, queues, message):
-        if message.function == ReputationProtocol.nack:
-            id1, id2, _ = from_json_string(message.obj)
-            idx = self._paxos_id_index(id1, id2)
-            if idx not in self.my_requests:
-                # Nack for an already-completed (grant succeeded, removed
-                # from my_requests) or never-issued (foreign id) request.
-                # Drop without retrying.
-                self.logger.debug('Nack for unknown or completed request')
-                return True
-            if idx not in self.backoff:
-                self.backoff[idx] = 1
-            if self.backoff[idx] < self.backoff_max:
-                self.backoff[idx] *= self.backoff_mult
-            self._spawn(self._try_again,
-                        args=(self.backoff[idx], queues, self.my_requests[idx].score))
-            return True
-        return False
-
-    def _request_update(self, queues, n=3):
-        self.num_updates = n
-        for peer in self.peers.find_top_n(n):
-            msg = Message(self.name, ReputationProtocol.outdated,
-                          str(len(self.history)), peer,
+    def _request_update(self, queues, n=3, quorum=None, key: str = ''):
+        # Only the no-majority path widens the vote. A backdate used to reset
+        # the quorum to 3 here as a side effect, which is what kept a node
+        # with two peers from ever catching up.
+        if quorum is not None:
+            self.num_updates = quorum
+        if key:
+            # A child chain: ask that group's members, naming the chain. Its
+            # update is applied directly (handle_update), so no vote is set.
+            members = {str(p.uuid) for p in
+                       self._members_of_group(self._group_by_uuid(key))}
+            peers = [p for p in self.peers.find_top_n(len(self.peers.all))
+                     if str(p.uuid) in members][:n]
+            req = json.dumps({'from': self._chain_for_key(key).next_index,
+                              'group': key})
+        else:
+            peers = self.peers.find_top_n(n)
+            req = str(len(self.history))
+        for peer in peers:
+            msg = Message(self.name, ReputationProtocol.outdated, req, peer,
                           from_whom=self.identity)
             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
-
-    def handle_backdate(self, queues, message):
-        if message.function == ReputationProtocol.backdate:
-            try:
-                self._request_update(queues)
-            except Full:
-                self.logger.error('request_update: Network queue full')
-            return True
-        return False
 
     # Bound on self.task_weights — twice the TransactionHistory chain
     # cap, so a freshly-submitted task is unlikely to need a weight
@@ -625,23 +1030,49 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # default; tunable via AT_TX_HISTORY_CAP picks the same factor.
     _TASK_WEIGHTS_CAP = 2 * TransactionHistory.DEFAULT_MAX_CHAIN_LEN
 
-    def _resolve_tx_weight(self, score: TransactionScore) -> int:
-        """Map a TS's capability_name to its transaction_weight, with a
-        graceful default. The lookup goes through the local Capabilities
-        registry (self.protocol.capabilities); peers that don't have
-        the capability registered locally treat the weight as 1.
-        Returns at least 1 (the 0-sentinel from proto3 is normalised to
-        1 in Capability.sync_from_message; this is a defence in depth).
+    def _resolve_tx_weight(self, score: TransactionScore, local: bool = False) -> int:
+        """Map a TS to its EMA weight: the capability's transaction_weight,
+        times the learned competence multiplier and the evidence channel's
+        multiplier when the evidence is ours.
+
+        The capability half looks up the local Capabilities registry
+        (self.protocol.capabilities); peers that don't have the capability
+        registered locally treat the weight as 1. Returns at least 1 (the
+        0-sentinel from proto3 is normalised to 1 in
+        Capability.sync_from_message; this is a defence in depth).
+
+        *local* says this score was produced ON THIS NODE — the IPC path from
+        our own subsystems (`forward_transaction`), never the wire path
+        (`handle_transaction`). Only then do the channel and the competence
+        multiplier apply (R+D.md §12.8, §12.5): the scorer chooses its own
+        channel and measures its own competence record, so honoring either
+        from a remote would let any peer treble the weight of a score it
+        fabricated against any other. See `tx_channel_weight` and
+        `competence_weight`.
+
+        The composed weight is `transaction_weight × competence × channel`,
+        rounded by `weight_round` (floor(x + 0.5), the one both runtimes
+        share) and floored at 1, because the EMA applies a weight by folding
+        the score in that many times. A capability authored at weight 1
+        therefore cannot be demoted by competence — see
+        doc/architecture/prequential-competence.md, which records that as a
+        limitation rather than working around it.
         """
         cap_name = getattr(score, 'capability_name', None)
-        if not cap_name:
-            return 1
-        try:
-            cap = self.protocol.capabilities[cap_name]
-        except (KeyError, AttributeError, TypeError):
-            return 1
-        w = getattr(cap, 'transaction_weight', 1) or 1
-        return max(1, int(w))
+        weight = 1
+        if cap_name:
+            try:
+                cap = self.protocol.capabilities[cap_name]
+            except (KeyError, AttributeError, TypeError):
+                cap = None
+            if cap is not None:
+                weight = max(1, int(getattr(cap, 'transaction_weight', 1) or 1))
+        if local:
+            competence = getattr(score, 'competence', None)
+            if competence is not None and float(competence) > 0.0:
+                weight = weight_round(float(weight) * float(competence))
+            weight *= tx_channel_weight(getattr(score, 'channel', None))
+        return max(1, int(weight))
 
     def _record_task_weight(self, task_id, weight: int) -> None:
         """Insert into self.task_weights with FIFO eviction at the cap.
@@ -685,58 +1116,165 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def _start_paxos(self, queues, score: TransactionScore, group_uuid=None):
         id1 = int(now().timestamp() * 1000)
+        # Outrank every ballot we have promised and promise our own, so our
+        # own grant counts toward the round. Mirrors C paxos_next_ids.
+        if self.last_id is not None and id1 <= self.last_id:
+            id1 = self.last_id + 1
+        self.last_id = id1
         id2 = len(self.history) + 1
         idx = self._paxos_id_index(id1, id2)
         pax_id = (id1, id2, self.identity.uuid)
-        self.my_requests[idx] = TxCount(score, 0)
+        if group_uuid is None and self.group is not None:
+            group_uuid = str(self.group.uuid)
+        # The half needs no round of its own: its place in the chain is
+        # decided by placement (doc/architecture/reputation.md, "Agreeing on
+        # an order"), so it goes straight to the co-signing phase. Mirrors C
+        # _forward_transaction.
+        # Follow our half until it is in the chain. A re-proposal of the same
+        # task keeps its attempt count and only restarts the clock; a parked
+        # half keeps the park's slower clock (§2.60).
+        deadline = now().timestamp() + self.COMMIT_TIMEOUT
+        waiting = self.awaiting_commit.get(str(score.task_id))
+        # [score, deadline, attempts, parked_at, last proposed, retries]
+        if waiting is None:
+            self.awaiting_commit[str(score.task_id)] = [
+                score, deadline, 0, None, now().timestamp(),
+                self.COMMIT_RETRIES]
+        else:
+            waiting[1] = (now().timestamp() + self.PARK_RETRY
+                          if waiting[3] is not None else deadline)
+            waiting[4] = now().timestamp()
         # Bind this round to its group so quorum + commit routing use
         # the round's own group, not the conflated self.peers.all.
         # Defaults to the primary group (the gateway's own/parent
         # cohort), which is correct for the demo where a gateway's
         # self-initiated transactions are with its command cohort.
-        if group_uuid is None and self.group is not None:
-            group_uuid = str(self.group.uuid)
         self.round_group[idx] = group_uuid
-        pax_msg = Message(self.name, ReputationProtocol.request,
-                          to_json_string(pax_id), self.group,
-                          from_whom=self.identity)
-        queues[CfgIds.network].put(pax_msg, block=True, timeout=self.q_cadence)
         self.proposals[idx] = score
+        self._propose_half(queues, pax_id, score, group_uuid)
         # Cache the weight for this task so _pure_reputation can later
         # aggregate it correctly (Slice 3 / trust-tiers.md §5), and the tier
-        # so the per-tier consensus view can bucket it (§2.3).
-        self._record_task_weight(score.task_id, self._resolve_tx_weight(score))
+        # so the per-tier consensus view can bucket it (doc/architecture/network-wire-format.md).
+        # local=True: every _start_paxos is OUR OWN proposal (the wire path
+        # replies from `handle_transaction` and never lands here), so this is
+        # the one weighting site where the evidence channel counts.
+        self._record_task_weight(score.task_id,
+                                 self._resolve_tx_weight(score, local=True))
         self._record_task_tier(score.task_id, self._resolve_tx_tier(score))
         self.logger.debug('Start a Paxos round')
 
     def handle_transaction(self, queues, message):
         if message.function == ReputationProtocol.transaction:
-            (id1, id2, peer_id), score = from_json_string(message.obj)
+            try:
+                parts = from_json_string(message.obj)
+                (id1, id2, peer_id), score = parts[0], parts[1]
+                # The third element asks for a commit certificate and the
+                # fourth names the round's group. A proposal without both is
+                # from a build that still ran the half round, which this
+                # node no longer grants.
+                certify = len(parts) > 2 and parts[2] is True
+                placing_group = (parts[3] if certify and len(parts) > 3
+                                 and isinstance(parts[3], str) else None)
+            except (ValueError, TypeError, IndexError) as err:
+                # An out-of-range score is rejected in TransactionScore's
+                # constructor (doc/architecture/reputation.md), which `from_json_string` runs. Dropping
+                # here rather than letting it propagate: the payload is
+                # peer-supplied, so a raise escaping into the process loop would
+                # hand a remote a lever on this node's reputation process.
+                self.logger.warning(
+                    'Dropping Paxos proposal from %s: %s', message.from_whom, err)
+                return True
             idx = self._paxos_id_index(id1, id2)
-            if idx not in self.requests:
-                return True  # not granted, drop
-            self.requests.remove(idx)
+            if placing_group is None:
+                self.logger.debug('Dropping a proposal from %s that names no '
+                                  'group (a half-round build)',
+                                  message.from_whom)
+                return True
             if not message.verified:
-                self.logger.warning(f"Rejecting unverified Paxos proposal from {message.from_whom}")
+                self.logger.warning('Rejecting unverified Paxos proposal from %s', message.from_whom)
                 return True  # drop unverified proposal
             if idx not in self.proposals:
                 self.proposals[idx] = score
                 self.logger.debug("Tx to proposals ")
             # Cache the weight for this task — incoming TS payload carries
             # capability_name (Slice 1). Receivers that don't register the
-            # capability locally fall back to weight 1.
+            # capability locally fall back to weight 1. No `local=True`: the
+            # channel on a peer's score is legibility only (R+D.md §12.8).
             if hasattr(score, 'task_id'):
                 self._record_task_weight(score.task_id, self._resolve_tx_weight(score))
                 self._record_task_tier(score.task_id, self._resolve_tx_tier(score))
+            reply = (id1, id2, peer_id)
+            if certify:
+                # Sign the half this round writes: its scorer is the proposer,
+                # and only the proposer may ask for one (a relayed proposal
+                # carries somebody else's round, and its signature would vouch
+                # for a round this node never saw that peer run).
+                sender = getattr(message.from_whom, 'uuid', None)
+                if sender is not None and str(sender) == str(peer_id) \
+                        and hasattr(score, 'task_id'):
+                    try:
+                        reply = reply + (self._detached_sig(
+                            self.identity, commit_designation(
+                                peer_id, score.task_id, score.score,
+                                score.channel)),)
+                    except Exception:
+                        self.logger.error(
+                            'handle_transaction: cannot sign the commit '
+                            'designation; accepting unsigned')
+                else:
+                    self.logger.warning(
+                        'Not certifying a proposal from %s for %s\'s round',
+                        getattr(message.from_whom, 'nickname', '?'),
+                        str(peer_id)[:8])
             msg = Message(self.name, ReputationProtocol.accepted,
-                          to_json_string((id1, id2, peer_id)),
+                          to_json_string(reply),
                           message.from_whom, from_whom=self.identity)
             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
             return True
         return False
 
+    def _is_probe(self, score) -> bool:
+        cap = getattr(score, 'capability_name', None)
+        return bool(cap) and cap.startswith(self.PROBE_CAP_PREFIX)
+
+    def _probe_load(self):
+        """(probe halves followed, parked included; is an app half of ours
+        pending, active not parked?). Mirrors C _probe_load_locked."""
+        probes, app = 0, False
+        for w in self.awaiting_commit.values():
+            if self._is_probe(w[0]):
+                probes += 1
+            elif w[3] is None:
+                app = True
+        return probes, app
+
+    def admit_new_half(self, score) -> bool:
+        """Probe backpressure (§2.60): may this NEW half be proposed? Always,
+        unless it is one of AT's probes and an app half of ours is pending or
+        MAX_PROBE_HALVES are already followed. Mirrors C _admit_new_half."""
+        if not self._is_probe(score):
+            return True
+        key = str(score.task_id)
+        if key in self.awaiting_commit:
+            return True
+        probes, app = self._probe_load()
+        if app:
+            self.logger.info('dropping probe half for task %s (%s): an app '
+                             'half of ours is pending', key,
+                             score.capability_name)
+            return False
+        if self.MAX_PROBE_HALVES > 0 and probes >= self.MAX_PROBE_HALVES:
+            self.logger.info('dropping probe half for task %s (%s): %d probe '
+                             'half(s) in flight, cap %.0f', key,
+                             score.capability_name, probes,
+                             self.MAX_PROBE_HALVES)
+            return False
+        return True
+
     def forward_transaction(self, queues, message):
         if isinstance(message, TransactionScore):
+            if not self.admit_new_half(message):
+                return True
             try:
                 # Don't write to history here.  The C twin
                 # _forward_transaction (rep_proc.c:1081-1102) only
@@ -759,20 +1297,56 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def handle_accepted(self, queues, message):
         if message.function == ReputationProtocol.accepted:
-            id1, id2, peer_id = from_json_string(message.obj)
+            parts = from_json_string(message.obj)
+            id1, id2, peer_id = parts[0], parts[1], parts[2]
             idx = self._paxos_id_index(id1, id2)
-            score = self.proposals[idx]
+            score = self.proposals.get(idx)
+            if score is None:
+                self.logger.debug('Acceptance for an unknown round')
+                return True
             self.logger.debug('Tx accepted')
-            if score.task_id not in self.acceptances:
-                self.acceptances[score.task_id] = []
-            if message.from_whom not in self.acceptances[score.task_id]:
-                if not message.verified:
-                    self.logger.warning(f"Rejecting unverified Paxos acceptance from {message.from_whom}")
-                    return True  # drop unverified acceptance
-                self.acceptances[score.task_id].append(message.from_whom)
+            if not message.verified:
+                self.logger.warning('Rejecting unverified Paxos acceptance from %s', message.from_whom)
+                return True  # drop unverified acceptance
+            voter_uuid = getattr(message.from_whom, 'uuid', None)
+            if voter_uuid is None:
+                return True
             round_group_uuid = self.round_group.get(idx)
-            if len(self.acceptances[score.task_id]) > self._quorum_for_group(
-                    round_group_uuid):
+            certificate = None
+            # Only a SIGNED acceptance counts here, and the round carries
+            # once the signatures clear the same bar a receiver will hold
+            # them to (_commit_cert_ok), so a commit this node sends is one
+            # its own group will write.
+            voter = self._attributed_voter(message, None, 'accepted')
+            sig = parts[3] if len(parts) > 3 else None
+            desig = commit_designation(peer_id, score.task_id,
+                                       score.score, score.channel)
+            if voter is None or not self._verify_cosignature(
+                    desig, voter, sig,
+                    self._roster_for_group(round_group_uuid)):
+                self.logger.warning(
+                    'Acceptance from %s carries no valid commit signature;'
+                    ' not counted', getattr(message.from_whom, 'nickname',
+                                            '?'))
+                return True
+            pending = self.commit_sigs_pending.setdefault(score.task_id, {})
+            pending[voter] = sig
+            if self._commit_cert_ok(peer_id, score.task_id, score.score,
+                                    score.channel, pending,
+                                    round_group_uuid):
+                certificate = dict(pending)
+            # One vote per member per round, ours included: sending the
+            # transaction was our own acceptance.
+            voters = self.acceptances.setdefault(idx, set())
+            voters.add(str(voter_uuid))
+            own = int(str(peer_id) == str(self.identity.uuid))
+            # Carried once the signatures make a certificate: sized by the
+            # logged roster when the chain has one (the certificate meets it),
+            # and by the round's quorum before the genesis.
+            reached = certificate is not None and (
+                self._roster_for_group(round_group_uuid) is not None
+                or len(voters) + own > self._round_quorum(round_group_uuid))
+            if reached:
                 # Idempotency guard: every ACCEPTED that arrives
                 # after the majority threshold has been crossed would
                 # otherwise re-fire the commit-and-broadcast block.
@@ -796,12 +1370,13 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # peers' histories (see ReputationProtocol.committed
                 # for the rationale). Route to the round's group chain
                 # — primary for leaf nodes, a child chain on a gateway.
-                self._chain_for_group(round_group_uuid).update(
-                    score.task_id, peer_id, score.score)
-                # Fold-on-commit: keep the dashboard running consensus EMA
-                # current the moment a tx completes (primary chain only).
-                self._fold_committed_tx(
-                    score.task_id, self._chain_for_group(round_group_uuid))
+                self._record_committed_half(
+                    round_group_uuid, score.task_id, peer_id, score.score,
+                    score.channel, certificate)
+                self.commit_sigs_pending.pop(score.task_id, None)
+                self.acceptances.pop(idx, None)
+                # Our half is in: stop watching it (ISSUES §2.24).
+                self.awaiting_commit.pop(str(score.task_id), None)
                 self._note_interaction(peer_id)
                 # Bumped to info to make demo debugging tractable —
                 # without a commit log, "no movement on reputations"
@@ -827,11 +1402,26 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     # group_uuid lets receivers route the commit to the
                     # right chain; handle_committed unpacks it
                     # length-tolerantly so legacy 3-tuples still work.
+                    #
+                    # The channel rides along as element 5 (R+D.md §12.8):
+                    # without it an acceptor writes the score and drops the
+                    # reason, and "every peer can judge a poor score for
+                    # itself" is only true if the reason reaches every peer.
+                    # It is also part of the entry hash on both sides, so a
+                    # commit that arrived without it and one that arrived
+                    # with `task_outcome` must hash the same -- which they do,
+                    # since both normalize to no channel block.
+                    #
+                    # The certificate rides as element 6, and only in a group
+                    # that requires it, so every other commit is the five
+                    # elements it always was.
+                    commit_obj = (score.task_id, peer_id, score.score,
+                                  round_group_uuid, score.channel)
+                    if certificate is not None:
+                        commit_obj = commit_obj + (certificate,)
                     commit_msg = Message(
                         self.name, ReputationProtocol.committed,
-                        to_json_string(
-                            (score.task_id, peer_id, score.score,
-                             round_group_uuid)),
+                        to_json_string(commit_obj),
                         self._group_by_uuid(round_group_uuid) or self.group,
                         from_whom=self.identity)
                     queues[CfgIds.network].put(
@@ -861,22 +1451,80 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # chain (group_uuid None -> _chain_for_group default).
                 task_id, peer_id, score = parsed[0], parsed[1], parsed[2]
                 group_uuid = parsed[3] if len(parsed) > 3 else None
+                # Element 5, appended the same length-tolerant way the
+                # group_uuid was: a legacy 3- or 4-tuple has no channel, which
+                # is `task_outcome` by construction (R+D.md §12.8).
+                channel = parsed[4] if len(parsed) > 4 else None
+                # Element 6: the commit certificate, present only from a group
+                # that requires one.
+                sigs = (parsed[5] if len(parsed) > 5
+                        and isinstance(parsed[5], dict) else None)
             except Exception:
                 self.logger.warning(
                     'handle_committed: malformed payload %r', message.obj)
                 return True
             if str(peer_id) == str(self.identity.uuid):
                 return True
+            # ISSUES.md §2.16, shape 2: provenance. Unsigned, a commit is
+            # nobody's word (its two sibling handlers already refused that);
+            # signed, it may write only its SENDER's own half -- the proposer
+            # commits the score it gave. Without this, any member wrote both
+            # halves of a fabricated entry about anybody.
+            if not message.verified:
+                self.logger.warning('Rejecting unverified committed from %s',
+                                    message.from_whom)
+                return True
+            sender = getattr(message.from_whom, 'uuid', None)
+            if sender is None or str(sender) != str(peer_id):
+                self.logger.warning(
+                    'Rejecting committed from %s: it writes %s\'s half, not '
+                    'its own', getattr(message.from_whom, 'nickname', '?'),
+                    str(peer_id)[:8])
+                return True
+            try:
+                # doc/architecture/reputation.md: this payload is a BARE float on the wire, not a
+                # TransactionScore, so it bypasses the constructor's check --
+                # and this is the path that writes history on every acceptor.
+                # An out-of-range score here would be averaged into a
+                # reputation by an unbounded amount.
+                score = validate_tx_score(score, 'handle_committed')
+            except ValueError as err:
+                self.logger.warning(
+                    'Dropping committed tx from %s: %s', str(peer_id)[:8], err)
+                return True
+            try:
+                # Validated BEFORE the write, and the whole commit is dropped
+                # on failure rather than the channel being coerced away. The
+                # channel is part of `_canonical_bytes` now, so accepting an
+                # unknown spelling would either fork this node's entry hash
+                # away from the rest of the group or silently rewrite the
+                # reason -- and a peer sending one is speaking a vocabulary
+                # this node does not have, which is exactly the case the
+                # closed set exists to catch.
+                channel = validate_tx_channel(channel, 'handle_committed')
+            except ValueError as err:
+                self.logger.warning(
+                    'Dropping committed tx from %s: %s', str(peer_id)[:8], err)
+                return True
+            # Commit certificates (doc/architecture/reputation.md): no
+            # ordinary half goes to the pool without a quorum of the roster in
+            # force having signed exactly this score.
+            if not (sigs and self._commit_cert_ok(
+                    peer_id, task_id, score, channel, sigs, group_uuid)):
+                self.logger.warning(
+                    'Rejecting committed from %s: %s',
+                    getattr(message.from_whom, 'nickname', '?'),
+                    'its certificate does not meet our quorum' if sigs
+                    else 'it carries no commit certificate')
+                return True
             chain = self._chain_for_group(group_uuid)
-            chain.update(task_id, peer_id, float(score))
-            # Fold-on-commit: advance the dashboard running consensus EMA as
-            # soon as this tx completes (primary chain only; idempotent).
-            self._fold_committed_tx(task_id, chain)
+            self._record_committed_half(
+                group_uuid, task_id, peer_id, score, channel, sigs)
             self._note_interaction(peer_id)
             self.logger.info(
-                'Recorded committed tx from %s: task=%s score=%.2f '
+                'Recorded committed tx from %s: task=%s score=%.2f via %s '
                 'group=%s (chain now %d txs, %d task_maps)',
-                str(peer_id)[:8], str(task_id)[:8], float(score),
+                str(peer_id)[:8], str(task_id)[:8], float(score), channel,
                 str(group_uuid)[:8],
                 len(chain),
                 len(chain._task_mapping))
@@ -900,6 +1548,223 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         sizing. '> quorum' total signers (including the slasher) finalizes,
         mirroring handle_accepted."""
         return self._quorum_for_group(group_uuid)
+
+    # ----- Quorum co-signatures (slash + checkpoint) -----------------------
+    # A three-phase quorum round is only worth what its RECEIVERS can check.
+    # Before this, the co-signature bytes were collected and thrown away:
+    # handle_*_sign credited the voter uuid CLAIMED in the payload, the
+    # finalizer broadcast ``sigs={}``, and handle_*_final applied the decision
+    # on transport authentication alone. So any single admitted member could
+    # finalize whatever it liked -- and because a slash floors a peer below
+    # COMM_CUTOFF into exclusion that is sticky (recovery only via explicit
+    # REASON_REHABILITATE), that was an insider primitive for permanently
+    # excluding any peer. Signatures are now retained, attributed to the
+    # authenticated sender, and verified by every receiver. See
+    # doc/architecture/reputation.md (Quorum attestation).
+    #
+    # Signature form follows the partition-probe idiom (idprocess.py): the
+    # signer emits ``identity.sign(designation).signature`` as ASCII hex, and
+    # the verifier hex-decodes and calls the raw-bytes
+    # ``signature.public.verify`` -- Identity.verify's two-arg form
+    # double-encodes under nacl.
+
+    @staticmethod
+    def _detached_sig(identity, designation):
+        """This node's detached signature over ``designation``, ASCII hex."""
+        return identity.sign(designation).signature.decode('ascii')
+
+    def _cosigner_identity(self, voter_uuid):
+        """Resolve a co-signer uuid to the Identity holding its public key:
+        self first (a proposer counts its own signature), then the peer
+        roster. None when the claimed voter is unknown to us -- an unknown
+        voter's signature cannot be verified, so it cannot count. A direct
+        peer is not on the roster (_roster_peers)."""
+        key = str(voter_uuid)
+        if key == str(self.identity.uuid):
+            return self.identity
+        for peer in self._roster_peers():
+            if str(peer.uuid) == key:
+                return peer
+        return None
+
+    def _verify_cosignature(self, designation, voter_uuid, sig,
+                            roster=None) -> bool:
+        """True iff ``sig`` is ``voter_uuid``'s signature over
+        ``designation``. Any malformed / unknown / bad-signature case is
+        False: a co-signature that cannot be checked must never be counted.
+
+        With a ``roster`` (a roster entry, doc/architecture/reputation.md,
+        "Who is in the group") only its members count, each verified with the
+        key the roster records, so a member who has since left is still
+        checkable and a peer outside it never counts."""
+        if sig is None:
+            return False
+        if roster is not None:
+            key = dict(roster.roster_members or ()).get(str(voter_uuid).lower())
+            if key is None:
+                return False
+            try:
+                verifier = VerifyKey(key.encode('ascii'), encoder=HexEncoder)
+            except (ValueError, TypeError):
+                return False
+        else:
+            ident = self._cosigner_identity(voter_uuid)
+            if ident is None:
+                return False
+            verifier = getattr(getattr(ident, 'signature', None), 'public', None)
+        try:
+            if isinstance(sig, str):
+                sig = sig.encode('ascii')
+            verifier.verify(designation, HexEncoder.decode(sig))
+        except (BadSignatureError, ValueError, TypeError, AttributeError):
+            return False
+        return True
+
+    def _verified_cosigners(self, designation, sigs, roster=None) -> set:
+        """The DISTINCT voters in ``sigs`` whose signature over
+        ``designation`` verifies against a key we hold (or, with ``roster``,
+        that roster records). Counting the set of verified signers -- rather
+        than tallying arriving messages -- is what makes one peer's replayed
+        signature worth exactly one vote."""
+        if not isinstance(sigs, dict):
+            return set()
+        return {str(voter).lower() for voter, sig in sigs.items()
+                if self._verify_cosignature(designation, voter, sig, roster)}
+
+    def _roster_for_group(self, group_uuid=None):
+        """The roster in force for the next instance of a group's chain, or
+        None before its genesis, when the live view decides."""
+        return self._chain_for_group(group_uuid).latest_roster()
+
+    def _attributed_voter(self, message, claimed, where: str):
+        """The uuid-str a ``*_sign`` ack may be credited to, or None.
+
+        The vote belongs to the AUTHENTICATED sender (``message.from_whom``),
+        never to the uuid the payload claims. Measured: this is defense in
+        depth, not the primary check -- ``_verify_cosignature`` already bounds
+        the tally to signatures the sender could actually obtain. What it adds
+        is the case where those differ: co-signatures are broadcast on
+        ``*_final`` and so are not secret, and binding the vote to the sender
+        stops a harvested genuine signature from being relayed under its
+        signer's name by somebody else. It also catches the plain bug of a node
+        mislabelling its own ack. A claim that disagrees with the sender is
+        refused rather than silently re-attributed: the two disagreeing is
+        either a bug or an attempt, and neither should quietly become a vote."""
+        sender = getattr(message.from_whom, 'uuid', None)
+        if sender is None:
+            self.logger.warning(
+                '%s: unattributable ack (no sender identity); not counted',
+                where)
+            return None
+        sender = str(sender)
+        if claimed is not None and str(claimed) != sender:
+            self.logger.warning(
+                '%s: ack claims voter %s but was sent by %s; refused',
+                where, str(claimed)[:8], sender[:8])
+            return None
+        return sender
+
+    def _quorum_met(self, designation, sigs, group_uuid=None) -> bool:
+        """Receiver-side quorum test over retained co-signatures: more than
+        ``_quorum_for_group`` distinct voters must have signed the exact bytes
+        this node re-derives. Sized against OUR OWN view of the group, so the
+        finalizer cannot also choose the bar it has to clear."""
+        return len(self._verified_cosigners(designation, sigs)) > \
+            self._quorum_for_group(group_uuid)
+
+    # ----- Commit certificates (doc/architecture/reputation.md) ------------
+    # Every ordinary half needs a quorum certificate: a placed entry carries
+    # its halves' certificates, and that is all an acceptor has to judge them
+    # by. What one proves is the round:
+    # that more than a quorum of this node's own view accepted exactly this
+    # score from this scorer. It cannot prove the score is TRUE -- an acceptor
+    # never sees the task -- so the lie it leaves open is a scorer's about its
+    # own half, which is R+D.md §14.2's to answer, not this one's.
+
+    def _commit_cert_ok(self, scorer, task_id, score, channel, sigs,
+                        group_uuid=None, roster=...) -> bool:
+        """Do `sigs` certify `scorer`'s half? At least ``_round_quorum``
+        distinct members of OUR view must have signed its
+        :func:`commit_designation`: with the scorer, a majority. The scorer's
+        own signature never counts: a proposer cannot vouch for its own
+        round."""
+        if not isinstance(sigs, dict) or not sigs:
+            return False
+        try:
+            desig = commit_designation(scorer, task_id, score, channel)
+        except (TypeError, ValueError):
+            return False
+        if roster is ...:
+            # Unless told otherwise, the roster in force for the group.
+            roster = self._roster_for_group(group_uuid)
+        voters = self._verified_cosigners(desig, sigs, roster) - {str(scorer).lower()}
+        if roster is not None:
+            # A majority of the logged roster, the scorer the remaining vote.
+            return len(voters) >= len(roster.roster_members or ()) // 2
+        return len(voters) >= self._round_quorum(group_uuid)
+
+    def _covered_by_checkpoint(self, chain):
+        """``(first, end)`` of the latest quorum-attested primary checkpoint
+        when `chain` holds that whole window and reproduces its root, else
+        None. Entries in that range are certified by the checkpoint, so
+        catch-up does not ask them for commit certificates: that is how a chain
+        cut before its group required certificates, or by members since gone,
+        stays acceptable once a quorum has checkpointed it."""
+        ckpt = self._finalized
+        if ckpt is None or not getattr(ckpt, 'count', 0):
+            return None
+        first, count = int(ckpt.first_index), int(ckpt.count)
+        window = [tx for tx in chain if getattr(tx, 'index', None) is not None
+                  and first <= tx.index < first + count]
+        if [tx.index for tx in window] != list(range(first, first + count)):
+            return None
+        root, theirs = window_root_of(window), ckpt.root
+        if isinstance(root, bytes):
+            root = root.decode('ascii')
+        if isinstance(theirs, bytes):
+            theirs = theirs.decode('ascii')
+        return (first, first + count) if root == theirs else None
+
+    def _held_identically(self, tx, hist=None) -> bool:
+        """Do we already hold `tx`, at its index, hashing the same? Then a
+        segment repeating it tells us nothing new and is not asked to prove it
+        again."""
+        hist = self.history if hist is None else hist
+        held = hist._task_mapping.get(getattr(tx, 'task_id', None))
+        return (held is not None and held.index is not None
+                and held.index == getattr(tx, 'index', None)
+                and held.entry_hash() == tx.entry_hash())
+
+    def _commit_certs_ok(self, chain, message, key: str = '') -> bool:
+        """Catch-up's half of commit certificates: every ordinary half of every entry in `chain` that is new to us
+        and outside a quorum checkpoint carries a certificate meeting our
+        quorum. Otherwise catch-up would be a way around the round. `key`
+        names the chain (a gateway's child chain is sized by its own group)."""
+        group = key or None
+        hist = self._chain_for_key(key)
+        covered = None if key else self._covered_by_checkpoint(chain)
+        for tx in chain:
+            if getattr(tx, 'attested', False) or getattr(tx, 'index', None) is None:
+                continue
+            if covered and covered[0] <= tx.index < covered[1]:
+                continue
+            if self._held_identically(tx, hist):
+                continue
+            for scorer, score, chan in ((tx.p1_id, tx.p1_score, tx.p1_channel),
+                                        (tx.p2_id, tx.p2_score, tx.p2_channel)):
+                if scorer is None:
+                    continue
+                sigs = (getattr(tx, 'commit_sigs', None) or {}).get(str(scorer))
+                if not self._commit_cert_ok(scorer, tx.task_id, score, chan,
+                                            sigs, group):
+                    self.logger.warning(
+                        'Rejecting chain from %s: entry %s (task %s) has no '
+                        'commit certificate for %s\'s half meeting our quorum,'
+                        ' and no checkpoint covers it',
+                        getattr(message.from_whom, 'nickname', '?'),
+                        tx.index, str(tx.task_id)[:8], str(scorer)[:8])
+                    return False
+        return True
 
     def _slash_target_ok(self, attestation) -> bool:
         """Reject self-slash adoption and degenerate slasher==target."""
@@ -941,16 +1806,36 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
         - No ``evidence_ref`` -> True (Phase 0 trust-the-detector fallback, so
           legacy / evidence-free slashes are unaffected).
-        - With ``evidence_ref`` -> the offending tx's inclusion proof must
-          verify against a root this node has FINALIZED as a checkpoint
-          (``self._checkpoint.root``). Tying it to our own quorum-agreed
-          checkpoint — not a root chosen by the accuser — is what makes the
-          evidence trustworthy. Any malformed / mismatched / unverifiable
-          evidence returns False and the slash is refused."""
+        - An ``evidence_ref`` that is not an inclusion proof at all -> also the
+          Phase-0 path. A detector's own verdict (the behaviour governor's
+          per-feature attribution, ``kind='behavioural_anomaly'``) is evidence
+          for a HUMAN, not something a co-signer can check, and running it
+          through the Merkle branch refused it on a missing 'leaf' key --
+          which quietly made every governor slash un-cosignable, i.e. the
+          SOW Task 3 path stopped at the proposer's own view. Accepting it
+          opens no hole that is not already open: a slasher wanting to dodge
+          the Merkle branch can simply send no evidence at all.
+        - With a Merkle ``evidence_ref`` -> the offending tx's inclusion proof must
+          verify against a root this node has FINALIZED as a checkpoint. Tying
+          it to our own quorum-agreed checkpoint — not a root chosen by the
+          accuser — is what makes the evidence trustworthy. Any malformed /
+          mismatched / unverifiable evidence returns False and the slash is
+          refused.
+
+        ANY of our finalized roots counts, not only the primary chain's: a
+        gateway finalizes a checkpoint per child group, and an offending tx
+        committed in a child group is anchored in that group's root. Accepting
+        only the primary root would refuse every legitimate subtree slash while
+        adding no security — each root cleared the same quorum test."""
         ev = attestation.evidence_ref
         if ev is None:
             return True
-        if self._checkpoint is None:
+        # Kind dispatch before the Merkle branch: only an inclusion proof is
+        # verifiable here, and only an inclusion proof claims to be. A dict
+        # that carries no proof is a detector's own account of what it saw.
+        if isinstance(ev, dict) and not ({'leaf', 'proof', 'root'} <= set(ev)):
+            return True
+        if not self._checkpoints:
             return False  # nothing to verify against
         try:
             leaf = ev['leaf']
@@ -961,22 +1846,47 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                      for s, left in ev['proof']]
         except (KeyError, TypeError, ValueError):
             return False
-        ck_root = self._checkpoint.root
-        if isinstance(ck_root, str):
-            ck_root = ck_root.encode('ascii')
-        # The evidence must be proven against OUR finalized checkpoint root.
-        if root != ck_root:
+        finalized = set()
+        for ck in self._checkpoints.values():
+            if ck is None or not ck.root:
+                continue
+            ck_root = ck.root
+            if isinstance(ck_root, str):
+                ck_root = ck_root.encode('ascii')
+            finalized.add(ck_root)
+        # The evidence must be proven against one of OUR finalized roots.
+        if root not in finalized:
             return False
         return TransactionHistory.verify_inclusion(leaf, proof, root)
 
     def _apply_slash(self, attestation):
         """Pin (or, for 'rehabilitate', lift) the target's reputation floor
         and queue a tier recompute so tier_lost flows through the existing
-        path. Idempotent per (target, epoch)."""
+        path. Idempotent per (target, epoch).
+
+        Replay-bounded per (target, slasher): a slash is applied only if its
+        epoch EXCEEDS every epoch already applied from that slasher against
+        that target. Since each slasher numbers its own slashes upward, a
+        second presentation of any earlier decision -- including one whose
+        ring entry has aged out, and including a punitive slash replayed after
+        a rehabilitation lifted it -- cannot move the floor again."""
         key = attestation.key()
         if key in self._slashed_seen:
             return
         target = str(attestation.target_uuid)
+        slasher = str(attestation.slasher_uuid)
+        epoch = int(attestation.epoch)
+        hw_key = (target, slasher)
+        # Epochs are assigned pre-incremented from 1 (forward_slash), so 0 is
+        # the never-seen floor and an attestation claiming epoch <= 0 is
+        # malformed; both land on the same refusal.
+        if epoch <= self._slash_hw.get(hw_key, 0):
+            self.logger.warning(
+                'Refusing slash for %s from %s: epoch %d not above applied '
+                'high-water %d (replay)',
+                target[:8], slasher[:8], epoch,
+                self._slash_hw.get(hw_key, 0))
+            return
         if attestation.reason == SlashAttestation.REASON_REHABILITATE:
             self._slashed.pop(target, None)
             # Drop the sticky floor AND the running-EMA latch so the score
@@ -1022,6 +1932,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self._slashed_seen[key] = None
         while len(self._slashed_seen) > self.COMMITTED_ROUNDS_CAP:
             self._slashed_seen.popitem(last=False)
+        # Advance the durable mark and write it out. Recorded for a
+        # rehabilitation too: a rehab is itself a decision that must not be
+        # replayable, and leaving the mark behind would let the punitive slash
+        # it superseded back in at the same epoch.
+        self._slash_hw[hw_key] = epoch
+        self._persist_slash_marks()
         # Queue a tier recompute (drained in process()): _compute_reputation
         # short-circuits on a floor and publishes tier 0 / tier_lost; a rehab
         # lift republishes the restored (neutral) tier and readmits.
@@ -1040,8 +1956,19 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         (a node always trusts its own detection — this is what the
         detector's dashboard reads), seed the co-signature set with
         ourself, and broadcast slash_propose to collect a quorum. Mirrors
-        forward_transaction's role for TransactionScore."""
+        forward_transaction's role for TransactionScore.
+
+        Refuses unless slashing is armed (``SLASH_ENABLED``). A detector on an
+        unarmed node keeps its own view and its own log and asks nobody for a
+        floor -- see the SLASH_ENABLED comment for why the default is off."""
         if isinstance(message, SlashAttestation):
+            if not self.SLASH_ENABLED:
+                self.logger.warning(
+                    'Slash NOT originated (slashing disarmed): target=%s '
+                    'reason=%s -- set AT_SLASH_ENABLED=1 to arm',
+                    str(getattr(message, 'target_uuid', ''))[:8],
+                    getattr(message, 'reason', None))
+                return True
             try:
                 att = message
                 att.slasher_uuid = self.identity.uuid
@@ -1055,7 +1982,18 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     att.signature = None
                 key = att.key()
                 self._slash_pending[key] = att
-                self._slash_sigs[key] = {str(self.identity.uuid)}
+                # Seed the co-signature map with OUR OWN detached signature,
+                # not a bare uuid: every entry that will travel on
+                # slash_final has to be verifiable by its recipients, the
+                # proposer's included.
+                self._slash_sigs[key] = {}
+                try:
+                    self._slash_sigs[key][str(self.identity.uuid)] = \
+                        self._detached_sig(self.identity, att.designation)
+                except Exception:
+                    self.logger.error(
+                        'forward_slash: cannot sign own attestation; '
+                        'this slash cannot reach quorum')
                 # Self-apply now so the detector's own consensus view (the
                 # dashboard) floors the target immediately, independent of
                 # co-sign round-trip latency.
@@ -1077,6 +2015,17 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def handle_slash_propose(self, queues, message):
         if message.function == ReputationProtocol.slash_propose:
+            # Declining to co-sign is the disarmed node's whole contribution:
+            # it neither vouches for the accusation nor argues with it, and
+            # the proposer simply fails to reach quorum if enough of the group
+            # is disarmed. Handled (returns True) rather than passed on, so
+            # the message is consumed and logged instead of falling through to
+            # another handler.
+            if not self.SLASH_ENABLED:
+                self.logger.info(
+                    'Not co-signing slash_propose from %s (slashing disarmed)',
+                    message.from_whom)
+                return True
             if not message.verified:
                 self.logger.warning(
                     'Rejecting unverified slash_propose from %s',
@@ -1101,9 +2050,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     'Declining slash_propose: evidence failed verification')
                 return True
             try:
-                sig = self.identity.sign(att.designation)
+                sig = self._detached_sig(self.identity, att.designation)
             except Exception:
-                sig = None
+                self.logger.error(
+                    'handle_slash_propose: cannot sign; declining to co-sign')
+                return True
             tgt, epoch = att.key()
             ack = (tgt, epoch, str(self.identity.uuid), sig)
             try:
@@ -1124,15 +2075,26 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             payload = message.obj
             if isinstance(payload, str):
                 payload = from_json_string(payload)
-            tgt, epoch, voter, _sig = payload
+            tgt, epoch, claimed, sig = payload
             key = (str(tgt), int(epoch))
             att = self._slash_pending.get(key)
             if att is None:
                 return True  # not our round, or already finalized
-            self._slash_sigs.setdefault(key, set()).add(str(voter))
+            voter = self._attributed_voter(message, claimed, 'slash_sign')
+            if voter is None:
+                return True
+            # A co-signature that does not verify is not a vote. Without this
+            # the tally counted assertions rather than signatures.
+            if not self._verify_cosignature(att.designation, voter, sig):
+                self.logger.warning(
+                    'handle_slash_sign: co-signature from %s failed '
+                    'verification; not counted', voter[:8])
+                return True
+            self._slash_sigs.setdefault(key, {})[voter] = sig
             grp_uuid = str(self.group.uuid) if self.group is not None else None
             if len(self._slash_sigs[key]) > self._slash_quorum(grp_uuid):
-                signed = SignedSlash(attestation=att, sigs={})
+                signed = SignedSlash(attestation=att,
+                                     sigs=dict(self._slash_sigs[key]))
                 try:
                     msg = Message(
                         self.name, ReputationProtocol.slash_final,
@@ -1154,6 +2116,15 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def handle_slash_final(self, _, message):
         if message.function == ReputationProtocol.slash_final:
+            # A disarmed node does not apply a floor it declined to co-sign.
+            # This is the half that makes the knob a real policy rather than
+            # decoration: origination and co-signing can both be refused and a
+            # quorum elsewhere in the group would still pin the peer here.
+            if not self.SLASH_ENABLED:
+                self.logger.info(
+                    'Ignoring slash_final from %s (slashing disarmed)',
+                    message.from_whom)
+                return True
             if not message.verified:
                 self.logger.warning(
                     'Rejecting unverified slash_final from %s',
@@ -1176,9 +2147,442 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self.logger.warning(
                     'Rejecting slash_final: evidence failed verification')
                 return True
+            # Quorum is verified HERE, by us, against the retained
+            # co-signatures. Transport authentication says only that some
+            # admitted member sent this; it says nothing about whether a
+            # majority agreed, and a slash floors a peer into sticky
+            # exclusion. A finalizer carrying no verifiable co-signatures is
+            # refused -- the flag day noted in reputation.md.
+            sigs = getattr(signed, 'sigs', None)
+            if not self._quorum_met(att.designation, sigs):
+                self.logger.warning(
+                    'Rejecting slash_final for %s: %d verified co-signature(s) '
+                    'do not meet quorum',
+                    str(att.target_uuid)[:8],
+                    len(self._verified_cosigners(att.designation, sigs)))
+                return True
             self._apply_slash(att)
             return True
         return False
+
+    # ----- Verifier-attested scores ---------------------------------------
+    # doc/architecture/reputation.md, "Verifier-attested scores". A fourth
+    # three-phase quorum, shaped like slash and checkpoint:
+    #   forward_attestation : a local producer (an extension, e.g. Stele's)
+    #                         puts an AttestedScore on the queue; we sign it as
+    #                         its verifier and broadcast attest_propose.
+    #   handle_attest_propose: a member other than the subject co-signs iff the
+    #                         attestation is ADMISSIBLE in its own view. It
+    #                         vouches for nothing about the finding's truth.
+    #   handle_attest_sign  : the verifier tallies verified co-signatures; on a
+    #                         strict majority of the non-subject members it
+    #                         appends the entry and broadcasts attest_final.
+    #   handle_attest_final : every node checks the quorum itself, against its
+    #                         own roster, and appends the entry.
+    # The subject's signature is never counted, so it cannot block the entry.
+
+    def _is_member(self, uuid) -> bool:
+        key = str(uuid)
+        return key == str(self.identity.uuid) or any(
+            str(p.uuid) == key for p in self._roster_peers())
+
+    #: Conflicted co-signers (ISSUES §2.54): ``{"teams": [[uuid, ...], ...]}``,
+    #: written by an application (Stele, from a verified team roster). Two
+    #: nodes in one team do not witness for each other. Mirrors C
+    #: REP_CONFLICTS_FILE.
+    CONFLICTS_FILE = 'attest_conflicts.cfg.json'
+
+    @staticmethod
+    def _conflicts_parse(doc):
+        teams = doc.get('teams') if isinstance(doc, dict) else None
+        if not isinstance(teams, list) or not all(
+                isinstance(t, list) and all(isinstance(u, str) for u in t)
+                for t in teams):
+            return None
+        return [set(t) for t in teams]
+
+    def set_attest_conflicts(self, doc):
+        """Replace the conflict set with ``doc`` instead of the file; None goes
+        back to the file. For tests and the conformance adapter. Raises
+        ValueError, changing nothing, on a malformed set. Mirrors C
+        reputation_set_attest_conflicts."""
+        if doc is None:
+            self._conflicts_override = None
+            return
+        teams = self._conflicts_parse(doc)
+        if teams is None:
+            raise ValueError('malformed attest conflict set')
+        self._conflicts_override = teams
+
+    def _attest_conflicts(self) -> list:
+        """The teams in force, re-read from the file when it changed."""
+        override = getattr(self, '_conflicts_override', None)
+        if override is not None:
+            return override
+        path = os.path.join(Configuration.get_cfg_dir(), self.CONFLICTS_FILE)
+        try:
+            st = os.stat(path)
+        except OSError:
+            self._conflicts_cache = (None, [])
+            return []
+        stamp = (st.st_mtime_ns, st.st_size)
+        cached = getattr(self, '_conflicts_cache', None)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        try:
+            with open(path) as f:
+                teams = self._conflicts_parse(json.load(f)) or []
+        except (OSError, ValueError):
+            teams = []
+        self._conflicts_cache = (stamp, teams)
+        return teams
+
+    def _conflicted(self, a, b) -> bool:
+        """Are ``a`` and ``b`` two different nodes of one team?"""
+        a, b = str(a), str(b)
+        return a != b and any(a in t and b in t for t in self._attest_conflicts())
+
+    def _conflicted_members(self, subject) -> list:
+        """The members of our roster conflicted with ``subject``, sorted."""
+        subject = str(subject)
+        mates = set()
+        for team in self._attest_conflicts():
+            if subject in team:
+                mates |= team - {subject}
+        return sorted(m for m in mates if self._is_member(m))
+
+    def _attest_quorum_met(self, att, sigs, roster=...) -> bool:
+        """The verifier's own signature plus a strict majority of the members
+        other than the subject AND its teammates (§2.54), sized from OUR
+        roster and counting only signatures that verify. Neither the
+        subject's signature nor a teammate's is ever counted, and once any
+        teammate is left out at least two signatures are needed. In a group
+        that places its order, the roster is the logged one in force (unless
+        `roster` names another, or None for the live view)."""
+        if not isinstance(sigs, dict):
+            return False
+        if roster is ...:
+            roster = self._roster_for_group(getattr(att, 'group_uuid', '') or None)
+        subject = str(att.subject_uuid).lower()
+        voters = {v for v in self._verified_cosigners(att.designation, sigs, roster)
+                  - {subject} if not self._conflicted(v, subject)}
+        if str(att.verifier_uuid).lower() not in voters:
+            return False
+        if roster is not None:
+            listed = [u for u, _k in roster.roster_members or ()]
+            members = len(listed)
+            mates = sum(1 for u in listed if u != subject and self._conflicted(u, subject))
+            others = members - (1 if subject in listed else 0)
+            others = max(others - mates, 0)
+            if mates and len(voters) < 2:
+                return False
+            return len(voters) > others // 2
+        members = len(self._roster_peers()) + 1
+        mates = len(self._conflicted_members(subject))
+        others = members - (1 if self._is_member(subject) else 0)
+        others = max(others - mates, 0)
+        if mates and len(voters) < 2:
+            return False
+        return len(voters) > others // 2
+
+    @staticmethod
+    def _attest_resident(chain, att) -> bool:
+        """Does `chain` already hold what this attestation would repeat? The
+        rate cap, counted from the chain itself so every node reaches the same
+        answer. Unscoped: one per (verifier, subject) pair in the resident
+        window. Scoped: one per (verifier, subject, channel, scope), so an
+        application can attest again about something new -- a fresh scan of a
+        fixed commit -- while a repeat about the same thing is still refused.
+        Mirrors _attest_resident_locked."""
+        for tx in chain:
+            if not (tx.attested and str(tx.p1_id) == str(att.verifier_uuid)
+                    and str(tx.subject_id) == str(att.subject_uuid)):
+                continue
+            if not att.attest_scope:
+                return True
+            if (str(tx.p1_channel) == str(att.channel)
+                    and getattr(tx, 'attest_scope', None) == att.attest_scope):
+                return True
+        return False
+
+    def _attest_admissible(self, att):
+        """``(True, '')`` when this node will vouch the attestation is
+        admissible, else ``(False, reason)``. Everything here is checked in
+        THIS node's own view; nothing is a judgement of the finding."""
+        if not isinstance(att, AttestedScore) or not att.well_formed():
+            return False, 'malformed'
+        if not self._is_member(att.verifier_uuid):
+            return False, 'verifier not a member'
+        if not self._is_member(att.subject_uuid):
+            return False, 'subject not a member'
+        # A teammate's finding about its own team is the team speaking about
+        # itself, which is what an attestation exists to get past (§2.54).
+        if self._conflicted(att.verifier_uuid, att.subject_uuid):
+            return False, 'verifier is a teammate of the subject'
+        if str(att.verifier_uuid) in self._slashed:
+            return False, 'verifier slashed'
+        if str(att.verifier_uuid) in self._excluded:
+            return False, 'verifier excluded'
+        rep = self.PREREP_NEUTRAL
+        for k in (att.verifier_uuid, str(att.verifier_uuid)):
+            try:
+                if k in self.reputations:
+                    rep = float(self.reputations[k])
+                    break
+            except (TypeError, ValueError):
+                continue
+        ceiling = self._standing_ceiling(att.verifier_uuid)
+        if ceiling is not None and rep > ceiling:
+            rep = ceiling
+        # ...and by its tenure, in case the stored score predates the hold.
+        rep = self._tenure_bound(att.verifier_uuid, rep)
+        tier = self._trust_tier(rep)
+        replication = str(att.channel) == TX_CHANNEL_REPLICATION
+        min_tier = (self.ATTEST_REPLICATION_TIER if replication
+                    else self.ATTEST_MIN_TIER)
+        min_rep = 0.0
+        if not replication and self.ATTEST_MIN_REP is not None:
+            min_tier, min_rep = 0, self.ATTEST_MIN_REP
+        if tier < min_tier or rep < min_rep:
+            return False, 'verifier tier %d (standing %.2f) below %d for %s' % (
+                tier, rep, min_tier, att.channel)
+        chain = self._chain_for_group(att.group_uuid or None)
+        task = att.task_id
+        if task in chain._task_mapping or task in chain._evicted_task_ids:
+            return False, 'already held'
+        if self._attest_resident(chain, att):
+            return False, ('rate cap: this verifier already attested this '
+                           'subject in this scope' if att.attest_scope else
+                           'rate cap: this verifier already attested this subject')
+        return True, ''
+
+    def _commit_attestation(self, att, sigs) -> bool:
+        """Put a certified attestation in its chain's pool. It waits there for
+        its placement, which logs it, folds it and brings a checkpoint forward
+        (_apply_placement)."""
+        chain = self._chain_for_group(att.group_uuid or None)
+        return chain.pool_attested(att.to_transaction(), dict(sigs))
+
+    def _attest_certified(self, tx) -> bool:
+        """Does an attested entry from somebody else's chain carry a
+        certificate that meets OUR quorum? Catch-up refuses one that does
+        not, or it would be a way around the round."""
+        return self._attest_quorum_met(AttestedScore.of_transaction(tx),
+                                       getattr(tx, 'attest_sigs', None))
+
+    def forward_attestation(self, queues, message):
+        """A local producer's AttestedScore: sign it as its verifier and ask
+        the group to co-sign. Nothing is appended until a quorum certifies it,
+        here as everywhere else."""
+        if not isinstance(message, AttestedScore):
+            return False
+        att = message
+        att.verifier_uuid = str(self.identity.uuid)
+        if not att.well_formed():
+            self.logger.warning('Attestation NOT proposed: malformed (%s)', att)
+            return True
+        if not self._is_member(att.subject_uuid):
+            self.logger.warning(
+                'Attestation NOT proposed: subject %s is not a member',
+                str(att.subject_uuid)[:8])
+            return True
+        chain = self._chain_for_group(att.group_uuid or None)
+        if self._attest_resident(chain, att):
+            self.logger.warning(
+                'Attestation NOT proposed: %s already attested in the window',
+                str(att.subject_uuid)[:8])
+            return True
+        key = str(att.task_id)
+        try:
+            sig = self._detached_sig(self.identity, att.designation)
+        except Exception:
+            self.logger.error('forward_attestation: cannot sign; not proposed')
+            return True
+        self._attest_pending[key] = att
+        self._attest_sigs[key] = {str(self.identity.uuid): sig}
+        self._attest_retry[key] = [now().timestamp() + self.ATTEST_RETRY_SEC, 0]
+        if self._send_attest_propose(queues, att):
+            self.logger.info('Proposed attested score: subject=%s score=%.2f',
+                             str(att.subject_uuid)[:8], float(att.score))
+        return True
+
+    def _send_attest_propose(self, queues, att) -> bool:
+        """Fan our attestation round's propose out to the group."""
+        if self.group is None:
+            return False
+        try:
+            msg = Message(self.name, ReputationProtocol.attest_propose,
+                          to_json_string(att), self.group,
+                          from_whom=self.identity)
+            queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+            return True
+        except Full:
+            self.logger.error('attest propose: network queue full')
+            return False
+
+    def _retry_pending_attestations(self, queues, present) -> int:
+        """Re-propose OUR attestation rounds still short of a quorum once
+        ATTEST_RETRY_SEC has passed, up to ATTEST_RETRIES times, then abandon
+        them (ISSUES §2.40). A round whose entry is already in the chain or the
+        pool (a final from elsewhere certified it) is forgotten. Mirrors C
+        _retry_pending_attestations. Returns how many were re-proposed."""
+        resent = 0
+        for key, clock in list(self._attest_retry.items()):
+            att = self._attest_pending.get(key)
+            if att is None:
+                del self._attest_retry[key]
+                continue
+            chain = self._chain_for_group(att.group_uuid or None)
+            if chain._task_mapping.get(att.task_id) is not None \
+                    or chain.pooled(att.task_id) is not None:
+                self._attest_pending.pop(key, None)
+                self._attest_sigs.pop(key, None)
+                del self._attest_retry[key]
+                continue
+            due, attempts = clock
+            if present < due:
+                continue
+            if attempts >= self.ATTEST_RETRIES:
+                self.logger.warning(
+                    'attested score about %s never reached a quorum after %d '
+                    're-proposal(s); abandoning it',
+                    str(att.subject_uuid)[:8], attempts)
+                self._attest_pending.pop(key, None)
+                self._attest_sigs.pop(key, None)
+                del self._attest_retry[key]
+                continue
+            clock[0] = present + self.ATTEST_RETRY_SEC
+            clock[1] = attempts + 1
+            self.logger.info(
+                'attested score about %s has no quorum yet; re-proposing it '
+                '(attempt %d of %d)', str(att.subject_uuid)[:8], attempts + 1,
+                self.ATTEST_RETRIES)
+            if self._send_attest_propose(queues, att):
+                resent += 1
+        return resent
+
+    def handle_attest_propose(self, queues, message):
+        if message.function != ReputationProtocol.attest_propose:
+            return False
+        if not message.verified:
+            self.logger.warning('Rejecting unverified attest_propose from %s',
+                                message.from_whom)
+            return True
+        att = (message.obj if isinstance(message.obj, AttestedScore)
+               else from_json_string(message.obj))
+        if not isinstance(att, AttestedScore):
+            return True
+        if str(att.verifier_uuid) == str(self.identity.uuid):
+            return True     # our own bounce-back
+        # The verifier is the AUTHENTICATED sender, never just a claim.
+        if self._attributed_voter(message, att.verifier_uuid,
+                                  'attest_propose') is None:
+            return True
+        if str(att.subject_uuid) == str(self.identity.uuid):
+            # Our signature would not count; say so rather than send it.
+            self.logger.info('Not co-signing an attestation about ourselves '
+                             'from %s', message.from_whom)
+            return True
+        if self._conflicted(self.identity.uuid, att.subject_uuid):
+            # Nor would a teammate's (§2.54).
+            self.logger.info('Not co-signing an attestation about a teammate '
+                             'from %s', message.from_whom)
+            return True
+        ok, why = self._attest_admissible(att)
+        if not ok:
+            self.logger.warning('Declining attest_propose from %s: %s',
+                                message.from_whom, why)
+            return True
+        try:
+            sig = self._detached_sig(self.identity, att.designation)
+        except Exception:
+            self.logger.error('handle_attest_propose: cannot sign; declining')
+            return True
+        ack = (str(att.task_id), str(self.identity.uuid), sig)
+        try:
+            msg = Message(self.name, ReputationProtocol.attest_sign,
+                          to_json_string(ack), message.from_whom,
+                          from_whom=self.identity)
+            queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+            self.logger.info('Co-signed attest_propose from %s',
+                             message.from_whom)
+        except Full:
+            self.logger.error('handle_attest_propose: queue full')
+        return True
+
+    def handle_attest_sign(self, queues, message):
+        if message.function != ReputationProtocol.attest_sign:
+            return False
+        if not message.verified:
+            self.logger.warning('Rejecting unverified attest_sign from %s',
+                                message.from_whom)
+            return True
+        payload = message.obj
+        if isinstance(payload, str):
+            payload = from_json_string(payload)
+        try:
+            task, claimed, sig = payload
+        except (TypeError, ValueError):
+            return True
+        att = self._attest_pending.get(str(task))
+        if att is None:
+            return True     # not our round, or already final
+        voter = self._attributed_voter(message, claimed, 'attest_sign')
+        if voter is None:
+            return True
+        if voter == str(att.subject_uuid):
+            self.logger.info('attest_sign from the subject; not counted')
+            return True
+        if not self._verify_cosignature(att.designation, voter, sig):
+            self.logger.warning('attest_sign from %s failed verification; '
+                                'not counted', voter[:8])
+            return True
+        sigs = self._attest_sigs.setdefault(str(task), {})
+        sigs[voter] = sig
+        if not self._attest_quorum_met(att, sigs):
+            return True
+        del self._attest_pending[str(task)]
+        self._attest_sigs.pop(str(task), None)
+        self._attest_retry.pop(str(task), None)
+        self._commit_attestation(att, sigs)
+        signed = SignedAttestation(attestation=att, sigs=dict(sigs))
+        try:
+            msg = Message(self.name, ReputationProtocol.attest_final,
+                          to_json_string(signed),
+                          self._group_by_uuid(att.group_uuid or None)
+                          or self.group, from_whom=self.identity)
+            queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('handle_attest_sign: queue full broadcasting final')
+        return True
+
+    def handle_attest_final(self, _, message):
+        if message.function != ReputationProtocol.attest_final:
+            return False
+        if not message.verified:
+            self.logger.warning('Rejecting unverified attest_final from %s',
+                                message.from_whom)
+            return True
+        signed = (message.obj if isinstance(message.obj, SignedAttestation)
+                  else from_json_string(message.obj))
+        att = getattr(signed, 'attestation', None)
+        if not isinstance(att, AttestedScore) or not att.well_formed():
+            return True
+        chain = self._chain_for_group(att.group_uuid or None)
+        if att.task_id in chain._task_mapping:
+            return True     # already appended (our own round, or a duplicate)
+        # Quorum is verified HERE, against our own roster. Whether this node
+        # would itself have vouched is not the question: the certificate says
+        # a majority of the others did.
+        sigs = getattr(signed, 'sigs', None)
+        if not self._attest_quorum_met(att, sigs):
+            self.logger.warning(
+                'Rejecting attest_final about %s: %d verified co-signature(s) '
+                'do not meet quorum', str(att.subject_uuid)[:8],
+                len(self._verified_cosigners(att.designation, sigs or {})))
+            return True
+        self._commit_attestation(att, sigs)
+        return True
 
     # ----- Phase 2: quorum-signed Merkle checkpoints ----------------------
     # Lifecycle (mirrors the slash three-phase shape):
@@ -1193,9 +2597,32 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     #                           latest agreed commitment to the committed window.
 
     def _checkpoint_quorum(self, group_uuid=None):
-        """Co-signers required to finalize a checkpoint; reuses Paxos majority
-        sizing. '> quorum' matching signers (including the proposer) finalize."""
-        return self._quorum_for_group(group_uuid)
+        """Co-signers required to finalize a checkpoint: '> quorum' matching
+        signers (the proposer's own included) finalize. A MAJORITY OF THE WHOLE
+        GROUP, THIS NODE INCLUDED: (roster + 1) // 2.
+
+        It used to reuse the Paxos sizing, len(peers) // 2, which counts the
+        roster WITHOUT this node and is one signature short for an even-sized
+        group, so both halves of an even split finalized their own windows and
+        could never reconcile after the heal (Agora Phase 4 DDIL, 2026-09-25).
+        Odd sizes are unchanged. Paxos rounds now take the same majority
+        (_round_quorum); slashing keeps len(peers) // 2.
+        Mirrors C _ckpt_quorum_for_group."""
+        return (self._checkpoint_roster(group_uuid) + 1) // 2
+
+    def _checkpoint_roster(self, group_uuid=None) -> int:
+        """The roster a checkpoint's quorum is sized from, this node NOT
+        included: the peers, or a gateway's members of that child group."""
+        if not self.child_groups:
+            return len(self._roster_peers())
+        grp = self._group_by_uuid(group_uuid)
+        return (len(self._roster_peers()) if grp is None
+                else len(self._members_of_group(grp)))
+
+    def _checkpoint_quorum_met(self, designation, sigs, group_uuid=None) -> bool:
+        """``_quorum_met`` with the checkpoint threshold."""
+        return len(self._verified_cosigners(designation, sigs)) > \
+            self._checkpoint_quorum(group_uuid)
 
     def forward_checkpoint(self, queues, message):
         """Entry point for a locally-originated checkpoint: putting a
@@ -1204,53 +2631,853 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         ignored — the proposer always commits to its own live window. Mirrors
         ``forward_slash``."""
         if isinstance(message, Checkpoint):
-            try:
-                self._checkpoint_epoch += 1
-                window = self.history._indexed_window()
-                root = self.history.window_root()
-                first = window[0].index if window else self.history._next_index
-                ckpt = Checkpoint(
-                    proposer_uuid=self.identity.uuid, root=root,
-                    epoch=self._checkpoint_epoch,
-                    first_index=first, count=len(window),
-                    nonce=os.urandom(8))
-                try:
-                    ckpt.signature = self.identity.sign(ckpt.designation)
-                except Exception:
-                    ckpt.signature = None
-                key = ckpt.key()
-                self._checkpoint_pending[key] = ckpt
-                self._checkpoint_sigs[key] = {str(self.identity.uuid)}
-                # Self-store immediately so a single-node group (or the
-                # originator's own view) has a finalized checkpoint without a
-                # co-sign round-trip, matching forward_slash's self-apply.
-                self._store_checkpoint(ckpt)
-                if self.group is not None:
-                    msg = Message(self.name,
-                                  ReputationProtocol.checkpoint_propose,
-                                  to_json_string(ckpt), self.group,
-                                  from_whom=self.identity)
-                    queues[CfgIds.network].put(
-                        msg, block=True, timeout=self.q_cadence)
-                self.logger.info(
-                    'Proposed checkpoint: epoch=%d count=%d root=%s',
-                    ckpt.epoch, ckpt.count,
-                    (root.decode() if isinstance(root, bytes) else str(root))[:12])
-            except Full:
-                self.logger.error('forward_checkpoint: network queue full')
+            # The trigger object's fields are ignored EXCEPT group_uuid, which
+            # selects which of our chains to commit to (a gateway has more than
+            # one). Everything else always comes from our own live window.
+            self._originate_checkpoint(
+                queues, self._chain_key(getattr(message, 'group_uuid', '')))
             return True
         return False
 
-    def _store_checkpoint(self, ckpt):
+    def _originate_checkpoint(self, queues, chain_key: str = ''):
+        """Propose a checkpoint over the chain ``chain_key`` names.
+
+        Broadcast goes to THAT chain's group: a child-group checkpoint is only
+        meaningful to that group's members, who are the ones holding the same
+        window to compare roots against, and they are also who sizes its
+        quorum."""
+        try:
+            chain = self._chain_for_key(chain_key)
+            epoch = self._checkpoint_epochs.get(chain_key, 0) + 1
+            self._checkpoint_epochs[chain_key] = epoch
+            window = chain._indexed_window()
+            root = chain.window_root()
+            first = window[0].index if window else chain._next_index
+            ckpt = Checkpoint(
+                proposer_uuid=self.identity.uuid, root=root,
+                epoch=epoch, first_index=first, count=len(window),
+                nonce=os.urandom(8), group_uuid=chain_key)
+            try:
+                ckpt.signature = self.identity.sign(ckpt.designation)
+            except Exception:
+                ckpt.signature = None
+            key = ckpt.key()
+            self._checkpoint_pending[key] = ckpt
+            # Our own detached signature, for the same reason as
+            # forward_slash: every entry travelling on checkpoint_final
+            # must be verifiable by its recipients.
+            self._checkpoint_sigs[key] = {}
+            try:
+                self._checkpoint_sigs[key][str(self.identity.uuid)] = \
+                    self._detached_sig(self.identity, ckpt.designation)
+            except Exception:
+                self.logger.error(
+                    'forward_checkpoint: cannot sign own checkpoint; '
+                    'this checkpoint cannot reach quorum')
+            # Self-store immediately so a single-node group (or the
+            # originator's own view) has a finalized checkpoint without a
+            # co-sign round-trip, matching forward_slash's self-apply.
+            # Only OUR signature exists yet, which is deliberately not
+            # special-cased: at boot the same quorum rule applies, so this
+            # self-store attests a genuinely single-node group and nothing
+            # more. The quorum map replaces it in handle_checkpoint_sign.
+            self._store_checkpoint(ckpt, self._checkpoint_sigs[key])
+            to_whom = (self._group_by_uuid(chain_key) if chain_key
+                       else self.group)
+            if to_whom is not None:
+                msg = Message(self.name,
+                              ReputationProtocol.checkpoint_propose,
+                              to_json_string(ckpt), to_whom,
+                              from_whom=self.identity)
+                queues[CfgIds.network].put(
+                    msg, block=True, timeout=self.q_cadence)
+            self.logger.info(
+                'Proposed checkpoint: chain=%s epoch=%d count=%d root=%s',
+                chain_key[:8] or 'primary', ckpt.epoch, ckpt.count,
+                (root.decode() if isinstance(root, bytes) else str(root))[:12])
+        except Full:
+            self.logger.error('forward_checkpoint: network queue full')
+
+    def _store_checkpoint(self, ckpt, sigs=None):
         """Record ``ckpt`` as the latest finalized checkpoint (idempotent on
-        re-broadcast via the seen-dedup ring)."""
+        re-broadcast via the seen-dedup ring).
+
+        ``sigs`` are the co-signatures that finalized it, retained because the
+        persisted evidence has to carry them: a boot-time rebuild verifies the
+        same quorum a live receiver does, and without the signatures there is
+        nothing to verify (see _rebuild_from_evidence).
+
+        This is also where the evidence file is written, and deliberately so:
+        at this instant the resident window and the agreed root describe each
+        other. Writing on every commit instead would be both hotter (~16/s in
+        the DoD demo) and *less* useful, since a chain that has moved past its
+        checkpoint is exactly a chain the rebuild cannot attest.
+        """
         key = ckpt.key()
+        chain_key = self._chain_key(getattr(ckpt, 'group_uuid', ''))
         if key in self._checkpoint_seen:
+            # Idempotent on re-broadcast, with one exception: a fuller
+            # co-signature set is an upgrade, not a duplicate. The proposer
+            # self-stores at propose time holding only its OWN signature (so a
+            # single-node group needs no round trip), and the quorum map only
+            # exists later.
+            held = self._checkpoint_sigs_final.get(chain_key, {})
+            if sigs and len(sigs) > len(held):
+                self._checkpoint_sigs_final[chain_key] = dict(sigs)
+                self._persist_history(chain_key)
+                self._persist_roster(chain_key)
+                self._archive_attested(chain_key)
+            self._note_final(ckpt, sigs, chain_key)
             return
-        self._checkpoint = ckpt
+        self._checkpoints[chain_key] = ckpt
+        self._checkpoint_sigs_final[chain_key] = dict(sigs or {})
         self._checkpoint_seen[key] = None
         while len(self._checkpoint_seen) > self.COMMITTED_ROUNDS_CAP:
             self._checkpoint_seen.popitem(last=False)
+        self._note_final(ckpt, sigs, chain_key)
+        self._persist_history(chain_key)
+        self._persist_roster(chain_key)
+        self._archive_attested(chain_key)
+
+    ROSTER_FILE = 'roster.cfg.json'
+    ROSTER_CKPTS = 256
+
+    def _persist_roster(self, chain_key: str = ''):
+        """Write the roster a reader of etc/at/attested/ verifies against:
+        every member this node has held (uuid -> signing key, first and last
+        seen, the effective tier last published, whether it is a member now)
+        and the final checkpoints it stored, newest last. A record carries its
+        signers' keys itself, which is what a forger would write too; a
+        verifier that takes keys from here checks the record against THIS
+        node's view of its group. A member who leaves is kept, marked, so a
+        record it signed while a member still verifies. Atomic; failure logged
+        and swallowed. Mirrors C _persist_roster."""
+        path = os.path.join(Configuration.get_cfg_dir(), self.ROSTER_FILE)
+        try:
+            try:
+                with open(path) as f:
+                    doc = json.load(f)
+                if not isinstance(doc, dict):
+                    doc = {}
+            except (OSError, ValueError):
+                doc = {}
+            members = doc.get('members')
+            if not isinstance(members, dict):
+                members = {}
+            ckpts = doc.get('checkpoints')
+            if not isinstance(ckpts, list):
+                ckpts = []
+            stamp = int(time.time())
+            for m in members.values():
+                if isinstance(m, dict):
+                    m['member'] = False
+            current = [self.identity] + self._roster_peers()
+            for ident in current:
+                uid = str(ident.uuid)
+                key = ident.signature.public.encode(
+                    encoder=HexEncoder).decode('ascii')
+                m = members.get(uid)
+                if not isinstance(m, dict) or m.get('pubkey', key) != key:
+                    # New, or a uuid whose key changed: a new identity.
+                    m = {'first_seen': stamp}
+                    members[uid] = m
+                # first_seen is the tenure clock's start when this node holds
+                # one for this key (doc/architecture/reputation.md, "Tenure"),
+                # so the file and the gate never disagree.
+                held_at = self._member_since.get(uid)
+                if held_at is not None and held_at[0] == key:
+                    m['first_seen'] = int(held_at[1])
+                m.update(pubkey=key, last_seen=stamp, member=True)
+                tier = self.peer_tiers.get(uid)
+                if tier is None:
+                    m.pop('tier', None)
+                else:
+                    m['tier'] = int(tier)
+            ckpt = self._checkpoints.get(chain_key)
+            if ckpt is not None:
+                gk = chain_key or ''
+                row = {'group_uuid': gk, 'epoch': int(ckpt.epoch),
+                       'root': _hex_str(ckpt.root),
+                       'first_index': int(ckpt.first_index),
+                       'count': int(ckpt.count)}
+                for i, c in enumerate(ckpts):
+                    if (isinstance(c, dict) and c.get('epoch') == row['epoch']
+                            and c.get('group_uuid') == gk):
+                        ckpts[i] = row
+                        break
+                else:
+                    ckpts.append(row)
+                del ckpts[:-self.ROSTER_CKPTS]
+            doc.update(schema='1', self=str(self.identity.uuid),
+                       group_uuid=str(self.group.uuid) if self.group else '',
+                       members=members, checkpoints=ckpts)
+            with atomic_write(path) as f:
+                json.dump(doc, f, indent=2)
+        except (OSError, IOError, ValueError, TypeError, AttributeError) as e:
+            self.logger.warning('Could not write %s: %s', self.ROSTER_FILE, e)
+
+    def _archive_path(self, task_id) -> str:
+        return os.path.join(Configuration.get_cfg_dir(), ATTESTED_DIR,
+                            '%s.json' % str(task_id))
+
+    def _archive_attested(self, chain_key: str = ''):
+        """Write a durable record (reputation.attested_record) for every
+        attested entry the chain's quorum-signed checkpoint now covers and
+        that has none yet. Once per entry, never rewritten: the record is the
+        lasting form of a finding the 200-entry window and the evidence file
+        both lose. Only under a checkpoint whose signatures meet the quorum in
+        OUR view, and with the keys WE hold, so a record says what this node
+        could verify. Failure is logged and swallowed, as for the evidence.
+        Mirrors C _archive_attested."""
+        try:
+            ckpt = self._checkpoints.get(chain_key)
+            if ckpt is None or not ckpt.count:
+                return
+            group = getattr(ckpt, 'group_uuid', '') or None
+            sigs = dict(self._checkpoint_sigs_final.get(chain_key, {}))
+            if not self._checkpoint_quorum_met(ckpt.designation, sigs, group):
+                return
+            hist = self._chain_for_key(chain_key)
+            # Only while our window reproduces the signed root: on a fork the
+            # quorum did not sign, a write-once record would carry a proof that
+            # never verifies. The next checkpoint after convergence archives.
+            mine = hist.range_root(ckpt.first_index, ckpt.count)
+            if mine is None or _hex_str(mine) != _hex_str(ckpt.root):
+                return
+            certs = getattr(hist, 'attest_certs', None) or {}
+            todo = [tx for tx in hist._indexed_window() if tx.attested
+                    and ckpt.first_index <= tx.index
+                    < ckpt.first_index + ckpt.count
+                    and not os.path.exists(self._archive_path(tx.task_id))]
+            if not todo:
+                return
+            os.makedirs(os.path.join(Configuration.get_cfg_dir(), ATTESTED_DIR),
+                        exist_ok=True)
+            doc = evidence_to_dict(hist, SignedCheckpoint(checkpoint=ckpt,
+                                                          sigs=sigs), certs)
+            ckpt_group_size = self._checkpoint_roster(group) + 1
+            for tx in todo:
+                voters = set(map(str, certs.get(tx.task_id, {}))) | set(sigs)
+                signers = {}
+                for voter in voters:
+                    ident = self._cosigner_identity(voter)
+                    if ident is not None:
+                        signers[voter] = ident.signature.public.encode(
+                            encoder=HexEncoder).decode('ascii')
+                # The group the certificate was made in: the roster in force
+                # at the entry's index when the chain logs one (AT §2.48), not
+                # today's, which a later join has grown (Stele red team
+                # rt-3765724, phase 7b). The live count before the genesis. Mirrors
+                # C.
+                in_force = hist.roster_at(tx.index)
+                group_size = (len(in_force.roster_members)
+                              if in_force is not None and in_force.roster_members
+                              else len(self._roster_peers()) + 1)
+                rec = attested_record(doc, tx.task_id, signers,
+                                      group_size, ckpt_group_size,
+                                      self._is_member(tx.subject_id))
+                if rec is None:
+                    continue
+                # The teammates this node left out of the quorum (§2.54).
+                # Informational: a reader verifies against its own roster.
+                mates = self._conflicted_members(tx.subject_id)
+                if mates:
+                    rec['excluded'] = mates
+                with atomic_write(self._archive_path(tx.task_id)) as f:
+                    json.dump(rec, f, indent=2)
+                self.logger.info('Archived attested entry %s (subject %s)',
+                                 str(tx.task_id)[:8], str(tx.subject_id)[:8])
+        except (OSError, IOError, ValueError, TypeError, KeyError) as e:
+            self.logger.warning('Could not archive attested entries: %s', e)
+
+    def _note_final(self, ckpt, sigs, chain_key):
+        """Record a primary checkpoint as FINAL once a quorum attests it.
+        Every caller of _store_checkpoint has verified the signatures it
+        passes (our own proposal carries one, ours), so their number is what
+        attests it. Mirrors C's _store_checkpoint."""
+        if chain_key or not ckpt.count:
+            return
+        if len(sigs or {}) > self._checkpoint_quorum(None):
+            self._finalized = ckpt
+
+    def _slash_marks_path(self):
+        """The file holding the per-(target, slasher) slash high-water marks."""
+        return os.path.join(Configuration.get_cfg_dir(),
+                            SLASH_MARKS_FILE + Configuration.file_ext)
+
+    def _persist_slash_marks(self):
+        """Write the slash high-water marks.
+
+        Unlike the chain evidence, this is NOT an optimization of trust: the
+        marks are what stop a superseded slash from being replayed into a
+        sticky exclusion, so losing them reopens that window. A write failure
+        is therefore logged at warning, not debug -- but it is still swallowed,
+        because the alternative is taking down the reputation process over a
+        full disk and leaving the node with no reputation at all.
+
+        Flat "target|slasher" keys: JSON has no tuple key, and the pair is
+        already two uuid strings.
+        """
+        try:
+            doc = {'%s|%s' % (t, s): int(e)
+                   for (t, s), e in self._slash_hw.items()}
+            with atomic_write(self._slash_marks_path()) as f:
+                json.dump(doc, f, indent=2)
+        except (OSError, IOError, ValueError, TypeError) as e:
+            self.logger.warning('Could not persist slash marks: %s', e)
+
+    def _load_slash_marks(self):
+        """Restore the marks and resume our own slash epoch past them.
+
+        A missing file is the cold-start case and not an error: the marks are
+        empty and the first slash from any slasher is accepted, which is the
+        behaviour a node with no history has to have. A CORRUPT file is
+        different -- it is refused loudly and left in place rather than being
+        silently treated as empty, because "no marks" is exactly the state an
+        attacker would want to induce.
+        """
+        path = self._slash_marks_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path) as f:
+                doc = json.load(f)
+            if not isinstance(doc, dict):
+                raise ValueError('not an object')
+            marks = {}
+            for flat, epoch in doc.items():
+                target, _, slasher = str(flat).partition('|')
+                if not target or not slasher:
+                    raise ValueError('malformed key %r' % flat)
+                marks[(target, slasher)] = int(epoch)
+        except (OSError, IOError, ValueError, TypeError) as e:
+            self.logger.error(
+                'Slash marks unreadable (%s); replay protection for slashes '
+                'starts from empty this boot', e)
+            return
+        self._slash_hw = marks
+        # Resume our own counter past anything we have already emitted, so our
+        # next slash clears the high-water marks our peers are holding for us.
+        # This is the same trap _rebuild_from_evidence documents for checkpoint
+        # epochs, and the reason the marks record our OWN slashes too.
+        me = str(self.identity.uuid)
+        mine = [e for (_, slasher), e in self._slash_hw.items() if slasher == me]
+        if mine:
+            self._slash_epoch = max(self._slash_epoch, max(mine))
+        self.logger.debug(
+            'Slash marks restored: %d pair(s), own epoch resumed at %d',
+            len(self._slash_hw), self._slash_epoch)
+
+    def _evidence_path(self, chain_key: str = ''):
+        """The evidence file for one chain.
+
+        One file per chain rather than one file holding every chain: it mirrors
+        the ``group_child_<name>.cfg.json`` convention already used for child
+        groups, keeps the primary file's shape byte-for-byte what it was, and
+        means a corrupt or stale child file costs that subtree its attestation
+        and nothing else."""
+        name = EVIDENCE_FILE
+        if chain_key:
+            name = '%s-%s' % (EVIDENCE_FILE, chain_key)
+        return os.path.join(Configuration.get_cfg_dir(),
+                            name + Configuration.file_ext)
+
+    def _persist_history(self, chain_key: str = ''):
+        """Write the evidence behind one chain: its resident hash-linked window
+        plus the quorum-signed checkpoint over it.
+
+        Failure is logged and swallowed. The evidence is an *optimization of
+        trust* -- its absence costs a warm start its elevated tiers (see
+        _rebuild_from_evidence) and nothing else -- so it must never be able to
+        take down the reputation process.
+        """
+        try:
+            ckpt = self._checkpoints.get(chain_key)
+            signed = None
+            if ckpt is not None:
+                signed = SignedCheckpoint(
+                    checkpoint=ckpt,
+                    sigs=dict(self._checkpoint_sigs_final.get(chain_key, {})))
+            hist = self._chain_for_key(chain_key)
+            doc = evidence_to_dict(hist, signed,
+                                   getattr(hist, 'attest_certs', None))
+            with atomic_write(self._evidence_path(chain_key)) as f:
+                json.dump(doc, f, indent=2)
+        except (OSError, IOError, ValueError, TypeError) as e:
+            self.logger.warning('Could not persist reputation evidence: %s', e)
+
+    def _checkpoint_phase(self) -> float:
+        """A per-node offset into the checkpoint interval, so members do not
+        all propose on the same tick.
+
+        Every member co-signs every proposal, so N nodes proposing together
+        cost N² messages in one burst; spread over the interval they cost the
+        same total at a fraction of the peak. Derived from our own uuid rather
+        than drawn randomly: the phase then survives a restart, which keeps a
+        restarted node from colliding with whichever node has drifted into its
+        slot."""
+        try:
+            seed = UUID(str(self.identity.uuid)).int
+        except (ValueError, AttributeError, TypeError):
+            return 0.0
+        return float(seed % max(1, int(self.CHECKPOINT_INTERVAL)))
+
+    def _maybe_checkpoint(self, queues, present):
+        """Originate a checkpoint over each of our committed windows, on the
+        interval, for every chain whose window has actually moved.
+
+        Two guards, both about not spending a group's bandwidth for nothing.
+        An empty window has nothing to attest. A window whose head has not
+        advanced since the last checkpoint is already attested -- re-signing
+        it produces a new epoch that commits to the same root, which no
+        verifier can use for anything the previous one could not.
+
+        A gateway runs this per chain, so an idle primary chain is skipped
+        while a busy child group is checkpointed, and each round is confined to
+        the group that can actually co-sign it."""
+        if self.CHECKPOINT_INTERVAL <= 0:
+            return
+        if self._next_checkpoint_at == 0.0:
+            self._next_checkpoint_at = present + self._checkpoint_phase()
+            return
+        if present < self._next_checkpoint_at:
+            return
+        self._next_checkpoint_at = present + self.CHECKPOINT_INTERVAL
+        for chain_key in self._chain_keys():
+            window = self._chain_for_key(chain_key)._indexed_window()
+            if not window:
+                continue
+            head = window[-1].index
+            last = self._last_checkpoint_heads.get(chain_key)
+            if last is not None and head <= last:
+                continue
+            self._last_checkpoint_heads[chain_key] = head
+            self._originate_checkpoint(queues, chain_key)
+
+    # ----- Verifiable warm start (doc/architecture/reputation.md) ------------------------
+
+    def _rebuild_from_evidence(self):
+        """At start-up, re-establish the committed history from the persisted
+        evidence and grade the restored reputations by whether that evidence
+        VERIFIES. Called last in ``__init__``: it needs the loaded snapshot,
+        the peer roster (to resolve co-signers) and the checkpoint state.
+
+        Three questions, in order, and every negative answer degrades to the
+        same safe outcome rather than raising:
+
+        1. Does the chain's hash-linkage hold? A broken link means the file
+           was altered or truncated.
+        2. Does the recomputed Merkle root over the checkpoint's window equal
+           the root the checkpoint commits to? This is what ties the entries
+           on disk to the thing that was signed.
+        3. Does a quorum of co-signatures over that checkpoint verify against
+           keys WE hold? Same test ``handle_checkpoint_final`` applies live,
+           for the same reason: without it the root is a number whoever wrote
+           the file chose.
+
+        Only if all three hold is the chain adopted and the persisted scores
+        allowed to stand. The chain is NOT loaded on failure, and that is the
+        load-bearing part: hash-linkage is computable by anyone (the digests
+        are public), so a self-consistent chain proves nothing on its own.
+        Loading one would let CTFT re-derive the very elevated scores the
+        clamp below exists to withhold -- the clamp would be decoration.
+        """
+        # Only the PRIMARY chain here. A gateway's child groups arrive later,
+        # over IPC (`ChildGroupSet` from IdentityProcess), so at __init__ time
+        # this node does not yet know which subtrees are its own — and reading a
+        # file for a group we may not gateway is exactly what
+        # _persisted_chain_keys refuses to do. The child chains are restored by
+        # _restore_child_evidence once the group set lands.
+        ceilings: dict = {}
+        self._rebuild_one_chain('', ceilings)
+        self._grade_restored_reputations(ceilings)
+
+    def _persisted_chain_keys(self):
+        """Child-group chain keys with evidence on disk.
+
+        Driven by ``child_groups`` rather than by globbing the directory: a file
+        naming a group we do not gateway is not ours to adopt, and reading only
+        what we are configured for keeps a stale file from resurrecting a
+        subtree we have left."""
+        return [group_uuid for group_uuid in self.child_groups
+                if os.path.exists(self._evidence_path(group_uuid))]
+
+    def _restore_child_evidence(self, queues):
+        """Restore a gateway's child-group chains once the group set has
+        arrived, one attempt per group (doc/architecture/gateway-reputation-tree.md).
+
+        This runs late by necessity -- ``child_groups`` is delivered over IPC
+        after ``__init__`` -- which shapes what it may do to a live score. It
+        only ever LIFTS, and never above what was persisted: a peer attested
+        solely in a child group was clamped at boot as uncovered, and this
+        returns it to what its subtree's evidence bears out. Lowering here
+        would be wrong twice over -- the peer may have earned standing in this
+        session since boot, and late-arriving evidence is not a reason to
+        discount it.
+        """
+        for chain_key in self._persisted_chain_keys():
+            if chain_key in self._child_evidence_tried:
+                continue
+            self._child_evidence_tried.add(chain_key)
+            ceilings: dict = {}
+            self._rebuild_one_chain(chain_key, ceilings)
+            for peer, ceiling in ceilings.items():
+                try:
+                    peer_uuid = UUID(peer)
+                except (ValueError, TypeError):
+                    continue
+                current = self.reputations.current.get(peer_uuid)
+                if current is None:
+                    continue
+                # Bounded by the persisted value we clamped away from, so this
+                # restores standing rather than inventing it.
+                lift = min(self._restore_clamped.get(peer, current), ceiling)
+                # doc/architecture/zta-integration.md: child-group evidence can restore standing, but not
+                # past what ZTA proved about the peer holding it. Evidence that
+                # a peer behaved well is not evidence it is who it claims.
+                lift = self._apply_standing_ceiling(peer_uuid, lift)
+                if lift <= current:
+                    continue
+                self.reputations.current[peer_uuid] = lift
+                self.logger.info(
+                    'Warm start: child-group evidence lifted %s %.3f -> %.3f',
+                    peer[:8], current, lift)
+                self._publish_tier_change(queues, peer_uuid, lift)
+                self._publish_reputation_change(queues, peer_uuid, lift)
+
+    def _rebuild_one_chain(self, chain_key: str, ceilings: dict) -> None:
+        """Verify and (only then) adopt one chain's persisted evidence, folding
+        its per-peer ceilings into ``ceilings``.
+
+        Where two attested windows bound the same peer, the HIGHER bound wins.
+        Both are quorum-attested statements about that peer, and the restored
+        score is a single scalar: letting one group's thin window suppress
+        standing another group's quorum actually witnessed would penalize the
+        peer for our topology rather than for its behaviour."""
+        try:
+            with open(self._evidence_path(chain_key)) as f:
+                doc = json.load(f)
+        except (OSError, IOError):
+            # No evidence on disk: a cold start, or a warm start from a
+            # snapshot written before checkpointing ever ran. Persisted
+            # scores are unattested, so they are clamped.
+            return
+        except ValueError as e:
+            self.logger.warning('Reputation evidence is not valid JSON: %s', e)
+            return
+        try:
+            chain, signed = evidence_from_dict(doc)
+        except (ValueError, KeyError, TypeError) as e:
+            self.logger.warning('Unusable reputation evidence: %s', e)
+            return
+        # A file must cover the chain it is named for. A child document
+        # claiming the primary chain (or another group's) would otherwise be
+        # adopted as that chain's history on the strength of signatures made
+        # over different bytes.
+        ckpt = getattr(signed, 'checkpoint', None)
+        if ckpt is not None and \
+                self._chain_key(getattr(ckpt, 'group_uuid', '')) != chain_key:
+            self.logger.warning(
+                'Reputation evidence for chain %s names chain %s; refusing it',
+                chain_key[:8] or 'primary',
+                str(getattr(ckpt, 'group_uuid', ''))[:8] or 'primary')
+            return
+        found = self._attested_ceilings(chain, signed)
+        if found is None:
+            return
+        # Verified: adopt the chain, and with it the checkpoint that attests
+        # it, so this node resumes with a history a peer can audit and an
+        # anchor slash evidence can be measured against.
+        restored = TransactionHistory(_chain=chain)
+        # Attested entries keep their quorum certificates across a restart:
+        # without them a peer catching up from us could not check the round.
+        resident = {tx.task_id for tx in chain if tx.attested}
+        restored.attest_certs = {k: v for k, v in
+                                 evidence_attest_certs(doc).items()
+                                 if k in resident}
+        for tx in chain:
+            if tx.attested and tx.task_id in restored.attest_certs:
+                tx.attest_sigs = dict(restored.attest_certs[tx.task_id])
+        # A child chain is restored late, so its pool may already hold halves
+        # (or what reputation-pool restored); they wait on this chain now.
+        previous = (self.child_histories.get(chain_key) if chain_key
+                    else self.history)
+        if previous is not None and previous.pooled_count():
+            restored.pool_from_dict(previous.pool_to_dict())
+        if chain_key:
+            self.child_histories[chain_key] = restored
+        else:
+            self.history = restored
+        self._checkpoints[chain_key] = ckpt
+        self._checkpoint_sigs_final[chain_key] = dict(signed.sigs or {})
+        self._checkpoint_seen[ckpt.key()] = None
+        if not chain_key:
+            self._finalized = ckpt    # the rebuild verified its quorum
+        # Resume our own epoch counter past the persisted checkpoint. Peers
+        # dedup on (proposer, epoch, chain) and their rings are NOT reset by
+        # our restart, so a restarted proposer that began again at epoch 1
+        # would have its first several proposals discarded as re-broadcasts.
+        if str(ckpt.proposer_uuid) == str(self.identity.uuid):
+            self._checkpoint_epochs[chain_key] = max(
+                self._checkpoint_epochs.get(chain_key, 0), int(ckpt.epoch))
+        for peer, ceiling in found.items():
+            if ceiling > ceilings.get(peer, -1.0):
+                ceilings[peer] = ceiling
+        self.logger.info(
+            'Reputation warm start VERIFIED: chain=%s, %d committed entries, '
+            'checkpoint epoch=%d, %d evidence-backed peer(s)',
+            chain_key[:8] or 'primary', len(chain), int(ckpt.epoch),
+            len(found))
+
+    def _attested_ceilings(self, chain, signed):
+        """The per-peer score ceilings the persisted evidence supports (see
+        ``_evidence_ceilings``), or None if the evidence does not verify.
+
+        None and an empty mapping are deliberately distinct: None means "no
+        usable evidence", so nothing may be adopted, whereas an empty mapping
+        means the evidence verified but bounds no peer -- a genuine empty
+        window -- which lets the chain be adopted while every score still
+        restores clamped."""
+        if not TransactionHistory.verify_chain_links(chain):
+            self.logger.warning(
+                'Reputation evidence chain failed hash-link verification; '
+                'discarding it and restoring at tier %d',
+                self.UNVERIFIED_RESTORE_TIER)
+            return None
+        ckpt = getattr(signed, 'checkpoint', None)
+        if ckpt is None:
+            self.logger.info(
+                'Reputation evidence carries no checkpoint; restoring at '
+                'tier %d', self.UNVERIFIED_RESTORE_TIER)
+            return None
+        window = self._checkpoint_window(chain, ckpt)
+        if window is None:
+            self.logger.warning(
+                'Reputation evidence does not cover checkpoint window '
+                '[%d, %d); restoring at tier %d', int(ckpt.first_index),
+                int(ckpt.first_index) + int(ckpt.count),
+                self.UNVERIFIED_RESTORE_TIER)
+            return None
+        recomputed = TransactionHistory._mth([tx.entry_hash() for tx in window])
+        expected = ckpt.root if ckpt.root else b''
+        if isinstance(expected, str):
+            expected = expected.encode('ascii')
+        if recomputed != expected:
+            self.logger.warning(
+                'Reputation evidence root mismatch (checkpoint commits to '
+                '%s, entries hash to %s); restoring at tier %d',
+                expected[:12].decode('ascii', 'replace'),
+                recomputed[:12].decode('ascii', 'replace'),
+                self.UNVERIFIED_RESTORE_TIER)
+            return None
+        # The quorum bar is sized against OUR OWN roster, exactly as on the
+        # live path, so whoever wrote the file cannot also set the bar it has
+        # to clear. A roster we have not yet loaded resolves no co-signers,
+        # which fails closed: the warm start is capped, not forged.
+        if not self._checkpoint_quorum_met(ckpt.designation, signed.sigs):
+            self.logger.warning(
+                'Reputation evidence checkpoint epoch=%s has %d verified '
+                'co-signature(s), short of quorum; restoring at tier %d',
+                str(ckpt.epoch),
+                len(self._verified_cosigners(ckpt.designation, signed.sigs)),
+                self.UNVERIFIED_RESTORE_TIER)
+            return None
+        return self._evidence_ceilings(window)
+
+    def _evidence_ceilings(self, window) -> dict:
+        """Per-peer upper bound on a restored score, derived from the attested
+        window and NOTHING else: ``{peer-uuid-str: ceiling}``.
+
+        Appearing in an attested window is not the same as having earned a
+        number. Verifying only presence leaves the original hole open -- a
+        score hand-raised in `reputation.cfg.json` would still be restored in
+        full, because the peer really does transact. So the evidence has to
+        bound the value, not merely vouch for the peer.
+
+        The bound is the mean of the counterparty-side scores the window
+        records for the peer, shrunk toward PREREP_NEUTRAL by a pseudo-count
+        (the ``_prereputation_prior`` idiom). Shrinkage is what makes a SHORT
+        attested history unable to justify a high restored score: two
+        transactions at 0.9 are two data points, not a track record, and
+        without the pseudo-count they would license the same standing as two
+        hundred.
+
+        Deliberately independent of ``self.reputations`` and of any running
+        EMA. Deriving the bound from state the persisted file feeds would be
+        circular -- the file would end up vouching for itself, which is the
+        one thing this must not do.
+        """
+        self_uuid = str(self.identity.uuid)
+        totals: dict = {}
+        counts: dict = {}
+        for tx in window:
+            if tx.attested:
+                # About its subject only, as in _fold_tx_for_peer. Its quorum
+                # certificate stands in for the counterparty's agreement.
+                pairs = ((tx.subject_id, tx.p1_score),)
+            elif len(tx) < 2:
+                continue  # not bilateral: no counterparty agreed to it
+            else:
+                # A peer's score in a tx is the COUNTERPARTY's side of it, as
+                # in _fold_tx_for_peer: p1's standing is what p2 scored it.
+                pairs = ((tx.p1_id, tx.p2_score), (tx.p2_id, tx.p1_score))
+            for peer, score in pairs:
+                key = str(peer)
+                if key == self_uuid or score is None:
+                    continue
+                totals[key] = totals.get(key, 0.0) + float(score)
+                counts[key] = counts.get(key, 0) + 1
+        ceilings = {}
+        k = self.RESTORE_SHRINKAGE_K
+        neutral = self.PREREP_NEUTRAL
+        for key, n in counts.items():
+            if n < self.RESTORE_EVIDENCE_MIN_TX:
+                continue
+            observed = totals[key] / n
+            ceilings[key] = min(1.0, max(0.0,
+                                         (n * observed + k * neutral) / (n + k)))
+        return ceilings
+
+    @staticmethod
+    def _checkpoint_window(chain, ckpt):
+        """The ``chain`` slice the checkpoint commits to, or None when the
+        chain cannot produce it.
+
+        A persisted chain may legitimately run PAST its checkpoint (commits
+        land after the checkpoint finalizes and the file is rewritten on the
+        co-signature upgrade), so the window is selected by absolute index
+        rather than taken as the whole chain. It may not fall SHORT: a
+        missing entry means the root cannot be reproduced, so demand exactly
+        ``count`` contiguous entries."""
+        first = int(ckpt.first_index)
+        count = int(ckpt.count)
+        if count < 0:
+            return None
+        window = [tx for tx in chain
+                  if tx.index is not None and first <= tx.index < first + count]
+        if len(window) != count:
+            return None
+        return window
+
+    def _grade_restored_reputations(self, ceilings):
+        """Clamp each restored score to what the evidence supports for that
+        peer: its ``_evidence_ceilings`` entry, or -- for a peer the evidence
+        does not cover at all -- the ``UNVERIFIED_RESTORE_TIER`` ceiling.
+
+        Self is never clamped (our own score is not a peer judgement).
+        Clamping is one-directional -- a score already at or below its ceiling
+        is untouched -- so this can only withhold standing, never confer it.
+        It composes with staleness decay: decay is the time-out-of-contact
+        axis, this is the "nothing here shows you earned that" axis.
+
+        There is no separate release step. The clamped value is where the peer
+        resumes climbing, so fresh in-session transactions re-earn the
+        elevated tier through the ordinary scoring path."""
+        unattested = self._tier_ceiling(self.UNVERIFIED_RESTORE_TIER)
+        self_uuid = str(self.identity.uuid)
+        clamped = []
+        for peer_uuid in list(self.reputations.current.keys()):
+            key = str(peer_uuid)
+            if key == self_uuid:
+                continue
+            ceiling = ceilings.get(key, unattested)
+            score = self.reputations.current.get(peer_uuid)
+            if score is None or score <= ceiling:
+                continue
+            self.reputations.current[peer_uuid] = ceiling
+            self._restore_clamped[key] = score
+            clamped.append((key, score, ceiling))
+        if clamped:
+            self.logger.info(
+                'Warm start: clamped %d peer score(s) to what the evidence '
+                'supports (%s)', len(clamped),
+                ', '.join('%s %.3f->%.3f' % (k[:8], s, c)
+                          for k, s, c in clamped[:8]))
+
+    COSIGNS_PARKED_MAX = 16
+
+    def _range_matches(self, chain_key, proposed, first_index, count) -> bool:
+        """Do the entries we hold at [first_index, first_index + count) hash to
+        ``proposed``? The range, not our whole window (ISSUES §2.29): the chain
+        grows every second or two and each member proposes on its own phase,
+        so on arrival a signer has often committed one entry more or fewer.
+        An empty range keeps the whole-window rule. Mirrors C
+        _range_matches_locked."""
+        chain = self._chain_for_key(chain_key)
+        if count > 0:
+            mine = chain.range_root(int(first_index), int(count))
+            return mine is not None and mine == proposed
+        return chain.window_root() == proposed
+
+    def _park_cosign(self, ckpt, proposer, present) -> None:
+        """Keep a proposal we could not co-sign on arrival. One slot per
+        proposer and chain; a late copy of an older epoch is ignored; when
+        every slot holds a different proposer the oldest goes. Mirrors C
+        _park_cosign_locked."""
+        slot = (str(ckpt.proposer_uuid), str(getattr(ckpt, 'group_uuid', '') or ''))
+        held = self._cosigns_parked.get(slot)
+        if held is not None and held[0].epoch > ckpt.epoch:
+            return
+        if held is None and len(self._cosigns_parked) >= self.COSIGNS_PARKED_MAX:
+            oldest = min(self._cosigns_parked,
+                         key=lambda k: self._cosigns_parked[k][2])
+            del self._cosigns_parked[oldest]
+        self._cosigns_parked[slot] = (ckpt, proposer, present)
+
+    def _send_cosign(self, queues, ckpt, proposer) -> bool:
+        """Sign ``ckpt``'s designation and send checkpoint_sign to the
+        proposer. Shared by the propose handler and the parked re-check, which
+        must produce identical acks."""
+        try:
+            sig = self._detached_sig(self.identity, ckpt.designation)
+        except Exception:
+            self.logger.error(
+                'handle_checkpoint_propose: cannot sign; '
+                'declining to co-sign')
+            return False
+        key_proposer, epoch, group = ckpt.key()
+        # The ack carries the chain too: the proposer needs it to find the
+        # right pending round, and it is inside the bytes we just signed.
+        # Length-tolerant on the far side, so a 4-tuple from an older peer
+        # still resolves to the primary chain.
+        ack = (key_proposer, epoch, str(self.identity.uuid), sig, group)
+        try:
+            msg = Message(self.name, ReputationProtocol.checkpoint_sign,
+                          to_json_string(ack), proposer,
+                          from_whom=self.identity)
+            queues[CfgIds.network].put(
+                msg, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('handle_checkpoint_propose: queue full')
+            return False
+        return True
+
+    def _recheck_parked_cosigns(self, queues, present) -> int:
+        """Co-sign every parked proposal whose range our chain now holds with
+        the proposed root; drop those parked longer than one checkpoint
+        interval, by which time the proposer has moved to a new epoch
+        (ISSUES §2.29). Returns how many were co-signed. Mirrors C
+        _recheck_parked_cosigns."""
+        signed = 0
+        for slot, (ckpt, proposer, parked_at) in list(self._cosigns_parked.items()):
+            if present - parked_at > self.CHECKPOINT_INTERVAL:
+                del self._cosigns_parked[slot]
+                continue
+            proposed = ckpt.root
+            if isinstance(proposed, str):
+                proposed = proposed.encode()
+            chain_key = self._chain_key(getattr(ckpt, 'group_uuid', ''))
+            if not self._range_matches(chain_key, proposed, ckpt.first_index,
+                                       ckpt.count):
+                continue
+            del self._cosigns_parked[slot]
+            self.logger.info(
+                'caught up to %s checkpoint epoch %d after %.1f s; '
+                'co-signing it now', str(ckpt.proposer_uuid)[:8], ckpt.epoch,
+                present - parked_at)
+            if self._send_cosign(queues, ckpt, proposer):
+                signed += 1
+        return signed
 
     def handle_checkpoint_propose(self, queues, message):
         if message.function == ReputationProtocol.checkpoint_propose:
@@ -1264,32 +3491,30 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             # Don't co-sign our own bounce-back.
             if str(ckpt.proposer_uuid) == str(self.identity.uuid):
                 return True
-            # Consensus check: co-sign ONLY if our own committed window
-            # produces the SAME Merkle root. A divergent window declines
-            # silently (no signature), so a checkpoint finalizes only when a
-            # quorum genuinely observed the same committed history.
+            # Consensus check: co-sign ONLY if the entries WE hold at the
+            # proposed indices produce the SAME Merkle root. A signer that is
+            # ahead of the proposer still holds that range; one that is behind
+            # parks the proposal and signs once it catches up (ISSUES §2.29).
+            # A divergent range never signs, so a checkpoint finalizes only
+            # when a quorum genuinely observed the same committed history.
             proposed = ckpt.root
             if isinstance(proposed, str):
                 proposed = proposed.encode()
-            mine = self.history.window_root()
-            if mine != proposed:
+            # Compare against the chain the proposal NAMES, not always our
+            # primary one: a gateway holds several, and comparing the wrong
+            # window would decline every honest child-group proposal (and, in
+            # the degenerate case where two chains share a root, accept one
+            # that says nothing about the chain it claims to cover).
+            chain_key = self._chain_key(getattr(ckpt, 'group_uuid', ''))
+            if not self._range_matches(chain_key, proposed, ckpt.first_index,
+                                       ckpt.count):
                 self.logger.debug(
-                    'checkpoint_propose: window_root mismatch, declining')
+                    'checkpoint_propose: range [%d, +%d) does not match our '
+                    'chain %s yet; parked', ckpt.first_index, ckpt.count,
+                    chain_key[:8] or 'primary')
+                self._park_cosign(ckpt, message.from_whom, now().timestamp())
                 return True
-            try:
-                sig = self.identity.sign(ckpt.designation)
-            except Exception:
-                sig = None
-            proposer, epoch = ckpt.key()
-            ack = (proposer, epoch, str(self.identity.uuid), sig)
-            try:
-                msg = Message(self.name, ReputationProtocol.checkpoint_sign,
-                              to_json_string(ack), message.from_whom,
-                              from_whom=self.identity)
-                queues[CfgIds.network].put(
-                    msg, block=True, timeout=self.q_cadence)
-            except Full:
-                self.logger.error('handle_checkpoint_propose: queue full')
+            self._send_cosign(queues, ckpt, message.from_whom)
             return True
         return False
 
@@ -1300,15 +3525,35 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             payload = message.obj
             if isinstance(payload, str):
                 payload = from_json_string(payload)
-            proposer, epoch, voter, _sig = payload
-            key = (str(proposer), int(epoch))
+            # Length-tolerant: a 5th element names the chain (see the ack built
+            # in handle_checkpoint_propose); a 4-tuple is the primary chain.
+            proposer, epoch, claimed, sig = payload[0], payload[1], payload[2], payload[3]
+            group = str(payload[4]) if len(payload) > 4 and payload[4] else ''
+            key = (str(proposer), int(epoch), group)
             ckpt = self._checkpoint_pending.get(key)
             if ckpt is None:
                 return True  # not our round, or already finalized
-            self._checkpoint_sigs.setdefault(key, set()).add(str(voter))
-            grp_uuid = str(self.group.uuid) if self.group is not None else None
+            voter = self._attributed_voter(message, claimed, 'checkpoint_sign')
+            if voter is None:
+                return True
+            if not self._verify_cosignature(ckpt.designation, voter, sig):
+                self.logger.warning(
+                    'handle_checkpoint_sign: co-signature from %s failed '
+                    'verification; not counted', voter[:8])
+                return True
+            self._checkpoint_sigs.setdefault(key, {})[voter] = sig
+            # Quorum is sized by the group whose chain this is: a child-group
+            # checkpoint must clear that group's majority, not the conflated
+            # roster a gateway sees across every group it belongs to.
+            grp_uuid = group or (str(self.group.uuid)
+                                 if self.group is not None else None)
             if len(self._checkpoint_sigs[key]) > self._checkpoint_quorum(grp_uuid):
-                signed = SignedCheckpoint(checkpoint=ckpt, sigs={})
+                signed = SignedCheckpoint(
+                    checkpoint=ckpt, sigs=dict(self._checkpoint_sigs[key]))
+                # Upgrade our own stored copy from the lone self-signature to
+                # the quorum map, so the evidence we persist is attested by the
+                # group rather than only by us.
+                self._store_checkpoint(ckpt, signed.sigs)
                 try:
                     msg = Message(
                         self.name, ReputationProtocol.checkpoint_final,
@@ -1318,8 +3563,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     queues[CfgIds.network].put(
                         msg, block=True, timeout=self.q_cadence)
                     self.logger.info(
-                        'Checkpoint finalized & broadcast: epoch=%d signers=%d',
-                        ckpt.epoch, len(self._checkpoint_sigs[key]))
+                        'Checkpoint finalized & broadcast: chain=%s epoch=%d '
+                        'signers=%d', group[:8] or 'primary', ckpt.epoch,
+                        len(self._checkpoint_sigs[key]))
                 except Full:
                     self.logger.error(
                         'handle_checkpoint_sign: queue full broadcasting final')
@@ -1328,7 +3574,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             return True
         return False
 
-    def handle_checkpoint_final(self, _, message):
+    def handle_checkpoint_final(self, queues, message):
         if message.function == ReputationProtocol.checkpoint_final:
             if not message.verified:
                 self.logger.warning(
@@ -1343,32 +3589,335 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             # The proposer already self-stored; skip the bounce-back.
             if str(ckpt.proposer_uuid) == str(self.identity.uuid):
                 return True
-            # Phase 3 will verify signed.sigs against known member identities;
-            # for now trust the transport-verified finalizer.
-            self._store_checkpoint(ckpt)
+            # Verify the retained co-signatures against member identities we
+            # hold. This root is the anchor _verify_slash_evidence measures
+            # slash evidence against, precisely so the root is "not chosen by
+            # the accuser" -- which only holds if a quorum is checked here. A
+            # checkpoint_final without verifiable co-signatures is refused.
+            sigs = getattr(signed, 'sigs', None)
+            # Sized against the group whose chain this covers, for the same
+            # reason the propose handler compares that chain's own root.
+            group = self._chain_key(getattr(ckpt, 'group_uuid', ''))
+            if not self._checkpoint_quorum_met(ckpt.designation, sigs,
+                                               group or None):
+                self.logger.warning(
+                    'Rejecting checkpoint_final chain=%s epoch=%s from %s: %d '
+                    'verified co-signature(s) do not meet quorum',
+                    group[:8] or 'primary', str(ckpt.epoch),
+                    str(ckpt.proposer_uuid)[:8],
+                    len(self._verified_cosigners(ckpt.designation, sigs)))
+                return True
+            self._store_checkpoint(ckpt, sigs)
+            # Outvoted: ask the finalizer for its chain from the window's
+            # start, which handle_update then adopts. Without this an order
+            # fork at EQUAL length never reconciles: catch-up runs only when a
+            # grant finds the lengths differ (moderation cohort mod-2537396,
+            # mod-2538837). Mirrors C.
+            if not group and self._outvoted() is not None:
+                self.logger.info(
+                    'Our chain does not reproduce checkpoint epoch=%s; '
+                    'requesting the finalizer\'s chain', str(ckpt.epoch))
+                try:
+                    queues[CfgIds.network].put(
+                        Message(self.name, ReputationProtocol.outdated,
+                                str(int(ckpt.first_index)),
+                                message.from_whom, from_whom=self.identity),
+                        block=True, timeout=self.q_cadence)
+                except Full:
+                    self.logger.error(
+                        'handle_checkpoint_final: network queue full; the '
+                        'next checkpoint will ask again')
             return True
         return False
 
     def handle_outdated(self, queues, message):
         if message.function == ReputationProtocol.outdated:
             try:
-                length = message.obj
-                if isinstance(length, bytes):
-                    length = length.decode(encoding)
-                index = int(length)
-                chain = to_json_string(self.history.era(index))
+                req = message.obj
+                if isinstance(req, bytes):
+                    req = req.decode(encoding)
+                # Bare length: the primary chain. An object names the chain's
+                # group, so a gateway's child chain can be caught up too.
+                group = ''
+                try:
+                    parsed = json.loads(req)
+                except (TypeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    int(parsed.get('from', 0))
+                    group = str(parsed.get('group') or '')
+                else:
+                    int(req)
+                key = self._chain_key(group)
+                if group and not key:
+                    return True         # not a chain we keep
+                # The whole resident window, as C sends, whatever length the
+                # requester reports: an equal-length requester on a fork got
+                # an empty slice and never reconciled (ISSUES §2.51).
+                hist = self._chain_for_key(key)
+                era = hist.era(0)
+                budget = getattr(self, 'update_page_bytes', UPDATE_PAGE_BYTES)
+                if len(to_json_string(era)) > budget:
+                    self._send_update_pages(queues, message.from_whom, key,
+                                            hist, era, budget)
+                    return True
+                chain = (to_json_string({'group': key, 'chain': era}) if key
+                         else to_json_string(era))
                 msg = Message(self.name, ReputationProtocol.update, chain,
                               message.from_whom, from_whom=self.identity)
                 queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                 self.logger.debug('Sent update')
             except Full:
                 self.logger.error('handle_outdated: Network queue full')
+            except (TypeError, ValueError):
+                self.logger.debug('handle_outdated: malformed request')
             return True
         return False
 
+    def _placement_certified_indices(self, hist, seg, group):
+        """The indices of `seg` whose placement certificates verify, each
+        against the roster in force for its instance (doc/architecture/
+        reputation.md, "Who is in the group") -- the latest roster entry below
+        it, ours or the segment's; a genesis, by every member it lists; with
+        no roster, nothing. None when a certificate over entries the segment
+        carries in full does not verify: that segment is refused whole. A
+        placement the segment carries only in part, and we cannot complete
+        from our own entries (or complete differently), is just
+        uncertified."""
+        out = set()
+        have = {t.index for t in seg if getattr(t, 'index', None) is not None}
+        seg_rosters = sorted((t for t in seg if getattr(t, 'is_roster', False)
+                              and t.index is not None), key=lambda t: t.index)
+        anchor = None
+        if hist.latest_roster() is None and seg_rosters:
+            # We know no roster of this chain (a newcomer, or a node far
+            # behind): anchor on the segment's latest one, judged against the
+            # group as identity shows it to us. What precedes it is taken by
+            # its hash links; what follows, by the rosters it leads to.
+            anchor = seg_rosters[-1]
+            if not self._roster_anchor_ok(anchor, group or ''):
+                return None
+            out = {i for i in have if i <= anchor.index}
+        for k, entries, sigs in hist.placement_batches(seg):
+            if anchor is not None and k <= anchor.index:
+                continue
+            whole = entries is not None and all(
+                i in have for i in range(k, k + len(entries)))
+            if entries is None:
+                continue
+            roster = hist.roster_at(k)
+            for r in seg_rosters:
+                if r.index < k and (roster is None or r.index > roster.index):
+                    roster = r
+            digest = place_value_digest(entries, k)
+            desig = place_designation(k, entries[0].prev_hash or b'', digest)
+            genesis = self._genesis_of(entries)
+            if roster is None and genesis is not None:
+                # A genesis is decided by every member it lists.
+                roster = genesis
+                need = len(genesis.roster_members or ())
+            elif roster is not None:
+                need = len(roster.roster_members or ()) // 2 + 1
+            else:
+                need = None             # nothing but a genesis before a roster
+            if need is not None and \
+                    len(self._verified_cosigners(desig, sigs, roster)) >= need:
+                out.update(range(k, k + len(entries)))
+            elif whole:
+                return None
+        return out
+
+    def _roster_anchor_ok(self, r, key) -> bool:
+        """May a node that knows no roster of chain `key` take the segment's
+        latest roster entry `r` as the group's? (doc/architecture/
+        reputation.md, "Who is in the group".) It must differ from the group
+        as identity shows it to us by at most one member (perhaps ourselves),
+        list the same keys for the members both know, and carry a placement
+        certificate signed by a majority of the roster before it, counting
+        only members we know and verifying their signatures with the keys
+        identity holds. A history invented by an insider fails one of these:
+        it cannot make the members we know sign its last roster change."""
+        live = dict(map(tuple, self._live_roster(key)))
+        members = dict(map(tuple, r.roster_members or ()))
+        if not members or len(set(live) ^ set(members)) > 1:
+            return False
+        if any(live[u] != members[u] for u in set(live) & set(members)):
+            return False
+        before = dict(members)
+        if r.roster_op == 'add' and r.roster_uuid is not None:
+            before.pop(str(r.roster_uuid).lower(), None)
+        if not getattr(r, 'place_sigs', None) or r.place_from != r.index:
+            return False
+        entries = [placement_entry(r)]
+        desig = place_designation(r.index, r.prev_hash or b'',
+                                  place_value_digest(entries, r.index))
+        signers = {u for u in self._verified_cosigners(desig, r.place_sigs, None)
+                   if u in before and u in live}
+        return len(signers) >= len(before) // 2 + 1
+
+    def _reconcile_into(self, queues, key, seg, who, message=None,
+                        final_end=None, attested=None) -> 'ReconcileResult | None':
+        """Reconcile one chain with a peer's verified segment and act on the
+        result. The segment's placement certificates decide
+        (TransactionHistory.reconcile, rules 6-9)."""
+        hist = self._chain_for_key(key)
+        group = key or None
+        certified = self._placement_certified_indices(hist, seg, group)
+        if certified is None:
+            self.logger.warning(
+                'Rejecting chain from %s: a placement certificate does '
+                'not meet our quorum', who)
+            return None
+        before = len(hist)
+        res = hist.reconcile(seg, final_end, attested, certified)
+        after = len(hist)
+        if res.status == ReconcileResult.ADOPTED:
+            self.logger.info(
+                'adopted chain from %s at index %d: dropped %d, added '
+                '%d (ours %d -> theirs %d)', who, res.fork,
+                len(res.dropped), len(res.added), before, after)
+        elif res.status == ReconcileResult.EXTENDED:
+            self.logger.info('caught up from %s: chain %d -> %d',
+                             who, before, after)
+        elif res.status == ReconcileResult.REFUSED_FINAL:
+            self.logger.warning(
+                'chain from %s forks at index %d, inside our finalized '
+                'checkpoint (ends %d); keeping ours', who, res.fork,
+                final_end)
+        elif res.status == ReconcileResult.EQUIVOCATION:
+            self.logger.error(
+                'chain from %s holds a certified placement at index %d '
+                'that differs from ours: two quorums signed two values '
+                'there; keeping ours', who, res.fork)
+        for tx in res.added + res.dropped:
+            for peer in (tx.p1_id, tx.p2_id):
+                if peer is not None:
+                    self._note_interaction(peer)
+        if res.status in (ReconcileResult.ADOPTED, ReconcileResult.EXTENDED):
+            # Placements buffered ahead of the chain may now follow it.
+            self._apply_ahead(key, hist, group)
+        if res.status == ReconcileResult.ADOPTED and res.pooled:
+            self.logger.info('returned %d dropped entr%s to the pool',
+                             res.pooled, 'y' if res.pooled == 1 else 'ies')
+        # A chain that grew from a peer means a quorum may be back:
+        # the minority side of a heal arrives here EXTENDED (§2.60).
+        if not key and res.status in (ReconcileResult.ADOPTED,
+                                      ReconcileResult.EXTENDED):
+            self._wake_parked(who)
+        return res
+
+    def _send_update_pages(self, queues, to_whom, key, hist, era, budget):
+        """Send `era` (the whole window of chain `key`) to `to_whom` as pages
+        whose entries each serialize to at most `budget` bytes, every page
+        naming the chain's head so the receiver puts together one window, not
+        pieces of two. A single entry larger than the budget gets a page
+        alone. Mirrors C _send_update_pages."""
+        starts, used = [], 0
+        for i, entry in enumerate(era):
+            size = len(to_json_string(entry)) + 1
+            if not starts or (used > 0 and used + size > budget):
+                if len(starts) == UPDATE_PAGES_MAX:
+                    self.logger.error('chain of %d entries needs more than %d '
+                                      'pages; not sent', len(era), UPDATE_PAGES_MAX)
+                    return
+                starts.append(i)
+                used = 0
+            used += size
+        starts.append(len(era))
+        pages = len(starts) - 1
+        head = hist._head_hash
+        head = head.decode() if isinstance(head, bytes) else str(head or '')
+        self.logger.info('sending our chain to %s in %d pages (%d entries)',
+                         getattr(to_whom, 'nickname', '?'), pages, len(era))
+        for p in range(pages):
+            page = {'page': p, 'of': pages, 'head': head,
+                    'chain': era[starts[p]:starts[p + 1]]}
+            if key:
+                page['group'] = key
+            msg = Message(self.name, ReputationProtocol.update,
+                          to_json_string(page), to_whom, from_whom=self.identity)
+            queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+
+    def _assemble_update_pages(self, message, reported):
+        """A `latest update` that is one page of a window (_send_update_pages):
+        keep it, and once every page of that head from that sender is in,
+        return the window as an unpaged reply carries it (a list, or
+        {'group', 'chain'} for a child chain). An unpaged reply comes back
+        unchanged; None while pages are missing or for a malformed page.
+        Mirrors C _assemble_update_pages."""
+        if not isinstance(reported, dict) or 'page' not in reported:
+            return reported
+        page, of = reported.get('page'), reported.get('of')
+        head, chunk = reported.get('head'), reported.get('chain')
+        group = reported.get('group')
+        if not isinstance(page, int) or not isinstance(of, int) \
+                or not isinstance(head, str) or not isinstance(chunk, list) \
+                or not 1 <= of <= UPDATE_PAGES_MAX or not 0 <= page < of:
+            self.logger.warning('malformed chain page from %s; dropped',
+                                message.from_whom.nickname)
+            return None
+        if not hasattr(self, 'page_bufs'):
+            self.page_bufs, self._page_seq = {}, 0
+        slot = (str(message.from_whom.uuid), group or '')
+        buf = self.page_bufs.get(slot)
+        # A new head or page count means the sender's window moved on.
+        if buf is None or buf['head'] != head or buf['of'] != of:
+            if buf is None and len(self.page_bufs) >= UPDATE_PAGE_BUFS:
+                oldest = min(self.page_bufs,
+                             key=lambda k: self.page_bufs[k]['seq'])
+                del self.page_bufs[oldest]
+            self._page_seq += 1
+            buf = {'head': head, 'of': of, 'pages': {}, 'seq': self._page_seq}
+            self.page_bufs[slot] = buf
+        buf['pages'].setdefault(page, chunk)
+        got = len(buf['pages'])
+        if got < of:
+            self.logger.debug('chain page %d of %d from %s; %d in', page + 1,
+                              of, message.from_whom.nickname, got)
+            return None
+        del self.page_bufs[slot]
+        whole = [e for p in range(of) for e in buf['pages'][p]]
+        self.logger.info('all %d pages of %s\'s chain are in (%d entries)', of,
+                         message.from_whom.nickname, len(whole))
+        return {'group': group, 'chain': whole} if group else whole
+
     def handle_update(self, queues, message):
         if message.function == ReputationProtocol.update:
-            self.updates[message.from_whom.uuid] = from_json_string(message.obj)
+            who = message.from_whom.nickname
+            reported = from_json_string(message.obj)
+            # A paged window waits here until every page is in.
+            reported = self._assemble_update_pages(message, reported)
+            if reported is None:
+                return True
+            if isinstance(reported, dict):
+                # A child chain's update: always applied directly, as the
+                # quorum of one is (the vote below is the primary chain's).
+                group = str(reported.get('group') or '')
+                key = self._chain_key(group)
+                chain = reported.get('chain')
+                if not key or not isinstance(chain, list):
+                    return True
+                if not self._chain_certified(chain, message, key):
+                    return True
+                self._reconcile_into(queues, key, chain, who, message)
+                return True
+            if self.num_updates <= 1:
+                # Quorum of one: apply this peer's verified segment directly,
+                # without storing it, so no stale report can out-vote it.
+                chain = reported
+                if not isinstance(chain, list):
+                    return True
+                if not self._chain_certified(chain, message):
+                    return True
+                # Outvoted: a chain reproducing the quorum's checkpoint wins
+                # even an equal-length tiebreak (ISSUES.md §2.15). Mirrors C.
+                self._reconcile_into(queues, '', chain, who, message,
+                                     self._final_end(), self._outvoted())
+                return True
+            if isinstance(reported, list) and \
+                    not self._chain_certified(reported, message):
+                return True
+            self.updates[message.from_whom.uuid] = reported
             up_count = len(self.updates)
             if up_count >= self.num_updates:
                 # Group reported chains by their serialized (canonical) form
@@ -1389,53 +3938,303 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self.logger.debug(grouping)
                 if len(best) > up_count // 2:
                     chain = best[0]  # all entries in the bucket are identical
-                    self.history.catchup(chain)
                     self.logger.debug('Updated')
+                    self._reconcile_into(queues, '', chain, 'the majority chain')
                 else:
-                    self.logger.error('Closest %d peers unable to agree on history' % self.num_updates)
-                    self._request_update(queues, len(self.peers.all))
+                    self.logger.error('Closest %d peers unable to agree on history', self.num_updates)
+                    roster = len(self._roster_peers())
+                    self._request_update(queues, roster, quorum=roster)
             return True
         return False
 
+    def _attest_already_held(self, tx) -> bool:
+        """Do we already hold, certified, the very attested entry ``tx`` is?
+        Then catch-up has nothing to re-judge: we accepted it under the quorum
+        in force when it committed, and if its certificate now looks short the
+        group has only grown since (ISSUES §2.48). Primary chain only.
+        Mirrors C _attest_already_held."""
+        held = self.history._task_mapping.get(tx.task_id)
+        certs = getattr(self.history, 'attest_certs', None) or {}
+        if held is None or not getattr(held, 'attested', False) \
+                or tx.task_id not in certs:
+            return False
+        return (str(held.p1_id) == str(tx.p1_id)
+                and str(held.subject_id) == str(tx.subject_id)
+                and str(held.p1_channel) == str(tx.p1_channel)
+                and str(held.evidence_digest) == str(tx.evidence_digest)
+                and (getattr(held, 'attest_scope', None) or '')
+                == (getattr(tx, 'attest_scope', None) or '')
+                and float(held.p1_score) == float(tx.p1_score))
+
+    def _chain_certified(self, chain, message, key: str = '') -> bool:
+        """Catch-up refuses a segment carrying an attested entry whose
+        certificate does not meet our quorum (doc/architecture/reputation.md):
+        otherwise catch-up would be a way around the round. An entry we already
+        hold certified is not re-judged against today's roster.
+
+        An entry a verified placement covers is not re-judged: its acceptors
+        checked each half's and each attestation's certificate against the
+        roster in force when they accepted it (the user's call, 2026-10-14).
+        A segment whose placement certificate does not verify is refused
+        whole."""
+        seg = sorted((t for t in chain if getattr(t, 'index', None) is not None),
+                     key=lambda t: t.index)
+        covered = self._placement_certified_indices(
+            self._chain_for_key(key), seg, key or None)
+        if covered is None:
+            self.logger.warning(
+                'Rejecting chain from %s: a placement certificate does not '
+                'meet the roster in force',
+                getattr(message.from_whom, 'nickname', '?'))
+            return False
+        chain = [t for t in chain if getattr(t, 'index', None) not in covered]
+        for tx in chain:
+            if getattr(tx, 'attested', False) \
+                    and not (not key and self._attest_already_held(tx)) \
+                    and not self._attest_certified(tx):
+                self.logger.warning(
+                    'Rejecting chain from %s: an attested entry (task %s) '
+                    'carries no certificate meeting our quorum',
+                    getattr(message.from_whom, 'nickname', '?'),
+                    str(tx.task_id)[:8])
+                return False
+        return self._commit_certs_ok(chain, message, key)
+
+    def _own_half_recorded(self, task_id) -> bool:
+        """Does any chain we keep hold OUR half of `task_id`, bilateral or not,
+        placed or waiting in the pool?"""
+        me = str(self.identity.uuid)
+        for chain in [self.history] + list(self.child_histories.values()):
+            for tx in (chain._task_mapping.get(task_id), chain.pooled(task_id)):
+                if tx is not None and me in (str(tx.p1_id), str(tx.p2_id)):
+                    return True
+        return False
+
+    def _record_committed_half(self, group_uuid, task_id, scorer, score,
+                               channel, certificate):
+        """Put a committed half in its chain's pool, where it waits to be
+        placed (doc/architecture/reputation.md, "Agreeing on an order")."""
+        self._chain_for_group(group_uuid).record_half(
+            task_id, scorer, score, channel, certificate=certificate)
+
+    #: Seconds after a peer is first seen at which our pending halves are
+    #: handed to it (ISSUES §2.62). Mirrors C REP_HANDOFF_AT.
+    HANDOFF_AT = (5.0, 15.0, 30.0)
+    #: At most this many halves go to one peer per pass. Mirrors C
+    #: REP_HANDOFF_MAX_HALVES.
+    HANDOFF_MAX_HALVES = 32
+
+    def _hand_off_pending_halves(self, queues, present) -> int:
+        """Hand our committed-but-unpaired halves on the primary chain to each
+        peer that joined after we committed them (ISSUES §2.62). A join
+        carries only bilateral entries, so without this a late member holds
+        our counterpart's half alone when it commits, and its chain forks from
+        ours (Stele rt-2404254 split two and two, and an even split never
+        finalizes a checkpoint). Each pass at HANDOFF_AT seconds after a peer
+        is first seen re-sends it the same `committed` we broadcast at commit,
+        certificate included. Only OUR halves: a commit may write only its
+        sender's half (§2.16). Repeated because a newcomer may not hold the
+        group key yet; the pool refuses a second half from
+        the same scorer, so a repeat is harmless. Mirrors C
+        _hand_off_pending_halves. Returns how many frames went out."""
+        identity = getattr(self, 'identity', None)
+        if identity is None:
+            return 0
+        roster = {str(p.uuid): p for p in self._roster_peers()}
+        for gone in [k for k in self.handoff if k not in roster]:
+            del self.handoff[gone]
+        due = []
+        for key, peer in roster.items():
+            seen = self.handoff.get(key)
+            if seen is None:
+                self.handoff[key] = [present, 0]
+                continue
+            first, done = seen
+            now_done = done
+            # Every pass whose time has come counts, but a late tick sends once.
+            while now_done < len(self.HANDOFF_AT) and \
+                    present >= first + self.HANDOFF_AT[now_done]:
+                now_done += 1
+            if now_done != done:
+                seen[1] = now_done
+                due.append((peer, now_done))
+        if not due:
+            return 0
+        me = str(identity.uuid)
+        # An unpaired half waits in the pool: a placed entry is always paired
+        # or attested.
+        halves = [tx for tx in self.history._pool.values()
+                  if len(tx) == 1 and not tx.attested and tx.p2_id is None
+                  and str(tx.p1_id) == me][:self.HANDOFF_MAX_HALVES]
+        if not halves:
+            return 0
+        sent = 0
+        for peer, done in due:
+            for tx in halves:
+                # The same tuple handle_accepted broadcasts; the primary chain
+                # carries no group uuid.
+                commit_obj = (tx.task_id, tx.p1_id, tx.p1_score, None,
+                              tx.p1_channel)
+                cert = tx.certificate_of(tx.p1_id)
+                if cert:
+                    commit_obj = commit_obj + (cert,)
+                try:
+                    queues[CfgIds.network].put(
+                        Message(self.name, ReputationProtocol.committed,
+                                to_json_string(commit_obj), peer,
+                                from_whom=identity),
+                        block=True, timeout=self.q_cadence)
+                    sent += 1
+                except Full:
+                    self.logger.error('hand_off_pending_halves: Network queue full')
+            self.logger.info('handed %d pending half(s) of ours to %s (pass %d '
+                             'of %d)', len(halves),
+                             getattr(peer, 'nickname', '?'), done,
+                             len(self.HANDOFF_AT))
+        return sent
+
+    def _retry_uncommitted_halves(self, queues, present) -> int:
+        """Re-propose OUR halves that waited out COMMIT_TIMEOUT without reaching
+        the chain (ISSUES §2.24). A half now in the chain or the pool, by our
+        commit or in a chain we adopted, is forgotten. After COMMIT_RETRIES the half is PARKED (§2.60): re-proposed
+        every PARK_RETRY, or on the next pass after the chain grows from a peer
+        (_wake_parked), and given up only after PARK_TTL. Mirrors C
+        _retry_uncommitted_halves. Returns how many were re-proposed."""
+        resent = 0
+        app_pending = self._probe_load()[1]
+        for key, waiting in list(self.awaiting_commit.items()):
+            score, deadline, attempts, parked_at = waiting[:4]
+            if self._own_half_recorded(score.task_id):
+                del self.awaiting_commit[key]
+                continue
+            if parked_at is not None:
+                if present - parked_at > self.PARK_TTL:
+                    expire = True
+                elif deadline <= present:
+                    expire = False
+                else:
+                    continue
+            elif deadline > present:
+                continue
+            if not (parked_at is not None and expire) and app_pending and \
+                    self._is_probe(score):
+                # A probe yields to a pending app half (§2.60): it waits, its
+                # attempts unspent, and is looked at again a timeout later.
+                waiting[1] = present + self.COMMIT_TIMEOUT
+                continue
+            if parked_at is not None:
+                if expire:
+                    self.logger.warning(
+                        'our half of task %s never committed after %d '
+                        're-proposal(s) and %.0f s parked; giving up on it',
+                        key, attempts, present - parked_at)
+                    del self.awaiting_commit[key]
+                    continue
+                self.logger.info('re-proposing parked half of task %s', key)
+            elif attempts >= waiting[5]:
+                reached, members = self._members_reachable(present)
+                if reached * 2 > members:
+                    # Reachable, just outcompeted: give it up as before.
+                    self.logger.warning(
+                        'our half of task %s never committed after %d '
+                        're-proposal(s), though %d of %d member(s) are '
+                        'reachable; giving up on it', key, attempts, reached,
+                        members)
+                    del self.awaiting_commit[key]
+                    continue
+                waiting[1] = present + self.PARK_RETRY
+                waiting[3] = present
+                self.logger.info(
+                    'our half of task %s has no quorum after %d '
+                    're-proposal(s) (%d of %d member(s) reachable); parking '
+                    'it until the chain grows from a peer (or every %.0f s)',
+                    key, attempts, reached, members, self.PARK_RETRY)
+                continue
+            else:
+                waiting[2] = attempts + 1
+                self.logger.info(
+                    'our half of task %s is not in the chain after %.0f s; '
+                    're-proposing it (attempt %d of %d)', key,
+                    self.COMMIT_TIMEOUT, attempts + 1, waiting[5])
+            try:
+                self._start_paxos(queues, score)
+                resent += 1
+            except Full:
+                self.logger.error('retry_uncommitted: Network queue full')
+            if parked_at is not None:
+                # The next slow retry counts from this pass.
+                waiting[1] = present + self.PARK_RETRY
+        return resent
+
+    def parked_count(self) -> int:
+        """How many of the halves in awaiting_commit are parked (§2.60)."""
+        return sum(1 for w in self.awaiting_commit.values()
+                   if w[3] is not None)
+
+    def _wake_parked(self, source) -> int:
+        """The chain just grew from a peer, so a quorum may be reachable
+        again: make every parked half due on the next pass (§2.60). Mirrors
+        C _wake_parked. Returns how many."""
+        woken = 0
+        present = now().timestamp()
+        for waiting in self.awaiting_commit.values():
+            if waiting[3] is not None:
+                # Not before its last round has had its chance, and spread by
+                # task so the island's backlog does not land in one tick.
+                b = UUID(str(waiting[0].task_id)).bytes
+                spread = ((b[0] << 8 | b[1]) % 1000) * self.WAKE_SPREAD / 1000
+                due = max(waiting[4] + self.COMMIT_TIMEOUT, present + spread)
+                waiting[1] = min(waiting[1], due)
+                # Unparked: an active half again, with WAKE_RETRIES retries,
+                # and reachability decides afresh when they run out. Left
+                # parked, every chain growth after the heal re-sent the whole
+                # backlog (part-2272442). Mirrors C _wake_parked_locked.
+                waiting[2] = 0
+                waiting[3] = None
+                waiting[5] = self.WAKE_RETRIES
+                woken += 1
+        if woken:
+            self.logger.info('chain grew from %s; re-proposing %d parked '
+                             'half(s)', source, woken)
+        return woken
+
     def _pure_reputation(self, peer):
-        # Counterparty's-score weighted by counterparty's-reputation
-        # AND by the originating capability's transaction_weight
-        # (doc/architecture/trust-tiers.md §5). Default PREREP_NEUTRAL
-        # (0.2) on no-history OR no-valid-tx (returning a lower value
-        # would route the peer back into CTFT mode on the next compute,
-        # the very condition we supposedly graduated from). Counterparties
-        # absent from self.reputations use the PREREP_NEUTRAL fallback
-        # rather than being silently skipped (skipping made the result
-        # sensitive to whether the local reputations dict had caught
-        # up to the history chain).
-        # `peer` may be a Peer object (production sender path), a
-        # raw UUID, or a uuid string (rep_req wire path — the
-        # canonical object form's `peer_uuid` field is a string,
-        # and Identity.uuid is also a string in this codebase).
+        # Counterparty's-score weighted by counterparty's-reputation AND by the
+        # originating capability's transaction_weight (doc/architecture/trust-tiers.md
+        # §5). Default PREREP_NEUTRAL (0.2) on no-history OR no-valid-tx (returning a
+        # lower value would route the peer back into CTFT mode on the next compute, the
+        # very condition we supposedly graduated from). Counterparties absent from
+        # self.reputations use the PREREP_NEUTRAL fallback rather than being silently
+        # skipped (skipping made the result sensitive to whether the local reputations
+        # dict had caught up to the history chain). `peer` may be a Peer object
+        # (production sender path), a raw UUID, or a uuid string (rep_req wire path —
+        # the canonical object form's `peer_uuid` field is a string, and Identity.uuid
+        # is also a string in this codebase).
         peer_uuid = peer if isinstance(peer, (UUID, str)) else peer.uuid
         try:
             txs = list(self.history.by_peer(peer_uuid))
         except KeyError:
             return self.PREREP_NEUTRAL
+        # A true weighted average: the divisor carries the reputation too.
+        # Dividing by the task weights alone multiplied every score by its
+        # reporter's reputation, and the rescore sweep then decayed a group of
+        # well-behaved peers below tier 1 (moderation cohort, 2026-09-23).
+        # Mirrors C reputation_pure.
         total = 0.0
-        total_weight = 0
+        total_weight = 0.0
         for tx in txs:
-            if tx.p1_id is None or tx.p2_id is None:
+            # An attested entry counts like any third-party observation, its
+            # verifier standing in for the counterparty (Tx.about).
+            about = tx.about(peer_uuid)
+            if about is None:
                 continue
-            if tx.p1_id == peer_uuid:
-                counterparty_id = tx.p2_id
-                counterparty_score = tx.p2_score
-            elif tx.p2_id == peer_uuid:
-                counterparty_id = tx.p1_id
-                counterparty_score = tx.p1_score
-            else:
-                continue
+            counterparty_score, counterparty_id = about
             cp_rep = self.reputations[counterparty_id] \
                 if counterparty_id in self.reputations else self.PREREP_NEUTRAL
             w = self.task_weights.get(str(tx.task_id), 1)
             total += counterparty_score * cp_rep * w
-            total_weight += w
-        if total_weight == 0:
+            total_weight += cp_rep * w
+        if total_weight <= 0:
             return self.PREREP_NEUTRAL
         return total / total_weight
 
@@ -1461,7 +4260,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     peer_scores.append(tx.p2_score)
                     my_scores.append(tx.p1_score)
         except KeyError:
-            self.logger.debug('No transaction history for peer %s' % peer_uuid)
+            self.logger.debug('No transaction history for peer %s', peer_uuid)
         if len(peer_scores) < 1 or len(my_scores) < 1:  # no bilateral w/ us
             # Cold-start: before any bilateral history WITH us exists, fall
             # back to a transaction-memory prior rather than a flat neutral.
@@ -1511,12 +4310,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         for tx in txs:
             if tx.task_id in seen:
                 continue
-            if tx.p1_id == peer_uuid and tx.p2_id is not None:
-                about_peer, counterparty_id = tx.p2_score, tx.p2_id
-            elif tx.p2_id == peer_uuid and tx.p1_id is not None:
-                about_peer, counterparty_id = tx.p1_score, tx.p1_id
-            else:
+            about = tx.about(peer_uuid)
+            if about is None:
                 continue
+            about_peer, counterparty_id = about
             if about_peer is None or counterparty_id == self_uuid:
                 continue
             seen.add(tx.task_id)
@@ -1554,12 +4351,71 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         return 0
 
     @classmethod
+    def _tier_ceiling(cls, tier: int) -> float:
+        """The highest score that still maps to ``tier`` -- i.e. the next
+        tier's floor, stepped down by one representable double.
+
+        Derived from TIER_FLOORS rather than written as a literal so
+        retuning the ladder cannot leave a stale ceiling behind that quietly
+        grants the tier above. ``nextafter`` (not a hand-picked epsilon)
+        because the clamp has to satisfy ``_trust_tier(ceiling) == tier``
+        exactly: an epsilon too small rounds back onto the floor and grants
+        the very tier the clamp exists to withhold. The top tier has no
+        ceiling, so it returns 1.0."""
+        for floor, t in cls.TIER_FLOORS:
+            if t == tier + 1:
+                return math.nextafter(floor, 0.0)
+        return 1.0
+
+    @classmethod
     def _is_excluded(cls, score) -> bool:
         """True if `score` is below the communication cut-off, i.e. the
         peer is excluded from the network (gateways stop forwarding
         to/for it, LAN/one-hop nodes ignore it). Recovery is
         explicit-only (REASON_REHABILITATE)."""
         return score is not None and score < cls.COMM_CUTOFF
+
+    def _final_end(self):
+        """One past the last index our finalized PRIMARY checkpoint covers, or
+        None. Reconciliation never rewrites below it (the user's finality
+        decision for ISSUES.md §2.15). Finalized means a quorum attested it,
+        never our own proposal alone."""
+        ckpt = self._finalized
+        if ckpt is None or not getattr(ckpt, 'count', 0):
+            return None
+        # Final only if our own entries over the window hash to the attested
+        # root: a node the quorum outvoted holds nothing final there, and
+        # guarding it would pin the losing side of a fork (moderation cohort,
+        # 2026-09-23). Mirrors C's _final_end_locked.
+        first, count = int(ckpt.first_index), int(ckpt.count)
+        mine = self.history.range_root(first, count)
+        theirs = ckpt.root
+        if isinstance(mine, bytes):
+            mine = mine.decode('ascii')
+        if isinstance(theirs, bytes):
+            theirs = theirs.decode('ascii')
+        if mine is None or mine != theirs:
+            return None
+        return first + count
+
+    def _outvoted(self):
+        """``(root, first_index, count)`` of the latest quorate primary
+        checkpoint iff our own entries do NOT reproduce it: the group
+        finalized a chain ours lost to. None otherwise. Mirrors C's
+        ``_outvoted_locked``."""
+        ckpt = self._finalized
+        if ckpt is None or not getattr(ckpt, 'count', 0):
+            return None
+        first, count = int(ckpt.first_index), int(ckpt.count)
+        root = ckpt.root
+        if isinstance(root, bytes):
+            root = root.decode('ascii')
+        mine = self.history.range_root(first, count)
+        if isinstance(mine, bytes):
+            mine = mine.decode('ascii')
+        if mine is not None and mine == root:
+            return None
+        return (root, first, count)
 
     def _note_interaction(self, peer_uuid):
         """Stamp 'we just transacted with peer_uuid' — resets its idle
@@ -1569,6 +4425,60 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         if key == str(self.identity.uuid):
             return
         self._last_interaction[key] = now().timestamp()
+        self._rescore_due.add(key)
+
+    def _rescore_sweep(self, present):
+        """Rescore every peer whose chain advanced since it was last scored,
+        and every admitted peer never scored; the process loop's pending_tiers
+        drain then publishes each tier and app event. Throttled to
+        RESCORE_INTERVAL. Returns the number scored. Mirrors C _rescore_peers.
+
+        WITHOUT THIS NO LIVE NODE EVER RATED ANYONE: a rep_req was the only
+        thing that computed and stored a score, a running node sends none
+        outside task automation, and a commit only appended to the chain.
+        Found by moderation_cohort.sh.
+        """
+        if (self._last_rescore_sweep is not None
+                and present - self._last_rescore_sweep < self.RESCORE_INTERVAL):
+            return 0
+        self._last_rescore_sweep = present
+        due = set(self._rescore_due)
+        self._rescore_due.clear()
+        # Tenure: start the clock of every member not held before, and rescore
+        # every held peer whose tenure is now served (or whose gate was turned
+        # off), so its tier rises without waiting for its next commit.
+        self._seed_tenure()
+        tenure_now = time.time()
+        for peer in list(getattr(self.peers, 'all', None) or []):
+            sig = getattr(peer, 'signature', None)
+            if sig is None:
+                continue
+            self._stamp_tenure(str(peer.uuid), sig.public.encode(
+                encoder=HexEncoder).decode('ascii'), tenure_now)
+        minimum = self._min_tenure()
+        for key in self._tenure_capped:
+            held_at = self._member_since.get(key)
+            if minimum <= 0 or (held_at is not None
+                                and tenure_now - held_at[1] >= minimum):
+                due.add(key)
+        current = self.reputations.current
+        for peer in list(getattr(self.peers, 'all', None) or []):
+            key = str(getattr(peer, 'uuid', peer))
+            try:
+                as_uuid = UUID(key)
+            except ValueError:
+                continue
+            # self.reputations tolerates str and UUID keys; either means rated.
+            # Rated AND already told to identity this run is the only skip: a
+            # peer restored from the snapshot is rated but untold, and a
+            # restarted node would gate it at tier 0 until its tier changed.
+            rated = key in current or as_uuid in current
+            if not rated or key not in self.peer_tiers:
+                due.add(key)
+        due.discard(str(self.identity.uuid))
+        for key in sorted(due):
+            self._compute_reputation(key, None, None, respond=False)
+        return len(due)
 
     @classmethod
     def _decayed_score(cls, score, idle_seconds):
@@ -1587,6 +4497,46 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         decayed = cls.REPUTATION_DECAY_ASYMPTOTE + \
             (score - cls.REPUTATION_DECAY_ASYMPTOTE) * factor
         return max(cls.REPUTATION_DECAY_ASYMPTOTE, decayed)
+
+    def _apply_seeds(self):
+        """Apply every extension's cold-start priors (ReputationHooks).
+
+        First contact's is FIRST_CONTACT_PLAN.md §10.5, the user's settled
+        fork: a contact whose key the two humans confirmed out of band (the
+        safety-number compare) starts SLIGHTLY above the neutral cold-start
+        band rather than at it -- one notch, not a jump into the CTFT pivot
+        band.
+
+        The seed is a PRIOR, not a score. It is written only where this node
+        has NO reputation for the peer at all, so it can never overwrite a
+        value the peer earned, a warm-started one from ``reputation.cfg.json``,
+        or a slashed one -- a contact cannot be verified back into good
+        standing. From there ``_consensus_baseline`` already prefers
+        ``reputations.current`` over the neutral, so the seed reaches every
+        reader without a second mechanism. A seed outside (0, 1] is refused,
+        not clamped: reputation lives in [0, 1], and a provider's source may
+        be a hand-editable file.
+        """
+        for hooks in reputation_hooks():
+            if hooks.trust_seeds is None:
+                continue
+            for peer_uuid, seed, what in hooks.trust_seeds(self):
+                try:
+                    peer_uuid = UUID(str(peer_uuid))
+                    seed = float(seed)
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                if not 0.0 < seed <= 1.0:
+                    self.logger.warning('%s: refusing seed %r for %s (outside '
+                                        '(0, 1])', hooks.label, seed,
+                                        str(peer_uuid)[:8])
+                    continue
+                current = self.reputations.current
+                if peer_uuid in current or str(peer_uuid) in current:
+                    continue     # already known here; earned beats seeded
+                self.reputations.update(peer_uuid, seed)
+                self.logger.info('%s: seeded %s %s at %.2f', hooks.label, what,
+                                 str(peer_uuid)[:8], seed)
 
     def _seed_idle_from_snapshot(self):
         """At start-up, treat the persisted reputation snapshot's mtime as
@@ -1662,13 +4612,14 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             if prior is not None and prior > self.REPUTATION_DECAY_ASYMPTOTE:
                 self._consensus_last[key] = self._decayed_score(prior, idle)
             self._publish_tier_change(queues, u, decayed)
+            self._publish_reputation_change(queues, u, decayed)
             changed = True
         if changed:
             try:
                 self._persist_reputations()
             except (OSError, IOError) as e:
                 self.logger.warning(
-                    'Could not persist reputations after decay: %s' % e)
+                    'Could not persist reputations after decay: %s', e)
 
     def _persist_reputations(self):
         """Write the reputation snapshot to disk, filtered two-sided.
@@ -1695,6 +4646,70 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         snapshot = self.reputations.filtered_for_persist(keep_uuids)
         snapshot.to_file(os.path.join(Configuration.get_cfg_dir(),
                                       CfgIds.reputation + Configuration.file_ext))
+
+    def _publish_reputation(self, queues, peer_uuid, score, rated):
+        """Emit one peer's reputation toward the app (doc/architecture/app-peer-carrier.md).
+
+        Mirror of the C twin's `_publish_reputation` (`rep_proc.c`): local IPC to
+        the main loop — `CfgIds.main` is Python's `AT_MAIN_QUEUE` — which owns the
+        outward hop to `external_feedback`. `rated` travels beside the score
+        because an unrated peer reads as PREREP_NEUTRAL, which is also a score a
+        peer can genuinely earn; `PeerReputation` zeroes the score when unrated so
+        a consumer ignoring the flag cannot read a plausible number.
+        """
+        try:
+            queues[CfgIds.main].put(
+                PeerReputation(str(peer_uuid), score, rated),
+                block=True, timeout=self.q_cadence)
+        except KeyError:
+            # No main queue in this configuration (unit tests, embedded use).
+            # Not an error: nothing is listening for an app feed.
+            pass
+        except Full:
+            self.logger.warning('_publish_reputation: main queue full for %s', str(peer_uuid)[:8])
+
+    def _publish_reputation_change(self, queues, peer_uuid, score):
+        """A score this process just computed is by construction rated."""
+        self._publish_reputation(queues, peer_uuid, score, True)
+
+    def emit_all_reputations(self, queues):
+        """Emit one message per known peer, rated or not; returns the count.
+
+        Mirror of C's `reputation_emit_all`. A peer with no rating is reported AS
+        unrated rather than skipped — silence would leave a consumer unable to
+        tell "we hold no rating" from "the message was lost" — and this pull is
+        the ONLY path on which `rated=False` can cross, since every change-driven
+        emission is rated by construction.
+
+        PEERS ONLY: this node's own uuid is not in the roster. A reputation is
+        what the network observed ABOUT a peer, and a node holds no such
+        observation of itself — a self-entry could only ever carry its own
+        unrated 0.0, which a consumer cannot distinguish from a genuine
+        unrated peer. C's `reputation_emit_all` walks `proc->protocol.peers`
+        and has always emitted N; Python emitted N+1 until this was aligned,
+        so the two "mirrors" disagreed by exactly the self-entry.
+        """
+        emitted = 0
+        for peer in list(self.peers.all):
+            peer_uuid = getattr(peer, 'uuid', peer)
+            key = UUID(str(peer_uuid)) if not isinstance(peer_uuid, UUID) \
+                else peer_uuid
+            rated = key in self.reputations
+            score = self.reputations[key] if rated else 0.0
+            self._publish_reputation(queues, peer_uuid, score, rated)
+            emitted += 1
+        return emitted
+
+    def handle_app_roster_request(self, queues, message):
+        """The app asked for the current peer view (C: handle_app_roster_request)."""
+        if message.function != ReputationProtocol.app_roster_request:
+            return False
+        # The local app's verb only, never a peer's (ISSUES §2.17).
+        if not is_local_app_verb(self, message):
+            return refuse_remote_app_verb(self, message, message.function)
+        count = self.emit_all_reputations(queues)
+        self.logger.debug('Emitted %d peer reputations for an app pull', count)
+        return True
 
     def _publish_tier_change(self, queues, peer_uuid, score):
         """Notify IdentityProcess of a trust-tier crossing.
@@ -1735,9 +4750,27 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             # IdentityProcess reading its own queue; no network egress).
             msg = Message(CfgIds.identity, IdentityProtocol.tier_update,
                           payload, to_whom=None, from_whom=self.identity)
-            queues[CfgIds.identity].put(msg, block=True, timeout=self.q_cadence)
-            self.logger.debug('Published tier_update for %s: %d (score=%.3f)' %
-                              (key, new_tier, score))
+            try:
+                queues[CfgIds.identity].put(msg, block=True,
+                                            timeout=self.q_cadence)
+            except Full:
+                # Undo the publication record, which is what suppresses a
+                # repeat: kept, a lost update left identity on the old tier
+                # until the score crossed another boundary. Mirrors C.
+                if old_tier is None:
+                    self.peer_tiers.pop(key, None)
+                else:
+                    self.peer_tiers[key] = old_tier
+                self._rescore_due.add(key)   # republish on the next sweep
+                self.logger.warning(
+                    '_publish_tier_change: identity queue full; tier_update '
+                    '%s -> %d will republish on the next rescore',
+                    key, new_tier)
+                return
+            if old_tier is None:
+                self.logger.info('Tier of %s first set to %d (score %.3f)', key, new_tier, score)
+            else:
+                self.logger.info('Tier of %s %d -> %d (score %.3f)', key, old_tier, new_tier, score)
             if is_demotion:
                 lost_msg = Message(CfgIds.negotiation, IdentityProtocol.tier_lost,
                                    payload, to_whom=None, from_whom=self.identity)
@@ -1753,7 +4786,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         except Full:
             self.logger.error('_publish_tier_change: identity queue full')
         except Exception as err:
-            self.logger.warning('_publish_tier_change failed: %s' % err)
+            self.logger.warning('_publish_tier_change failed: %s', err)
 
     def _publish_exclusion(self, queues, peer_uuid, excluded):
         """Tell the network process to exclude (or readmit) a peer whose
@@ -1761,8 +4794,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         peer's address from the live roster and sends a local-IPC
         Network.exclude / Network.readmit control message; the network
         process then drops the peer's inbound frames and filters it out
-        of outbound targets. No-op if the address is unknown (nothing to
-        key the network-layer gate on)."""
+        of outbound targets, and refuses it as a relay client or relay by
+        uuid. The address may be unknown; the uuid gate still applies."""
         try:
             # Peer uuids are strings in this codebase, but callers may hand
             # us a UUID (pending_tiers) or a Peer/Identity object; resolve
@@ -1773,14 +4806,13 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                         or self.peers.find_by_uuid(str(peer_uuid)))
             else:
                 peer = peer_uuid  # already a Peer/Identity
-            address = getattr(peer, 'address', None)
-            if not address:
-                self.logger.debug(
-                    'Exclusion %s for %s: no address, network gate skipped',
-                    'add' if excluded else 'remove', str(peer_uuid)[:8])
-                return
+            address = getattr(peer, 'address', None) or ''
+            uuid = str(getattr(peer, 'uuid', None) or peer_uuid)
+            # Sent even with no address: the uuid alone gates the peer as a
+            # relay client and as a relay (network/relay.py).
             func = Network.exclude if excluded else Network.readmit
-            msg = Message(CfgIds.network, func, address,
+            msg = Message(CfgIds.network, func,
+                          json.dumps({'address': address, 'uuid': uuid}),
                           to_whom=None, from_whom=self.identity)
             queues[CfgIds.network].put(
                 msg, block=True, timeout=self.q_cadence)
@@ -1790,9 +4822,317 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         except Full:
             self.logger.error('_publish_exclusion: network queue full')
         except Exception as err:
-            self.logger.warning('_publish_exclusion failed: %s' % err)
+            self.logger.warning('_publish_exclusion failed: %s', err)
 
-    def _compute_reputation(self, peer, req_proc, requestor):
+    def _current_chain_index(self) -> int:
+        """The absolute index the next committed transaction will take.
+
+        Used as the "everything before here is already recorded" watermark when
+        ZTA proves a peer. Read off the history's own counter, with a fallback
+        derived from the resident chain so a history implementation without the
+        private counter still anchors somewhere truthful rather than at 0 --
+        anchoring at 0 would silently mean "unwind everything".
+        """
+        nxt = getattr(self.history, '_next_index', None)
+        if isinstance(nxt, int):
+            return nxt
+        highest = -1
+        for tx in self.history:
+            idx = getattr(tx, 'index', None)
+            if isinstance(idx, int) and idx > highest:
+                highest = idx
+        return highest + 1
+
+    def _standing_unwind_ceiling(self, peer_uuid, anchor_index):
+        """What the peer's standing may be, judged ONLY on evidence that
+        predates its last proved verification (doc/architecture/zta-integration.md).
+
+        This is the "how far back" answer: back to the last point ZTA actually
+        proved something, and no further. Standing earned before that point was
+        earned by a peer whose credential verified, so it is not in question;
+        standing earned after it was earned while nobody could confirm the peer
+        was who it claimed, and a later affirmative failure is what calls it in.
+
+        Deliberately a recomputation from the pre-anchor window rather than a
+        stored "score as of then" -- no such score is checkpointed (a
+        ``Checkpoint`` commits to a history WINDOW, not to per-peer values), and
+        inventing one would be the circularity ``_evidence_ceilings`` exists to
+        avoid. Reusing that same routine also means the unwind inherits its
+        shrinkage: a short pre-anchor history cannot justify a high score.
+
+        Falls back to the unverified-restore tier when there is no usable
+        pre-anchor evidence -- including the case where the chain has evicted
+        it. Absent evidence bounds a peer low; it does not excuse it.
+        """
+        floor_tier = self._tier_ceiling(self.UNVERIFIED_RESTORE_TIER)
+        if anchor_index is None:
+            # Never proved at all: nothing this peer holds rests on a verified
+            # credential, so none of it survives the failure.
+            return floor_tier
+        window = [tx for tx in self.history
+                  if isinstance(getattr(tx, 'index', None), int)
+                  and tx.index < anchor_index]
+        if not window:
+            return floor_tier
+        return self._evidence_ceilings(window).get(str(peer_uuid), floor_tier)
+
+    def _apply_peer_standings(self, queues):
+        """Act on authority findings that have landed since the last sweep.
+
+        Idempotent by design: it runs every process iteration (like
+        ``_restore_child_evidence``) and acts only on a standing it has not
+        already acted on for that peer. A repeated identical verdict -- which
+        periodic re-verification produces by the hour -- must not re-unwind a
+        peer that was already unwound.
+        """
+        standing = getattr(self.protocol, 'peer_standing', None)
+        if not standing:
+            return
+        for key, found in list(standing.items()):
+            mark = (found.status, found.ceiling, found.verified_at, found.reason)
+            if self._peer_acted.get(key) == mark:
+                continue
+            self._peer_acted[key] = mark
+            if found.status == STANDING_PROVED:
+                # Advance the anchor: everything committed up to now was
+                # observed while this peer's credential verified.
+                self._peer_proved_index[key] = self._current_chain_index()
+                self.logger.info(
+                    'Standing[%s]: %s proved; unwind anchor set at chain '
+                    'index %d', found.source, found.peer_uuid[:8],
+                    self._peer_proved_index[key])
+            elif found.status == STANDING_FAILED:
+                self._unwind_standing_failure(queues, key, found)
+                continue
+            # Proved or capped: rescore under the bound as it now stands. The
+            # stored score is the capped one, and nothing else makes a steady
+            # peer due (moderation cohort mod-2518340 read the lifted cap long
+            # after the lift). A lift is rescored NOW, not at the next sweep
+            # (mod-2531555 read the cap in the seconds before it ran), so it
+            # takes effect the moment it lands, as a cap does. Mirrors C.
+            key_peer = str(found.peer_uuid)
+            current = self.reputations.current
+            rated = key_peer in current or any(
+                str(c) == key_peer for c in current)
+            if found.status == STANDING_PROVED and rated:
+                self._compute_reputation(key_peer, None, None, respond=False)
+            else:
+                self._rescore_due.add(key_peer)
+            self._publish_standing_tier(queues, found)
+
+    def _publish_standing_tier(self, queues, found):
+        """Republish the tier a new (or lifted) bound allows. Mirrors C's
+        `_publish_standing_change`.
+
+        Identity's tier-gates read the tier last published, so without this a
+        ceiling that had just landed gated nothing until the peer's score next
+        happened to be recomputed. The STORED score is left alone -- a ceiling
+        bounds, it does not itself drive a peer downward -- and
+        `_publish_tier_change` dedups, so a repeated finding is a no-op.
+        """
+        for candidate in self.reputations.current:
+            if str(candidate) == found.peer_uuid:
+                score = self.reputations.current.get(candidate)
+                if score is not None:
+                    # _standing_ceiling, not _apply_standing_ceiling: the latter
+                    # logs and counts a CAP OF A WRITTEN score, and none happens.
+                    ceiling = self._standing_ceiling(candidate)
+                    if ceiling is not None and score > ceiling:
+                        score = ceiling
+                    self._publish_tier_change(queues, candidate, score)
+                return
+
+    def _unwind_standing_failure(self, queues, key, found):
+        """A peer that operated unproved has now affirmatively FAILED: unwind
+        its standing to what pre-anchor evidence supports, and let the tier
+        machinery demote it (doc/architecture/zta-integration.md).
+
+        No scalar penalty is sent. A ZTA verdict is an authority finding, not
+        an interaction outcome, and AT's [0, 1] scale has no representation for
+        one -- which is why the previous attempt, a ``score = -0.8``
+        TRANSACTION_SCORE, was rejected at the boundary and did nothing at all.
+        Bounding the value and republishing the tier is the action; demotion,
+        and exclusion below the cut-off, follow from the score the tier
+        machinery already reacts to.
+        """
+        anchor = self._peer_proved_index.get(key)
+        # Resolve the peer from the FINDING, never from `key` -- the key is
+        # "<peer>|<source>" now and would match no uuid at all.
+        peer_uuid = None
+        for candidate in self.reputations.current:
+            if str(candidate) == found.peer_uuid:
+                peer_uuid = candidate
+                break
+        if peer_uuid is None:
+            # Nothing scored for this peer yet; record the ceiling so the first
+            # score it does earn is bounded, and leave it at that.
+            self.logger.info(
+                'Standing[%s]: %s failed (%s); no score to unwind',
+                found.source, found.peer_uuid[:8], found.reason)
+            return
+        current = self.reputations.current.get(peer_uuid)
+        unwound = self._standing_unwind_ceiling(peer_uuid, anchor)
+        if current is not None and current <= unwound:
+            self.logger.info(
+                'Standing[%s]: %s failed (%s); score %.3f already at or below '
+                'what pre-verification evidence supports (%.3f)',
+                found.source, found.peer_uuid[:8], found.reason, current,
+                unwound)
+            return
+        self.reputations.update(peer_uuid, unwound)
+        # Force CTFT so a peer whose credential is later repaired re-earns
+        # trust from the punished regime instead of snapping back into
+        # cooperation -- the same reasoning as the slash override.
+        self._coop_mode[peer_uuid] = False
+        self.logger.warning(
+            'Standing[%s]: %s FAILED (%s); unwound %.3f -> %.3f (anchor %s)',
+            found.source, found.peer_uuid[:8], found.reason,
+            -1.0 if current is None else current, unwound,
+            'none — never proved' if anchor is None else 'chain index %d' % anchor)
+        _probes.counter('rep.compute', 'standing_unwound')
+        try:
+            self._persist_reputations()
+        except (OSError, IOError) as e:
+            self.logger.warning('Could not persist reputations: %s', e)
+        self._publish_tier_change(queues, peer_uuid, unwound)
+        self._publish_reputation_change(queues, peer_uuid, unwound)
+
+    def _standing_ceiling(self, peer_uuid):
+        """Highest reputation this peer may hold given what ZTA actually proved
+        (doc/architecture/zta-integration.md), or None for "no bound".
+
+        None covers three different situations that all mean the same thing
+        here: ZTA proved the peer, ZTA is switched off, or IdentityProcess has
+        not spoken about this peer at all. A deployment that has not turned ZTA
+        on is not bounded by it, which is the no-change-in-behavior setting.
+
+        Read off `protocol.peer_standing`, which is this node's OWN finding
+        delivered over IPC -- never anything the peer asserted about itself, so
+        a peer cannot raise its own ceiling.
+        """
+        standing = getattr(self.protocol, 'peer_standing', None)
+        if not standing:
+            return None
+        # MINIMUM over authorities: a peer is bounded by the strictest finding
+        # against it, and an authority that has said nothing withholds nothing.
+        # Mirrors C's _standing_ceiling_of.
+        want = str(peer_uuid)
+        lowest = None
+        for found in standing.values():
+            if found.peer_uuid != want or found.ceiling is None:
+                continue
+            if lowest is None or found.ceiling < lowest:
+                lowest = found.ceiling
+        return lowest
+
+    def _min_tenure(self):
+        """AT_REP_MIN_TENURE_SEC, read on every use (0, the default, turns the
+        gate off), unless a fixture set the minimum. Mirrors C REP_MIN_TENURE."""
+        override = getattr(self, '_tenure_min_override', None)
+        if override is not None:
+            return float(override)
+        return _env_float('AT_REP_MIN_TENURE_SEC', 0.0)
+
+    def _tenure_young(self, key):
+        """(short of its tenure in this node's view, age so far). Mirrors C
+        _tenure_young_locked."""
+        minimum = self._min_tenure()
+        held_at = self._member_since.get(key)
+        since = held_at[1] if held_at is not None else None
+        age = 0.0 if since is None else time.time() - since
+        return minimum > 0 and (since is None or age < minimum), age
+
+    def _tenure_bound(self, peer_uuid, score):
+        """`score` bounded by the peer's tenure, with no logging and no record:
+        for readers of a stored score (the attest co-sign gate), which may
+        predate the hold. Mirrors C _tenure_bound_locked."""
+        ceiling = self._tier_ceiling(self.TENURE_TIER)
+        young, _ = self._tenure_young(str(peer_uuid))
+        return ceiling if young and score > ceiling else score
+
+    def _apply_tenure_ceiling(self, peer_uuid, score):
+        """Bound `score` by the peer's tenure (doc/architecture/reputation.md,
+        "Tenure"): until it has been a member of this node's peer list for
+        AT_REP_MIN_TENURE_SEC it holds at most TENURE_TIER, however well it has
+        answered. A sybil that answers probes honestly earns a high score in a
+        few probes (Stele red team rt-3717776: tier 4 fourteen seconds after
+        joining); this makes it wait. A peer this node has never held counts as
+        new. Logged when the gate first holds a peer and when it lets go.
+        Mirrors C _tenure_apply_locked."""
+        if score is None:
+            return score
+        key = str(peer_uuid)
+        minimum = self._min_tenure()
+        young, age = self._tenure_young(key)
+        ceiling = self._tier_ceiling(self.TENURE_TIER)
+        if young and score > ceiling:
+            if key not in self._tenure_capped:
+                self.logger.info('tier of %s held at %d until it has been a '
+                                 'member %.0f s (tenure; %.0f s so far)', key,
+                                 self.TENURE_TIER, minimum, age)
+                self._tenure_capped.add(key)
+            return ceiling
+        if key in self._tenure_capped:
+            self._tenure_capped.discard(key)
+            if not young:
+                self.logger.info('tier of %s no longer held: a member %.0f s '
+                                 '(tenure %.0f s)', key, age, minimum)
+        return score
+
+    def _seed_tenure(self):
+        """Read each member's first_seen and key from roster.cfg.json, once, so
+        a restart keeps the clock this node already started. A missing or
+        unreadable file seeds nothing, and every member starts now. Mirrors C
+        _tenure_seed_locked."""
+        if self._tenure_seeded:
+            return
+        self._tenure_seeded = True
+        path = os.path.join(Configuration.get_cfg_dir(), self.ROSTER_FILE)
+        try:
+            with open(path) as f:
+                members = (json.load(f) or {}).get('members') or {}
+        except (OSError, ValueError, AttributeError):
+            return
+        for uid, m in members.items():
+            if (isinstance(m, dict) and isinstance(m.get('first_seen'), int)
+                    and isinstance(m.get('pubkey'), str)
+                    and uid not in self._member_since):
+                self._member_since[uid] = (m['pubkey'], float(m['first_seen']))
+
+    def _stamp_tenure(self, uid, key, present):
+        """Start the tenure clock of a member not held before, or whose key
+        changed (a new identity). A clock started without a key keeps its start
+        and takes this key. Mirrors C _tenure_stamp_locked."""
+        held_at = self._member_since.get(uid)
+        if held_at is not None:
+            if held_at[0] == key:
+                return
+            if held_at[0] is None:
+                self._member_since[uid] = (key, held_at[1])
+                return
+        self._member_since[uid] = (key, present)
+
+    def _apply_standing_ceiling(self, peer_uuid, score):
+        """Bound `score` by the peer's ZTA ceiling, if it has one.
+
+        The bound is applied where the score is WRITTEN rather than where it is
+        read, so every consumer -- tier computation, persistence, the app-facing
+        carrier, a peer answering a rep_req -- sees one consistent number. A
+        ceiling enforced only at read time would leave the stored score above
+        it and leak the unbounded value the moment some other path reported it.
+        """
+        ceiling = self._standing_ceiling(peer_uuid)
+        if ceiling is None or score is None or score <= ceiling:
+            return score
+        self.logger.info(
+            'Standing: %s capped %.3f -> %.3f (bounded by an authority)',
+            str(peer_uuid)[:8], score, ceiling)
+        _probes.counter('rep.compute', 'standing_capped')
+        return ceiling
+
+    def _compute_reputation(self, peer, req_proc, requestor, respond=True):
+        """Score, bound and store `peer`, and queue its tier. `respond=False`
+        is the rescore sweep: nobody asked, so no rep_resp is queued."""
         _probes.counter('rep.compute', 'enter')
         try:
             # peer may be a Peer/Identity object (production), a UUID,
@@ -1801,6 +5141,13 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             # below also returns a string — `peer_uuid` is the same
             # type as the keys in self.reputations / self._coop_mode.
             peer_uuid = peer if isinstance(peer, (UUID, str)) else peer.uuid
+            # A node never scores itself: its own history holds no bilateral
+            # evidence about it, and a stored self-score would feed its own
+            # tier. Dropped, not answered -- the sweep already skips self;
+            # this closes the rep_req path. Mirrors C handle_rep_request.
+            if str(peer_uuid) == str(self.identity.uuid):
+                _probes.counter('rep.compute', 'self_skipped')
+                return
             # Slash override (fast-penalty path): a finalized slash floors
             # the score immediately, bypassing the CTFT/pure EMA dispatch.
             # Force CTFT mode so that if the slash is later lifted the peer
@@ -1814,15 +5161,24 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 try:
                     self._persist_reputations()
                 except (OSError, IOError) as e:
-                    self.logger.warning('Could not persist reputations: %s' % e)
+                    self.logger.warning('Could not persist reputations: %s', e)
                 self.pending_tiers.append((peer_uuid, rep_score))
-                self.requested_reps.append(
-                    (Reputation(peer_uuid, rep_score), req_proc, requestor))
+                if respond:
+                    self.requested_reps.append(
+                        (Reputation(peer_uuid, rep_score), req_proc, requestor))
                 _probes.counter('rep.compute', 'slashed')
                 return
-            previous = self.PREREP_NEUTRAL
+            # A peer scored for the first time has no stored score, and an
+            # absent score must not choose the regime: it read as neutral,
+            # held a peer known only through others at its cold-start prior,
+            # and the next entry about it (a finding, in Stele's cohort
+            # st-2590772) flipped it to the pure mean and RAISED it. The
+            # first score's regime follows what this node would assign it
+            # now (AT ISSUES §2.64). Mirrors C _score_peer_locked.
             if peer_uuid in self.reputations:
                 previous = self.reputations[peer_uuid]
+            else:
+                previous = self._contrite_tit_for_tat(peer)
             in_coop = self._coop_mode.get(peer_uuid, False)
             if in_coop:
                 use_pure = previous > self.COOP_EXIT
@@ -1852,21 +5208,26 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     'local history (previous=%.2f)',
                     str(peer_uuid)[:8], n_bilateral, previous)
                 rep_score = self._contrite_tit_for_tat(peer)
+            # doc/architecture/zta-integration.md: an unproved credential bounds how far this peer may rise,
+            # whichever regime produced the score above.
+            rep_score = self._apply_standing_ceiling(peer_uuid, rep_score)
+            rep_score = self._apply_tenure_ceiling(peer_uuid, rep_score)
             self.reputations.update(peer_uuid, rep_score)
             try:
                 self._persist_reputations()
             except (OSError, IOError) as e:
-                self.logger.warning('Could not persist reputations: %s' % e)
+                self.logger.warning('Could not persist reputations: %s', e)
             # Queue a tier-update for IdentityProcess; drained by the
             # process loop alongside forward_reputation. The spawned
             # _compute_reputation thread doesn't have access to queues
             # so it can't put directly.
             self.pending_tiers.append((peer_uuid, rep_score))
-            self.requested_reps.append((Reputation(peer_uuid, rep_score), req_proc, requestor))
+            if respond:
+                self.requested_reps.append((Reputation(peer_uuid, rep_score), req_proc, requestor))
             _probes.counter('rep.compute', 'queued')
         except Exception as e:
             _probes.counter('rep.compute', 'exception', type(e).__name__)
-            self.logger.warning('_compute_reputation failed: %s' % e)
+            self.logger.warning('_compute_reputation failed: %s', e)
 
     def _consensus_baseline(self, peer_uuid):
         """Cold-start baseline for a peer with no committed bilateral
@@ -1915,14 +5276,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             return
         if tx.index <= self._consensus_folded_idx.get(key, -1):
             return
-        if tx.p1_id == peer_uuid:
-            cp_score = tx.p2_score
-        elif tx.p2_id == peer_uuid:
-            cp_score = tx.p1_score
-        else:
+        about = tx.about(peer_uuid)
+        if about is None:
             return
-        if cp_score is None:
-            return
+        cp_score = about[0]
         ema = self._consensus_ema.get(key)
         # transaction_weight applied as w single-step folds (see
         # _consensus_reputation for why this preserves the [0,1] range).
@@ -1949,7 +5306,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         it into BOTH counterparties' running consensus EMAs immediately, so the
         dashboard value is retained independently of when consensus is next
         queried. Idempotent (index-guarded), so it is safe to call after every
-        chain.update — a still-incomplete tx (index None) folds nothing.
+        placement — a still-incomplete tx (index None) folds nothing.
         Child-chain (gateway) commits are ignored here: those peers score via
         the pure from-scratch recompute in _consensus_reputation."""
         if chain is not self.history:
@@ -1958,6 +5315,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         if tx is None or tx.index is None:
             return
         alpha = 1.0 - 0.5 ** (1.0 / float(self.CONSENSUS_EMA_HALF_LIFE))
+        if tx.attested:
+            # About its subject only; the verifier gains nothing from it.
+            self._fold_tx_for_peer(tx.subject_id, tx, alpha)
+            return
         self._fold_tx_for_peer(tx.p1_id, tx, alpha)
         self._fold_tx_for_peer(tx.p2_id, tx, alpha)
 
@@ -1966,8 +5327,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
         The value is built by folding each committed bilateral tx exactly once
         (``_fold_tx_for_peer``, tracked by chain index). Folding happens
-        eagerly ON COMMIT (``_fold_committed_tx`` from the accept/commit
-        handlers), so already-folded transactions stay reflected in the stored
+        eagerly ON COMMIT (``_fold_committed_tx`` from
+        ``_apply_placement``), so already-folded transactions stay reflected in the stored
         value even after they evict from the bounded window — the score changes
         ONLY when new transactions commit and never wobbles as the shared
         window slides. That is the fix for the synchronized "Trust Dynamics"
@@ -2077,16 +5438,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             txs,
             key=lambda t: (t.index if t.index is not None else 0))
         for tx in ordered:
-            if tx.p1_id is None or tx.p2_id is None:
+            about = tx.about(peer_uuid)
+            if about is None:
                 continue
-            if tx.p1_id == peer_uuid:
-                cp_score = tx.p2_score
-            elif tx.p2_id == peer_uuid:
-                cp_score = tx.p1_score
-            else:
-                continue
-            if cp_score is None:
-                continue
+            cp_score = about[0]
             # Apply the capability's transaction_weight by running the
             # EMA update `w` times — a tier-w transaction moves the
             # EMA exactly as far as w tier-1 transactions would. This
@@ -2137,18 +5492,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         ema_by_tier: dict[int, float] = {}
         seen = set()
         for tx in ordered:
-            if tx.p1_id is None or tx.p2_id is None:
-                continue
             if tx.task_id in seen:
                 continue
-            if tx.p1_id == peer_uuid:
-                cp_score = tx.p2_score
-            elif tx.p2_id == peer_uuid:
-                cp_score = tx.p1_score
-            else:
+            about = tx.about(peer_uuid)
+            if about is None:
                 continue
-            if cp_score is None:
-                continue
+            cp_score = about[0]
             seen.add(tx.task_id)
             tier = self.task_tiers.get(str(tx.task_id), 0)
             w = self.task_weights.get(str(tx.task_id), 1)
@@ -2162,6 +5511,340 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         if ema_by_tier:
             self._per_tier_last[str(peer_uuid)] = dict(ema_by_tier)
         return ema_by_tier
+
+    # --- Deep resolution: one peer, on demand
+    # (doc/architecture/gateway-reputation-tree.md) -----------
+    #
+    # The subtree roster below covers this node's DIRECT children, which is
+    # everything it can score: a peer two levels down transacts in a chain
+    # this node is not a member of. Enumerating the whole tree to reach it
+    # would cost the size of the tree on every query to satisfy a need that
+    # is one peer, so instead the query is relayed to whoever holds the
+    # chain and the answer comes back carrying its own proof.
+
+    def _chain_holding(self, peer_uuid):
+        """The key of the chain whose window holds committed bilateral
+        entries for ``peer_uuid``, or None if no chain of ours does.
+
+        Primary chain first, so a peer we transact with directly is always
+        answered from the chain that actually knows it rather than from a
+        child chain that merely mentions it."""
+        target = str(peer_uuid)
+        for key in self._chain_keys():
+            chain = self._chain_for_key(key)
+            for tx in list(chain):
+                if tx.index is None or tx.p1_id is None:
+                    continue
+                if tx.attested:
+                    if target in (str(tx.p1_id), str(tx.subject_id)):
+                        return key
+                    continue
+                if tx.p2_id is None:
+                    continue
+                if target in (str(tx.p1_id), str(tx.p2_id)):
+                    return key
+        return None
+
+    def _resolve_signers(self, sigs):
+        """The co-signer identities an answer carries, in the DRY canonical
+        public form. Only signers we actually hold an identity for: a uuid we
+        cannot produce a key for would travel as an unverifiable name, which
+        is worse than absent -- the receiver would count a signature it has
+        no way to check, or spend time deciding not to."""
+        out = []
+        for voter in (sigs or {}):
+            ident = self._cosigner_identity(voter)
+            if ident is None:
+                continue
+            try:
+                canon = public_identity_to_canonical(ident)
+            except Exception:
+                continue
+            if canon:
+                out.append(canon)
+        return out
+
+    def _resolve_answer(self, query_id, peer_uuid, chain_key):
+        """Build the answer for a peer we hold a chain for, or None when that
+        chain has no finalized checkpoint.
+
+        No checkpoint means no answer at all, deliberately. The window would
+        still be true, but nothing would attest it, and a receiver two hops
+        away has no way to tell an unattested truth from a fabrication -- so
+        sending one would only teach requestors to accept unverifiable
+        answers."""
+        ckpt = self._checkpoints.get(chain_key)
+        if ckpt is None:
+            self.logger.debug(
+                'resolve %s: chain %s has no finalized checkpoint; no answer',
+                str(peer_uuid)[:8], chain_key[:8] or 'primary')
+            return None
+        sigs = self._checkpoint_sigs_final.get(chain_key) or {}
+        chain = self._chain_for_key(chain_key)
+        window = [tx for tx in list(chain) if tx.index is not None]
+        score = self._consensus_reputation(
+            peer_uuid, chain=chain if chain_key else None)
+        return resolved_to_dict(
+            query_id, peer_uuid, window,
+            SignedCheckpoint(checkpoint=ckpt, sigs=sigs),
+            signers=self._resolve_signers(sigs), score=score)
+
+    def _prune_resolve_state(self):
+        """Expire relayed and outstanding queries. Called from the process
+        loop: an answer that never arrives is the normal case for a subtree
+        that has gone dark, and nothing else would ever clear these."""
+        stamp = now().timestamp()
+        for qid in [q for q, v in self._resolve_pending.items() if v[1] <= stamp]:
+            self._resolve_pending.pop(qid, None)
+        for qid in [q for q, v in self._resolve_outstanding.items() if v[1] <= stamp]:
+            peer, _ = self._resolve_outstanding.pop(qid)
+            self.logger.info('Deep resolve of %s timed out', str(peer)[:8])
+
+    def _mark_resolve_seen(self, query_id) -> bool:
+        """Record a query-id, returning False if it was already seen (the
+        caller must then drop it). FIFO-bounded like the other dedup rings."""
+        if query_id in self._resolve_seen:
+            return False
+        self._resolve_seen[query_id] = None
+        while len(self._resolve_seen) > self.RESOLVE_SEEN_MAX:
+            self._resolve_seen.popitem(last=False)
+        return True
+
+    def resolve_reputation(self, queues, peer_uuid, ttl=RESOLVE_TTL_DEFAULT,
+                           query_id=None):
+        """Ask the tree for one peer's reputation. Returns the query id.
+
+        Fire-and-forget by design: the answer arrives later on
+        ``rep_resolved`` and lands in ``self.resolved_reps``. Nothing here
+        blocks, so a caller that needs the value polls that dict or waits for
+        the timeout to log.
+
+        ``query_id`` is caller-chosen so a test or conformance step can
+        correlate the answer it feeds back; production leaves it None. Mirrors
+        C ``reputation_deep_resolve``, which takes the same argument for the
+        same reason."""
+        qid = query_id or '%s-%s' % (str(self.identity.uuid)[:8],
+                                     str(now().timestamp()).replace('.', ''))
+        query = resolve_query_to_dict(qid, peer_uuid, ttl=ttl,
+                                      requesting_process=self.name)
+        self._resolve_outstanding[qid] = (
+            str(peer_uuid), now().timestamp() + self.RESOLVE_PENDING_TTL)
+        self._mark_resolve_seen(qid)
+        self._forward_resolve(queues, query)
+        return qid
+
+    def _forward_resolve(self, queues, query):
+        """Send a query one level DOWN: to each child group we gateway.
+
+        Addressed to the child GROUP rather than to a chosen child gateway.
+        The reputation process holds each child group (over the ChildGroupSet
+        IPC) but not the rank data the identity process picks a gateway with,
+        and asking the group is the same answer without a second, drifting
+        copy of that derivation living here. Everyone in the group sees that
+        somebody asked about a peer -- not who asked, since the query carries
+        no originator -- and whoever holds the chain answers.
+
+        Returns the number of groups the query went to; 0 means this branch
+        is a dead end and no answer will ever come back through us."""
+        if int(query.get('ttl', 0)) <= 0:
+            return 0
+        onward = dict(query)
+        onward['ttl'] = int(query['ttl']) - 1
+        sent = 0
+        for grp_uuid, group in self.child_groups.items():
+            try:
+                msg = Message(self.name, ReputationProtocol.rep_resolve,
+                              to_json_string(onward), group,
+                              from_whom=self.identity)
+                queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+                sent += 1
+            except Full:
+                self.logger.error('_forward_resolve: Network queue full')
+            except Exception as err:
+                self.logger.warning('Could not forward resolve to %s: %s',
+                                    str(grp_uuid)[:8], err)
+        return sent
+
+    def handle_resolve(self, queues, message):
+        """Answer a deep query, or relay it one level down.
+
+        Never blocks awaiting a child: the relay records who to answer and
+        returns immediately, and the answer is an independent message that
+        arrives (or does not) later. That is the same non-blocking model the
+        identity roster walk was designed around -- a handler that waited on
+        a child would stall this process's whole loop for the depth of the
+        subtree."""
+        if message.function != ReputationProtocol.rep_resolve:
+            return False
+        if not message.verified:
+            self.logger.warning('Rejecting unverified rep_resolve from %s',
+                                message.from_whom)
+            return True
+        try:
+            payload = message.obj
+            if isinstance(payload, str):
+                payload = from_json_string(payload)
+            query = resolve_query_from_dict(payload)
+        except (ValueError, TypeError) as err:
+            self.logger.warning('Malformed rep_resolve: %s', err)
+            return True
+        qid = query['query_id']
+        if not self._mark_resolve_seen(qid):
+            return True  # already handled; a loop or a duplicate leg
+        sender = getattr(message.from_whom, 'uuid', None)
+        if sender is None:
+            self.logger.warning('rep_resolve with no sender identity; dropped')
+            return True
+        chain_key = self._chain_holding(query['peer_uuid'])
+        if chain_key is not None:
+            answer = self._resolve_answer(qid, query['peer_uuid'], chain_key)
+            if answer is not None:
+                self._send_resolved(queues, message.from_whom, answer,
+                                    query.get('requesting_process'))
+                return True
+            # Held the chain but cannot attest it: fall through and let a
+            # deeper node that can answer instead.
+        if self._forward_resolve(queues, query):
+            self._resolve_pending[qid] = (
+                str(sender), now().timestamp() + self.RESOLVE_PENDING_TTL,
+                query.get('requesting_process') or '')
+        return True
+
+    def _send_resolved(self, queues, to_whom, answer, requesting_process=None):
+        try:
+            msg = Message(requesting_process or self.name,
+                          ReputationProtocol.rep_resolved,
+                          to_json_string(answer), to_whom,
+                          from_whom=self.identity)
+            queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('_send_resolved: Network queue full')
+        except Exception as err:
+            self.logger.warning('Could not send resolved answer: %s', err)
+
+    def handle_resolved(self, queues, message):
+        """Take an answer: relay it back one hop, or accept it if it is ours.
+
+        An answer for a query-id we never relayed and never sent is dropped
+        unread. Answers are unsolicited-by-construction on a relay path, so
+        the pending table is the only thing distinguishing an answer we are
+        carrying from one somebody injected."""
+        if message.function != ReputationProtocol.rep_resolved:
+            return False
+        if not message.verified:
+            self.logger.warning('Rejecting unverified rep_resolved from %s',
+                                message.from_whom)
+            return True
+        try:
+            payload = message.obj
+            if isinstance(payload, str):
+                payload = from_json_string(payload)
+            qid, peer, score, chain, signed, signers = \
+                resolved_from_dict(payload)
+        except (ValueError, TypeError, KeyError) as err:
+            self.logger.warning('Malformed rep_resolved: %s', err)
+            return True
+        relay = self._resolve_pending.pop(qid, None)
+        if relay is not None:
+            answer_to = self._identity_for_uuid(relay[0])
+            if answer_to is None:
+                self.logger.warning(
+                    'rep_resolved %s: cannot relay, %s no longer known',
+                    qid[:8], relay[0][:8])
+                return True
+            # Relayed VERBATIM, not re-serialized from parsed parts: the
+            # signatures are over bytes, and a re-encode that reordered a key
+            # or renormalized a float would invalidate evidence this node has
+            # no business invalidating. Relays carry, they do not curate.
+            self._send_resolved(queues, answer_to, payload, relay[2] or None)
+            return True
+        outstanding = self._resolve_outstanding.pop(qid, None)
+        if outstanding is None:
+            self.logger.debug('Unsolicited rep_resolved %s; dropped', qid[:8])
+            return True
+        self._accept_resolved(peer, score, chain, signed, signers)
+        return True
+
+    def _identity_for_uuid(self, uuid_str):
+        """A peer identity by uuid string, for addressing a relay hop."""
+        for peer in self.peers.all:
+            if str(peer.uuid) == str(uuid_str):
+                return peer
+        return None
+
+    def _accept_resolved(self, peer, claimed_score, chain, signed, signers):
+        """Verify an answer to a query we made and record the result.
+
+        The recorded score is the one WE compute from the attested window,
+        not the number the holder sent. The holder's value travels only as a
+        cross-check, because the weighting that produced it comes from a
+        node-local capability cache that is not part of any hashed entry and
+        so cannot be re-derived here (see consensus_score_from_window)."""
+        ok, reason = verify_resolved(
+            chain, signed, signers, self._resolve_verify_signature,
+            trust_signer=self._resolve_trust_signer,
+            min_signers=self.RESOLVE_MIN_SIGNERS)
+        if not ok:
+            self.logger.warning('Deep resolve of %s REFUSED: %s',
+                                str(peer)[:8], reason)
+            self.resolved_reps[str(peer)] = (None, False, reason)
+            return
+        score = consensus_score_from_window(
+            peer, chain, self.CONSENSUS_EMA_HALF_LIFE)
+        if score is None:
+            self.resolved_reps[str(peer)] = (
+                None, True, 'attested window holds no bilateral entry for peer')
+            return
+        note = reason
+        if claimed_score is not None and abs(float(claimed_score) - score) > 1e-9:
+            # Not a failure: the holder weights by capability tier and we
+            # cannot. Worth surfacing, because a large gap is also what a
+            # holder shading its own subtree would look like.
+            note = ('%s; holder reported %.4f vs %.4f unweighted here'
+                    % (reason, float(claimed_score), score))
+        self.resolved_reps[str(peer)] = (score, True, note)
+        self.logger.info('Deep resolve of %s = %.4f (%s)',
+                         str(peer)[:8], score, note)
+
+    def _resolve_verify_signature(self, designation, voter, sig, signer):
+        """Verify one co-signature, preferring an identity we already hold
+        over the one the answer supplied. Our own copy cannot have been
+        chosen by the sender; the carried one is the fallback that makes a
+        cross-boundary answer checkable at all."""
+        ident = self._cosigner_identity(voter)
+        if ident is None and isinstance(signer, dict):
+            try:
+                ident = public_identity_from_canonical(signer)
+            except Exception:
+                ident = None
+        if ident is None or sig is None:
+            return False
+        try:
+            if isinstance(sig, str):
+                sig = sig.encode('ascii')
+            ident.signature.public.verify(designation, HexEncoder.decode(sig))
+        except (BadSignatureError, ValueError, TypeError, AttributeError):
+            return False
+        return True
+
+    def _resolve_trust_signer(self, voter, signer):
+        """Whether a co-signer may count toward an answer's evidence.
+
+        A peer we already hold counts: it cleared admission. Otherwise the
+        carried identity must present a credential that chains to one of OUR
+        configured trust anchors -- the doc/architecture/zta-integration.md rule, applied to evidence
+        instead of to federation. Without this gate an answer could ship its
+        own freshly-minted signers and satisfy every signature check in
+        ``verify_resolved`` with keys it generated a moment earlier."""
+        if self._cosigner_identity(voter) is not None:
+            return True
+        if not isinstance(signer, dict):
+            return False
+        # An admission authority (ZTA) may vouch for a stranger whose credential
+        # chains to an anchor we accept. Without one an unknown signer cannot be
+        # trusted at all: refusing is the fail-safe direction.
+        return any(hook.credential_anchored(self, signer) for hook in identity_hooks(self)
+                   if hook.credential_anchored is not None)
 
     def _subtree_roster(self, gateway_uuid):
         """Reputation roster for a node and everything below it in the
@@ -2230,7 +5913,85 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         except Exception as e:
             _probes.counter('rep.consensus', 'exception', type(e).__name__)
             self.logger.warning(
-                '_compute_consensus_reputation failed: %s' % e)
+                '_compute_consensus_reputation failed: %s', e)
+
+    def _compute_consensus_reputation_batch(self, peer_uuids, req_proc, requestor):
+        """Answer one batched consensus request with a single deduplicated roster.
+
+        Equivalent to running _compute_consensus_reputation once per named
+        subject and concatenating, minus the duplication: a gateway's
+        _subtree_roster carries its child-group members alongside the requested
+        subject, and those entries do not depend on which subject was asked, so
+        naming N subjects would otherwise repeat them N times.
+
+        Our own uuid is skipped. The caller is sweeping observer-by-subject and
+        has no use for a self-pair, and skipping it here is what lets one request
+        body (hence one signature) serve every observer in a round.
+        """
+        _probes.counter('rep.consensus_batch', 'enter')
+        try:
+            roster = []
+            seen = set()
+            my_uuid = str(self.identity.uuid)
+            for peer_uuid in peer_uuids:
+                if str(peer_uuid) == my_uuid:
+                    continue
+                for rep in self._subtree_roster(peer_uuid):
+                    key = str(rep.peer_id)
+                    if key in seen or key == my_uuid:
+                        continue
+                    seen.add(key)
+                    roster.append(rep)
+            if not roster:
+                _probes.counter('rep.consensus_batch', 'empty')
+                return
+            self.requested_reps.append((roster, req_proc, requestor))
+            _probes.counter('rep.consensus_batch', 'queued', str(len(roster)))
+        except Exception as e:
+            _probes.counter('rep.consensus_batch', 'exception', type(e).__name__)
+            self.logger.warning(
+                '_compute_consensus_reputation_batch failed: %s', e)
+
+    def handle_consensus_reputation_batch_request(self, _, message):
+        if message.function != ReputationProtocol.consensus_rep_batch_req:
+            return False
+        if isinstance(message.obj, str):
+            parsed = from_json_string(message.obj)
+        else:
+            parsed = message.obj
+        if isinstance(parsed, dict):
+            uuids = parsed.get('peer_uuids')
+            req_proc = parsed.get('requesting_process')
+        elif isinstance(parsed, (list, tuple)) and len(parsed) >= 2:
+            uuids, req_proc = parsed[0], parsed[1]
+        else:
+            self.logger.error(
+                'handle_consensus_reputation_batch_request: unsupported '
+                'payload shape %r', type(parsed).__name__)
+            return True
+        if not isinstance(uuids, (list, tuple)):
+            self.logger.error(
+                'handle_consensus_reputation_batch_request: peer_uuids must be '
+                'a list, got %r', type(uuids).__name__)
+            return True
+        if len(uuids) > MAX_REP_BATCH_SUBJECTS:
+            # Each named subject costs a chain walk, so an unbounded list turns
+            # one cheap message into arbitrary work for the responder. Truncated
+            # rather than refused: a legitimate oversized cohort still gets a
+            # partial answer, and the count is logged so the cause is visible
+            # instead of appearing as a silently incomplete graph.
+            self.logger.warning(
+                'consensus reputation batch from %s named %d subjects; '
+                'answering the first %d only (MAX_REP_BATCH_SUBJECTS bounds the '
+                'work one message may ask for)',
+                getattr(message.from_whom, 'nickname', '?'), len(uuids),
+                MAX_REP_BATCH_SUBJECTS)
+            _probes.counter('rep.consensus_batch', 'truncated')
+            uuids = list(uuids)[:MAX_REP_BATCH_SUBJECTS]
+        requestor = message.from_whom
+        self._spawn(self._compute_consensus_reputation_batch,
+                    args=(uuids, req_proc, requestor))
+        return True
 
     def handle_consensus_reputation_request(self, _, message):
         if message.function != ReputationProtocol.consensus_rep_req:
@@ -2247,11 +6008,48 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         else:
             self.logger.error(
                 'handle_consensus_reputation_request: unsupported '
-                'payload shape %r' % type(parsed).__name__)
+                'payload shape %r', type(parsed).__name__)
             return True
         requestor = message.from_whom
         self._spawn(self._compute_consensus_reputation,
                     args=(ident, req_proc, requestor))
+        return True
+
+    def handle_local_rep_query(self, queues, message):
+        """Another local process asks for one peer's score (C:
+        handle_local_rep_query). Refused off the wire: the reply is pushed to
+        whichever process the payload names."""
+        if message.function != ReputationProtocol.local_rep_query:
+            return False
+        if not is_local_app_verb(self, message):
+            return refuse_remote_app_verb(self, message, message.function)
+        try:
+            payload = from_json_string(message.obj) if isinstance(
+                message.obj, (str, bytes)) else message.obj
+            peer_uuid_str = str(payload['peer_uuid'])
+            return_proc = str(payload['return_process'])
+        except (KeyError, TypeError, ValueError):
+            self.logger.error('handle_local_rep_query: missing JSON fields')
+            return True
+        score, found = 0.0, False
+        try:
+            key = UUID(peer_uuid_str)
+            if key in self.reputations:
+                score, found = float(self.reputations[key]), True
+        except (ValueError, TypeError):
+            pass
+        if return_proc not in queues:
+            self.logger.warning('handle_local_rep_query: unknown return process %r',
+                                return_proc)
+            return True
+        try:
+            queues[return_proc].put(
+                Message(return_proc, ReputationProtocol.local_rep_response,
+                        to_json_string({'peer_uuid': peer_uuid_str, 'score': score,
+                                        'found': found})),
+                block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.warning('handle_local_rep_query: %s queue full', return_proc)
         return True
 
     def handle_reputation_request(self, _, message):
@@ -2270,8 +6068,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 ident, req_proc = parsed[0], parsed[1]
             else:
                 self.logger.error(
-                    'handle_reputation_request: unsupported payload shape %r'
-                    % type(parsed).__name__)
+                    'handle_reputation_request: unsupported payload shape %r', type(parsed).__name__)
                 return True
             requestor = message.from_whom
             # Tag the requestor type so we can correlate
@@ -2297,7 +6094,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     def forward_reputation(self, queues):
         while len(self.requested_reps) > 0:
             payload, req_proc, requestor = self.requested_reps.pop(0)
-            self.logger.debug('Forward reps to %s at %s' % (req_proc, requestor))
+            self.logger.debug('Forward reps to %s at %s', req_proc, requestor)
             # payload is either a single Reputation (the rep_req /
             # _compute_reputation path) or a list[Reputation] (the
             # consensus subtree path). A 1-element roster is sent as a
@@ -2346,7 +6143,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     queues[req_proc].put(
                         msg, block=True, timeout=self.q_cadence)
             except Full:
-                self.logger.error('forward_reputation: %s queue full' % req_proc)
+                self.logger.error('forward_reputation: %s queue full', req_proc)
 
     def _dump_reputation_trace(self, present):
         """Debug instrument: emit THIS node's own reputation view of every
@@ -2437,11 +6234,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     'exc': key in self._excluded,
                 })
             rec = {'t': round(present, 3), 'self': me, 'view': view}
-            self.logger.info('AT_REPDUMP %s' % to_json_string(rec))
+            self.logger.info('AT_REPDUMP %s', to_json_string(rec))
         except Exception as err:
-            self.logger.error('reputation dump failed: %s' % err)
+            self.logger.error('reputation dump failed: %s', err)
 
     def process(self, queues, signal):
+        run_post_fork(self)
         # Drain budget per iter. Each handle_reputation_request spawns
         # a short-lived thread, so processing many per iter is cheap
         # and lets us stay ahead of inbound rep_req volume. The hard
@@ -2458,6 +6256,19 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     for key in list(self._excluded):
                         self._publish_exclusion(queues, key, True)
                     self._exclusions_synced = True
+                # A gateway's child groups arrive over IPC after __init__, so
+                # their persisted evidence is restored here rather than at boot
+                # (idempotent per group; see _restore_child_evidence).
+                if self.child_groups:
+                    self._restore_child_evidence(queues)
+                # ZTA findings arrive over IPC from IdentityProcess; act on any
+                # that are new (doc/architecture/zta-integration.md). Idempotent, so it is safe every pass.
+                self._apply_peer_standings(queues)
+                # A contact verified since boot (the identity process rewrites
+                # contacts.cfg.json on every handshake and verification) gets
+                # its seed here. First contact's provider is guarded by mtime,
+                # so the usual pass is one stat() and nothing else.
+                self._apply_seeds()
                 drained = 0
                 # First iteration blocks briefly so we don't hot-spin
                 # when the queue is empty; subsequent iterations are
@@ -2474,44 +6285,71 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     except Empty:
                         break
                     drained += 1
+                    if isinstance(message, Message):
+                        # Who is reachable, for parking (§2.60).
+                        self.note_heard(message.from_whom)
                     if not self.protocol.run_message_handlers(queues, message):
                         if not self.forward_transaction(queues, message):
                             # Raw SlashAttestation objects (put on the queue
                             # by a local detector, e.g. the coordinator)
                             # route here, mirroring forward_transaction.
                             if not self.forward_slash(queues, message) \
-                                    and not self.forward_checkpoint(queues, message):
+                                    and not self.forward_checkpoint(queues, message) \
+                                    and not self.forward_attestation(queues, message):
                                 if isinstance(message, Message):
                                     _probes.counter('proc.reputation', 'unhandled', message.function)
                                     _probes.trace_msg(message, 'unhandled', proc='reputation')
-                                    self.logger.error('Unhandled message %s' % message.function)
+                                    self.logger.error('Unhandled message %s', message.function)
                                 else:
                                     _probes.counter('proc.reputation', 'unhandled', 'type:' + message.__class__.__name__)
-                                    self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
+                                    self.logger.error('Unhandled message of type %s', message.__class__.__name__)  # noqa
                 _probes.counter('proc.reputation', 'iter_drained', str(drained))
                 self.forward_reputation(queues)
+                # Score whoever the chain moved for (see _rescore_sweep), so
+                # the drain below publishes them this same iteration.
+                self._rescore_sweep(now().timestamp())
                 # Drain tier updates queued by _compute_reputation.
                 while self.pending_tiers:
                     peer_uuid, rep_score = self.pending_tiers.pop(0)
                     self._publish_tier_change(queues, peer_uuid, rep_score)
+                    # Beside the tier change, exactly as the C twin does
+                    # (rep_proc.c: _publish_tier_change then
+                    # _publish_reputation_change): the tier is coarse, and an
+                    # app watching a score needs every change, not only the four
+                    # that step over a floor.
+                    self._publish_reputation_change(queues, peer_uuid, rep_score)
 
                 present = now().timestamp()
+                # Expire deep-resolution state. A relayed query whose subtree
+                # never answers is the ordinary case, not an error, and this
+                # is the only thing that clears it.
+                self._prune_resolve_state()
                 # Staleness sweep: relax idle peers' operational
                 # reputation toward almost-neutral (warm-start memory
                 # fades). Throttled internally to SWEEP_INTERVAL.
                 self._decay_reputations(queues, present)
+                # Periodically commit to our own window so the persisted
+                # evidence carries a quorum-signed root (verifiable warm
+                # start). Throttled internally to CHECKPOINT_INTERVAL.
+                self._maybe_checkpoint(queues, present)
+                # Our halves that went out and never came back (§2.24).
+                self._retry_uncommitted_halves(queues, present)
+                # Our unpaired halves, to members that joined after we
+                # committed them (§2.62).
+                self._hand_off_pending_halves(queues, present)
+                # Our attestation rounds whose propose went missing (§2.40).
+                self._retry_pending_attestations(queues, present)
+                # Ordered placement: propose the next instance of any chain
+                # whose ready items are ours to place now.
+                self._maybe_place(queues, present)
+                self._persist_pools()
+                # Checkpoint proposals that arrived before our chain held
+                # their range (§2.29).
+                self._recheck_parked_cosigns(queues, present)
                 # Debug instrument: emit this node's own reputation view for
                 # a host-side log harvester (opt-in, throttled internally).
                 self._dump_reputation_trace(present)
-                for req in list(self.requests):
-                    if present - req[0] > self.expiration:
-                        self.requests.remove(req)
-                for prop in dict(self.proposals):
-                    if present - prop[0] > self.expiration:
-                        del self.proposals[prop]
-                for rnd in list(self.round_group):
-                    if present - rnd[0] > self.expiration:
-                        del self.round_group[rnd]
+                self._expire_rounds(present)
                 # Guarantee a CPU-yield floor. queue.get's q_cadence timeout
                 # only sleeps when the queue is idle for a full window; under
                 # continuous traffic there is no idle window and this loop
@@ -2530,4 +6368,4 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             self._persist_reputations()
             self.logger.debug('Final reputation flush on shutdown')
         except Exception as err:
-            self.logger.warning('Final reputation flush failed: %s' % err)
+            self.logger.warning('Final reputation flush failed: %s', err)

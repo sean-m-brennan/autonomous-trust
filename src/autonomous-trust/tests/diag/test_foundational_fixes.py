@@ -536,6 +536,8 @@ def test_process_rebinds_receiver_socket_timeouts():
 
     nproc = NetworkProcess.__new__(NetworkProcess)
     nproc.socket_timeout = 0.1
+    # process() applies the plaintext-verb policy first, and logs through this.
+    nproc.logger = MagicMock()
 
     captured: dict = {'ptp': None, 'grp': None, 'cast': None}
 
@@ -560,6 +562,8 @@ def test_process_rebinds_receiver_socket_timeouts():
     nproc.group_receiver = lambda: None
     nproc.unknown_receiver = lambda: None
     nproc.mystery_handler = lambda *_: None
+    # Relay start-up (rendezvous's on_start hook) sets up its own state, so
+    # the __new__-built process needs no stub for it.
 
     nproc.process({}, MagicMock())
 

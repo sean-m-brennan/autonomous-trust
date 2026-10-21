@@ -1,0 +1,272 @@
+schema_version: "1"
+kind: scenario
+protocol: prequential
+name: competence-weighting
+byte_pinning: false
+description: |
+    A peer's record of forecasts against outcomes sets how much its evidence
+    WEIGHS, and never what its evidence says (R+D.md §12.5;
+    doc/verification_oracle.md layer 2, build-order step 4;
+    doc/architecture/prequential-competence.md).
+
+    Why this has to agree across runtimes. This layer produces no score and no
+    evidence channel — it produces the multiplier between a capability's
+    authored `transaction_weight` and the weight the EMA folds a score in at.
+    A peer that one runtime weights at 6 and the other at 2 makes every
+    reputation it appears in depend on which implementation happened to be
+    scoring, which is the one thing a weighted consensus cannot tolerate. The
+    arithmetic is therefore pinned, not merely the direction of the effect.
+
+    What each row pins:
+
+      - Rows 1-5: the layer is OPT-IN and SILENT about anything unusable. An
+        undeclared capability, a reply that attached no forecast, an inverted
+        box and mismatched `lo`/`hi` arities all record NOTHING. "Declared
+        predictive and attached nothing" is a fact about the claim and the
+        coverage audit already scores it 0.3 on `calibration`; scoring it here
+        too would double-count one omission, and this layer has no channel to
+        score it on in any case.
+      - Rows 6-10: a peer's own report never settles its own forecast — the
+        report lands, the forecast stays outstanding and the record does not
+        grow. Otherwise the peer supplies the truth it is weighted against.
+        Another peer's report closes it through the physics-declared path, so
+        an ordinary later result completes the loop with no application
+        involvement.
+      - Rows 11-12: under `min_samples` the multiplier is EXACTLY 1.0 — the
+        authored weight, verbatim. Same rule as the coverage audit's silence:
+        a layer whose failure mode is a guess is worse than one that says
+        nothing.
+      - Rows 13-24: a SHARP forecaster and a VAGUE one over four rounds, both
+        awake every round. A's boxes are one unit wide and cover: loss
+        1/10 = 0.1 each, mean 0.1, multiplier 2.0 - 1.5(0.1) = 1.85. B's are
+        sixteen units wide and cover every time: interval score 16 over a
+        scale of 10 SATURATES at 1.0, mean 1.0, multiplier 0.5 — the floor of
+        the declared band. The coverage audit is REQUIRED to forgive B, which
+        never over-claimed; this is the layer that does not, and that division
+        of labour is the whole reason this layer exists.
+      - Rows 25-29: the composed integer weight, which is where the two
+        runtimes could differ without either being obviously wrong.
+        `weight_round` is floor(x + 0.5): Python's `round` is banker's and C's
+        `lround` is half-away-from-zero, and they disagree at exactly 0.5 —
+        which is where a band-mapped weight lands most often. Authored 5 with
+        B's 0.5 is exactly 2.5 and must round to 3; the banker's rule would
+        say 2. Authored 1 cannot be demoted below 1, because a weight is how
+        many times the EMA folds a score in and there is nothing below one
+        fold — recorded in the design doc as a limitation of an integer fold
+        rather than worked around.
+      - Rows 30-33: the multiplier is REGIONAL without anyone declaring the
+        regions. A's record on `fc.temp` says nothing about A on `fc.pos`,
+        which has resolved nothing, and nothing at all is known about a peer
+        that has never forecast. Every one of those is exactly 1.0.
+      - Rows 34-36: Hedge's regret, MEASURED rather than asserted. The mixture
+        loss, each peer's cumulative loss and the bound `ln N / eta + eta T/8`
+        are pinned, and the realized regret against every peer stays under the
+        bound. This is the one guarantee in AT that holds against arbitrary,
+        adversarial peers at any sample size, and it needs no assumption about
+        the honest fraction.
+      - Row 37: the aggregate forecast lost to the mixture on this sequence,
+        and that is a property of the BOUNDED loss rather than a defect. The
+        raw interval score is convex in the endpoints, so Jensen puts the
+        vincentized forecast at or below the mixture; `min(1, IS/scale)` is
+        not convex, so once several awake forecasts saturate the aggregate can
+        land above it. `saturated_rounds` is reported for exactly this reason
+        — a reader who found the totals crossed with no explanation would
+        reasonably conclude the implementation was wrong.
+      - Rows 38-41: the aggregate query itself, which nothing in AT core
+        consumes: it is the API for an application that wants the mesh's best
+        estimate, and the claimant for the bound above. Endpoint-wise
+        (vincentized) at the Hedge weights, and two peers with no record yet
+        weigh equally.
+      - Rows 42-45: a forecast that outlives its horizon is DROPPED, not
+        scored as a miss. Nothing was observed, so there is no evidence in
+        either direction, and charging a peer for a truth that arrived too
+        late would let a quiet quantity convict it.
+      - Rows 46-49: a vector box is scored as the MEAN over components, so a
+        3-vector forecast is not three times worse than a scalar one; and a
+        forecast whose arity the observation contradicts is the WORST case
+        rather than an absent one, because it committed to a shape the world
+        denied.
+
+    Shape. Non-message-driven, like the physics, calibration and bootstrap
+    scenarios: each adapter loads `fixtures.prequential` (and
+    `fixtures.physics`, for the reporting capability -> quantity link) into its
+    own runtime's estimator and replays `fixtures.events` in order. The two
+    runtimes cannot share a call site — Python observes from its main process
+    and C from its negotiation process — so what is pinned is the rules.
+
+    Two event kinds assert STORE state rather than a number, and they earn
+    their place the same way the calibration scenario's do: a peer's own
+    report not settling its own forecast, and an expired forecast being
+    dropped, have no observable effect on any single multiplier. Silence is
+    also what a correctly-weighted neutral peer produces, so a runtime that
+    got either wrong would pass a multiplier-only scenario.
+
+    `t` is supplied by the fixture rather than read from a clock, so a replay
+    produces the weights the live path did.
+
+participants:
+  - id: requestor
+    role: new_node
+  - id: worker
+    role: peer
+
+fixtures:
+  physics:
+    version: 1
+    quantities:
+      sat.bus-temp:
+        capability: sat.temp
+        unit: degC
+        min: -80.0
+        max: 120.0
+      sat.position:
+        capability: sat.pos
+        unit: m
+        components: 3
+      sat.bus-volt:
+        capability: sat.volt
+        unit: V
+  prequential:
+    version: 1
+    min_samples: 2
+    max_outcomes: 8
+    max_outstanding: 8
+    horizon_sec: 10.0
+    eta: 1.0
+    weight_band:
+      min: 0.5
+      max: 2.0
+    capabilities:
+      fc.temp:
+        quantity: sat.bus-temp
+        scale: 10.0
+        alpha: 0.1
+        horizon_sec: 10.0
+      fc.pos:
+        quantity: sat.position
+        scale: 10.0
+        alpha: 0.1
+      fc.brief:
+        quantity: sat.bus-temp
+        scale: 10.0
+        alpha: 0.1
+        horizon_sec: 2.0
+      # On its own quantity DELIBERATELY: every settle with an awake forecast
+      # is a Hedge round, so putting the self-report and min_samples rows on
+      # sat.bus-temp would add a round and a third expert to the regret
+      # figures the sharp/vague sequence pins below.
+      fc.volt:
+        quantity: sat.bus-volt
+        scale: 10.0
+        alpha: 0.1
+
+  events:
+    #  1 undeclared capability: not this layer's business
+    - {forecast: {capability: other.thing, lo: [0.0], hi: [1.0]}, subject: A, t: 0.0, recorded: false}
+    #  2 declared predictive, attached nothing -- the coverage audit scores this
+    - {forecast: {capability: fc.temp}, subject: A, t: 0.0, recorded: false}
+    #  3 inverted box
+    - {forecast: {capability: fc.temp, lo: [5.0], hi: [1.0]}, subject: A, t: 0.0, recorded: false}
+    #  4 mismatched arities
+    - {forecast: {capability: fc.temp, lo: [1.0, 2.0], hi: [5.0]}, subject: A, t: 0.0, recorded: false}
+    #  5 a usable one
+    - {forecast: {capability: fc.volt, lo: [26.0], hi: [30.0]}, subject: S, t: 1.0, recorded: true}
+    - {outstanding: {quantity: sat.bus-volt, count: 1}}
+
+    #  6-10 a peer's own report never settles its own forecast
+    - {report: {capability: sat.volt, result: 28.0}, subject: S, t: 1.5, settled: 0}
+    - {outstanding: {quantity: sat.bus-volt, count: 1}}
+    - {outcomes: {subject: S, capability: fc.volt, count: 0}}
+    - {report: {capability: sat.volt, result: 28.0}, subject: R, t: 1.6, settled: 1}
+    - {outstanding: {quantity: sat.bus-volt, count: 0}}
+    - {outcomes: {subject: S, capability: fc.volt, count: 1}}
+
+    # 11-12 one resolution, min_samples 2: exactly the authored weight
+    - {competence: {subject: S, capability: fc.volt}, value: 1.0}
+    - {weight: {subject: S, capability: fc.volt, transaction_weight: 3}, value: 3}
+
+    # 13-24 a sharp forecaster and a vague one, four rounds each.
+    # Truth 21, 22, 20, 21; A is +/-0.5 and B is +/-8.
+    - {forecast: {capability: fc.temp, lo: [20.5], hi: [21.5]}, subject: A, t: 2.0, recorded: true}
+    - {forecast: {capability: fc.temp, lo: [13.0], hi: [29.0]}, subject: B, t: 2.0, recorded: true}
+    - {resolve: {quantity: sat.bus-temp, value: 21.0}, t: 2.5, settled: 2}
+    - {forecast: {capability: fc.temp, lo: [21.5], hi: [22.5]}, subject: A, t: 3.0, recorded: true}
+    - {forecast: {capability: fc.temp, lo: [14.0], hi: [30.0]}, subject: B, t: 3.0, recorded: true}
+    - {resolve: {quantity: sat.bus-temp, value: 22.0}, t: 3.5, settled: 2}
+    - {forecast: {capability: fc.temp, lo: [19.5], hi: [20.5]}, subject: A, t: 4.0, recorded: true}
+    - {forecast: {capability: fc.temp, lo: [12.0], hi: [28.0]}, subject: B, t: 4.0, recorded: true}
+    - {resolve: {quantity: sat.bus-temp, value: 20.0}, t: 4.5, settled: 2}
+    - {forecast: {capability: fc.temp, lo: [20.5], hi: [21.5]}, subject: A, t: 5.0, recorded: true}
+    - {forecast: {capability: fc.temp, lo: [13.0], hi: [29.0]}, subject: B, t: 5.0, recorded: true}
+    - {resolve: {quantity: sat.bus-temp, value: 21.0}, t: 5.5, settled: 2}
+    - {outcomes: {subject: A, capability: fc.temp, count: 4}}
+    - {outcomes: {subject: B, capability: fc.temp, count: 4}}
+    # sharp: mean loss 0.1 -> 2.0 - 1.5(0.1); vague: saturated -> the floor
+    - {competence: {subject: A, capability: fc.temp}, value: 1.85}
+    - {competence: {subject: B, capability: fc.temp}, value: 0.5}
+
+    # 25-29 the composed integer weight. floor(x + 0.5), which is neither
+    # Python's banker's round nor C's lround.
+    - {weight: {subject: A, capability: fc.temp, transaction_weight: 3}, value: 6}   # 5.55 -> 6
+    - {weight: {subject: B, capability: fc.temp, transaction_weight: 3}, value: 2}   # 1.5  -> 2
+    - {weight: {subject: B, capability: fc.temp, transaction_weight: 5}, value: 3}   # 2.5  -> 3, NOT 2
+    - {weight: {subject: A, capability: fc.temp, transaction_weight: 1}, value: 2}   # 1.85 -> 2
+    - {weight: {subject: B, capability: fc.temp, transaction_weight: 1}, value: 1}   # 0.5 floors at 1
+
+    # 30-33 regional, and silent about the unseen
+    - {competence: {subject: A, capability: fc.pos}, value: 1.0}
+    - {competence: {subject: A, capability: other.thing}, value: 1.0}
+    - {competence: {subject: Z, capability: fc.temp}, value: 1.0}
+    - {weight: {subject: Z, capability: fc.temp, transaction_weight: 3}, value: 3}
+
+    # 34-37 Hedge's guarantee, measured. A's cumulative loss is 4(0.1) and
+    # B's is 4(1.0); the bound is ln 2 + 4/8.
+    - {regret: {quantity: sat.bus-temp}, rounds: 4, experts: 2, mixture_loss: 1.2944874264992323, aggregate_loss: 1.8908123774987204, saturated_rounds: 4, bound_holds: true}
+    - {peer_regret: {quantity: sat.bus-temp, peer: A}, cumulative_loss: 0.4, rounds: 4, bound: 1.1931471805599454}
+    - {peer_regret: {quantity: sat.bus-temp, peer: B}, cumulative_loss: 4.0, rounds: 4, bound: 1.1931471805599454}
+    # a quantity nothing has forecast has no regret to report
+    - {regret: {quantity: sat.position}, absent: true}
+
+    # 38-41 the aggregate query. Two peers with no record on THIS quantity
+    # weigh equally, so the aggregate of [0,2] and [10,12] is [5,7].
+    - {aggregate: {quantity: sat.position}, absent: true}
+    - {forecast: {capability: fc.pos, lo: [0.0, 0.0, 0.0], hi: [2.0, 2.0, 2.0]}, subject: A, t: 6.0, recorded: true}
+    - {forecast: {capability: fc.pos, lo: [10.0, 10.0, 10.0], hi: [12.0, 12.0, 12.0]}, subject: B, t: 6.0, recorded: true}
+    - {aggregate: {quantity: sat.position}, lo: [5.0, 5.0, 5.0], hi: [7.0, 7.0, 7.0], contributors: 2, weights: [0.5, 0.5]}
+
+    # 42-45 a forecast that outlives its horizon is dropped, not scored
+    - {forecast: {capability: fc.brief, lo: [20.0], hi: [22.0]}, subject: E, t: 7.0, recorded: true}
+    - {outstanding: {quantity: sat.bus-temp, count: 1}}
+    - {resolve: {quantity: sat.bus-temp, value: 21.0}, t: 100.0, settled: 0}
+    - {outcomes: {subject: E, capability: fc.brief, count: 0}}
+    - {competence: {subject: E, capability: fc.brief}, value: 1.0}
+
+    # 46-49 a vector box: the mean over components, and a shape the
+    # observation contradicts is the worst case. V's boxes are 2 units wide
+    # in each of three components and cover -> 2/10 = 0.2 per round;
+    # W forecasts three components against a scalar truth -> 1.0 per round.
+    - {forecast: {capability: fc.pos, lo: [0.0, 0.0, 0.0], hi: [2.0, 2.0, 2.0]}, subject: V, t: 8.0, recorded: true}
+    - {forecast: {capability: fc.pos, lo: [0.0, 0.0, 0.0], hi: [2.0, 2.0, 2.0]}, subject: W, t: 8.0, recorded: true}
+    - {resolve: {quantity: sat.position, value: [1.0, 1.0, 1.0]}, t: 8.5, settled: 4}
+    - {forecast: {capability: fc.pos, lo: [0.0, 0.0, 0.0], hi: [2.0, 2.0, 2.0]}, subject: V, t: 9.0, recorded: true}
+    - {forecast: {capability: fc.pos, lo: [0.0, 0.0, 0.0], hi: [2.0, 2.0, 2.0]}, subject: W, t: 9.0, recorded: true}
+    - {resolve: {quantity: sat.position, value: 1.0}, t: 9.5, settled: 2}
+    # V: one covered vector round (0.2) and one arity mismatch (1.0) -> 0.6
+    - {competence: {subject: V, capability: fc.pos}, value: 1.1}
+    - {competence: {subject: W, capability: fc.pos}, value: 1.1}
+
+steps:
+  - id: 1
+    from: requestor
+    to: requestor
+    function: replay_events
+    description: |
+        Trigger. The requestor replays each row of `fixtures.events` through
+        its own runtime's prequential estimator, in order, carrying the
+        outstanding-forecast and resolved-loss stores from row to row. A
+        `forecast` row asserts whether the box was usable; `competence` and
+        `weight` rows assert the multiplier and the composed integer EMA
+        weight; `regret`, `peer_regret` and `aggregate` rows assert the
+        sleeping-experts accounting and the vincentized forecast;
+        `outstanding` and `outcomes` rows assert store state that no single
+        multiplier makes visible.

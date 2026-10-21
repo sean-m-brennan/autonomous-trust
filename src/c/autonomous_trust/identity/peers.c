@@ -101,9 +101,13 @@ const public_identity_t *peers_find_by_uuid(peers_t *peers, const uuid_t uuid)
 /* Frama-C: skipped — [solver-timeout] array iteration preconditions */
 const public_identity_t *peers_find_by_address(peers_t *peers, const char *address)
 {
-    /* Strip CIDR suffix if present (mirrors Python behavior) */
+    /* Strip a CIDR suffix if present (mirrors Python's strip_cidr). A DTN
+     * endpoint ID (dtn:/ipn:) is kept whole: its slashes are part of the
+     * address, and cutting at the first one turned every EID into "dtn:". */
     char addr_buf[ADDR_LEN + 1];
-    const char *slash = strchr(address, '/');
+    const char *slash = (strncmp(address, "dtn:", 4) == 0 ||
+                         strncmp(address, "ipn:", 4) == 0)
+                        ? NULL : strchr(address, '/');
     if (slash != NULL)
     {
         size_t len = (size_t)(slash - address);
@@ -212,7 +216,12 @@ int peers_promote(peers_t *peers, const public_identity_t *who)
         {
             if (vlvl > 0)
             {
-                /* Move up one valuation level */
+                /* Move up one valuation level. The ref is what makes this a
+                 * move rather than a free: map_set adopts the reference the
+                 * source map holds, and the map_remove below releases it, so
+                 * without a second one the value dies in transit and the
+                 * destination map is left pointing at freed memory. */
+                smrt_ref(val);
                 map_set(&peers->valuations[vlvl - 1], nick, val);
                 map_remove(&peers->valuations[vlvl], nick);
             }
@@ -239,7 +248,9 @@ int peers_demote(peers_t *peers, const public_identity_t *who)
         {
             if (vlvl < VALUES - 1)
             {
-                /* Move down one valuation level */
+                /* Move down one valuation level; see peers_promote for why
+                 * the ref is needed before the map_remove below. */
+                smrt_ref(val);
                 map_set(&peers->valuations[vlvl + 1], nick, val);
             }
             else

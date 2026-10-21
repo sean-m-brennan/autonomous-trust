@@ -1,0 +1,29 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: device-cert-wrong-version
+description: A cert of another version is malformed, even when properly signed.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: device
+    mode: verify
+    cert:
+      body: '{"v":2,"typename":"at-device-cert","operator":"17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce","uuid":"dddddddd-0000-4000-8000-000000000052","key":"2012cb90ca60e8e5d8daf66e2272d2233e0486d557e8c66141ed8920177d7eb7","issued_at":1790000000}'
+      sig: 7e060b0a8dc90c257613ec58bcc25c80f49bb8e3050c24f1f15618a33517cd0c9588139ebae30fad5509f7b9f3ea9235ab1046952c4b960f8ff6558167004001
+steps:
+- id: 1
+  from: host
+  to: host
+  function: device
+  description: 'trigger: device verify'
+expected_state:
+  host:
+    device_status: malformed

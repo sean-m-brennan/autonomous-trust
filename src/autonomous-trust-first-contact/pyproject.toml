@@ -1,0 +1,30 @@
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "autonomous_trust_first_contact"
+version = "0.2.1"
+description = "AutonomousTrust first contact: contacts and invitations, the 1:1 handshake, the directory and area flows, devices, siblings and the backup"
+authors = ["Sean M Brennan <sean.brennan@tekfive.com>"]
+readme = "README.md"
+packages = [{include = "autonomous_trust"}]
+exclude = ["**/__pycache__"]
+
+[project]
+name = "autonomous_trust_first_contact"
+version = "0.2.1"
+
+# How an installed core finds first contact (autonomous_trust.core.extensions):
+# the handshake, and its always-on network half.
+[project.entry-points."autonomous_trust.extensions"]
+first_contact = "autonomous_trust.first_contact._at_extension:EXTENSION"
+first_contact_network = "autonomous_trust.first_contact._at_extension:NETWORK_EXTENSION"
+
+[tool.poetry.dependencies]
+python = "^3.13"
+autonomous-trust = ">=0.2.1"
+# The relays it rides (directory, area hubs, relay hints in its links).
+autonomous-trust-rendezvous = ">=0.2.1"
+# Invitations, safety numbers, device certs and the backup's Argon2id + XChaCha20.
+PyNaCl = ">=1.5.0"

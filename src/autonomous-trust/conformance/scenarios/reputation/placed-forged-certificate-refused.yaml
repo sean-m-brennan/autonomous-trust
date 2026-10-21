@@ -1,0 +1,41 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: placed-forged-certificate-refused
+byte_pinning: false
+description: |
+    Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+    order"): a decided placement is broadcast with a quorum certificate over its
+    designation (index, predecessor head, value digest), and every member writes
+    it at that index exactly as given.
+
+    alice signed every entry of the certificate herself, under the others' names.
+    Only her own signature verifies, so bob does not write the placement.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures: {}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: placed
+    payload:
+      k: 0
+      value:
+        - {task_id: t-1, p1: carol, p1_score: 0.9, p2: dave, p2_score: 0.7}
+        - {task_id: t-2, p1: alice, p1_score: 0.8, p2: carol, p2_score: 0.6}
+      forged_by: alice
+
+expected_state:
+  bob:
+    chain_tasks: []

@@ -1,0 +1,36 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-final-without-the-verifier-refused
+byte_pinning: false
+description: |
+    An attestation needs its verifier's own signature.
+
+    bob and dave signed; alice, the verifier the entry names, did not. That is a
+    majority of the non-subjects, but the entry would then be an author's claim
+    the author never made. dave refuses it.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+  - id: dave
+    role: member
+
+steps:
+  - id: 1
+    from: alice
+    to: dave
+    function: attest final
+    payload:
+      subject: carol
+      score: 0.3
+      cosigners: [bob, dave]
+    description: a certificate without its author.
+
+expected_state:
+  dave:
+    committed_tx_count: 0

@@ -205,7 +205,7 @@ class TestIdentityHistory:
         result = h._pre_verify(blob, proof, b'sig')
         assert result is True
 
-    # --- §3.2 divergence detection (proof-digest consistency) ---
+    # --- doc/architecture/identity-protocol.md divergence detection (proof-digest consistency) ---
 
     def _make_proof(self, blob, uuid, digest=None, nonce=None):
         from autonomous_trust.core.algorithms.agreement import AgreementProof

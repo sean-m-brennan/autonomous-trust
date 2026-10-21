@@ -79,7 +79,7 @@ class ByzantineReputationProcess(ReputationProcess, metaclass=ProcMeta,
             )
             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
 
-        self.logger.debug("Byzantine: sent inconsistent scores for (%s, %s)" % (id1, id2))
+        self.logger.debug("Byzantine: sent inconsistent scores for (%s, %s)", id1, id2)
         return True
 
     def handle_reputation_request(self, _, message):
@@ -94,11 +94,9 @@ class ByzantineReputationProcess(ReputationProcess, metaclass=ProcMeta,
 
         req_hash = int(hashlib.md5(str(message.from_whom).encode()).hexdigest(), 16)
         if req_hash % 2 == 0:
-            self.logger.debug("Byzantine: inflating reputation for %s (requester %s)" %
-                            (ident, message.from_whom))
+            self.logger.debug("Byzantine: inflating reputation for %s (requester %s)", ident, message.from_whom)
         else:
-            self.logger.debug("Byzantine: deflating reputation for %s (requester %s)" %
-                            (ident, message.from_whom))
+            self.logger.debug("Byzantine: deflating reputation for %s (requester %s)", ident, message.from_whom)
 
         return super().handle_reputation_request(_, message)
 

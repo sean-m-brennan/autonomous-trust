@@ -160,7 +160,481 @@ DEFINE_TEST(test_group_init_nul_terminates_long_address)
 }
 END_TEST_DEFINITION()
 
+
+/* --- Group key rotation (doc/architecture/gateway-reputation-tree.md)
+ * --------------------------------
+ * Admission used to hand a joiner a PERMANENT shared key, so a new member
+ * could decrypt cohort traffic it had recorded before it joined. Admission now
+ * rotates; these pin the three things that makes safe. */
+
+DEFINE_TEST(test_group_rotate_key_mints_new_key_and_bumps_epoch)
+{
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t uuid;
+    uuid_generate(uuid);
+    char addr[] = "10.0.0.1";
+    group_t *grp = NULL;
+    ck_assert_ret_ok(group_create(&uuid, addr, &grp));
+    ck_assert(grp->key_epoch == 0);   /* never rotated */
+
+    unsigned char before[crypto_box_SECRETKEYBYTES];
+    memcpy(before, grp->encryptor.private, sizeof(before));
+
+    ck_assert(group_rotate_key(grp) == 1);
+    ck_assert(grp->key_epoch == 1);
+    /* The point of the rotation: the live key is a DIFFERENT key. */
+    ck_assert(memcmp(before, grp->encryptor.private, sizeof(before)) != 0);
+    /* ...and the superseded one is retained for the grace window only. */
+    ck_assert(grp->num_previous_keys == 1);
+    ck_assert_mem_eq(grp->previous_keys[0].private, before, sizeof(before));
+
+    /* Retained keys are bounded: a third rotation evicts the oldest rather
+     * than growing the window without limit. */
+    ck_assert(group_rotate_key(grp) == 2);
+    ck_assert(group_rotate_key(grp) == 3);
+    ck_assert(grp->num_previous_keys == GROUP_PREVIOUS_KEY_MAX);
+
+    group_free(grp);
+}
+
+/* A public-only view of somebody else's group has no standing to rotate it:
+ * minting a key we cannot already decrypt with would fork the cohort into two
+ * halves that cannot hear each other. */
+#ifndef AT_NO_LINK_WRAP
+/* Linked with -Wl,--wrap=encryptor_generate (CMakeLists.txt): every call the
+ * library makes lands here and passes through unless a test asks for a failed
+ * mint. */
+unsigned char *__real_encryptor_generate(void);
+static bool _fail_next_mint = false;
+unsigned char *__wrap_encryptor_generate(void)
+{
+    if (_fail_next_mint)
+    {
+        _fail_next_mint = false;
+        return NULL;
+    }
+    return __real_encryptor_generate();
+}
+
+/* A mint that fails changes nothing. It used to retire the live key first, so
+ * the group kept a current key that was also in its own retired list, and every
+ * update carrying that key (the cohort's tiebreak winner included) was refused
+ * as "a key we already retired". */
+DEFINE_TEST(test_group_rotate_key_failed_mint_retires_nothing)
+{
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t uuid;
+    uuid_generate(uuid);
+    char addr[] = "10.0.0.7";
+    group_t *grp = NULL;
+    ck_assert_ret_ok(group_create(&uuid, addr, &grp));
+    encryptor_t live = grp->encryptor;
+
+    _fail_next_mint = true;
+    ck_assert(group_rotate_key(grp) == -1);
+    ck_assert(!_fail_next_mint);   /* the mint was attempted */
+    ck_assert(grp->key_epoch == 0);
+    ck_assert(grp->num_previous_keys == 0);
+    ck_assert_mem_eq(grp->encryptor.private, live.private,
+                     sizeof(live.private));
+
+    /* The same key offered back at our epoch is ours, not a retired one. */
+    group_t offer = {0};
+    memcpy(offer.uuid, grp->uuid, sizeof(uuid_t));
+    offer.key_epoch = 0;
+    offer.encryptor = live;
+    ck_assert_str_eq(group_rotation_refusal(grp, &offer), "already our key");
+
+    /* And the next mint works as usual. */
+    ck_assert(group_rotate_key(grp) == 1);
+    ck_assert(grp->num_previous_keys == 1);
+    ck_assert_mem_eq(grp->previous_keys[0].private, live.private,
+                     sizeof(live.private));
+
+    group_free(grp);
+}
+#else
+/* No --wrap on this linker (Apple's, lld-link), so no way to fail one mint here. */
+DEFINE_TEST(test_group_rotate_key_failed_mint_retires_nothing)
+{
+    printf("  skipped: needs -Wl,--wrap (not available on this linker)\n");
+}
+#endif
+
+DEFINE_TEST(test_group_rotate_key_refused_without_private)
+{
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t uuid;
+    uuid_generate(uuid);
+    char addr[] = "10.0.0.2";
+    group_t *grp = NULL;
+    ck_assert_ret_ok(group_create(&uuid, addr, &grp));
+    sodium_memzero(grp->encryptor.private, crypto_box_SECRETKEYBYTES);
+
+    ck_assert(group_rotate_key(grp) == -1);
+    ck_assert(grp->key_epoch == 0);
+    ck_assert(grp->num_previous_keys == 0);
+
+    group_free(grp);
+}
+
+/* accept_rotation's conditions, each of which is load-bearing. The epoch is the
+ * security-relevant half: without it a captured OLD key could be replayed back
+ * over a newer one, which is exactly what rotation exists to foreclose. */
+DEFINE_TEST(test_group_accept_rotation_requires_higher_epoch_and_key)
+{
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t uuid;
+    uuid_generate(uuid);
+    char addr[] = "10.0.0.3";
+    group_t *mine = NULL, *theirs = NULL;
+    ck_assert_ret_ok(group_create(&uuid, addr, &mine));
+    ck_assert_ret_ok(group_create(&uuid, addr, &theirs));
+    memcpy(theirs->uuid, mine->uuid, sizeof(uuid_t));
+
+    /* Equal epoch offering the key we ALREADY hold: nothing to adopt. (An equal
+     * epoch offering a DIFFERENT live key is the simultaneous-rotation fork,
+     * settled by a deterministic tiebreak — see
+     * test_group_accept_rotation_equal_epoch_converges.) */
+    group_t same = *theirs;
+    same.encryptor = mine->encryptor;
+    ck_assert(!group_accept_rotation(mine, &same));
+    ck_assert(mine->key_epoch == 0);
+
+    /* Strictly higher epoch + a real private key: adopted. */
+    theirs->key_epoch = 1;
+    ck_assert(group_accept_rotation(mine, theirs));
+    ck_assert(mine->key_epoch == 1);
+    ck_assert_mem_eq(mine->encryptor.private, theirs->encryptor.private,
+                     crypto_box_SECRETKEYBYTES);
+    /* Our superseded key stays available for the grace window. */
+    ck_assert(mine->num_previous_keys == 1);
+
+    /* A LOWER epoch afterwards is refused — the replay, arriving late. */
+    unsigned char current[crypto_box_SECRETKEYBYTES];
+    memcpy(current, mine->encryptor.private, sizeof(current));
+    group_t *stale = NULL;
+    ck_assert_ret_ok(group_create(&uuid, addr, &stale));
+    memcpy(stale->uuid, mine->uuid, sizeof(uuid_t));
+    stale->key_epoch = 0;
+    ck_assert(!group_accept_rotation(mine, stale));
+    ck_assert_mem_eq(mine->encryptor.private, current, sizeof(current));
+
+    /* A public-only offer carries nothing to adopt: taking it would leave us
+     * unable to decrypt our own cohort. */
+    stale->key_epoch = 9;
+    sodium_memzero(stale->encryptor.private, crypto_box_SECRETKEYBYTES);
+    ck_assert(!group_accept_rotation(mine, stale));
+    ck_assert(mine->key_epoch == 1);
+
+    /* A key for a DIFFERENT cohort is not a rotation of this one. */
+    uuid_t other_uuid;
+    uuid_generate(other_uuid);
+    group_t *foreign = NULL;
+    ck_assert_ret_ok(group_create(&other_uuid, addr, &foreign));
+    foreign->key_epoch = 99;
+    ck_assert(!group_accept_rotation(mine, foreign));
+    ck_assert(mine->key_epoch == 1);
+
+    group_free(foreign);
+    group_free(stale);
+    group_free(theirs);
+    group_free(mine);
+}
+
+/* A rotation is not synchronous across a cohort: a member that has not yet
+ * processed the key update is still sending under the old key. Those frames
+ * must still decrypt, or rotation would cost more than it buys. */
+DEFINE_TEST(test_group_decrypt_falls_back_to_retired_key)
+{
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t uuid;
+    uuid_generate(uuid);
+    char addr[] = "10.0.0.4";
+    group_t *sender = NULL, *receiver = NULL;
+    ck_assert_ret_ok(group_create(&uuid, addr, &sender));
+    ck_assert_ret_ok(group_create(&uuid, addr, &receiver));
+    /* Both hold the SAME shared key, as cohort members do. */
+    memcpy(&receiver->encryptor, &sender->encryptor, sizeof(encryptor_t));
+
+    unsigned char plain[] = "cohort traffic in flight";
+    msg_str_t in = { plain, sizeof(plain) };
+    unsigned char nonce[crypto_box_NONCEBYTES];
+    randombytes_buf(nonce, sizeof(nonce));
+    unsigned char cipher[sizeof(plain) + crypto_box_MACBYTES];
+    ck_assert_ret_ok(group_encrypt(sender, &in, sender, nonce, cipher));
+
+    /* The receiver rotates (it just admitted somebody); the sender has not yet
+     * seen the update. */
+    ck_assert(group_rotate_key(receiver) == 1);
+
+    msg_str_t ct = { cipher, sizeof(cipher) };
+    unsigned char out[sizeof(plain)] = {0};
+    ck_assert_ret_ok(group_decrypt(receiver, &ct, sender, nonce, out));
+    ck_assert_mem_eq(out, plain, sizeof(plain));
+
+    /* But the window is bounded: age the retired key past the grace period and
+     * the same frame no longer opens. An unbounded fallback would make
+     * rotation decorative. */
+    receiver->previous_retired_at[0] -= (GROUP_PREVIOUS_KEY_GRACE + 1.0);
+    ck_assert_ret_nonzero(group_decrypt(receiver, &ct, sender, nonce, out));
+
+    group_free(receiver);
+    group_free(sender);
+}
+
+/* The network process's call: the group itself as `whom` (net_proc.c
+ * `group_decrypt(grp, &cmsg, grp, ...)`). The fallback used to pair the
+ * retired private with whom's public, which is then the CURRENT public, so this
+ * exact call never opened a frame sealed under a retired key. */
+DEFINE_TEST(test_group_decrypt_retired_key_with_itself_as_sender)
+{
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t uuid;
+    uuid_generate(uuid);
+    char addr[] = "10.0.0.8";
+    group_t *grp = NULL;
+    ck_assert_ret_ok(group_create(&uuid, addr, &grp));
+
+    unsigned char plain[] = "sealed just before the rotation";
+    msg_str_t in = { plain, sizeof(plain) };
+    unsigned char nonce[crypto_box_NONCEBYTES];
+    randombytes_buf(nonce, sizeof(nonce));
+    unsigned char cipher[sizeof(plain) + crypto_box_MACBYTES];
+    ck_assert_ret_ok(group_encrypt(grp, &in, grp, nonce, cipher));
+
+    ck_assert(group_rotate_key(grp) == 1);
+
+    msg_str_t ct = { cipher, sizeof(cipher) };
+    unsigned char out[sizeof(plain)] = {0};
+    ck_assert_ret_ok(group_decrypt(grp, &ct, grp, nonce, out));
+    ck_assert_mem_eq(out, plain, sizeof(plain));
+
+    group_free(grp);
+}
+
+/* Two members that rotate at the SAME INSTANT both mint the same epoch with
+ * different keys. That is not a replay, it is a fork — and refusing it flatly
+ * (as a strict `>` epoch gate does) makes the fork PERMANENT: same group uuid,
+ * same epoch number, different keys, and every group multicast fails its MAC
+ * from then on. It is exactly what ordinary mesh discovery produces when two
+ * nodes admit each other at once, and it took down the first live group
+ * multicast the project ever sent (agora business-ad cohort, 2026-09-17).
+ *
+ * The resolution is a deterministic tiebreak on the key itself, so both sides
+ * reach the SAME answer from what is already on the wire, with no extra round
+ * trip: exactly one of them adopts, and the cohort converges. */
+DEFINE_TEST(test_group_accept_rotation_equal_epoch_converges)
+{
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t uuid;
+    uuid_generate(uuid);
+    char addr[] = "10.0.0.5";
+    group_t *a = NULL, *b = NULL;
+    ck_assert_ret_ok(group_create(&uuid, addr, &a));
+    ck_assert_ret_ok(group_create(&uuid, addr, &b));
+    memcpy(b->uuid, a->uuid, sizeof(uuid_t));
+    /* Both hold the same key, as cohort members do... */
+    memcpy(&b->encryptor, &a->encryptor, sizeof(encryptor_t));
+    /* ...and then both rotate, each unaware of the other. THE FORK. */
+    ck_assert(group_rotate_key(a) == 1);
+    ck_assert(group_rotate_key(b) == 1);
+    ck_assert(memcmp(a->encryptor.public, b->encryptor.public,
+                     crypto_box_PUBLICKEYBYTES) != 0);
+
+    /* Each side judges the other's update as it went on the wire, i.e. from a
+     * snapshot taken BEFORE either of them adopted anything. accept_rotation
+     * reads only uuid/epoch/encryptor, which is why id_proc.c can hand it a
+     * stack group_t too. */
+    group_t a_wire = *a;
+    group_t b_wire = *b;
+
+    bool a_adopts = group_accept_rotation(a, &b_wire);
+    bool b_adopts = group_accept_rotation(b, &a_wire);
+
+    /* Exactly one adopts — that IS convergence. Both adopting would swap the
+     * fork for a different fork; neither adopting is the deadlock. */
+    ck_assert(a_adopts != b_adopts);
+    ck_assert(a->key_epoch == 1);
+    ck_assert(b->key_epoch == 1);
+    ck_assert_mem_eq(a->encryptor.private, b->encryptor.private,
+                     crypto_box_SECRETKEYBYTES);
+
+    /* The lower public key is the survivor: the rule both sides can compute. */
+    const unsigned char *winner =
+        (memcmp(a_wire.encryptor.public, b_wire.encryptor.public,
+                crypto_box_PUBLICKEYBYTES) < 0)
+        ? a_wire.encryptor.public : b_wire.encryptor.public;
+    ck_assert_mem_eq(a->encryptor.public, winner, crypto_box_PUBLICKEYBYTES);
+
+    /* And it is STABLE: re-offering the key that lost does not unseat it, so
+     * the two nodes cannot oscillate. */
+    ck_assert(!group_accept_rotation(a, &a_wire));
+    ck_assert(!group_accept_rotation(a, &b_wire));
+
+    group_free(b);
+    group_free(a);
+}
+
+/* A node holding only a PUBLIC view of the group cannot read the cohort at all.
+ * At an equal epoch it must therefore take a real key rather than win a byte
+ * comparison and stay deaf — the state a merge adopter can land in. */
+DEFINE_TEST(test_group_accept_rotation_public_only_takes_a_real_key)
+{
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t uuid;
+    uuid_generate(uuid);
+    char addr[] = "10.0.0.7";
+    group_t *mine = NULL, *theirs = NULL;
+    ck_assert_ret_ok(group_create(&uuid, addr, &mine));
+    ck_assert_ret_ok(group_create(&uuid, addr, &theirs));
+    memcpy(theirs->uuid, mine->uuid, sizeof(uuid_t));
+
+    /* We hold a public-only view: same epoch, no private half. */
+    sodium_memzero(mine->encryptor.private, crypto_box_SECRETKEYBYTES);
+    ck_assert(mine->key_epoch == theirs->key_epoch);
+
+    /* Adopted regardless of which way the tiebreak would have gone, and we are
+     * left actually able to decrypt. */
+    ck_assert(group_accept_rotation(mine, theirs));
+    ck_assert_mem_eq(mine->encryptor.private, theirs->encryptor.private,
+                     crypto_box_SECRETKEYBYTES);
+    ck_assert(!sodium_is_zero(mine->encryptor.private,
+                              crypto_box_SECRETKEYBYTES));
+    /* Nothing was retired: we had no key to retire. */
+    ck_assert(mine->num_previous_keys == 0);
+
+    group_free(theirs);
+    group_free(mine);
+}
+
+/* The property the epoch was introduced for, now enforced by key identity
+ * rather than by the epoch number alone: a key we have rotated AWAY from must
+ * never come back, no matter what epoch the offer claims. Without this, letting
+ * an equal epoch through (above) would have handed the replay a second door. */
+DEFINE_TEST(test_group_accept_rotation_never_reinstates_a_retired_key)
+{
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t uuid;
+    uuid_generate(uuid);
+    char addr[] = "10.0.0.6";
+    group_t *mine = NULL;
+    ck_assert_ret_ok(group_create(&uuid, addr, &mine));
+
+    encryptor_t captured = mine->encryptor;   /* what an attacker recorded */
+    ck_assert(group_rotate_key(mine) == 1);
+    ck_assert(mine->num_previous_keys == 1);
+
+    /* Offered back at the SAME epoch (the tiebreak door)... */
+    group_t replay = {0};
+    memcpy(replay.uuid, mine->uuid, sizeof(uuid_t));
+    replay.key_epoch = 1;
+    replay.encryptor = captured;
+    ck_assert(!group_accept_rotation(mine, &replay));
+
+    /* ...and at a FORGED higher epoch (the original door). Refused either way,
+     * and our live key is untouched. */
+    replay.key_epoch = 99;
+    ck_assert(!group_accept_rotation(mine, &replay));
+    ck_assert(mine->key_epoch == 1);
+    ck_assert(memcmp(mine->encryptor.public, captured.public,
+                     crypto_box_PUBLICKEYBYTES) != 0);
+
+    group_free(mine);
+}
+
+/* group_rotation_refusal names WHY a rotation is refused, for the log line a
+ * forked cohort is diagnosed from (a three-way boot rotation, rep-2368077, could
+ * not be: every refusal read "ours stands"). Each reason, and the one rule
+ * that makes the line trustworthy: accept_rotation refuses exactly when the
+ * reason is non-NULL. */
+static void _assert_refusal(group_t *mine, const group_t *offer,
+                            const char *expect)
+{
+    const char *why = group_rotation_refusal(mine, offer);
+    if (expect == NULL)
+        ck_assert_ptr_null(why);
+    else
+        ck_assert_str_eq(why, expect);
+    group_t probe = *mine;   /* accept mutates; judge a copy */
+    ck_assert(group_accept_rotation(&probe, offer) == (why == NULL));
+}
+
+DEFINE_TEST(test_group_rotation_refusal_names_each_reason)
+{
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t uuid;
+    uuid_generate(uuid);
+    char addr[] = "10.0.0.8";
+    group_t *mine = NULL, *theirs = NULL;
+    ck_assert_ret_ok(group_create(&uuid, addr, &mine));
+    ck_assert_ret_ok(group_create(&uuid, addr, &theirs));
+    memcpy(theirs->uuid, mine->uuid, sizeof(uuid_t));
+    encryptor_t first = mine->encryptor;
+    ck_assert(group_rotate_key(mine) == 1);
+
+    group_t offer = *theirs;
+    offer.key_epoch = 2;
+    _assert_refusal(mine, &offer, NULL);
+
+    offer.key_epoch = 0;
+    _assert_refusal(mine, &offer, "a lower epoch (a replay)");
+
+    uuid_t other_uuid;
+    uuid_generate(other_uuid);
+    group_t foreign = offer;
+    memcpy(foreign.uuid, other_uuid, sizeof(uuid_t));
+    foreign.key_epoch = 2;
+    _assert_refusal(mine, &foreign, "a different group");
+
+    group_t public_only = offer;
+    public_only.key_epoch = 2;
+    sodium_memzero(public_only.encryptor.private, crypto_box_SECRETKEYBYTES);
+    _assert_refusal(mine, &public_only, "it carries no private key");
+
+    group_t replay = offer;
+    replay.key_epoch = 5;
+    replay.encryptor = first;
+    _assert_refusal(mine, &replay, "a key we already retired");
+
+    group_t same = *mine;
+    _assert_refusal(mine, &same, "already our key");
+
+    /* Equal epoch, a different live key: exactly one of the two orders wins. */
+    group_t rival = offer;
+    rival.key_epoch = mine->key_epoch;
+    bool theirs_lower = memcmp(rival.encryptor.public, mine->encryptor.public,
+                               crypto_box_PUBLICKEYBYTES) < 0;
+    _assert_refusal(mine, &rival, theirs_lower
+                    ? NULL : "ours stands (the lower key wins the tiebreak)");
+
+    ck_assert_str_eq(group_rotation_refusal(NULL, &offer), "no group to compare");
+
+    group_free(theirs);
+    group_free(mine);
+}
+
 RUN_TESTS(Group2, test_group_json_roundtrip,
           test_group_json_roundtrip_preserves_keypair, test_group_free_null,
           test_group_publish_null,
-          test_group_init_nul_terminates_long_address)
+          test_group_init_nul_terminates_long_address,
+          test_group_rotate_key_mints_new_key_and_bumps_epoch,
+          test_group_rotate_key_refused_without_private,
+          test_group_rotate_key_failed_mint_retires_nothing,
+          test_group_accept_rotation_requires_higher_epoch_and_key,
+          test_group_accept_rotation_equal_epoch_converges,
+          test_group_accept_rotation_never_reinstates_a_retired_key,
+          test_group_accept_rotation_public_only_takes_a_real_key,
+          test_group_rotation_refusal_names_each_reason,
+          test_group_decrypt_falls_back_to_retired_key,
+          test_group_decrypt_retired_key_with_itself_as_sender)

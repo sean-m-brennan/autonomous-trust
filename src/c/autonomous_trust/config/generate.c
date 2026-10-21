@@ -25,7 +25,11 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <unistd.h>
+#ifndef SIOCGIFHWADDR
+#include <net/if_dl.h>  /* Darwin/BSD: the MAC is the interface's AF_LINK entry */
+#endif
 
 #include <jansson.h>
 #include <uuid/uuid.h>
@@ -254,7 +258,25 @@ static int discover_network_for(net_iface_t *iface, const char *preferred_ip)
         found_ip4 = true;
     }
 
-    /* Get MAC address via ioctl */
+    /* Get MAC address: an ioctl on Linux; the BSDs have no SIOCGIFHWADDR and
+     * list it in getifaddrs as the interface's AF_LINK address instead. */
+#ifndef SIOCGIFHWADDR
+    for (struct ifaddrs *ifa = ifaddr; found_ip4 && ifa != NULL; ifa = ifa->ifa_next)
+    {
+        if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_LINK
+            || strcmp(ifa->ifa_name, iface->if_name) != 0)
+            continue;
+        const struct sockaddr_dl *sdl = (const struct sockaddr_dl *)ifa->ifa_addr;
+        if (sdl->sdl_alen == 6)
+        {
+            const unsigned char *mac = (const unsigned char *)LLADDR(sdl);
+            snprintf(iface->mac_addr, MAC_ADDR_LEN + 1,
+                     "%02x:%02x:%02x:%02x:%02x:%02x",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        }
+        break;
+    }
+#else
     if (found_ip4)
     {
         int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -273,6 +295,7 @@ static int discover_network_for(net_iface_t *iface, const char *preferred_ip)
             close(sock);
         }
     }
+#endif
 
     freeifaddrs(ifaddr);
 
@@ -331,12 +354,14 @@ int generate_identity(const char *fullname, const char *cfg_dir,
     const net_transport_t *active = net_transport_find(default_transport_name());
     network_protocol_t fam = (active != NULL) ? active->net_proto : NETPROTO_IPV4;
 
-    /* Manual byte-copy with explicit truncation — ADDR_LEN (32) is shorter
-     * than IPV6_ADDR_LEN (46), so a long IPv6 address may truncate. The
-     * compiler's -Wformat-truncation / -Wstringop-truncation can't see
-     * that truncation is intentional here, so we copy bytes and NUL-
-     * terminate by hand. Widening `public_identity_t.address` is a
-     * separate (L4-class) wire-format change. */
+    /* ADDR_LEN + 1 is now IPV6_ADDR_LEN (identity.h, widened 2026-09-10), so a
+     * numeric address of either family fits whole and this copy no longer has
+     * to truncate. It used to: this block hand-rolled a memcpy precisely to
+     * stop -Wstringop-truncation complaining about clipping the node's OWN
+     * discovered IPv6 address, which is about the worst thing to silently
+     * shorten -- everything downstream compares against it. Kept as a CHECKED
+     * copy rather than reverting to strncpy: if the two constants ever drift
+     * again, this must fail loudly, not quietly clip. */
     const char *src = NULL;
     if (disc == 0) {
         switch (fam) {
@@ -355,10 +380,13 @@ int generate_identity(const char *fullname, const char *cfg_dir,
     } else {
         src = "127.0.0.1";
     }
-    size_t copy_len = strlen(src);
-    if (copy_len > ADDR_LEN) copy_len = ADDR_LEN;
-    memcpy(address, src, copy_len);
-    address[copy_len] = '\0';
+    if (at_strlcpy(address, src, sizeof(address)) >= sizeof(address)) {
+        /* Unreachable while ADDR_LEN + 1 >= IPV6_ADDR_LEN (net_proc.c pins
+         * that with a _Static_assert), and an error rather than a clip
+         * because a node whose own address is wrong cannot recognise its own
+         * traffic -- it would look like a network fault, not a config one. */
+        return EXCEPTION(ENET_ADDR_TOO_LONG);
+    }
 
     identity_t *ident = NULL;
     /* fullname is the online nickname to embed; petname (local) defaults NULL */
@@ -463,25 +491,16 @@ int generate_subsystems_config(const char *cfg_dir)
     err = tracker_register_subsystem(&tracker, "reputation", "rep_proc");
     if (err != 0)
         return err;
-    err = tracker_register_subsystem(&tracker, "fleet", "fleet_proc");
-    if (err != 0)
-        return err;
-    err = tracker_register_subsystem(&tracker, "artifact", "artifact_proc");
-    if (err != 0)
-        return err;
-    err = tracker_register_subsystem(&tracker, "update", "update_proc");
-    if (err != 0)
-        return err;
-    err = tracker_register_subsystem(&tracker, "config", "config_proc");
-    if (err != 0)
-        return err;
-    /* ISR data-source service (C counterpart of Python DataProcess). Subsystem
-     * key "data-source" becomes the process queue name net_proc routes inbound
-     * subscribe requests to (route_to_process), and must match the wire name the
-     * coordinator's DataRcvr addresses (Python DataProcess.name). */
-    err = tracker_register_subsystem(&tracker, "data-source", "data_source_proc");
-    if (err != 0)
-        return err;
+    /* The subsystems linked extensions provide (DEFINE_SUBSYSTEM): fleet's
+     * four and the data-source service, when their libraries are linked
+     * (FEATURE_SPLIT_PLAN Phase 8). */
+    const char *keys[AT_SUBSYSTEM_EXT_MAX], *impls[AT_SUBSYSTEM_EXT_MAX];
+    size_t n_ext = subsystem_defaults(keys, impls, AT_SUBSYSTEM_EXT_MAX);
+    for (size_t i = 0; i < n_ext; i++) {
+        err = tracker_register_subsystem(&tracker, keys[i], impls[i]);
+        if (err != 0)
+            return err;
+    }
 
     char filepath[CFG_PATH_LEN + 1];
     if (path_join(filepath, sizeof(filepath), cfg_dir, default_tracker_filename) < 0)

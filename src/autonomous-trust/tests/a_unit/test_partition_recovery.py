@@ -47,6 +47,7 @@ What's covered:
 from __future__ import annotations
 
 import logging
+import tempfile
 import time
 import uuid as uuid_mod
 from datetime import timedelta
@@ -61,6 +62,8 @@ from autonomous_trust.core.identity.protocol import IdentityProtocol
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.system import CfgIds, now
 from autonomous_trust.core._python.protocol import Protocol
+from autonomous_trust.core._python.freshness import Freshness
+from autonomous_trust.core.config import Configuration
 
 
 _MOCK_ADDRESSES = {
@@ -124,6 +127,9 @@ class _FakeQueue:
         return len(self.items)
 
 
+_FRESHNESS_TMPDIRS = []
+
+
 def _build_process(identity, group, peers=None):
     """Allocate a minimally-populated IdentityProcess.
 
@@ -150,6 +156,15 @@ def _build_process(identity, group, peers=None):
     proc._partition_probe_cooldown = {}
     proc._partition_response_cooldown = {}
     proc._partition_recovery_in_progress = None
+    proc._probe_seq = None
+    # Freshness state, in a per-test temp dir so the marks never leak between
+    # tests (or onto a developer's real config tree). The probe/response verbs
+    # carry a monotonic sequence and the receiver keeps a high-water mark;
+    # a handler cannot run without it.
+    tmp = tempfile.mkdtemp(prefix='at-freshness-')
+    _FRESHNESS_TMPDIRS.append(tmp)
+    with patch.object(Configuration, 'get_cfg_dir', staticmethod(lambda: tmp)):
+        proc.freshness = Freshness(CfgIds.identity, proc.logger)
     # report_exception only exists on the Process base class; route it
     # to the logger so test failures surface as warnings, not crashes.
     proc.report_exception = lambda err, where: \
@@ -192,13 +207,20 @@ class TestPartitionSignal:
             if isinstance(probe.obj, (str, bytes)) else probe.obj
         assert payload['my_group_uuid'] == str(grp.uuid)
         assert payload['my_group_size'] == 1
-        # Signature must verify under the sender identity's public key.
+        # Freshness sequence: stamped, positive, and remembered so a response
+        # can be tied to this round.
+        assert int(payload['seq']) > 0
+        assert proc._probe_seq == int(payload['seq'])
+        # Signature must verify under the sender identity's public key, over
+        # the canonical form INCLUDING the sequence — a probe signed without
+        # it no longer verifies, which is what makes the stamp unstrippable.
         # Use the raw-bytes path per the documented quirk in message.py.
         sender_id = payload['from_identity']
         sig_raw = HexEncoder.decode(payload['signature'].encode('ascii'))
         sender_id.signature.public.verify(
             IdentityProcess._partition_probe_canonical(
-                payload['my_group_uuid'], payload['my_group_size']),
+                payload['my_group_uuid'], payload['my_group_size'],
+                payload['seq']),
             sig_raw)
 
     def test_cooldown_suppresses_repeated_probe(self):
@@ -276,10 +298,15 @@ class TestPartitionSignal:
 
 class TestPartitionProbe:
     def _craft_probe(self, sender_identity, sender_group_uuid,
-                     sender_group_size):
-        """Construct a signed probe payload as if `sender_identity` sent it."""
+                     sender_group_size, seq=1):
+        """Construct a signed probe payload as if `sender_identity` sent it.
+
+        ``seq`` is the prober's freshness sequence and is inside the signed
+        bytes; a caller replaying a probe re-sends the same seq, which is what
+        the receiver's high-water mark refuses.
+        """
         sig_bytes = IdentityProcess._partition_probe_canonical(
-            sender_group_uuid, sender_group_size)
+            sender_group_uuid, sender_group_size, seq)
         signed = sender_identity.sign(sig_bytes)
         from autonomous_trust.core.config import to_json_string
         payload = to_json_string({
@@ -287,6 +314,7 @@ class TestPartitionProbe:
             'from_address': sender_identity.address,
             'my_group_uuid': sender_group_uuid,
             'my_group_size': sender_group_size,
+            'seq': seq,
             'signature': signed.signature.decode('ascii'),
         })
         return Message(CfgIds.identity, IdentityProtocol.partition_probe,
@@ -321,8 +349,12 @@ class TestPartitionProbe:
         rp['from_identity'].signature.public.verify(
             IdentityProcess._partition_response_canonical(
                 rp['my_group_uuid'], rp['my_group_size'],
-                rp['in_response_to']),
+                rp['in_response_to'], rp['in_response_to_seq'], rp['seq']),
             resp_sig_raw)
+        # The response names the probe round it answers, and carries the
+        # responder's own sequence.
+        assert int(rp['in_response_to_seq']) == 1   # _craft_probe default
+        assert int(rp['seq']) > 0
 
     def test_c_originated_probe_canonical_identity(self):
         # A C / cross-runtime sender serializes from_identity as the flat
@@ -345,13 +377,14 @@ class TestPartitionProbe:
         sender = _new_identity('lone-coord', '10.0.0.3')
         sender_group_uuid = str(uuid_mod.uuid4())
         sig_bytes = IdentityProcess._partition_probe_canonical(
-            sender_group_uuid, 1)
+            sender_group_uuid, 1, 1)
         signed = sender.sign(sig_bytes)
         payload = to_json_string({
             'from_identity': public_identity_to_canonical(sender.publish()),
             'from_address': sender.address,
             'my_group_uuid': sender_group_uuid,
             'my_group_size': 1,
+            'seq': 1,
             'signature': signed.signature.decode('ascii'),
         })
         probe = Message(CfgIds.identity, IdentityProtocol.partition_probe,
@@ -371,7 +404,7 @@ class TestPartitionProbe:
         sender = _new_identity('attacker', '10.0.0.99')
         # Sign claim X but advertise claim Y.
         sig_bytes = IdentityProcess._partition_probe_canonical(
-            'real-group-uuid', 1)
+            'real-group-uuid', 1, 1)
         signed = sender.sign(sig_bytes)
         from autonomous_trust.core.config import to_json_string
         payload = to_json_string({
@@ -379,6 +412,7 @@ class TestPartitionProbe:
             'from_address': sender.address,
             'my_group_uuid': 'lied-group-uuid',   # mismatch
             'my_group_size': 99,                  # mismatch
+            'seq': 1,
             'signature': signed.signature.decode('ascii'),
         })
         probe = Message(CfgIds.identity, IdentityProtocol.partition_probe,
@@ -387,16 +421,68 @@ class TestPartitionProbe:
         assert len(queues[CfgIds.network]) == 0
 
     def test_response_cooldown_per_sender(self):
+        """One response per prober per cooldown window.
+
+        Two DISTINCT probe rounds (advancing sequences), so the freshness
+        guard passes both and it is genuinely the cooldown being tested. The
+        replay case — the same round twice — is
+        ``test_replayed_probe_refused`` below.
+        """
         me = _new_identity('captain', '10.0.0.10')
         my_group = _group_of_size(me, [])
         proc = _build_process(me, my_group)
         queues = _build_queues()
         sender = _new_identity('probing-coord', '10.0.0.3')
-        probe = self._craft_probe(sender, str(uuid_mod.uuid4()), 1)
-        proc.handle_partition_probe(queues, probe)
-        proc.handle_partition_probe(queues, probe)
+        group_uuid = str(uuid_mod.uuid4())
+        proc.handle_partition_probe(
+            queues, self._craft_probe(sender, group_uuid, 1, seq=1))
+        proc.handle_partition_probe(
+            queues, self._craft_probe(sender, group_uuid, 1, seq=2))
         # Same sender within 30s — only one response.
         assert len(queues[CfgIds.network]) == 1
+
+    def test_replayed_probe_refused(self):
+        """The same probe round, presented twice, is answered once.
+
+        Before the freshness sequence the probe pre-image covered only the
+        group uuid and size, so a captured probe — plaintext multicast, no
+        prior access needed — could be re-presented indefinitely, and each
+        replay drove the responder's symmetric-adoption path. The cooldown
+        only ever narrowed that to one per 30s per prober.
+        """
+        me = _new_identity('captain', '10.0.0.10')
+        my_group = _group_of_size(me, [])
+        proc = _build_process(me, my_group)
+        proc.package_hash = b'pkg-hash-stub'   # symmetric adoption may fire
+        from autonomous_trust.core._python.capabilities import Capabilities
+        proc.protocol.capabilities = Capabilities()
+        queues = _build_queues()
+        sender = _new_identity('probing-coord', '10.0.0.3')
+
+        def responses():
+            return [m for m in queues[CfgIds.network].items
+                    if m.function == IdentityProtocol.partition_response]
+
+        probe = self._craft_probe(sender, str(uuid_mod.uuid4()), 1, seq=7)
+        proc.handle_partition_probe(queues, probe)
+        assert len(responses()) == 1
+        # Clear the cooldown so the ONLY thing that can refuse the replay is
+        # the freshness mark.
+        proc._partition_response_cooldown.clear()
+        proc.handle_partition_probe(queues, probe)
+        assert len(responses()) == 1
+        # An older round from the same prober is refused too, not just an
+        # exact repeat.
+        proc._partition_response_cooldown.clear()
+        proc.handle_partition_probe(
+            queues, self._craft_probe(sender, str(uuid_mod.uuid4()), 1, seq=6))
+        assert len(responses()) == 1
+        # A NEWER round is still answered — the guard bounds replay, not
+        # legitimate re-probing.
+        proc._partition_response_cooldown.clear()
+        proc.handle_partition_probe(
+            queues, self._craft_probe(sender, str(uuid_mod.uuid4()), 1, seq=8))
+        assert len(responses()) == 2
 
     def test_adopts_when_prober_advertises_larger_group(self):
         # Symmetric adoption: a node that only ever RECEIVES probes — it
@@ -479,20 +565,31 @@ class TestPartitionProbe:
 class TestPartitionResponse:
     def _craft_response(self, responder_identity, responder_group_uuid,
                          responder_group_size, in_response_to,
-                         leader_uuid=None, leader_address=None):
+                         leader_uuid=None, leader_address=None,
+                         probe_seq=1, seq=1):
+        """A signed response.
+
+        ``probe_seq`` names the probe round being answered — the receiver
+        refuses an echo that does not match the probe it is currently running,
+        which is what stops a genuine response being kept and re-presented
+        later. ``seq`` is the responder's own freshness sequence.
+        """
         from autonomous_trust.core.config import to_json_string
         sig_bytes = IdentityProcess._partition_response_canonical(
-            responder_group_uuid, responder_group_size, in_response_to)
+            responder_group_uuid, responder_group_size, in_response_to,
+            probe_seq, seq)
         signed = responder_identity.sign(sig_bytes)
         payload = to_json_string({
             'from_identity': responder_identity.publish(),
             'from_address': responder_identity.address,
             'in_response_to': in_response_to,
+            'in_response_to_seq': probe_seq,
             'my_group_uuid': responder_group_uuid,
             'my_group_size': responder_group_size,
             'my_group_leader': leader_uuid or str(responder_identity.uuid),
             'my_group_leader_address': leader_address
                                        or responder_identity.address,
+            'seq': seq,
             'signature': signed.signature.decode('ascii'),
         })
         return Message(CfgIds.identity, IdentityProtocol.partition_response,
@@ -511,8 +608,12 @@ class TestPartitionResponse:
 
         responder = _new_identity('captain', '10.0.0.10')
         their_group_uuid = str(uuid_mod.uuid4())
+        # We are running probe round 1; the response answers it. A response
+        # that answers no current round is refused (see
+        # test_ignores_unsolicited_response).
+        proc._probe_seq = 1
         resp = self._craft_response(responder, their_group_uuid, 5,
-                                    str(me.uuid))
+                                    str(me.uuid), probe_seq=1)
         proc.handle_partition_response(queues, resp)
 
         # Recovery should be marked in progress.
@@ -544,13 +645,64 @@ class TestPartitionResponse:
         queues = _build_queues()
 
         responder = _new_identity('coord', '10.0.0.3')
+        proc._probe_seq = 1   # so it is the size comparison being tested
         resp = self._craft_response(responder, str(uuid_mod.uuid4()), 2,
-                                    str(me.uuid))
+                                    str(me.uuid), probe_seq=1)
         proc.handle_partition_response(queues, resp)
         assert proc._partition_recovery_in_progress is None
         # No request_access should fire — they will initiate from their end.
         assert all(m.function != IdentityProtocol.announce
                    for m in queues[CfgIds.network].items)
+
+    def test_ignores_unsolicited_response(self):
+        """A response answering no probe round of ours changes nothing.
+
+        ``in_response_to`` is only our uuid, which never changes, so before
+        the echoed round a genuine response could be captured and
+        re-presented to us for the life of the node — each time driving a
+        request_access toward a group the responder named.
+        """
+        me = _new_identity('coord', '10.0.0.3')
+        proc = _build_process(me, _group_of_size(me, []))
+        proc.package_hash = b'pkg-hash-stub'
+        from autonomous_trust.core._python.capabilities import Capabilities
+        proc.protocol.capabilities = Capabilities()
+        queues = _build_queues()
+        responder = _new_identity('captain', '10.0.0.10')
+        assert proc._probe_seq is None   # we never probed
+        resp = self._craft_response(responder, str(uuid_mod.uuid4()), 5,
+                                    str(me.uuid), probe_seq=1)
+        proc.handle_partition_response(queues, resp)
+        assert proc._partition_recovery_in_progress is None
+        assert len(queues[CfgIds.network]) == 0
+
+    def test_replayed_response_refused_within_round(self):
+        """Two presentations of one response drive one adoption.
+
+        The echoed round bounds a response to the probe it answers; this mark
+        bounds a responder to one answer inside that round.
+        """
+        me = _new_identity('coord', '10.0.0.3')
+        proc = _build_process(me, _group_of_size(me, []))
+        proc.package_hash = b'pkg-hash-stub'
+        from autonomous_trust.core._python.capabilities import Capabilities
+        proc.protocol.capabilities = Capabilities()
+        queues = _build_queues()
+        responder = _new_identity('captain', '10.0.0.10')
+        proc._probe_seq = 4
+        resp = self._craft_response(responder, str(uuid_mod.uuid4()), 5,
+                                    str(me.uuid), probe_seq=4, seq=9)
+        proc.handle_partition_response(queues, resp)
+        first = [m for m in queues[CfgIds.network].items
+                 if m.function == IdentityProtocol.announce]
+        assert len(first) == 1
+        # Clear the in-flight guard so the freshness mark is the only thing
+        # that can refuse the replay.
+        proc._partition_recovery_in_progress = None
+        proc.handle_partition_response(queues, resp)
+        again = [m for m in queues[CfgIds.network].items
+                 if m.function == IdentityProtocol.announce]
+        assert len(again) == 1
 
 
 # ---------------------------------------------------------------------------

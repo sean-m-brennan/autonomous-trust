@@ -18,11 +18,12 @@
 
 Drives `kind: scenario` for `protocol: reputation`. Builds real
 ReputationProcess instances and turns on synchronous_dispatch so the
-threaded paths (handle_grant -> _paxos_timeout, handle_nack -> _try_again,
-handle_reputation_request -> _compute_reputation) execute inline.
+threaded paths (handle_reputation_request -> _compute_reputation) execute
+inline.
 
-Phase F covers the leaderless Byzantine multi-Paxos request/grant/transaction
-flow plus the chain-length backdate and stale-id nack branches.
+Every group places its order (doc/architecture/reputation.md, "Agreeing on an
+order"): a half is co-signed (transaction / tx accepted / tx committed) and
+placement decides where it goes in the chain.
 """
 
 from __future__ import annotations
@@ -38,6 +39,12 @@ from uuid import UUID, uuid5
 
 from autonomous_trust.core.capabilities import PeerCapabilities
 from autonomous_trust.core.config import Configuration, to_json_string
+from autonomous_trust.core.reputation.reputation import (
+    RESOLVE_TTL_DEFAULT, PeerReputation, resolve_query_to_dict,
+    resolved_to_dict, Transaction, attest_task_id, AttestedScore,
+    SignedAttestation, commit_designation)
+from autonomous_trust.core._python.identity.identity import (
+    public_identity_to_canonical)
 from autonomous_trust.core.identity import Group, Identity, Peers
 from autonomous_trust.core.identity.encrypt import Encryptor
 from autonomous_trust.core.identity.sign import Signature
@@ -47,8 +54,13 @@ from autonomous_trust.core.reputation.repprocess import ReputationProcess
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
 from autonomous_trust.core.reputation.reputation import (
     TransactionScore, SlashAttestation, SignedSlash,
-    Checkpoint, SignedCheckpoint)
+    Checkpoint, SignedCheckpoint, evidence_to_dict, place_designation,
+    place_value_digest, placement_entry)
+from autonomous_trust.core.reputation.placement import entry_to_dict
+from autonomous_trust.core.reputation.reputation import TransactionHistory
 from autonomous_trust.core.system import CfgIds, PackageHash
+from autonomous_trust.core._python.identity.peer_standing import (
+    PeerStanding, STANDING_CAPPED)
 
 from ...common.scenario_loader import Case
 from ..scenario_engine import (
@@ -93,6 +105,18 @@ class _Participant:
         # it to resolve pid -> Identity.uuid for self.process.reputations
         # lookups.
         self._all_participants: dict[str, '_Participant'] = {}
+        # Cumulative count of slash proposals this participant ORIGINATED,
+        # tallied in _record_and_put rather than read off a drained outbox:
+        # the engine clears the outbox each step, and the assertion this
+        # exists for is "over the whole scenario, none" (R+D.md §12.8). A
+        # per-step outbox cannot express that, and the engine's step matching
+        # is permissive about extra messages, so an unpinned stray proposal
+        # would pass silently.
+        self.slashes_proposed = 0
+        # Cumulative count of attestation co-signatures this participant SENT
+        # (doc/architecture/reputation.md, "Verifier-attested scores"), for the
+        # same reason: the cases this exists for are mostly "it declined".
+        self.attest_signs_sent = 0
 
     def drain_outbox(self) -> list[CapturedMessage]:
         captured: list[CapturedMessage] = []
@@ -110,6 +134,44 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: history_len={actual}, expected {expected}'
                     )
+            elif key == 'chain_tasks':
+                # The resident chain's tasks in index order, by slug.
+                want = [uuid5(_NS, f'tx:{slug}') for slug in expected]
+                actual = [tx.task_id for tx in self.process.history]
+                if [str(t) for t in actual] != [str(t) for t in want]:
+                    raise AssertionError(f'{self.id}: chain_tasks differ '
+                                         f'({len(actual)} resident)')
+            elif key == 'pool_count':
+                # How many entries wait in the primary chain's pool.
+                have = self.process.history.pooled_count()
+                if have != expected:
+                    raise AssertionError(f'{self.id}: pool_count={have}, '
+                                         f'expected {expected}')
+            elif key in ('chain_entries', 'pooled_entries', 'pool_tasks'):
+                # The resident chain's entries in index order, or the pool's
+                # entries as a set, by chain-spec slug ("chain:<slug>"); or the
+                # pool's tasks as a set, by task slug ("tx:<slug>").
+                ns = 'tx' if key == 'pool_tasks' else 'chain'
+                want = [str(uuid5(_NS, f'{ns}:{slug}')) for slug in expected]
+                hist = self.process.history
+                actual = ([str(tx.task_id) for tx in hist] if key == 'chain_entries'
+                          else sorted(str(t) for t in hist._pool))
+                if key != 'chain_entries':
+                    want = sorted(want)
+                if actual != want:
+                    raise AssertionError(f'{self.id}: {key} differ '
+                                         f'({len(actual)} held)')
+            elif key == 'place_promised':
+                # {n, by: <pid>}, or null for no promise.
+                have = self.process._place_state('')['promised']
+                if expected is None:
+                    ok = have is None
+                else:
+                    by = participants[expected['by']].identity.uuid
+                    ok = have == (int(expected['n']), str(by).lower())
+                if not ok:
+                    raise AssertionError(f'{self.id}: place_promised={have!r}, '
+                                         f'expected {expected!r}')
             elif key == 'committed_tx_count':
                 # Count of transactions resident in the hash-linked chain
                 # (== len(history) here). The C twin reads tx_history rather
@@ -122,6 +184,25 @@ class _Participant:
                         f'{self.id}: committed_tx_count={actual}, '
                         f'expected {expected}'
                     )
+            elif key in ('halves_held', 'certified_halves'):
+                # Ordinary halves held (in the chain or waiting in the pool),
+                # and how many carry a commit certificate
+                # (doc/architecture/reputation.md, "Commit certificates").
+                held = certified = 0
+                hist = self.process.history
+                for tx in (list(hist._task_mapping.values())
+                           + list(hist._pool.values())):
+                    if tx.attested:
+                        continue
+                    for scorer in (tx.p1_id, tx.p2_id):
+                        if scorer is None:
+                            continue
+                        held += 1
+                        certified += tx.certificate_of(scorer) is not None
+                actual = held if key == 'halves_held' else certified
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: {key}={actual}, expected {expected}')
             elif key == 'window_root':
                 # Phase 2: RFC 6962 ordered Merkle root over the resident
                 # committed window. Pins cross-language byte-identity of the
@@ -147,17 +228,174 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: checkpoint_root={actual}, expected {expected}'
                     )
-            elif key == 'last_id_set':
-                actual = self.process.last_id is not None
-                if actual != bool(expected):
-                    raise AssertionError(
-                        f'{self.id}: last_id_set={actual}, expected {expected}'
-                    )
-            elif key == 'requests_count':
-                actual = len(self.process.requests)
+            elif key == 'checkpoint_cosigns_parked':
+                # A proposal this node could not co-sign on arrival, kept for
+                # a later one (ISSUES §2.29). Mirrors C reputation_parked_cosign_count.
+                actual = len(getattr(self.process, '_cosigns_parked', {}))
                 if actual != expected:
                     raise AssertionError(
-                        f'{self.id}: requests_count={actual}, expected {expected}'
+                        f'{self.id}: checkpoint_cosigns_parked={actual}, '
+                        f'expected {expected}'
+                    )
+            elif key == 'evidence_doc':
+                # Verifiable warm start (doc/architecture/reputation.md). The persisted-evidence
+                # document is the ONE artifact both runtimes read, so its shape
+                # belongs in the corpus. Pinned by the fields that carry
+                # meaning across the boundary: the schema (a mismatch is a
+                # refusal to rebuild rather than a misparse), the entry count,
+                # and the root the checkpoint block commits to.
+                if not isinstance(expected, dict):
+                    raise AssertionError(
+                        f'{self.id}: evidence_doc must be a mapping, got '
+                        f'{type(expected).__name__}'
+                    )
+                ckpt = getattr(self.process, '_checkpoint', None)
+                signed = None
+                if ckpt is not None:
+                    signed = SignedCheckpoint(
+                        checkpoint=ckpt,
+                        sigs=dict(getattr(self.process,
+                                          '_checkpoint_sigs_final', {})))
+                doc = evidence_to_dict(self.process.history, signed)
+                actual = {
+                    'schema': doc['schema'],
+                    'chain_len': len(doc['chain']),
+                    'checkpoint_root': ((doc['checkpoint'] or {}).get('root')
+                                        or ''),
+                }
+                for field, want in expected.items():
+                    if field not in actual:
+                        raise AssertionError(
+                            f'{self.id}: unsupported evidence_doc field '
+                            f'{field!r}'
+                        )
+                    if actual[field] != want:
+                        raise AssertionError(
+                            f'{self.id}: evidence_doc.{field}='
+                            f'{actual[field]!r}, expected {want!r}'
+                        )
+            elif key == 'resolved_reputation':
+                # The verdict on a deep-resolution answer, and the score this
+                # node computed FROM the attested window rather than the one
+                # the answer claimed. Both runtimes must reach the same
+                # verdict on the same evidence, or the same peer is trusted on
+                # one implementation and refused on the other.
+                if not isinstance(expected, dict):
+                    raise AssertionError(
+                        f'{self.id}: resolved_reputation must be a mapping, '
+                        f'got {type(expected).__name__}'
+                    )
+                peer_pid = expected.get('peer')
+                other = participants.get(peer_pid)
+                if other is None:
+                    raise AssertionError(
+                        f'{self.id}.resolved_reputation: unknown participant '
+                        f'{peer_pid!r}'
+                    )
+                entry = self.process.resolved_reps.get(
+                    str(other.identity.uuid))
+                if entry is None:
+                    raise AssertionError(
+                        f'{self.id}.resolved_reputation[{peer_pid}]: no answer '
+                        f'recorded'
+                    )
+                score, verified, reason = entry
+                if 'verified' in expected and verified != bool(expected['verified']):
+                    raise AssertionError(
+                        f'{self.id}.resolved_reputation.verified={verified!r}, '
+                        f'expected {expected["verified"]!r} (reason: {reason})'
+                    )
+                if 'score' in expected:
+                    want = expected['score']
+                    if want is None:
+                        if score is not None:
+                            raise AssertionError(
+                                f'{self.id}.resolved_reputation.score='
+                                f'{score!r}, expected none'
+                            )
+                    elif score is None or abs(score - float(want)) > 1e-3:
+                        raise AssertionError(
+                            f'{self.id}.resolved_reputation.score={score!r}, '
+                            f'expected {want!r}'
+                        )
+            elif key == 'evidence_ceiling_of':
+                # { "<other_pid>": float } — the score ceiling the resident
+                # window supports for that peer. This is the security
+                # parameter of warm start made observable: if the two runtimes
+                # disagree here they hand the same peer different tiers on
+                # restore, with nothing else to show it.
+                if not isinstance(expected, dict):
+                    raise AssertionError(
+                        f'{self.id}: evidence_ceiling_of must be a mapping, '
+                        f'got {type(expected).__name__}'
+                    )
+                window = self.process.history._indexed_window()
+                ceilings = self.process._evidence_ceilings(window)
+                for other_pid, want in expected.items():
+                    other = participants.get(other_pid)
+                    if other is None:
+                        raise AssertionError(
+                            f'{self.id}.evidence_ceiling_of: unknown '
+                            f'participant {other_pid!r}'
+                        )
+                    got = ceilings.get(str(other.identity.uuid))
+                    if got is None:
+                        raise AssertionError(
+                            f'{self.id}.evidence_ceiling_of[{other_pid}]: not '
+                            f'bounded by the window (expected {want!r})'
+                        )
+                    if abs(got - float(want)) > 1e-3:
+                        raise AssertionError(
+                            f'{self.id}.evidence_ceiling_of[{other_pid}]='
+                            f'{got:.4f}, expected {float(want):.4f}'
+                        )
+            elif key == 'slashes_proposed':
+                # How many slash proposals this participant ORIGINATED
+                # (R+D.md §12.8). Its reason for existing is the zero case:
+                # a hard-channel refutation that arrived FROM A PEER must not
+                # let that peer accuse a third party, because the sender picks
+                # its own channel tag. Both runtimes enforce that structurally
+                # -- the accused subject is local-only and never serialized --
+                # and this key is what makes the two agree about it in the
+                # corpus rather than only in each side's unit tests.
+                actual = self.slashes_proposed
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: slashes_proposed={actual}, '
+                        f'expected {expected}'
+                    )
+            elif key == 'attest_signs_sent':
+                # How many attestation co-signatures this participant sent.
+                # Zero is the declining cases' pin: an inadmissible
+                # attestation, or one about this participant itself.
+                actual = self.attest_signs_sent
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: attest_signs_sent={actual}, '
+                        f'expected {expected}')
+            elif key == 'app_roster':
+                # Which peers the app-facing roster pull reported, as
+                # participant ids. The carrier is local IPC toward the main
+                # loop -- a PeerReputation object on AT_MAIN_QUEUE, not a
+                # network Message (doc/architecture/app-peer-carrier.md) --
+                # so it is read off the main queue rather than the outbox.
+                #
+                # Asserted as a SET of ids rather than a count because the
+                # content is the point: the roster is peers only and never
+                # carries this node itself. Python emitted a self-entry (N+1)
+                # while C emitted N until that was aligned, and a bare count
+                # would have hidden which entry differed.
+                seen = set()
+                for item in participants[self.id].queues[CfgIds.main]._sink:
+                    if isinstance(item, PeerReputation):
+                        seen.add(str(item.peer_uuid))
+                by_uuid = {str(p.identity.uuid): pid
+                           for pid, p in participants.items()}
+                actual = sorted(by_uuid.get(u, u) for u in seen)
+                if actual != sorted(expected):
+                    raise AssertionError(
+                        f'{self.id}: app_roster={actual}, '
+                        f'expected {sorted(expected)}'
                     )
             elif key == 'reputation_of':
                 # `expected` is { "<other_pid>": float } — compare
@@ -188,8 +426,126 @@ class _Participant:
                             f'{self.id}.reputation_of[{other_pid}]={got:.4f}, '
                             f'expected {float(want):.4f}'
                         )
+            elif key == 'unrated':
+                # `expected` is [ "<pid>", ... ] -- participants this one
+                # holds NO stored score for (the negation reputation_of cannot
+                # express). C twin reads the same snapshot slot.
+                if not isinstance(expected, list):
+                    raise AssertionError(
+                        f'{self.id}: unrated must be a list, got '
+                        f'{type(expected).__name__}'
+                    )
+                for other_pid in expected:
+                    other = participants.get(other_pid)
+                    if other is None:
+                        raise AssertionError(
+                            f'{self.id}.unrated: unknown participant '
+                            f'{other_pid!r}'
+                        )
+                    other_uuid = other.identity.uuid
+                    if other_uuid in self.process.reputations:
+                        raise AssertionError(
+                            f'{self.id}.unrated[{other_pid}]: scored '
+                            f'{self.process.reputations[other_uuid]:.4f}'
+                        )
             else:
                 raise AssertionError(f'{self.id}: unsupported expected_state key {key!r}')
+
+
+def _chain_half(entry: dict, half: int, task: str, uuid_of) -> UUID:
+    """The uuid of one half of a `local_chain` / `latest update` chain entry:
+    the participant named by its `p1_id` / `p2_id` when there is one (so a
+    scenario can make an entry this node's OWN half, Agora Phase 4 DDIL), else
+    the synthetic ``chainp1:<task>`` / ``chainp2:<task>`` derivation. Both
+    builders go through here so the chains hash-match up to the fork. Mirrors
+    the C adapter's _chain_half_uuid."""
+    pid = entry.get('p1_id' if half == 1 else 'p2_id')
+    if pid is not None:
+        u = uuid_of(pid)
+        if u is not None:
+            return u
+    return uuid5(_NS, f"chainp{half}:{task}")
+
+
+def _write_roster(hist, entry, member, sign) -> None:
+    """A roster entry of a chain spec, placed alone at the chain's next index
+    (doc/architecture/reputation.md, "Who is in the group"): {roster: genesis,
+    members: [ids]} or {roster: add, member: id}, its placement certificate
+    signed by `placed_by: [ids]`. `member(id)` returns [uuid, key]. Mirrors the
+    C adapter's _write_roster."""
+    from autonomous_trust.core.reputation.reputation import (roster_digest,
+                                                             roster_task_id)
+    op, who = entry['roster'], None
+    if op == 'genesis':
+        members = [member(m) for m in entry['members']]
+        prev = None
+    else:
+        r = hist.latest_roster()
+        members, prev = list(map(list, r.roster_members)), r.task_id
+        if op == 'add':
+            m = member(entry['member'])
+            members, who = members + [m], m[0]
+    d = roster_digest(members)
+    tx = Transaction(roster_task_id(prev, op, who, d), roster_op=op,
+                     roster_uuid=None if who is None else UUID(who),
+                     roster_digest=d, roster_members=members)
+    k = hist.next_index
+    by = entry.get('placed_by')
+    sigs = (sign(by, place_designation(k, hist.head_hash,
+                                       place_value_digest([tx], k)))
+            if isinstance(by, list) else None)
+    hist.apply_placed(k, [tx], sigs)
+
+
+def _write_chain(hist, spec, uuid_of, sign, member=None) -> None:
+    """Write a `local_chain` / `latest update` chain spec into `hist` through
+    the production writers. An entry without `batch` is written the legacy way
+    (two update() halves). Consecutive entries sharing a `batch` are written as
+    ONE decided placement at the chain's next index (apply_placed); the batch's
+    last entry may name `placed_by: [ids]`, who sign its placement certificate
+    (doc/architecture/reputation.md, "Agreeing on an order"). `certified_by:
+    [ids]` certifies both halves of an entry. `sign(ids, designation)` returns
+    {uuid str: signature hex}. Mirrors the C adapter's _write_chain."""
+    i = 0
+    while i < len(spec):
+        entry = spec[i]
+        if isinstance(entry.get('roster'), str):
+            _write_roster(hist, entry, member, sign)
+            i += 1
+            continue
+        if entry.get('batch') is None:
+            tk = uuid5(_NS, f"chain:{entry['task']}")
+            hist.update(tk, _chain_half(entry, 1, entry['task'], uuid_of),
+                        float(entry['p1']))
+            hist.update(tk, _chain_half(entry, 2, entry['task'], uuid_of),
+                        float(entry['p2']))
+            i += 1
+            continue
+        group = []
+        while i < len(spec) and spec[i].get('batch') == entry['batch']:
+            group.append(spec[i])
+            i += 1
+        entries = [placement_entry(Transaction(
+            uuid5(_NS, f"chain:{e['task']}"),
+            p1_id=_chain_half(e, 1, e['task'], uuid_of), p1_score=float(e['p1']),
+            p2_id=_chain_half(e, 2, e['task'], uuid_of), p2_score=float(e['p2'])))
+            for e in group]
+        k = hist.next_index
+        by = group[-1].get('placed_by')
+        sigs = (sign(by, place_designation(k, hist.head_hash,
+                                           place_value_digest(entries, k)))
+                if isinstance(by, list) else None)
+        hist.apply_placed(k, entries, sigs)
+    for entry in spec:
+        by = entry.get('certified_by')
+        if not isinstance(by, list) or 'task' not in entry:
+            continue
+        tx = hist._task_mapping.get(uuid5(_NS, f"chain:{entry['task']}"))
+        if tx is None:
+            continue
+        for scorer, score in ((tx.p1_id, tx.p1_score), (tx.p2_id, tx.p2_score)):
+            tx.attach_certificate(scorer, sign(
+                by, commit_designation(scorer, tx.task_id, score)))
 
 
 def _to_captured(msg: Any, emitter_id: str) -> CapturedMessage:
@@ -266,21 +622,24 @@ class ReputationAdapter:
     def _build_participants(self, case: Case) -> dict[str, ParticipantHandle]:
         spec_participants = case.data['participants']
         fixtures = case.data.get('fixtures', {}) or {}
-        # Preset state for handlers that gate on history length / last_id /
-        # requests list — see scenario YAML keys for documentation.
+        # Preset state for handlers that gate on history length -- see
+        # scenario YAML keys for documentation.
         preset_history_len: dict[str, int] = fixtures.get('history_len', {}) or {}
-        preset_last_id: dict[str, int] = fixtures.get('last_id', {}) or {}
-        preset_requests: dict[str, list[list[int]]] = fixtures.get('requests', {}) or {}
-        # my_requests pre-stages a proposer's outstanding paxos rounds. Each
-        # entry: {id1, id2, task_id, score}. Required by handle_nack
-        # / handle_grant to recognize the round and look up the score.
-        preset_my_requests: dict[str, list[dict[str, Any]]] = fixtures.get('my_requests', {}) or {}
+        # proposals pre-stages a proposer's outstanding rounds. Each entry:
+        # {id1, id2, task_id, score, channel?}. handle_accepted looks the
+        # round's score up by (id1, id2). Mirrors the C adapter.
+        preset_proposals: dict[str, list[dict[str, Any]]] = fixtures.get('proposals', {}) or {}
         # tx_history pre-stages bilateral Transactions in self.process.history.
-        # { pid -> [ {task_id, p1, p1_score, p2, p2_score}, ... ] }. p1/p2
+        # { pid -> [{task_id, p1, p1_score, p2, p2_score}, ... ] }. p1/p2
         # reference other participant ids; the adapter resolves them to
         # UUIDv5(rep:<pid>). Required by reputation_pure / _contrite_tft
         # to score against committed bilateral txs.
         preset_tx_history: dict[str, list[dict[str, Any]]] = fixtures.get('tx_history', {}) or {}
+        # local_chain: { pid -> [{task, p1, p2}] } -- the participant's OWN
+        # committed chain, built through history.update() with the SAME uuid
+        # derivation as the `latest update` payload builder, so it hash-matches
+        # a reported chain up to wherever the two fork. Mirrors C.
+        preset_local_chain: dict[str, list[dict[str, Any]]] = fixtures.get('local_chain', {}) or {}
         # reputations pre-stages self.process.reputations. { pid -> { other_pid -> float } }.
         # Used to pin the counterparty's reputation (consumed by reputation_pure)
         # and the subject peer's `previous` value (consumed by _compute_reputation's
@@ -293,6 +652,23 @@ class ReputationAdapter:
         # Hysteresis latch read by _compute_reputation; combined with `reputations`,
         # pins which branch (pure vs. CTFT) runs.
         preset_coop_mode: dict[str, dict[str, bool]] = fixtures.get('coop_mode', {}) or {}
+        # peer_standing pre-sets what an authority has found about a peer
+        # (doc/architecture/zta-integration.md):
+        # { pid -> { other_pid -> <spec> | [<spec>, ...] } }, where <spec> is
+        # {status, ceiling, source?, reason?}. Installed directly rather than
+        # driven through an admission step because the verdict is produced by
+        # the IDENTITY process and this protocol's harness stands up only the
+        # reputation one -- the cross-language claim being pinned is what
+        # reputation DOES with a standing, not how identity reaches it.
+        # A LIST lets two authorities speak about the same peer, which is the
+        # only way to pin the minimum-over-sources reduction.
+        preset_peer_standing: dict[str, dict[str, Any]] = fixtures.get('peer_standing', {}) or {}
+        # tenure pre-sets the tenure gate (doc/architecture/reputation.md,
+        # "Tenure"): { pid -> {min_sec: N, <other_pid>: seconds_ago, ...} },
+        # the minimum and when this participant first held each member.
+        # Installed directly, like peer_standing: the clock is started by the
+        # rescore sweep, which this harness does not run.
+        preset_tenure: dict[str, dict[str, Any]] = fixtures.get('tenure', {}) or {}
         # checkpoint pre-seeds a finalized Phase 2 checkpoint root.
         # { pid -> {root: <hex>, epoch: int} }. Lets a single-step scenario
         # verify an evidence-bearing slash against a checkpoint (Phase 3); the
@@ -305,6 +681,19 @@ class ReputationAdapter:
         # conformance harness resets state per step, so cross-step quorum
         # accumulation isn't portable. Default stays the production value (3).
         preset_num_updates: dict[str, int] = fixtures.get('num_updates', {}) or {}
+        # slash_enabled arms the slash protocol for this case. It is opt-in in
+        # production (R+D.md §12.8): unarmed, a node originates nothing,
+        # declines to co-sign a proposal, and ignores a finalized slash, so a
+        # scenario that drives that protocol has to say so -- and every
+        # scenario that does NOT say so is a pin that the default is off.
+        # Scenario-level rather than per-participant, because the C twin's
+        # knob is an environment variable and the whole cohort shares it.
+        preset_slash_enabled: bool = bool(fixtures.get('slash_enabled', False))
+        # attest_conflicts: [[pid, ...], ...] -- the teams whose members do not
+        # witness for each other (ISSUES §2.54). Scenario-level: every node
+        # holds the same set, as every node holding one verified team roster
+        # does. Mirrors the C adapter's reputation_set_attest_conflicts.
+        preset_attest_conflicts: list = fixtures.get('attest_conflicts') or []
 
         identities: dict[str, Identity] = {}
         for idx, spec in enumerate(spec_participants):
@@ -321,12 +710,32 @@ class ReputationAdapter:
             identities[pid] = identity
 
         # Group seeded by first participant; every existing participant in
-        # the group's address map.
+        # the group's address map, except the `direct_peers`: a first-contact
+        # direct peer is in every peer list and in no group (R+D.md §13.5 D2).
+        # The first participant must not be one. Mirrors the C adapter.
+        direct = {str(d) for d in fixtures.get('direct_peers') or ()}
         seed_pid = spec_participants[0]['id']
         group = Group(identities[seed_pid].uuid, {identities[seed_pid].uuid: identities[seed_pid].address},
                       'rep-grp', Encryptor.generate(), False)
         for spec in spec_participants[1:]:
-            group.add_address(identities[spec['id']].uuid, identities[spec['id']].address)
+            if spec['id'] not in direct:
+                group.add_address(identities[spec['id']].uuid, identities[spec['id']].address)
+        # Every group places its order (doc/architecture/reputation.md,
+        # "Agreeing on an order"). Placement state lives in a directory per
+        # participant, fresh per case: every participant shares this process
+        # and its config directory.
+        place_root = tempfile.mkdtemp(prefix='at-conf-place-')
+        preset_place_promised = fixtures.get('place_promised', {}) or {}
+        # The roster in force before the scenario starts: every participant,
+        # unless `roster` names one per participant ({} for none, an unfounded
+        # chain). Mirrors the C adapter.
+        if 'roster' in fixtures:
+            preset_roster = fixtures.get('roster') or {}
+        else:
+            everyone = [p['id'] for p in spec_participants
+                        if p['id'] not in direct]
+            preset_roster = {p['id']: everyone for p in spec_participants}
+        self._fixture_roster = preset_roster
 
         handles: dict[str, ParticipantHandle] = {}
         for spec in spec_participants:
@@ -341,6 +750,35 @@ class ReputationAdapter:
                 peers.add(other_id)
 
             participant = self._build_one(pid, role, identity, peers, group)
+            where = os.path.join(place_root, pid)
+            os.makedirs(where, exist_ok=True)
+            participant.process._placement_path = (
+                lambda key, where=where: os.path.join(
+                    where, 'reputation-placement' + ('-' + key if key else '')
+                    + Configuration.file_ext))
+            if pid in preset_roster:
+                # roster: {pid: [member pids]} -- the roster in force on pid's
+                # primary chain before the scenario starts, each member with
+                # its signing key (doc/architecture/reputation.md, "Who is in
+                # the group"). An anchor with no index, so the scenario's
+                # instances keep theirs. Mirrors the C adapter.
+                from nacl.encoding import HexEncoder
+                from autonomous_trust.core.reputation.reputation import (
+                    Transaction, roster_digest, roster_task_id)
+                members = [[str(identities[m].uuid),
+                            identities[m].signature.public.encode(
+                                encoder=HexEncoder).decode('ascii')]
+                           for m in preset_roster[pid]]
+                digest = roster_digest(members)
+                participant.process.history.roster_anchor = Transaction(
+                    roster_task_id(None, 'genesis', None, digest),
+                    roster_op='genesis', roster_digest=digest,
+                    roster_members=members)
+            if pid in preset_place_promised:
+                spec_pp = preset_place_promised[pid]
+                participant.process._place_state('')['promised'] = (
+                    int(spec_pp['n']),
+                    str(identities[spec_pp['by']].uuid).lower())
 
             # Preset history_len: append N zero-Transaction stubs so
             # len(history) returns the expected value without altering
@@ -353,11 +791,12 @@ class ReputationAdapter:
                 participant.process.history._chain.append(tx)
                 participant.process.history._task_mapping[tx.task_id] = tx
 
-            if pid in preset_last_id:
-                participant.process.last_id = preset_last_id[pid]
-
             if pid in preset_num_updates:
                 participant.process.num_updates = int(preset_num_updates[pid])
+            # Instance attribute, shadowing the class-level default that reads
+            # the environment at import: the corpus must not depend on how the
+            # harness process was launched.
+            participant.process.SLASH_ENABLED = preset_slash_enabled
 
             if pid in preset_checkpoint:
                 spec_ck = preset_checkpoint[pid]
@@ -369,41 +808,88 @@ class ReputationAdapter:
                     first_index=int(spec_ck.get('first_index', 0)),
                     count=int(spec_ck.get('count', 0)))
 
-            for r in preset_requests.get(pid, []):
-                # Each preset request entry is [id1, id2] — pre-stage the
-                # acceptor's `requests` list so handle_transaction's check
-                # `if idx not in self.requests` passes.
-                participant.process.requests.append(tuple(r))
-
-            for entry in preset_my_requests.get(pid, []):
-                from autonomous_trust.core.reputation.repprocess import TxCount
+            for entry in preset_proposals.get(pid, []):
                 idx = (int(entry['id1']), int(entry['id2']))
                 score = TransactionScore(
                     task_id=str(uuid5(_NS, f'tx:{entry.get("task_id", "default")}')),
                     score=float(entry.get('score', 1.0)),
+                    # Absent -> TX_CHANNEL_TASK_OUTCOME (R+D.md §12.8).
+                    channel=entry.get('channel'),
                 )
-                participant.process.my_requests[idx] = TxCount(score, 0)
-                # Also stage the proposals dict so handle_grant /
-                # handle_accepted can look up the score by idx.
                 participant.process.proposals[idx] = score
+                participant.process.round_group[idx] = str(group.uuid)
 
             # tx_history: each entry installs a bilateral Transaction via
             # two history.update calls (matching how handle_committed
             # builds bilateral history in production). p1/p2 reference
             # participant ids; missing ids on either side are skipped.
+            def _ident_uuid(other):
+                return identities[other].uuid if other in identities else None
+            local = preset_local_chain.get(pid, [])
+            if any('batch' in e or 'certified_by' in e for e in local):
+                # A placed (or certified) local chain: built apart, then
+                # loaded verbatim with its certificates, as catch-up loads one.
+                def _sign_ids(ids, desig):
+                    return {str(identities[i].uuid):
+                            ReputationProcess._detached_sig(identities[i], desig)
+                            for i in ids if i in identities}
+                tmp = TransactionHistory(max_chain_len=len(local) + 1)
+                _write_chain(tmp, local, _ident_uuid, _sign_ids)
+                built = list(tmp)
+                participant.process.history.reconcile(
+                    built, certified={t.index for t in built})
+            else:
+                for entry in local:
+                    tk = uuid5(_NS, f"chain:{entry['task']}")
+                    participant.process.history.update(
+                        tk, _chain_half(entry, 1, entry['task'], _ident_uuid),
+                        float(entry['p1']))
+                    participant.process.history.update(
+                        tk, _chain_half(entry, 2, entry['task'], _ident_uuid),
+                        float(entry['p2']))
+
             for entry in preset_tx_history.get(pid, []):
+                if entry.get('attested'):
+                    # A verifier-attested entry: p1 is the verifier, its task
+                    # id derived from its content. Mirrors the C adapter.
+                    v, subj = entry.get('p1'), entry.get('subject')
+                    if v in identities and subj in identities:
+                        vu, su = identities[v].uuid, identities[subj].uuid
+                        dig = entry.get('evidence_digest')
+                        participant.process.history.append_attested(Transaction(
+                            attest_task_id(vu, su, dig), p1_id=vu,
+                            p1_score=float(entry.get('p1_score', 0.0)),
+                            p1_channel=entry.get('p1_channel'), attested=True,
+                            subject_id=su, evidence_digest=dig,
+                            attest_scope=entry.get('attest_scope')))
+                    continue
                 slug = entry.get('task_id')
                 p1_id = entry.get('p1')
                 p2_id = entry.get('p2')
-                if slug is None or p1_id not in identities or p2_id not in identities:
+                if slug is None or p1_id not in identities:
                     continue
                 task_uuid = uuid5(_NS, f'tx:{slug}')
+                if p2_id is None:
+                    # One side only, waiting in the pool for its counterpart,
+                    # as a committed half does (mirrors C's
+                    # reputation_install_tx_single): lets a single step drive
+                    # the arrival that completes the entry, since the C
+                    # harness resets state between steps.
+                    participant.process.history.record_half(
+                        task_uuid, identities[p1_id].uuid,
+                        float(entry.get('p1_score', 0.0)),
+                        entry.get('p1_channel'))
+                    continue
                 participant.process.history.update(
                     task_uuid, identities[p1_id].uuid,
-                    float(entry.get('p1_score', 0.0)))
+                    float(entry.get('p1_score', 0.0)),
+                    entry.get('p1_channel'))
+                if p2_id not in identities:
+                    continue
                 participant.process.history.update(
                     task_uuid, identities[p2_id].uuid,
-                    float(entry.get('p2_score', 0.0)))
+                    float(entry.get('p2_score', 0.0)),
+                    entry.get('p2_channel'))
 
             for other_pid, score in preset_reputations.get(pid, {}).items():
                 if other_pid not in identities:
@@ -422,6 +908,45 @@ class ReputationAdapter:
                 participant.process._coop_mode[
                     identities[other_pid].uuid
                 ] = bool(in_coop)
+
+            for other_pid, spec in preset_peer_standing.get(pid, {}).items():
+                if other_pid not in identities:
+                    continue
+                specs = spec if isinstance(spec, list) else [spec]
+                for one in specs:
+                    ceiling = one.get('ceiling')
+                    found = PeerStanding(identities[other_pid].uuid,
+                                         one.get('status', STANDING_CAPPED),
+                                         None if ceiling is None else float(ceiling),
+                                         one.get('verified_at'),
+                                         one.get('reason', ''),
+                                         one.get('source'))
+                    # Keyed by the finding's own (peer, source) key, exactly as
+                    # Protocol.run_message_handlers would file it.
+                    participant.process.protocol.peer_standing[found.key] = found
+            # Always set, so a conflict file another case wrote into the
+            # shared config dir is never read: no teams unless staged.
+            participant.process.set_attest_conflicts({'teams': [
+                [str(uuid5(_NS, f'rep:{m}')) for m in team]
+                for team in preset_attest_conflicts]})
+            tenure = preset_tenure.get(pid) or {}
+            if tenure:
+                import time as _time
+                proc = participant.process
+                proc._tenure_min_override = float(tenure.get('min_sec', 0))
+                proc._tenure_seeded = True
+                for other_pid, ago in tenure.items():
+                    if other_pid == 'min_sec' or other_pid not in identities:
+                        continue
+                    proc._member_since[str(identities[other_pid].uuid)] = (
+                        None, _time.time() - float(ago))
+            if preset_peer_standing.get(pid):
+                # ACT on them, not merely record them: the C adapter's
+                # reputation_apply_peer_standing does the unwind at install time,
+                # and in production the reputation process loop does it every
+                # pass. Recording only would leave Python a step behind C and
+                # report an asymmetry that is the harness's, not the runtime's.
+                participant.process._apply_peer_standings({})
 
             handles[pid] = ParticipantHandle(
                 id=pid, role=role, impl=participant,
@@ -489,6 +1014,10 @@ class ReputationAdapter:
         def _record_and_put(item, *args, **kwargs):
             if isinstance(item, Message):
                 captured.outbox_buffer.append(item)
+                if item.function == ReputationProtocol.slash_propose:
+                    captured.slashes_proposed += 1
+                if item.function == ReputationProtocol.attest_sign:
+                    captured.attest_signs_sent += 1
             original_put(item, *args, **kwargs)
 
         queues[CfgIds.network].put = _record_and_put  # type: ignore[method-assign]
@@ -503,11 +1032,229 @@ class ReputationAdapter:
         if not isinstance(inbound, Message):
             raise AssertionError(f'expected a Message, got {type(inbound).__name__}')
         participant.process.protocol.run_message_handlers(participant.queues, inbound)
+        # Stand in for the process loop's forwarding tick. The rep_req and
+        # consensus_rep_req handlers do not answer inline: they compute a
+        # roster and park it on `requested_reps`, which production drains
+        # from ReputationProcess.process() on the next pass. C answers from
+        # inside its handler (`_send_rep_response`), so without this the two
+        # runtimes are not comparable on the reply at all -- Python would
+        # emit nothing and any assertion on the answer could only ever hold
+        # on one side. Draining here is a no-op for every handler that
+        # already replied inline.
+        participant.process.forward_reputation(participant.queues)
         return participant.drain_outbox()
 
     # ------------------------------------------------------------------
     # Inbound construction
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _detached_sig(identity, designation: bytes) -> str:
+        """One participant's detached signature over ``designation``, in the
+        ASCII-hex form both runtimes' handlers verify."""
+        return identity.sign(designation).signature.decode('ascii')
+
+    def _cosignatures(self, participants: dict[str, ParticipantHandle],
+                      payload: dict[str, Any], designation: bytes,
+                      exclude: str = None) -> dict:
+        """Build the ``sigs`` map a ``*_final`` step carries.
+
+        A finalizer is only applied if the RECEIVER can verify more than
+        ``floor(N/2)`` distinct co-signatures over these exact bytes, so the
+        map is real cryptography built at scenario time by each named
+        co-signer's own key.
+
+        ``cosigners`` names them (participant ids); the default is every
+        participant except ``exclude`` (the slash target -- a peer does not
+        co-sign its own slash), which is the ordinary quorum-agreed case.
+        Negative controls override it: a shorter list is sub-quorum, and
+        ``forged_by`` makes ONE participant sign every entry while the entries
+        stay labelled with the others' uuids -- the case where a finalizer
+        mints the whole map itself.
+        """
+        ids = payload.get('cosigners') if isinstance(payload, dict) else None
+        if ids is None:
+            ids = [pid for pid in participants if pid != exclude]
+        forger = payload.get('forged_by') if isinstance(payload, dict) else None
+        signer = participants[forger].impl.identity if forger else None
+        sigs = {}
+        for pid in ids:
+            if pid not in participants:
+                raise AssertionError(f'cosigner {pid!r} not a known participant')
+            ident = participants[pid].impl.identity
+            sigs[str(ident.uuid)] = self._detached_sig(signer or ident,
+                                                      designation)
+        return sigs
+
+    def _resolved_answer(self, participants: dict[str, ParticipantHandle],
+                         from_id: str, to_id: str,
+                         payload: dict[str, Any]) -> dict:
+        """The answer document a deep-resolution reply carries, built from the
+        SENDER's real window and checkpoint -- real evidence at scenario time,
+        the same way ``_cosignatures`` builds real signatures rather than
+        placeholder bytes.
+
+        The receiver only accepts an answer to a query it is waiting for, so
+        the query is registered on it here. That is harness setup standing in
+        for the resolve this scenario does not send: registering it is what
+        makes the step test VERIFICATION rather than the relay bookkeeping,
+        which has its own coverage.
+
+        ``omit_last`` drops the final entry, which is the negative control the
+        whole payload shape exists for: the answer stays internally consistent
+        and every entry in it is genuine, but the window no longer reproduces
+        the root a quorum signed.
+        """
+        holder = participants[from_id].impl.process
+        holder_id = participants[from_id].impl.identity
+        target = participants[payload['peer']].impl.identity.uuid
+        qid = str(payload.get('query_id', 'q1'))
+        window = holder.history._indexed_window()
+        if not window:
+            raise AssertionError(
+                f'{from_id} has no committed window to answer with')
+        # The checkpoint is built over the holder's ACTUAL window and signed
+        # here by real keys, rather than taken from the `checkpoint` fixture:
+        # that fixture installs a root and no co-signatures, and an answer
+        # carrying an unsigned root would be refused for a reason the scenario
+        # is not trying to test. Same principle as _cosignatures -- real
+        # cryptography at scenario time.
+        ckpt = Checkpoint(proposer_uuid=holder_id.uuid,
+                          root=holder.history.window_root(),
+                          epoch=int(payload.get('epoch', 1)),
+                          first_index=window[0].index, count=len(window))
+        cosigners = payload.get('cosigners') or [from_id]
+        sigs = {}
+        for pid in cosigners:
+            if pid not in participants:
+                raise AssertionError(f'cosigner {pid!r} not a known participant')
+            ident = participants[pid].impl.identity
+            sigs[str(ident.uuid)] = self._detached_sig(ident, ckpt.designation)
+        signed = SignedCheckpoint(checkpoint=ckpt, sigs=sigs)
+        signers = [public_identity_to_canonical(participants[pid].impl.identity)
+                   for pid in cosigners]
+        doc = resolved_to_dict(qid, target, window, signed, signers=signers,
+                               score=payload.get('score'))
+        if payload.get('omit_last') and doc['chain']:
+            doc['chain'] = doc['chain'][:-1]
+        receiver = participants[to_id].impl.process
+        receiver._resolve_outstanding[qid] = (
+            str(target), float('inf'))
+        return doc
+
+    #: A member no participant knows (roster specs). Mirrors the C adapter.
+    STRANGER = ['5e5e5e5e-0000-4000-8000-000000000005', '55' * 32]
+
+    def _roster_member(self, participants, pid):
+        if pid == 'stranger':
+            return list(self.STRANGER)
+        from nacl.encoding import HexEncoder
+        ident = participants[pid].impl.identity
+        return [str(ident.uuid).lower(),
+                ident.signature.public.encode(encoder=HexEncoder).decode('ascii')]
+
+    def _roster_spec(self, participants, spec, base):
+        """A roster entry from its spec (doc/architecture/reputation.md, "Who
+        is in the group"): {roster: genesis, members: [pid...]}, {roster: add,
+        member: pid[, key: hex]} or {roster: restate}; an add or restate
+        builds on the recipient's `roster` fixture (`base`). Mirrors the C
+        adapter's _rp_roster_entry."""
+        from autonomous_trust.core.reputation.reputation import (roster_digest,
+                                                                 roster_task_id)
+        op = spec['roster']
+        who = None
+        if op == 'genesis':
+            members = [self._roster_member(participants, p) for p in spec['members']]
+            d = roster_digest(members)
+            task = roster_task_id(None, 'genesis', None, d)
+        else:
+            members = [self._roster_member(participants, p) for p in base or []]
+            prev = roster_task_id(None, 'genesis', None, roster_digest(members))
+            if op == 'add':
+                m = self._roster_member(participants, spec['member'])
+                if spec.get('key'):
+                    m[1] = spec['key']
+                members = members + [m]
+                who = m[0]
+            d = roster_digest(members)
+            task = roster_task_id(prev, op, who, d)
+        return Transaction(task, roster_op=op,
+                           roster_uuid=None if who is None else UUID(who),
+                           roster_digest=d, roster_members=members)
+
+    def _place_value(self, participants, payload, base=None):
+        """A placement value from its spec: {task_id, p1, p1_score, p2,
+        p2_score} entries, each half certified by `cosigners` (default every
+        participant but the entry's two parties) unless `uncertified`, halves
+        in canonical order unless `swap`, entries by task id unless the step
+        says `unsorted`. Returns (entries, wire list). Mirrors the C adapter's
+        _rp_place_value."""
+        out = []
+        for spec in payload.get('value') or []:
+            if isinstance(spec.get('roster'), str):
+                out.append(self._roster_spec(participants, spec, base))
+                continue
+            a, b = spec['p1'], spec['p2']
+            ia = participants[a].impl.identity
+            ib = participants[b].impl.identity
+            task = uuid5(_NS, f'tx:{spec["task_id"]}')
+            sa, sb = float(spec['p1_score']), float(spec['p2_score'])
+            certs = None
+            if not spec.get('uncertified'):
+                signers = spec.get('cosigners') or [
+                    pid for pid in participants if pid not in (a, b)]
+                certs = {}
+                for who, score in ((ia, sa), (ib, sb)):
+                    certs[str(who.uuid)] = {
+                        str(participants[pid].impl.identity.uuid):
+                            self._detached_sig(participants[pid].impl.identity,
+                                               commit_designation(who.uuid, task, score))
+                        for pid in signers}
+            tx = placement_entry(Transaction(task, p1_id=ia.uuid, p1_score=sa,
+                                             p2_id=ib.uuid, p2_score=sb,
+                                             commit_sigs=certs))
+            if spec.get('swap'):
+                tx.p1_id, tx.p2_id = tx.p2_id, tx.p1_id
+                tx.p1_score, tx.p2_score = tx.p2_score, tx.p1_score
+            out.append(tx)
+        out.sort(key=lambda tx: str(tx.task_id).lower())
+        if payload.get('unsorted'):
+            out.reverse()
+        return out, [entry_to_dict(tx) for tx in out]
+
+    def _place_body(self, participants, from_id, to_id, function, payload):
+        """{group: '', k, ballot: {n, by}, head[, value]} or, for placed,
+        {group: '', k, value, sigs}. `head` is a literal, '' by default, or
+        `recipient` for the recipient's own head. `signers` name a placement
+        certificate's signers (default every participant); `forged_by` makes
+        one sign for all. Mirrors the C adapter."""
+        k = int(payload.get('k', 0))
+        head = payload.get('head', '')
+        if head == 'recipient':
+            head = participants[to_id].impl.process.history.head_hash.decode('ascii')
+        body = {'group': '', 'k': k}
+        if function != ReputationProtocol.placed:
+            ballot = payload.get('ballot') or {}
+            by = participants[ballot.get('by', from_id)].impl.identity.uuid
+            body['ballot'] = {'n': int(ballot.get('n', 1)), 'by': str(by).lower()}
+            body['head'] = head
+        if function == ReputationProtocol.place_request:
+            return body
+        entries, wire = self._place_value(
+            participants, payload,
+            (getattr(self, '_fixture_roster', None) or {}).get(to_id))
+        body['value'] = wire
+        if function == ReputationProtocol.placed:
+            desig = place_designation(k, head, place_value_digest(entries, k))
+            signers = payload.get('signers') or list(participants)
+            forger = payload.get('forged_by')
+            by_key = participants[forger].impl.identity if forger else None
+            body['sigs'] = {
+                str(participants[pid].impl.identity.uuid):
+                    self._detached_sig(by_key or participants[pid].impl.identity,
+                                       desig)
+                for pid in signers}
+        return body
 
     def _build_inbound(self, participants: dict[str, ParticipantHandle], *,
                        from_id: str, to_id: str, function: str,
@@ -526,35 +1273,87 @@ class ReputationAdapter:
             raise AssertionError(f'proposer {proposer_id!r} not a known participant')
         proposer_uuid = participants[proposer_id].impl.identity.uuid
 
-        if function == ReputationProtocol.request:
-            tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
-            obj = to_json_string(tup)
-        elif function == ReputationProtocol.grant:
-            id_tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
-            last_id = payload.get('last_id')
-            last_idx = int(payload.get('last_idx', 0))
-            last_val = payload.get('last_val')
-            ack = (id_tup, (last_id, last_idx), last_val)
-            obj = to_json_string(ack)
-        elif function in (ReputationProtocol.nack, ReputationProtocol.backdate):
-            tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
-            obj = to_json_string(tup)
+        if function == ReputationProtocol.rep_resolve:
+            # A query names a peer and nothing else -- deliberately no originator, which
+            # is the opacity property (doc/architecture/gateway-reputation-tree.md).
+            target = participants[payload['peer']].impl.identity.uuid
+            obj = to_json_string(resolve_query_to_dict(
+                str(payload.get('query_id', 'q1')), target,
+                ttl=int(payload.get('ttl', RESOLVE_TTL_DEFAULT))))
+        elif function == ReputationProtocol.rep_resolved:
+            obj = to_json_string(self._resolved_answer(participants,
+                                                       from_id, to_id, payload))
+        elif function in ReputationProtocol.retired:
+            # A verb of the retired half round, as a build that still runs it
+            # sends one: [id1, id2, proposer]. Mirrors the C adapter.
+            obj = to_json_string((int(payload.get('id1', 1)),
+                                  int(payload.get('id2', 1)), proposer_uuid))
         elif function == ReputationProtocol.transaction:
             id_tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
             score = TransactionScore(
                 task_id=str(uuid5(_NS, f'tx:{payload.get("task_id", "default")}')),
                 score=float(payload.get('score', 1.0)),
+                # Lets a scenario drive the evidence channel across the wire and
+                # assert the C twin agrees on the closed set -- including that an
+                # unknown spelling is REFUSED by both (R+D.md §12.8). Absent
+                # keeps the pre-channel behavior.
+                channel=payload.get('channel'),
             )
-            obj = to_json_string((id_tup, score))
+            # A proposer asks for certification and names its group ('' is
+            # the primary). `certify: false` or `placing: false` builds the
+            # proposal a half-round build sent, which is dropped.
+            tup = (id_tup, score)
+            if payload.get('certify', True) is True:
+                tup = tup + (True,)
+            if payload.get('placing', True) is True:
+                if len(tup) < 3:
+                    tup = tup + (False,)
+                tup = tup + ('',)
+            obj = to_json_string(tup)
         elif function == ReputationProtocol.accepted:
             tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
+            if payload.get('signed') is True:
+                # The acceptor's signature over the half's commit_designation
+                # (doc/architecture/reputation.md, "Commit certificates"). Only a SOURCE step builds here; a
+                # response step re-delivers the real message, which is why the
+                # C adapter needs these same keys to rebuild it.
+                task_id = uuid5(_NS, f'tx:{payload.get("task_id", "default")}')
+                tup = tup + (self._detached_sig(
+                    sender_identity, commit_designation(
+                        proposer_uuid, task_id, float(payload.get('score', 1.0)),
+                        payload.get('channel'))),)
             obj = to_json_string(tup)
         elif function == ReputationProtocol.committed:
-            # Phase 3 broadcast — (task_id, peer_id, score).  Mirrors
-            # repprocess.py's commit_msg payload in handle_accepted.
-            task_id = str(uuid5(_NS, f'tx:{payload.get("task_id", "default")}'))
-            obj = to_json_string((task_id, proposer_uuid,
-                                  float(payload.get('score', 1.0))))
+            # Phase 3 broadcast — (task_id, peer_id, score, group_uuid,
+            # channel).  Mirrors repprocess.py's commit_msg payload in
+            # handle_accepted, which appends both trailing elements the same
+            # length-tolerant way. A scenario that names no channel sends the
+            # legacy 3-tuple, so every pre-channel vector is unchanged.
+            # UUID objects, not strings: `ConfigJSONEncoder` round-trips them
+            # with a `__type__` tag, so the handler receives the same types
+            # production puts in (`repprocess.handle_accepted` passes
+            # `score.task_id` and `peer_id` unchanged). Stringifying here made
+            # the task key a `str` while a staged fixture keyed the same task
+            # by `UUID` -- two entries for one task, so an arriving commit
+            # could never complete a staged one.
+            task_id = uuid5(_NS, f'tx:{payload.get("task_id", "default")}')
+            tup = (task_id, proposer_uuid, float(payload.get('score', 1.0)))
+            if payload.get('channel') is not None:
+                tup = tup + (None, str(payload['channel']))
+            if 'cosigners' in payload or 'forged_by' in payload:
+                # A commit certificate (doc/architecture/reputation.md, "Commit certificates"): real
+                # signatures over commit_designation, built at scenario time.
+                # Only when the scenario names one. Mirrors the C adapter.
+                if len(tup) == 3:
+                    tup = tup + (None, payload.get('channel'))
+                # certified_score: the certificate is cut over a DIFFERENT
+                # score than the one committed (the binding's negative control).
+                tup = tup + (self._cosignatures(
+                    participants, payload, commit_designation(
+                        proposer_uuid, task_id,
+                        float(payload.get('certified_score', tup[2])),
+                        payload.get('channel'))),)
+            obj = to_json_string(tup)
         elif function == ReputationProtocol.outdated:
             obj = str(payload.get('length', 0))
         elif function == ReputationProtocol.update:
@@ -574,16 +1373,35 @@ class ReputationAdapter:
                 from autonomous_trust.core.reputation.reputation import (
                     TransactionHistory)
                 tmp = TransactionHistory(max_chain_len=max(len(spec) + 1, 2))
-                for entry in spec:
-                    tk = uuid5(_NS, f"chain:{entry['task']}")
-                    p1 = uuid5(_NS, f"chainp1:{entry['task']}")
-                    p2 = uuid5(_NS, f"chainp2:{entry['task']}")
-                    tmp.update(tk, p1, float(entry['p1']))
-                    tmp.update(tk, p2, float(entry['p2']))
+                def _part_uuid(other):
+                    return (participants[other].impl.identity.uuid
+                            if other in participants else None)
+                # certified_by: [ids] certifies both halves of an entry with
+                # those participants' signatures (doc/architecture/reputation.md,
+                # "Commit certificates"); batch / placed_by write placements.
+                _write_chain(tmp, spec, _part_uuid,
+                             lambda ids, desig: self._cosignatures(
+                                 participants, {'cosigners': ids}, desig),
+                             lambda pid: self._roster_member(participants, pid))
                 built = list(tmp)
                 if payload.get('tamper') and len(built) >= 2:
                     built[1].p2_score = -1.0
-                obj = to_json_string(built)
+                # from: N sends the chain from its Nth entry on, as a peer whose
+                # window has moved past the start would.
+                built = built[int(payload.get('from') or 0):]
+                # to: N stops before the Nth entry (with from, one page's
+                # slice of a window).
+                if payload.get('to') is not None:
+                    built = built[:int(payload['to']) - int(payload.get('from') or 0)]
+                # page / of / head: send it as one page of a paged window
+                # (ISSUES §2.67), as a responder over the page size would.
+                if payload.get('page') is not None:
+                    obj = to_json_string({'page': payload['page'],
+                                          'of': payload.get('of'),
+                                          'head': payload.get('head', 'h'),
+                                          'chain': built})
+                else:
+                    obj = to_json_string(built)
         elif function in (ReputationProtocol.rep_req,
                           ReputationProtocol.consensus_rep_req):
             # Canonical wire form (BUGS.md §P9B): JSON object with named
@@ -603,6 +1421,29 @@ class ReputationAdapter:
                 'peer_uuid': target_uuid,
                 'requesting_process': req_proc,
             })
+        elif function == ReputationProtocol.app_roster_request:
+            # The app pulling the current peer view. The verb carries no
+            # payload at all: it names no subject, because the answer is the
+            # whole roster (doc/architecture/app-peer-carrier.md).
+            obj = to_json_string({})
+        elif function == ReputationProtocol.consensus_rep_batch_req:
+            # Batched consensus request: one message naming MANY subjects,
+            # answered with one roster. Same fields as the single-subject form
+            # but plural (`peer_uuids`), and both adapters build these identical
+            # bytes so cross-language wire interop is pinned here too. `targets`
+            # is a list of participant ids; a non-participant id passes through
+            # verbatim so a scenario can name an unknown uuid deliberately.
+            target_pids = payload.get('targets') or [payload.get('target', from_id)]
+            uuids = []
+            for target_pid in target_pids:
+                if target_pid in participants:
+                    uuids.append(str(participants[target_pid].impl.identity.uuid))
+                else:
+                    uuids.append(target_pid)
+            obj = to_json_string({
+                'peer_uuids': uuids,
+                'requesting_process': payload.get('proc', 'negotiation'),
+            })
         elif function in (ReputationProtocol.slash_propose,
                           ReputationProtocol.slash_sign,
                           ReputationProtocol.slash_final):
@@ -619,20 +1460,71 @@ class ReputationAdapter:
             epoch = int(payload.get('epoch', 1))
             reason = payload.get('reason',
                                  SlashAttestation.REASON_PEER_EXCLUDE)
+            att = SlashAttestation(
+                slasher_uuid=str(proposer_uuid), target_uuid=target_uuid,
+                reason=reason, floor_score=floor, epoch=epoch)
             if function == ReputationProtocol.slash_sign:
+                # Co-signatures are SIGNED HERE, at scenario time, by the
+                # sending participant's own key -- not pinned as blobs -- so
+                # both adapters are held to the same pre-image and scheme
+                # rather than to one side's recorded output (the doc/architecture/zta-integration.md
+                # precedent). The ack names its sender, because the receiver
+                # credits the authenticated sender rather than the claim. The
+                # sign step's payload must therefore describe the SAME round
+                # as its propose (reason + floor_score + epoch): the
+                # designation covers those fields, so a sign step that omits
+                # them signs different bytes and is correctly refused.
                 obj = to_json_string(
-                    (target_uuid, epoch, str(proposer_uuid), None))
+                    (target_uuid, epoch, str(sender_identity.uuid),
+                     self._detached_sig(sender_identity, att.designation)))
             else:
-                att = SlashAttestation(
-                    slasher_uuid=str(proposer_uuid), target_uuid=target_uuid,
-                    reason=reason, floor_score=floor, epoch=epoch)
                 # Phase 3: optional Merkle evidence {task_id, leaf, proof,
                 # root} tying the slash to a checkpoint-committed tx.
                 if isinstance(payload, dict) and payload.get('evidence'):
                     att.evidence_ref = payload['evidence']
-                obj = (to_json_string(SignedSlash(attestation=att, sigs={}))
-                       if function == ReputationProtocol.slash_final
-                       else to_json_string(att))
+                if function == ReputationProtocol.slash_final:
+                    sigs = self._cosignatures(participants, payload,
+                                              att.designation,
+                                              exclude=target_pid)
+                    obj = to_json_string(SignedSlash(attestation=att,
+                                                     sigs=sigs))
+                else:
+                    obj = to_json_string(att)
+        elif function in (ReputationProtocol.attest_propose,
+                          ReputationProtocol.attest_sign,
+                          ReputationProtocol.attest_final):
+            # Verifier-attested scores -- Python's native shapes (per-impl;
+            # byte_pinning:false checks state equivalence). propose/final
+            # carry an AttestedScore / SignedAttestation; sign is a
+            # (task, voter, sig) tuple. The VERIFIER is the proposer (the
+            # step's `from` for propose/final, its `to` for sign), so every
+            # step of one round must name the same subject, score, channel and
+            # digest: the designation covers them all.
+            subject_pid = payload.get('subject')
+            subject_uuid = (str(participants[subject_pid].impl.identity.uuid)
+                            if subject_pid in participants else subject_pid)
+            verifier_pid = payload.get(
+                'verifier',
+                to_id if function == ReputationProtocol.attest_sign else from_id)
+            att = AttestedScore(
+                verifier_uuid=str(participants[verifier_pid].impl.identity.uuid),
+                subject_uuid=subject_uuid,
+                score=float(payload.get('score', 0.3)),
+                channel=payload.get('channel', 'probe'),
+                evidence_digest=payload.get('evidence_digest', 'ab' * 32),
+                attest_scope=payload.get('scope'))
+            if function == ReputationProtocol.attest_sign:
+                obj = to_json_string(
+                    (str(att.task_id), str(sender_identity.uuid),
+                     self._detached_sig(sender_identity, att.designation)))
+            elif function == ReputationProtocol.attest_final:
+                sigs = self._cosignatures(participants, payload,
+                                          att.designation,
+                                          exclude=subject_pid)
+                obj = to_json_string(SignedAttestation(attestation=att,
+                                                       sigs=sigs))
+            else:
+                obj = to_json_string(att)
         elif function in (ReputationProtocol.checkpoint_propose,
                           ReputationProtocol.checkpoint_sign,
                           ReputationProtocol.checkpoint_final):
@@ -649,21 +1541,37 @@ class ReputationAdapter:
             epoch = int(payload.get('epoch', 1))
             first_index = int(payload.get('first_index', 0))
             count = int(payload.get('count', 0))
+            ck = Checkpoint(
+                proposer_uuid=str(proposer_uuid),
+                root=root_hex.encode('ascii') if isinstance(root_hex, str)
+                else root_hex,
+                epoch=epoch, first_index=first_index, count=count)
             if function == ReputationProtocol.checkpoint_sign:
+                # Signed at scenario time by the sender, as for slash_sign.
+                # The sign step's payload must name the same root / epoch /
+                # bounds as its propose, since the designation covers them.
                 obj = to_json_string(
-                    (str(proposer_uuid), epoch, str(proposer_uuid), None))
+                    (str(proposer_uuid), epoch, str(sender_identity.uuid),
+                     self._detached_sig(sender_identity, ck.designation)))
+            elif function == ReputationProtocol.checkpoint_final:
+                sigs = self._cosignatures(participants, payload,
+                                          ck.designation)
+                obj = to_json_string(SignedCheckpoint(checkpoint=ck,
+                                                      sigs=sigs))
             else:
-                ck = Checkpoint(
-                    proposer_uuid=str(proposer_uuid),
-                    root=root_hex.encode('ascii') if isinstance(root_hex, str)
-                    else root_hex,
-                    epoch=epoch, first_index=first_index, count=count)
-                obj = (to_json_string(SignedCheckpoint(checkpoint=ck, sigs={}))
-                       if function == ReputationProtocol.checkpoint_final
-                       else to_json_string(ck))
+                obj = to_json_string(ck)
+        elif function in (ReputationProtocol.place_request,
+                          ReputationProtocol.place, ReputationProtocol.placed):
+            obj = to_json_string(self._place_body(participants, from_id, to_id,
+                                                  function, payload))
         else:
             raise AssertionError(f'unsupported reputation function {function!r}')
 
+        # An app verb comes from this node's own app, with no sender, unless
+        # the step says it came off the wire (`from_wire: true`), which
+        # production refuses (ISSUES §2.17). Mirrors the C adapter.
+        if function.startswith('app_') and not payload.get('from_wire'):
+            sender_identity = None
         msg = Message(
             CfgIds.reputation, function, obj,
             from_whom=sender_identity,

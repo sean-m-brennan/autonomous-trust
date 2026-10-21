@@ -14,45 +14,688 @@
 #   limitations under the License.
 # ******************
 
+import copy
+import json
+import math
 import os
 from collections import OrderedDict
 from collections.abc import Mapping
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from ..config import Configuration
 from ..structures.merkle import MerkleTree
 
 
+#: The scale every absolute measure in AT and in the tiers above it assumes.
+#: Named here so the bound is one value rather than a convention repeated in
+#: prose; mirrors TX_SCORE_MIN / TX_SCORE_MAX in the C twin's reputation.h.
+TX_SCORE_MIN = 0.0
+TX_SCORE_MAX = 1.0
+
+
+def validate_tx_score(score, where: str = 'TransactionScore'):
+    """Return `score` as a float in [0, 1], or raise ValueError.
+
+    The [0, 1] score bound, enforced (doc/architecture/reputation.md; asked for
+    by kith-covenant's erosion-legibility audit). The
+    [0, 1] scale was a convention in AT rather than an enforced invariant, so an
+    out-of-range score was *graded* rather than rejected — it flowed into the
+    weighted average and moved a reputation by an unbounded amount. Rejecting is
+    the whole point, so this deliberately does not clamp: a caller submitting 5.0
+    has a bug, and silently recording 1.0 would hide it while still rewarding the
+    peer more than any honest score could.
+
+    NaN is rejected by the same comparison that rejects 5.0 (every comparison
+    against NaN is false), which is worth knowing because NaN is the value that
+    would otherwise poison an average irrecoverably.
+    """
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        raise ValueError('%s: score must be a number, got %r' % (where, score))
+    if not (TX_SCORE_MIN <= value <= TX_SCORE_MAX):
+        raise ValueError('%s: score %r is outside the [%g, %g] scale '
+                         '(NaN is rejected here too)'
+                         % (where, score, TX_SCORE_MIN, TX_SCORE_MAX))
+    return value
+
+
+#: Evidence channels (R+D.md §12.8, doc/verification_oracle.md "Keep the
+#: channels separate").
+#:
+#: A transaction score says HOW WELL a peer did. The channel says HOW WE KNOW
+#: — and those are not the same fact. "Refuted by conservation of energy,"
+#: "poorly calibrated over the last hundred predictions," "disagrees with the
+#: swarm," "failed a replicated task," and "contradicted its own signed
+#: archive" are different findings warranting different responses (immediate
+#: demotion, gradual decay, an opened dispute). Collapsing them into one scalar
+#: before the score reaches the reputation algebra destroys exactly what an
+#: escalation path would need to choose between those responses, and a bare
+#: score is what the wire carried before this field existed.
+#:
+#: The first slice (2026-08-21) carried the channel and branched on nothing.
+#: The second gives it consequences, and there are two: a graded channel
+#: weights the consensus EMA (:data:`TX_CHANNEL_WEIGHTS`, locally-produced
+#: evidence only — see :func:`tx_channel_weight`), and the channel is part of
+#: the committed fact, so every peer retains the reason alongside the score
+#: and judges for itself. No channel levies a verdict of its own.
+#:
+#: Mirrors TX_CHANNEL_* in the C twin's reputation/tx_channel.h; the spellings
+#: must match verbatim, since a divergence is a score one twin accepts and the
+#: other drops.
+
+#: Ordinary grading of a completed task: the negotiation-driven path that
+#: produced every score before channels existed. The default, and what an
+#: absent/empty channel normalizes to, so a legacy peer's scores stay
+#: indistinguishable from a tagged peer's task outcomes.
+TX_CHANNEL_TASK_OUTCOME = 'task_outcome'
+
+#: Hard refutation by conservation law or dimensional analysis. Needs no
+#: history and no training data (oracle layer 1) — a verdict, not a drift.
+TX_CHANNEL_PHYSICAL = 'physical'
+
+#: A certificate-carrying task interface checked out (or failed to). Interface
+#: work rather than algorithm work (oracle layer 2); this is where a ZKP
+#: verdict on a task result lands (see automate.py).
+TX_CHANNEL_CERTIFICATE = 'certificate'
+
+#: Conformal coverage audit / prequential log-loss: the peer is not wrong so
+#: much as overconfident, which averaged reputation cannot see (layers 3-4).
+TX_CHANNEL_CALIBRATION = 'calibration'
+
+#: The peer contradicted its own signed, hash-chained claim archive (layer 5).
+#: The cheapest channel of the set: falsification needing no peers, no physics,
+#: and no domain knowledge.
+TX_CHANNEL_SELF_CONSISTENCY = 'self_consistency'
+
+#: Outcome of sampled replication of the peer's work (layer 6).
+TX_CHANNEL_REPLICATION = 'replication'
+
+#: The peer disagrees with the swarm (layers 7-8). Named separately BECAUSE it
+#: is the one that should eventually open a dispute rather than levy a penalty
+#: — a majority is not an oracle.
+TX_CHANNEL_SWARM_DISAGREEMENT = 'swarm_disagreement'
+
+#: A honeypot probe: a task whose correct answer the requestor already knows,
+#: checked against that answer (R+D.md §12.7). The AT bootstrap corpus
+#: (at.handshake / at.time-attest / at.echo-challenge) is this pattern.
+#:
+#: Kept distinct from :data:`TX_CHANNEL_TASK_OUTCOME` because a probe verdict is
+#: the one piece of evidence that does not degrade as the adversarial fraction
+#: rises — every other channel is ultimately an aggregate over peers, and a
+#: majority cannot be beaten without an external reference. A probe IS that
+#: reference. Distinct from :data:`TX_CHANNEL_CERTIFICATE` too: a certificate is
+#: a proof the PEER supplies about its own work, while a probe is a question the
+#: VERIFIER authored and already knows the answer to.
+TX_CHANNEL_PROBE = 'probe'
+
+#: One node's own, first-person account of an interaction it was party to
+#: (Phase 4 P4.1). The person operating this node says the exchange went badly,
+#: and that is the entire warrant — no oracle, no replication, no
+#: verifier-authored question, no second witness.
+#:
+#: NAMED FOR ITS EPISTEMOLOGY, like every other spelling here, and deliberately
+#: not `report`. That name would invite the thing this channel must never
+#: become: an accusation several nodes co-sign into a verdict. There is no
+#: adjudicator for this channel and none is planned, for the same reason
+#: :data:`TX_CHANNEL_SWARM_DISAGREEMENT` has none.
+#:
+#: The WEAKEST evidence in the set, weight 1. A first-person account is one
+#: peer's reading of one event, with the added problem that the peer is an
+#: interested party — so the bound on it is the ACCRUAL CAP, not the weight: a
+#: reporter spends their own daily budget, and report-spam costs the spammer
+#: their own ability to accrue. Distinct from swarm_disagreement, which is an
+#: aggregate over peers; this is one party to one exchange.
+TX_CHANNEL_FIRST_PERSON = 'first_person'
+
+#: The closed set, in the build order of doc/verification_oracle.md. Mirrors
+#: TX_CHANNEL_ALL in the C twin. Ordered (not a set literal) so error messages
+#: list the vocabulary the same way on both sides of the wire.
+TX_CHANNELS = (TX_CHANNEL_TASK_OUTCOME,
+               TX_CHANNEL_PHYSICAL,
+               TX_CHANNEL_CERTIFICATE,
+               TX_CHANNEL_CALIBRATION,
+               TX_CHANNEL_SELF_CONSISTENCY,
+               TX_CHANNEL_REPLICATION,
+               TX_CHANNEL_SWARM_DISAGREEMENT,
+               TX_CHANNEL_PROBE,
+               TX_CHANNEL_FIRST_PERSON)
+
+#: What an absent channel resolves to. Absence means "a peer or an app that
+#: predates channels," which is a task outcome by construction — every
+#: producer before this field was grading a completed task.
+TX_CHANNEL_DEFAULT = TX_CHANNEL_TASK_OUTCOME
+
+#: Channels a verifier may author a VERIFIER-ATTESTED score on: an entry that
+#: commits on the verifier's half plus a quorum, without the subject's
+#: (doc/architecture/reputation.md, "Verifier-attested scores"). Each is a
+#: finding the verifier can stand behind on its own: `probe` (a question it
+#: authored), `certificate` (it checked a proof the subject supplied about its
+#: own work) and `self_consistency` (its own evidence contradicts a claim the
+#: subject signed) and `replication` (it re-ran another verifier's check;
+#: agreement across N verifiers is the consuming app's fold, and the chain only
+#: gates who may replicate, AT_ATTEST_REPLICATION_TIER);
+#: `first_person` never qualifies, since a first-person account co-signed by a
+#: quorum is exactly the accusation that channel must not become. Mirrors
+#: tx_channel_attestable.
+TX_CHANNELS_ATTESTABLE = (TX_CHANNEL_PROBE, TX_CHANNEL_CERTIFICATE,
+                          TX_CHANNEL_SELF_CONSISTENCY, TX_CHANNEL_REPLICATION)
+
+#: Namespace for an attested entry's task id, which is derived from its content
+#: (verifier, subject, evidence digest) rather than chosen: a duplicate is then
+#: recognizable on sight and an attestation cannot borrow a live round's id.
+#: uuid5(NAMESPACE_URL, 'urn:autonomous-trust:attested-score'). Mirrors
+#: AT_ATTEST_NS in reputation.h.
+ATTEST_NS = UUID('f0f4b5b1-5247-55ca-9d1e-b132dc9354fc')
+
+#: An attested entry's evidence digest: the lowercase-hex 32-byte blake2b of
+#: the document the verifier's finding rests on, which the application that
+#: produced it publishes. Mirrors TX_ATTEST_DIGEST_HEX_LEN.
+ATTEST_DIGEST_HEX_LEN = 64
+
+
+def attest_task_id(verifier, subject, evidence_digest) -> UUID:
+    """The task id an attested entry MUST carry: uuid5 over
+    ``verifier|subject|evidence_digest`` (canonical lowercase uuids). Mirrors
+    tx_attest_task_uuid."""
+    return uuid5(ATTEST_NS, f'{str(verifier).lower()}|{str(subject).lower()}|'
+                            f'{evidence_digest}')
+
+
+#: uuid5(NAMESPACE_URL, 'urn:autonomous-trust:roster'). Mirrors AT_ROSTER_NS.
+ROSTER_NS = UUID('26dd8363-9e20-5e9e-9627-133144c10ccc')
+
+#: What a roster entry records (doc/architecture/reputation.md, "Who is in the
+#: group"): the first roster, one member added, or the same members restated so
+#: the roster in force never leaves the resident window.
+ROSTER_OPS = ('genesis', 'add', 'restate')
+
+
+def roster_members_norm(members) -> 'list[tuple[str, str]]':
+    """``members`` as sorted ``(uuid, signing key hex)`` pairs, lowercase.
+    Raises ValueError on a malformed or repeated member."""
+    out = {}
+    for m in members or ():
+        uid, key = m[0], m[1]
+        uid = str(UUID(str(uid))).lower()
+        key = str(key).lower()
+        if len(key) != 64 or any(c not in '0123456789abcdef' for c in key):
+            raise ValueError('roster member key is not 32 bytes of hex')
+        if uid in out:
+            raise ValueError('roster member repeated')
+        out[uid] = key
+    if not out:
+        raise ValueError('empty roster')
+    return sorted(out.items())
+
+
+def roster_digest(members) -> str:
+    """blake2b over ``AT-ROSTER\0`` and one ``uuid:key`` line per member,
+    sorted by uuid: what a roster entry's hash covers of its member list.
+    Mirrors C roster_digest."""
+    lines = '\n'.join('%s:%s' % m for m in roster_members_norm(members))
+    return MerkleTree.get_hash(b'AT-ROSTER\x00' + lines.encode('ascii')).decode('ascii')
+
+
+def roster_task_id(prev_task, op, member, digest) -> UUID:
+    """The task id a roster entry carries: uuid5 over
+    ``prev roster task|op|member|digest`` ('null' for none), so two members
+    proposing the same change propose the same value. Mirrors
+    tx_roster_task_uuid."""
+    prev = 'null' if prev_task is None else str(prev_task).lower()
+    who = 'null' if member is None else str(member).lower()
+    return uuid5(ROSTER_NS, f'{prev}|{op}|{who}|{digest}')
+
+
+#: uuid5(NAMESPACE_URL, 'urn:autonomous-trust:task-pair'). Mirrors AT_PAIR_NS.
+PAIR_NS = UUID('61c22477-1384-51fd-b286-bb4b7f285044')
+
+
+def pair_task_id(task, executor) -> UUID:
+    """The reputation task id for ONE requester-executor pair of negotiation
+    task ``task``: uuid5 over ``task|executor`` (canonical lowercase uuids). A
+    task fanned out to N executors is N transactions; under the bare task id
+    its N+1 halves were paired by arrival and nodes forked (ISSUES §2.50).
+    Used for every task, since an executor cannot tell a fan-out. Mirrors
+    tx_pair_task_uuid."""
+    return uuid5(PAIR_NS, f'{str(task).lower()}|{str(executor).lower()}')
+
+
+def is_attestable_channel(channel) -> bool:
+    """True iff `channel` is a spelling a verifier may attest on."""
+    return channel in TX_CHANNELS_ATTESTABLE
+
+
+def valid_evidence_digest(digest) -> bool:
+    """True iff `digest` is 64 lowercase hex characters."""
+    return (isinstance(digest, str) and len(digest) == ATTEST_DIGEST_HEX_LEN
+            and all(c in '0123456789abcdef' for c in digest))
+
+
+def validate_tx_channel(channel, where: str = 'TransactionScore'):
+    """Return `channel` as one of :data:`TX_CHANNELS`, or raise ValueError.
+
+    ``None`` and ``''`` resolve to :data:`TX_CHANNEL_DEFAULT` — absence is a
+    different question from invalidity, and a legacy producer (or a peer
+    running a build from before this field) is *absent*, not wrong. Anything
+    else must match a known channel byte-exactly.
+
+    Unknown spellings are REFUSED rather than passed through or coerced to the
+    default. A channel that silently becomes "some string a peer sent" is worth
+    less than no channel at all, since the entire value of the field is that a
+    demotion reason means one agreed thing on both sides of the wire; and
+    coercing an unknown to ``task_outcome`` would be worse still, because it
+    turns a typo'd physics refutation into an ordinary task grade with no trace
+    that anything was lost. Matching is case-sensitive for the same reason
+    (``'Physical'`` is refused): a closed set that accepts near-misses is not
+    closed.
+
+    Like :func:`validate_tx_score`, this runs in ``TransactionScore``'s
+    constructor and therefore on the remote path, where ``from_json_string``
+    reconstructs via ``cls(**kwargs)``. Handlers there already catch
+    ``ValueError`` and drop the message, so a peer sending an unknown channel
+    loses its proposal rather than raising inside the process loop.
+    """
+    if channel is None or channel == '':
+        return TX_CHANNEL_DEFAULT
+    if not isinstance(channel, str):
+        raise ValueError('%s: channel must be a string, got %r'
+                         % (where, channel))
+    if channel not in TX_CHANNELS:
+        raise ValueError('%s: unknown evidence channel %r (known: %s)'
+                         % (where, channel, ', '.join(TX_CHANNELS)))
+    return channel
+
+
+# --- What a channel DOES (R+D.md §12.8, the differentiated responses) ------
+#
+# Two responses, both settled with the user before implementing:
+#
+#   weighting     every channel carries an integer multiplier on the consensus
+#                 EMA, composed with the per-capability transaction weight
+#                 (they multiply: a heavy capability refuted on physics counts
+#                 as both). Applied ONLY to locally-produced evidence -- see
+#                 `tx_channel_weight`.
+#   durability    the channel is part of the COMMITTED FACT: it rides the
+#                 `committed` broadcast, is written to every acceptor's
+#                 history, and is covered by `Transaction._canonical_bytes`
+#                 and therefore by the entry hash, the chain link, the window
+#                 root and the quorum-signed checkpoint over it. A peer that
+#                 strips a refutation off a chain entry breaks the link.
+#
+# There is deliberately NO third mechanism, and no automatic accusation.
+#
+# An earlier slice (2026-09-01) made a defection-grade score on a
+# hard-falsification channel grounds to propose a slash. That was removed at
+# the user's direction: a transaction is scored poorly with a reason given,
+# every peer sees both, and each judges for itself. Discipline is the EMA and
+# the tier machinery working at their own pace -- which is graduated by
+# construction -- rather than one detector's verdict pinning a floor. That
+# also disposes of the dispute question the entry left open: with no verdict
+# levied there is nothing to dispute, so `swarm_disagreement` needs no
+# adjudicator, and none is planned for either runtime.
+#
+# What that decision COSTS the reason, and what pays for it: a reason nobody
+# retains is not something a peer can judge on. The channel used to stop at
+# the chain boundary, so every acceptor's persisted history kept the number
+# and dropped the reason. Hence `durability` above -- the migration the
+# earlier slice deferred, taken here because "peers judge for themselves" is
+# only true if the reason survives, is attributable, and cannot be edited in
+# flight.
+
+#: Multiplier on a locally-produced score's EMA weight, by channel.
+#:
+#: The weight is applied by folding the score into the EMA that many times
+#: (``consensus_score_from_window``), which is why these are small integers
+#: rather than floats: the existing per-capability ``transaction_weight`` uses
+#: the same repeat mechanism, and the two multiply.
+#:
+#: The values are a ranking of how much one observation tells you, not a tuning
+#: surface: 1 = one peer's reading of one event; 2 = corroborated by
+#: construction (a replication has several executors; a probe is checked
+#: against an answer the verifier authored); 3 = a verdict that needs no
+#: history at all. `calibration` is deliberately 1 — it is the channel the
+#: oracle doc names as the one that should decay a peer *gradually*.
+#:
+#: Mirrors TX_CHANNEL_WEIGHT_* in the C twin's reputation/tx_channel.h.
+TX_CHANNEL_WEIGHTS = {
+    TX_CHANNEL_TASK_OUTCOME: 1,
+    TX_CHANNEL_CALIBRATION: 1,
+    TX_CHANNEL_SWARM_DISAGREEMENT: 1,
+    TX_CHANNEL_REPLICATION: 2,
+    TX_CHANNEL_PROBE: 2,
+    TX_CHANNEL_PHYSICAL: 3,
+    TX_CHANNEL_CERTIFICATE: 3,
+    TX_CHANNEL_SELF_CONSISTENCY: 3,
+    # Written EXPLICITLY, unlike C. There the weight falls out of
+    # tx_channel_weight's `return 1` fall-through, so adding the channel was
+    # enough; here the table is a dict and silence would be a divergence the
+    # moment someone tightened the lookup.
+    TX_CHANNEL_FIRST_PERSON: 1,
+}
+
+def tx_channel_weight(channel) -> int:
+    """The EMA multiplier for *channel*, defaulting to 1 for anything unknown.
+
+    Unknown is impossible through ``TransactionScore`` (the constructor refuses
+    it), so the default is for a caller reading a raw string off an older
+    record — and 1 is the right answer there: an unrecognized channel must
+    never weigh MORE than a recognized one, or adding a channel on one side of
+    the wire would silently amplify it on the other.
+
+    **Only ever applied to locally-produced evidence.** The channel is chosen
+    by whoever wrote the score, so honoring a remote peer's tag here would hand
+    every peer a lever on every other peer's reputation: tag a fabricated 0.0
+    `physical` and it lands with triple weight. A remote score keeps its
+    channel for legibility and is weighted by capability alone. The cost is
+    that two nodes can compute slightly different EMAs for the same peer — but
+    that is already true of the per-capability weights (see
+    ``consensus_score_from_window``'s ``weights`` argument, which a verifier
+    across a trust boundary cannot reproduce either), so this adds a term to an
+    existing local-view divergence rather than introducing one.
+    """
+    return int(TX_CHANNEL_WEIGHTS.get(channel, 1))
+
+
+def weight_round(value: float) -> int:
+    """``floor(value + 0.5)``, clamped to at least 1.
+
+    The EMA applies a weight by folding the score in that many times
+    (``consensus_score_from_window``), so the composed weight has to be a
+    positive integer. 1 is therefore the floor, which is why a capability
+    authored at ``transaction_weight: 1`` cannot be demoted by competence --
+    see doc/architecture/prequential-competence.md, which records that as a
+    limitation rather than working around it.
+    """
+    if not math.isfinite(value):
+        return 1
+    rounded = int(math.floor(value + 0.5))
+    return rounded if rounded > 1 else 1
+
+
 class TransactionScore(Configuration):
-    def __init__(self, task_id, score, capability_name: str = None):
+    """One peer's score for one task, plus how that score was arrived at.
+
+    ``channel`` names the evidence channel the score came from (see
+    :data:`TX_CHANNELS` and R+D.md §12.8). On a score THIS node produced it
+    also carries an EMA multiplier (:data:`TX_CHANNEL_WEIGHTS`); on a score
+    that arrived from a peer it is weighted by capability alone, because the
+    sender picks its own tag. It is never an accusation on either path.
+
+    ``subject_uuid`` is the peer this score is ABOUT. It is local-only and
+    never serialized (see :meth:`to_dict`): the wire form pairs the two sides
+    of a transaction by ``task_id``, and nothing downstream of the chain needs
+    it. Producers that know which peer they are grading set it so the log names
+    the peer without waiting for the bilateral pairing to close.
+
+    ``competence`` is the learned multiplier on this score's EMA weight
+    (R+D.md §12.5): the subject peer's prequential record on this capability,
+    measured by whichever process observed the forecast, carried to the
+    reputation process that applies the weight. Local-only and never
+    serialized for the same reason ``subject_uuid`` is, and one more: a peer
+    that could stamp its own competence would hold a lever on every EMA it
+    appears in. ``None`` means 1.0 -- the authored ``transaction_weight``,
+    verbatim -- which is what every producer predating the field meant.
+
+    ``channel`` DOES reach the committed fact, unlike the two fields above it.
+    :meth:`Transaction.add` carries it onto the chain entry and
+    ``Transaction._canonical_bytes`` covers it, so the reason a score was poor
+    is retained by every acceptor and is as tamper-evident as the score. That
+    is what lets peers judge a poor score for themselves instead of taking one
+    node's verdict for it (R+D.md §12.8). ``capability_name`` deliberately does
+    NOT travel with it: it would publish a per-peer record of which capability
+    every transaction exercised, and per-capability weighting stays local.
+    """
+
+    def __init__(self, task_id, score, capability_name: str = None,
+                 channel: str = None, subject_uuid=None,
+                 competence: float = None):
         self.task_id = task_id
-        self.score = score
+        # Enforced, not assumed (doc/architecture/reputation.md). This constructor is also the wire-side
+        # entry point -- `from_json_string` reconstructs via `cls(**kwargs)` --
+        # so a peer sending an out-of-range score raises here. Handlers on the
+        # remote path therefore CATCH this and drop the message: an exception a
+        # remote can trigger inside the process loop is its own problem.
+        self.score = validate_tx_score(score)
         # Optional: name of the Capability whose execution produced this
         # TS. Used by _pure_reputation to look up transaction_weight at
         # scoring time (Slice 3). None means "unknown / legacy" — weight
         # defaults to 1. See doc/architecture/trust-tiers.md §4.4.
         self.capability_name = capability_name
+        # Which evidence channel produced this score (R+D.md §12.8). Refused
+        # here if unknown, on the same remote path and for the same reason as
+        # `score` above. Normalized rather than left None so every TS on the
+        # wire carries an explicit channel and a reader never has to know
+        # whether None meant "task outcome" or "producer forgot".
+        self.channel = validate_tx_channel(channel)
+        # Local-only; see the class docstring. Accepted as a keyword because
+        # `from_json_string` rebuilds via `cls(**kwargs)` and a record written
+        # by some future producer could carry it -- but `to_dict` drops it, so
+        # nothing this node SENDS ever has one, and a peer that sets it anyway
+        # gets it back out of the reputation process's hands at the one place
+        # that matters (`forward_transaction` is IPC-only; see there).
+        self.subject_uuid = None if subject_uuid is None else str(subject_uuid)
+        # Local-only, on the same terms as `subject_uuid`: accepted as a
+        # keyword because `from_json_string` rebuilds via `cls(**kwargs)`, and
+        # dropped by `to_dict` so nothing this node SENDS ever carries one.
+        # Non-positive is normalized away rather than trusted: a multiplier of
+        # 0 or less would zero or invert an EMA weight, and the only way to
+        # get one is a producer bug or a peer trying it on.
+        self.competence = (None if competence is None or float(competence) <= 0.0
+                           else float(competence))
+
+    def to_dict(self):
+        # `subject_uuid` is process-local provenance, not part of the score:
+        # the committed wire form pairs p1/p2 by task_id and has never carried
+        # a subject. Dropping it here is the same discipline as Group.to_dict
+        # dropping `_previous_keys` and Identity dropping `_rank_adjustment`,
+        # and it keeps every byte-pinned TransactionScore vector valid.
+        d = super().to_dict()
+        d.pop('subject_uuid', None)
+        # `competence` likewise: a learned weight is this node's measurement of
+        # the peer, has no meaning in another node's EMA, and would be a lever
+        # if it travelled. See the class docstring and R+D.md §12.5.
+        d.pop('competence', None)
+        return d
+
+
+def commit_designation(scorer, task_id, score, channel=None) -> bytes:
+    """The bytes an acceptor signs to certify ONE half of an ordinary commit
+    (doc/architecture/reputation.md, "Commit certificates"): that `scorer` put
+    this score, on this channel, for this task, to a round the signer accepted.
+
+    Domain-separated like every other co-signed designation in this module.
+    ``%.17g`` and lowercase uuids, as the C twin's ``commit_designation``. The
+    channel is normalized, so an absent channel and an explicit
+    :data:`TX_CHANNEL_DEFAULT` are one claim with one signature, exactly as they
+    are one entry hash.
+
+    The group is deliberately NOT covered. The acceptor is never told which of
+    a gateway's chains the round lands in, and a group's uuid changes when it is
+    absorbed by a merge, which would orphan every certificate cut before it. A
+    certificate replayed into another chain still has to clear THAT group's
+    quorum with signers the receiver resolves, so the reach this leaves is a
+    scorer re-filing its own certified half, never anybody else's."""
+    chan = channel if channel else TX_CHANNEL_DEFAULT
+    return (b'AT-COMMIT\x00'
+            + str(scorer).lower().encode()
+            + b'|' + str(task_id).lower().encode()
+            + b'|' + format(float(score), '.17g').encode()
+            + b'|' + str(chan).encode())
+
+
+# Upper bound on the entries one placement decides (doc/architecture/
+# reputation.md, "Agreeing on an order").
+PLACE_BATCH_MAX = 32
+
+# The persisted pool's schema (TransactionHistory.pool_to_dict).
+POOL_SCHEMA = 1
+
+
+def placement_entry(tx: 'Transaction') -> 'Transaction':
+    """`tx` as a placement writes it: a copy with no index or link, and the two
+    halves of an ordinary entry ordered by scorer uuid, so every node builds
+    the same bytes whichever half reached it first. An attested entry keeps its
+    verifier in p1. Mirrors C placement_entry."""
+    out = copy.copy(tx)
+    out.index = None
+    out.prev_hash = None
+    out.place_from = None
+    out.place_sigs = None
+    if (not out.attested and out.p1_id is not None and out.p2_id is not None
+            and str(out.p2_id).lower() < str(out.p1_id).lower()):
+        out.p1_id, out.p2_id = out.p2_id, out.p1_id
+        out.p1_score, out.p2_score = out.p2_score, out.p1_score
+        out.p1_channel, out.p2_channel = out.p2_channel, out.p1_channel
+    return out
+
+
+def place_value_bytes(entries, k: int) -> bytes:
+    """The canonical bytes of a placement's value: `entries` (placement
+    entries, in order) written at chain indices k, k+1, ..., each in its
+    entry's canonical form. Domain-separated. Mirrors C place_value_bytes."""
+    parts = []
+    for i, entry in enumerate(entries):
+        at = copy.copy(entry)
+        at.index = int(k) + i
+        parts.append(at._canonical_bytes())
+    return b'AT-PLACE-VALUE\x00' + b'\n'.join(parts)
+
+
+def place_value_digest(entries, k: int) -> bytes:
+    """blake2b of :func:`place_value_bytes`, 64 lowercase hex bytes, like an
+    entry hash."""
+    return MerkleTree.get_hash(place_value_bytes(entries, k))
+
+
+def place_designation(k: int, prev_hash, digest) -> bytes:
+    """The bytes an acceptor signs to certify a placement: that the value with
+    `digest` is what the chain holds from index `k`, after the entry whose hash
+    is `prev_hash` (b'' at the genesis). Covering the predecessor pins the whole
+    prefix, so the group is not needed. Mirrors C place_designation."""
+    prev = prev_hash or b''
+    if isinstance(prev, str):
+        prev = prev.encode('ascii')
+    dig = digest.encode('ascii') if isinstance(digest, str) else digest
+    return b'AT-PLACE\x00' + str(int(k)).encode() + b'|' + prev + b'|' + dig
 
 
 class Transaction(Configuration):
+    """A committed chain entry: who transacted, how well, and how we know.
+
+    The last of those is ``p1_channel`` / ``p2_channel``, the evidence channel
+    of each side's score (R+D.md §12.8). It is here rather than only on the
+    ``TransactionScore`` because the reason a score was poor is what lets every
+    other peer judge that score for itself, and a reason nobody retains is not
+    something anyone can judge on: before this field the ``committed``
+    broadcast carried a bare score, so every acceptor's history kept the number
+    and dropped the reason.
+
+    Absent normalizes to :data:`TX_CHANNEL_DEFAULT`, which is what every
+    producer predating channels meant.
+    """
+
     def __init__(self, task_id: UUID, p1_id: UUID = None, p1_score: float = None,
                  p2_id: UUID = None, p2_score: float = None, index: int = None,
-                 prev_hash: bytes = None):
+                 prev_hash: bytes = None, p1_channel: str = None,
+                 p2_channel: str = None, attested: bool = False,
+                 subject_id: UUID = None, evidence_digest: str = None,
+                 attest_sigs: dict = None, commit_sigs: dict = None,
+                 attest_scope: str = None, place_from: int = None,
+                 place_sigs: dict = None, roster_op: str = None,
+                 roster_uuid: UUID = None, roster_digest: str = None,
+                 roster_members: list = None):
         self.task_id = task_id
         self.p1_id = p1_id
         self.p1_score = p1_score
         self.p2_id = p2_id
         self.p2_score = p2_score
         self.index = index
+        # Evidence channel of each side's score. Validated, so an unknown
+        # spelling cannot reach the canonical bytes and fork the chain: the
+        # closed set is what makes the entry hash mean the same thing on both
+        # sides of the wire. Kept as None when absent (rather than eagerly
+        # defaulted) so `_canonical_bytes` can tell "no channels here" from
+        # "explicitly a task outcome" -- they hash identically either way, but
+        # only the first can keep a legacy entry's hash unchanged.
+        self.p1_channel = (None if p1_channel is None
+                           else validate_tx_channel(p1_channel, 'Transaction'))
+        self.p2_channel = (None if p2_channel is None
+                           else validate_tx_channel(p2_channel, 'Transaction'))
         # Phase 1 hash-linking: digest of the entry committed immediately
         # before this one in the resident chain (b'' / None for the genesis
         # entry or the oldest entry whose predecessor has been evicted). Set
         # by TransactionHistory when the tx goes bilateral and is appended.
         # Makes a committed Transaction tamper-evident on its own and the
         # catch-up sync verifiable (see reputation-vs-blockchain-analysis.md
-        # §2.1). Mirrors transaction_t.prev_hash in the C twin; the canonical
+        # doc/architecture/process-architecture.md). Mirrors transaction_t.prev_hash in the C twin; the canonical
         # serialization below MUST stay byte-identical across languages.
         self.prev_hash = prev_hash
+        # A VERIFIER-ATTESTED entry (doc/architecture/reputation.md,
+        # "Verifier-attested scores"): p1 is the verifier, p2 is never set, and
+        # it commits on a quorum certificate rather than on the subject's half.
+        # An ordinary entry names only its two scorers and the subject is "the
+        # other side"; a one-sided entry has no other side, hence subject_id.
+        # evidence_digest names the document the finding rests on. Both are
+        # covered by the canonical bytes. Mirrors transaction_t.attested /
+        # subject_uuid / evidence_digest.
+        self.attested = bool(attested)
+        self.subject_id = subject_id
+        self.evidence_digest = evidence_digest
+        # An attested entry's optional SCOPE (64 lowercase hex): what the
+        # attesting application says the finding is about. Keys the rate cap
+        # (one per verifier, subject, channel and scope) and is in the
+        # canonical bytes ONLY when set, so an unscoped entry hashes as it
+        # always did. Mirrors transaction_t.attest_scope.
+        self.attest_scope = attest_scope or None
+        # The quorum certificate, carried on the catch-up wire so a receiver can
+        # check the round (catch-up refuses an attested entry without one). NOT
+        # in the canonical bytes, as a checkpoint's co-signatures are not in
+        # its root; the history keeps its own copy in attest_certs.
+        self.attest_sigs = dict(attest_sigs) if attest_sigs else None
+        # The commit certificate of each ORDINARY half (doc/architecture/
+        # reputation.md, "Commit certificates"): scorer uuid str -> {voter uuid
+        # str: signature hex over `commit_designation`}. The two halves of an
+        # entry are committed by two rounds, so there are two certificates. NOT
+        # in the canonical bytes, as a checkpoint's co-signatures are not in its
+        # root: an entry hashes the same with or without them, which is what
+        # lets a group start requiring them without breaking a stored chain.
+        self.commit_sigs = ({str(k): dict(v) for k, v in commit_sigs.items()
+                             if isinstance(v, dict)}
+                            if isinstance(commit_sigs, dict) and commit_sigs
+                            else None)
+        # The placement certificate (doc/architecture/reputation.md, "Agreeing
+        # on an order"), on the LAST entry a decided placement wrote:
+        # `place_from` is the index the placement began at and `place_sigs`
+        # {voter uuid str: signature hex over place_designation}. Carried on
+        # the catch-up wire and in persisted evidence so a receiver can check
+        # the placement; NOT in the canonical bytes, like the other
+        # certificates.
+        self.place_from = (int(place_from) if place_sigs and place_from is not None
+                           else None)
+        self.place_sigs = ({str(k): str(v) for k, v in place_sigs.items()}
+                           if isinstance(place_sigs, dict) and place_sigs
+                           and place_from is not None else None)
+        # A ROSTER entry (doc/architecture/reputation.md, "Who is in the
+        # group"): who the group is from the next index on. No scorer and no
+        # score; `roster_op` is one of ROSTER_OPS, `roster_uuid` the member an
+        # `add` adds, and `roster_digest` covers the member list, which
+        # travels beside the entry like a certificate ([[uuid, signing key
+        # hex]], `roster_members`) and is checked against the digest. Covered
+        # by the canonical bytes. Mirrors transaction_t.roster / roster_op /
+        # roster_uuid / roster_digest.
+        if roster_op is not None and roster_op not in ROSTER_OPS:
+            raise ValueError('unknown roster op %r' % (roster_op,))
+        self.roster_op = roster_op
+        self.roster_uuid = roster_uuid
+        self.roster_digest = roster_digest
+        self.roster_members = ([[str(u), str(k)] for u, k in
+                                roster_members_norm(roster_members)]
+                               if roster_members else None)
+
+    @property
+    def is_roster(self) -> bool:
+        return self.roster_op is not None
 
     def __len__(self):
         if self.p1_id is None and self.p2_id is None:
@@ -61,6 +704,86 @@ class Transaction(Configuration):
             return 1
         return 2
 
+    def to_dict(self):
+        # Channels are OMITTED when absent rather than serialized as null.
+        # `Configuration.to_dict` is `dict(self.__dict__)`, so without this an
+        # untagged entry -- i.e. every entry a legacy peer holds -- would
+        # change shape on the catchup wire (`ReputationProtocol.update`) and in
+        # persisted history the moment this field appeared, for no information
+        # gained. Same rule as `_canonical_bytes` and the evidence document:
+        # absent adds nothing, present travels. `from_json_string` rebuilds
+        # via `cls(**kwargs)`, where an omitted key is exactly None.
+        d = super().to_dict()
+        if d.get('p1_channel') is None:
+            d.pop('p1_channel', None)
+        if d.get('p2_channel') is None:
+            d.pop('p2_channel', None)
+        # Likewise the attested fields: an ordinary entry carries none of them,
+        # so its shape on the catch-up wire and in persisted history is what
+        # it always was.
+        if not d.get('attested'):
+            for k in ('attested', 'subject_id', 'evidence_digest',
+                      'attest_sigs', 'attest_scope'):
+                d.pop(k, None)
+        else:
+            if not d.get('attest_sigs'):
+                d.pop('attest_sigs', None)
+            if not d.get('attest_scope'):
+                d.pop('attest_scope', None)
+        # And the commit certificates: a group that does not declare them never
+        # cuts one, so its entries keep the shape they always had.
+        if not d.get('commit_sigs'):
+            d.pop('commit_sigs', None)
+        # And the placement certificate: only a placement's last entry has one.
+        if not d.get('place_sigs'):
+            d.pop('place_sigs', None)
+            d.pop('place_from', None)
+        # And the roster fields: only a roster entry has them.
+        if d.get('roster_op') is None:
+            for k in ('roster_op', 'roster_uuid', 'roster_digest',
+                      'roster_members'):
+                d.pop(k, None)
+        return d
+
+    def certificate_of(self, scorer) -> 'dict | None':
+        """The commit certificate held for `scorer`'s half, or None."""
+        return (self.commit_sigs or {}).get(str(scorer))
+
+    def attach_certificate(self, scorer, sigs) -> None:
+        """Keep `sigs` as the certificate of `scorer`'s half. The caller has
+        verified it; an empty one is not kept."""
+        if not sigs:
+            return
+        if self.commit_sigs is None:
+            self.commit_sigs = {}
+        self.commit_sigs[str(scorer)] = dict(sigs)
+
+    def about(self, peer_uuid):
+        """``(score, author)``: the score this entry holds ABOUT `peer_uuid` and
+        who gave it, or None when it holds none. One reading for every fold,
+        so ordinary and attested entries cannot be read two ways.
+
+        An ordinary entry is about each side, scored by the other. An attested
+        entry is about its subject only, scored by the verifier in p1; the
+        verifier itself is the author, not a subject, and gains nothing from it.
+        Mirrors transaction_score_about."""
+        if self.attested:
+            if (self.subject_id is not None and self.p1_score is not None
+                    and str(self.subject_id) == str(peer_uuid)):
+                return float(self.p1_score), self.p1_id
+            return None
+        if self.p1_id is None or self.p2_id is None:
+            return None
+        if str(self.p1_id) == str(peer_uuid):
+            score, author = self.p2_score, self.p2_id
+        elif str(self.p2_id) == str(peer_uuid):
+            score, author = self.p1_score, self.p1_id
+        else:
+            return None
+        if score is None:
+            return None
+        return float(score), author
+
     def _canonical_bytes(self) -> bytes:
         """Deterministic, language-agnostic serialization of the entry's
         identifying content (everything EXCEPT prev_hash). Floats use
@@ -68,7 +791,29 @@ class Transaction(Configuration):
         C's ``snprintf("%.17g", …)``); UUIDs use the canonical lowercase
         hyphenated form (== C's ``uuid_unparse_lower``); None is ``null``.
         Keep this in lockstep with ``transaction_canonical_bytes`` in
-        ``src/c/autonomous_trust/reputation/reputation.c``."""
+        ``src/c/autonomous_trust/reputation/reputation.c``.
+
+        ``task_id|p1_id|p1_score|p2_id|p2_score|index``, with
+        ``|p1_channel|p2_channel`` APPENDED only when at least one side
+        carries a channel other than :data:`TX_CHANNEL_DEFAULT` (R+D.md
+        §12.8). The condition is what makes covering the channel a
+        non-migration rather than a chain break:
+
+        * The same fact still hashes to the same bytes. An absent channel and
+          an explicit ``task_outcome`` are the same claim (see
+          :func:`validate_tx_channel`), and both omit the block, so two nodes
+          cannot disagree about an entry's hash because one of them received
+          the default spelled out.
+        * Every entry committed before this field keeps its hash. Entry hashes
+          chain (``prev_hash``) and roll up into the window root that
+          checkpoints are quorum-signed over, so unconditionally appending
+          would invalidate every stored chain, every finalized checkpoint and
+          every byte-pinned corpus vector at once.
+        * The tampering that matters is still caught. STRIPPING a refutation
+          off an entry drops the block and changes the bytes, so the link and
+          the window root no longer verify; ADDING ``task_outcome`` to an
+          untagged entry is a no-op because it asserts nothing.
+        """
         def _u(x):
             return 'null' if x is None else str(x)
 
@@ -78,9 +823,28 @@ class Transaction(Configuration):
         def _i(x):
             return 'null' if x is None else str(int(x))
 
-        return '|'.join((_u(self.task_id), _u(self.p1_id), _f(self.p1_score),
-                         _u(self.p2_id), _f(self.p2_score),
-                         _i(self.index))).encode('utf-8')
+        fields = [_u(self.task_id), _u(self.p1_id), _f(self.p1_score),
+                  _u(self.p2_id), _f(self.p2_score), _i(self.index)]
+        c1 = self.p1_channel or TX_CHANNEL_DEFAULT
+        c2 = self.p2_channel or TX_CHANNEL_DEFAULT
+        if self.attested or c1 != TX_CHANNEL_DEFAULT or c2 != TX_CHANNEL_DEFAULT:
+            fields += [c1, c2]
+        if self.attested:
+            # A final block names whom the entry is about and what it rests on.
+            # No ordinary entry has p2 unset at commit time, so this form
+            # cannot collide with one, and no ordinary entry's bytes change.
+            fields += ['attested', _u(self.subject_id),
+                       self.evidence_digest or 'null']
+            # The scope, only when set: an unscoped entry's bytes are unchanged.
+            if self.attest_scope:
+                fields.append(str(self.attest_scope))
+        if self.roster_op is not None:
+            # A roster entry: no scorer, no channel, so its block follows the
+            # six common fields. No other entry has `roster` there ("roster"
+            # is not a channel), and no existing entry's bytes change.
+            fields += ['roster', str(self.roster_op), _u(self.roster_uuid),
+                       self.roster_digest or 'null']
+        return '|'.join(fields).encode('utf-8')
 
     def entry_hash(self) -> bytes:
         """blake2b digest (64-char lowercase-hex bytes, matching
@@ -90,10 +854,12 @@ class Transaction(Configuration):
         prev = self.prev_hash if self.prev_hash else b''
         return MerkleTree.get_hash(self._canonical_bytes() + prev)
 
-    def add(self, peer_id: UUID, score: float):
+    def add(self, peer_id: UUID, score: float, channel: str = None):
         if self.p1_id is None:
             self.p1_id = peer_id
             self.p1_score = score
+            self.p1_channel = (None if channel is None
+                               else validate_tx_channel(channel, 'Transaction'))
         elif self.p2_id is None and peer_id != self.p1_id:
             # A Transaction is intrinsically bilateral; the same peer cannot
             # occupy both slots. Without this guard a duplicate `committed`
@@ -102,6 +868,32 @@ class Transaction(Configuration):
             # silently rejects.
             self.p2_id = peer_id
             self.p2_score = score
+            self.p2_channel = (None if channel is None
+                               else validate_tx_channel(channel, 'Transaction'))
+
+
+class ReconcileResult:
+    """What ``TransactionHistory.reconcile`` did. Mirrors C's
+    ``tx_reconcile_result_t``."""
+    NONE = 'none'                # nothing new: we hold all of it
+    EXTENDED = 'extended'        # the peer's chain continued ours
+    ADOPTED = 'adopted'          # forked; the peer's tip won, ours from `fork` dropped
+    KEPT = 'kept'                # forked; our tip won
+    REFUSED_FINAL = 'refused_final'  # forked inside our finalized checkpoint
+    REJECTED = 'rejected'        # links, a gap, or an impossible duplicate
+    # Ordered placement: the peer's CERTIFIED entry differs from one we hold
+    # inside our own placed prefix. Two quorums cannot certify two values at
+    # one index unless someone signed both, so this is never resolved by rule.
+    EQUIVOCATION = 'equivocation'
+
+    def __init__(self):
+        self.status = self.NONE
+        self.fork = None
+        self.dropped: 'list[Transaction]' = []
+        self.added: 'list[Transaction]' = []
+        # Under ordered placement: how many dropped entries went back to the
+        # pool to be placed again.
+        self.pooled = 0
 
 
 class TransactionHistory(Mapping):
@@ -191,6 +983,32 @@ class TransactionHistory(Mapping):
         # chain's tail so a persisted/synced chain resumes the link cleanly.
         self._head_hash: bytes = (self._chain[-1].entry_hash()
                                   if self._chain else b'')
+        # Quorum certificates of attested entries, task_id -> {voter uuid str:
+        # signature hex}. OUTSIDE the entry hash, as a checkpoint's
+        # co-signatures are outside its root; evicted with the entry.
+        self.attest_certs: dict = {}
+        # Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+        # order"). Committed halves and certified attestations wait in the
+        # POOL, by task, until a decided placement writes their entry; nothing
+        # in it is in the chain or the peer map, so no score reads it. Bounded
+        # FIFO, the size of the chain.
+        self._pool: 'OrderedDict[UUID, Transaction]' = OrderedDict()
+        # Bumped on every change to the pool, so the process persists it
+        # (reputation-pool.cfg.json) only when there is something new.
+        self.pool_rev = 0
+        # Decided placements that arrived ahead of the chain: first index ->
+        # (entries, placement certificate). Applied in order.
+        self._decided: dict = {}
+        # Placement certificates, task_id of a placement's LAST entry ->
+        # {voter uuid str: signature hex over place_designation}. Outside the
+        # entry hash; evicted with the entry.
+        self.place_certs: dict = {link.task_id: dict(link.place_sigs)
+                                   for link in self._chain
+                                   if getattr(link, 'place_sigs', None)}
+        # A roster taken as in force below every resident roster entry, with
+        # no index: how a conformance fixture stands for a roster logged before
+        # the scenario starts, as fixture checkpoints stand for finalized ones.
+        self.roster_anchor: 'Transaction | None' = None
 
     def _map_peers(self, tx: Transaction):
         if tx.p1_id is not None:
@@ -201,18 +1019,22 @@ class TransactionHistory(Mapping):
             if tx.p2_id not in self._peer_mapping:
                 self._peer_mapping[tx.p2_id] = []
             self._peer_mapping[tx.p2_id].append(tx)
+        if tx.attested and tx.subject_id is not None \
+                and tx.subject_id != tx.p1_id:
+            self._peer_mapping.setdefault(tx.subject_id, []).append(tx)
 
     def _evict_oldest(self):
         """Drop chain[0] and scrub it from the task and peer maps.
 
-        Identity-compares on removal because ``_map_peers`` may have
-        appended the same tx twice to the same peer's list (it fires
-        on both the p1-only and completed states), so a single
-        ``list.remove`` would leave a stale reference behind.
+        Identity-compares on removal, so every reference to this tx goes
+        (a single ``list.remove`` would drop only the first).
         """
         oldest = self._chain.pop(0)
         self._task_mapping.pop(oldest.task_id, None)
-        for peer_id in {oldest.p1_id, oldest.p2_id} - {None}:
+        self.attest_certs.pop(oldest.task_id, None)
+        self.place_certs.pop(oldest.task_id, None)
+        for peer_id in {oldest.p1_id, oldest.p2_id,
+                        oldest.subject_id if oldest.attested else None} - {None}:
             lst = self._peer_mapping.get(peer_id)
             if not lst:
                 continue
@@ -233,7 +1055,8 @@ class TransactionHistory(Mapping):
     def __getitem__(self, key):
         return self._task_mapping[key]
 
-    def update(self, task_id: UUID, peer_id: UUID, score: float):
+    def update(self, task_id: UUID, peer_id: UUID, score: float,
+               channel: str = None, certificate: dict = None):
         if task_id not in self._task_mapping:
             # Refuse to reanimate a task we already committed and
             # rolled out of the resident chain. handle_committed
@@ -248,15 +1071,33 @@ class TransactionHistory(Mapping):
                 return
             self._task_mapping[task_id] = Transaction(task_id)
         tx = self._task_mapping[task_id]
+        if certificate and peer_id is not None and not tx.attested \
+                and str(peer_id) in (str(tx.p1_id), str(tx.p2_id)):
+            # The half is already held, perhaps from a commit that arrived
+            # before this group required certificates: keep the certificate
+            # beside it rather than drop it, since that is what catch-up will
+            # ask for. Covers the duplicate case below as well.
+            tx.attach_certificate(peer_id, certificate)
         if len(tx) == 2:
             return  # ignore duplicates
+        if tx.attested:
+            # An attested entry is complete on its own; nothing may fill the
+            # half its subject never gave (doc/architecture/reputation.md).
+            return
         if peer_id == tx.p1_id:
             # Skip before `_map_peers` so we don't re-append the same tx to
             # `_peer_mapping[p1_id]` (which would inflate by_peer() results
             # and skew downstream peer-tx counts).
             return
-        tx.add(peer_id, score)
-        self._map_peers(tx)
+        tx.add(peer_id, score, channel)
+        if certificate and peer_id is not None:
+            tx.attach_certificate(peer_id, certificate)
+        # Index only the side just added. `_map_peers` indexes BOTH sides, so
+        # calling it on each half listed every tx twice under its p1 and
+        # double-counted those in every by_peer() consumer (CTFT, pure, the
+        # prior). Mirrors C, which indexes each tx once per peer.
+        if peer_id is not None:
+            self._peer_mapping.setdefault(peer_id, []).append(tx)
         if len(tx) > 1:
             tx.index = self._next_index
             self._next_index += 1
@@ -270,6 +1111,280 @@ class TransactionHistory(Mapping):
             self._head_hash = tx.entry_hash()
             if len(self._chain) == 1:
                 self._first_index = tx.index
+
+    @staticmethod
+    def _attested_well_formed(tx: Transaction) -> bool:
+        """The chain's half of the attested-entry rule (append_attested)."""
+        if not tx.attested or tx.p1_id is None or tx.p2_id is not None:
+            return False
+        if tx.subject_id is None or str(tx.subject_id) == str(tx.p1_id):
+            return False
+        if tx.p1_score is None or not 0.0 <= float(tx.p1_score) <= 1.0:
+            return False
+        if not is_attestable_channel(tx.p1_channel):
+            return False
+        if not valid_evidence_digest(tx.evidence_digest):
+            return False
+        if tx.attest_scope and not valid_evidence_digest(tx.attest_scope):
+            return False
+        return str(tx.task_id) == str(attest_task_id(tx.p1_id, tx.subject_id,
+                                                     tx.evidence_digest))
+
+    def append_attested(self, tx: Transaction, certificate: dict = None) -> bool:
+        """Commit a verifier-attested entry. Returns False, and changes
+        nothing, unless `tx` is well-formed: attested, the verifier in p1 with
+        a score in [0, 1] on an attestable channel, p2 unset, a subject other
+        than the verifier, a valid evidence digest, the derived task id, and a
+        task id this history has never held. The quorum is the CALLER's to
+        check; this is the chain's half of the rule. Mirrors
+        tx_history_append_attested."""
+        if not tx.attested or tx.p1_id is None or tx.p2_id is not None:
+            return False
+        if tx.subject_id is None or str(tx.subject_id) == str(tx.p1_id):
+            return False
+        if not self._attested_well_formed(tx):
+            return False
+        if tx.task_id in self._task_mapping or tx.task_id in self._evicted_task_ids:
+            return False
+        tx.p2_channel = None
+        tx.index = self._next_index
+        self._next_index += 1
+        tx.prev_hash = self._head_hash
+        if len(self._chain) >= self.max_chain_len:
+            self._evict_oldest()
+        self._chain.append(tx)
+        self._task_mapping[tx.task_id] = tx
+        self._map_peers(tx)
+        self._head_hash = tx.entry_hash()
+        if len(self._chain) == 1:
+            self._first_index = tx.index
+        if certificate:
+            self.attest_certs[tx.task_id] = dict(certificate)
+            tx.attest_sigs = dict(certificate)
+        return True
+
+    # --- Ordered placement ------------------------------------------------
+
+    def _placed(self, task_id) -> bool:
+        tx = self._task_mapping.get(task_id)
+        return tx is not None and tx.index is not None
+
+    def _pool_room(self):
+        while len(self._pool) > self.max_chain_len:
+            self._pool.popitem(last=False)
+
+    def record_half(self, task_id: UUID, peer_id: UUID, score: float,
+                    channel: str = None, certificate: dict = None) -> str:
+        """Put a committed half in the pool. Returns 'pending' (the task has
+        one half), 'ready' (both, so its entry can be placed), 'dup' (this
+        scorer's half is already held), 'placed' (the task is in the chain) or
+        'tombstoned' (it was, and has been evicted). Nothing here touches the
+        chain. Mirrors C tx_history_record_half."""
+        if self._placed(task_id):
+            return 'placed'
+        if task_id in self._evicted_task_ids:
+            return 'tombstoned'
+        tx = self._pool.get(task_id)
+        if tx is None:
+            tx = Transaction(task_id)
+            self._pool[task_id] = tx
+            self._pool_room()
+            self.pool_rev += 1
+        if tx.attested:
+            return 'dup'
+        if peer_id is not None and str(peer_id) in (str(tx.p1_id),
+                                                    str(tx.p2_id)):
+            if certificate and tx.certificate_of(peer_id) != certificate:
+                tx.attach_certificate(peer_id, certificate)
+                self.pool_rev += 1
+            return 'dup'
+        if len(tx) == 2:
+            return 'dup'
+        tx.add(peer_id, score, channel)
+        if certificate:
+            tx.attach_certificate(peer_id, certificate)
+        self.pool_rev += 1
+        return 'ready' if len(tx) == 2 else 'pending'
+
+    def pool_attested(self, tx: Transaction, certificate: dict = None) -> bool:
+        """Put a certified attested entry in the pool, ready to be placed.
+        False, and nothing changes, when it is malformed or its task was ever
+        held. Mirrors C tx_history_pool_attested."""
+        if not self._attested_well_formed(tx):
+            return False
+        if (tx.task_id in self._task_mapping or tx.task_id in self._pool
+                or tx.task_id in self._evicted_task_ids):
+            return False
+        held = copy.copy(tx)
+        held.p2_channel = None
+        if certificate:
+            held.attest_sigs = dict(certificate)
+        self._pool[held.task_id] = held
+        self._pool_room()
+        self.pool_rev += 1
+        return True
+
+    def pooled(self, task_id) -> 'Transaction | None':
+        return self._pool.get(task_id)
+
+    def pooled_count(self) -> int:
+        return len(self._pool)
+
+    def pool_drop(self, task_id) -> bool:
+        """Take `task_id` out of the pool. False when it was not pooled.
+        Mirrors C tx_history_pool_drop."""
+        if self._pool.pop(task_id, None) is None:
+            return False
+        self.pool_rev += 1
+        return True
+
+    def pool_to_dict(self) -> dict:
+        """The pool as persisted (reputation-pool[-<chain>].cfg.json), oldest
+        first. A half keeps its scorer, score, channel and commit certificate;
+        an attested entry is written as a placement writes it. Mirrors C
+        _pool_to_json (rep_proc.c)."""
+        from .placement import entry_to_dict
+        items = []
+        for tx in self._pool.values():
+            if tx.attested:
+                items.append(entry_to_dict(tx))
+                continue
+            halves = []
+            for uid, score, chan in ((tx.p1_id, tx.p1_score, tx.p1_channel),
+                                     (tx.p2_id, tx.p2_score, tx.p2_channel)):
+                if uid is None:
+                    continue
+                half = {'by': str(uid), 'score': float(score)}
+                if chan:
+                    half['channel'] = str(chan)
+                cert = tx.certificate_of(uid)
+                if cert:
+                    half['cert'] = {str(k): _hex_str(v) for k, v in cert.items()}
+                halves.append(half)
+            items.append({'task': str(tx.task_id), 'halves': halves})
+        return {'schema': POOL_SCHEMA, 'pool': items}
+
+    def pool_from_dict(self, doc) -> int:
+        """Put back what :meth:`pool_to_dict` wrote, through record_half and
+        pool_attested, so a task since placed or tombstoned stays out. An item
+        that does not parse is skipped. Returns how many items are pooled
+        afterwards. Raises ValueError when the document itself is not a pool.
+        Mirrors C _pool_from_json (rep_proc.c)."""
+        from .placement import entry_from_dict
+        if not isinstance(doc, dict) or doc.get('schema') != POOL_SCHEMA \
+                or not isinstance(doc.get('pool'), list):
+            raise ValueError('not a reputation pool document')
+        for item in doc['pool']:
+            try:
+                if not isinstance(item, dict):
+                    continue
+                if item.get('attested') is True:
+                    tx = entry_from_dict(item)
+                    self.pool_attested(tx, tx.attest_sigs)
+                    continue
+                task = UUID(str(item['task']))
+                for half in item.get('halves') or []:
+                    score = half['score']
+                    if isinstance(score, bool) or not isinstance(score, (int, float)) \
+                            or not 0.0 <= float(score) <= 1.0:
+                        continue
+                    cert = half.get('cert')
+                    cert = ({str(k): str(v) for k, v in cert.items()}
+                            if isinstance(cert, dict) else None)
+                    self.record_half(task, UUID(str(half['by'])), float(score),
+                                     half.get('channel') or None, cert)
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+        return len(self._pool)
+
+    def ready_items(self, limit: int = PLACE_BATCH_MAX) -> 'list[Transaction]':
+        """Up to `limit` pooled entries that can be placed now, as placement
+        entries, by task id. Mirrors C tx_history_ready_items."""
+        ready = [tx for tx in self._pool.values()
+                 if tx.attested or len(tx) == 2]
+        ready.sort(key=lambda tx: str(tx.task_id).lower())
+        return [placement_entry(tx) for tx in ready[:max(0, int(limit))]]
+
+    def _append_placed(self, entries, place_sigs):
+        last = None
+        first = self._next_index
+        for entry in entries:
+            tx = placement_entry(entry)
+            tx.index = self._next_index
+            self._next_index += 1
+            tx.prev_hash = self._head_hash
+            if len(self._chain) >= self.max_chain_len:
+                self._evict_oldest()
+            self._chain.append(tx)
+            self._task_mapping[tx.task_id] = tx
+            self._map_peers(tx)
+            self._head_hash = tx.entry_hash()
+            if len(self._chain) == 1:
+                self._first_index = tx.index
+            if tx.attested and tx.attest_sigs:
+                self.attest_certs[tx.task_id] = dict(tx.attest_sigs)
+            self.pool_drop(tx.task_id)
+            last = tx
+        if last is not None and place_sigs:
+            last.place_from = first
+            last.place_sigs = {str(k): str(v) for k, v in place_sigs.items()}
+            self.place_certs[last.task_id] = dict(place_sigs)
+
+    def apply_placed(self, k: int, entries, place_sigs: dict = None) -> str:
+        """Write a decided placement: `entries` at chain indices k, k+1, ...,
+        exactly as given. 'applied' when k is the next index (and any buffered
+        placements that then follow are applied too), 'buffered' when k is
+        ahead of the chain, 'old' when it is behind, 'empty' for no entries.
+        Validity was settled before the placement was decided, so nothing is
+        checked here. Mirrors C tx_history_apply_placed."""
+        entries = list(entries or [])
+        if not entries:
+            return 'empty'
+        k = int(k)
+        if k < self._next_index:
+            return 'old'
+        if k > self._next_index:
+            self._decided[k] = (entries, dict(place_sigs) if place_sigs else None)
+            return 'buffered'
+        self._append_placed(entries, place_sigs)
+        while self._next_index in self._decided:
+            more, sigs = self._decided.pop(self._next_index)
+            self._append_placed(more, sigs)
+        for stale in [i for i in self._decided if i < self._next_index]:
+            del self._decided[stale]
+        return 'applied'
+
+    @property
+    def next_index(self) -> int:
+        return self._next_index
+
+    @property
+    def head_hash(self) -> bytes:
+        return self._head_hash
+
+    def roster_at(self, k: int) -> 'Transaction | None':
+        """The roster in force for instance `k`: the latest resident roster
+        entry below index `k`, or None when the window holds none (doc/
+        architecture/reputation.md, "Who is in the group"). Restatement keeps
+        the roster in force inside the window. Mirrors C tx_history_roster_at."""
+        best = None
+        for tx in self._chain:
+            if tx.is_roster and tx.index is not None and tx.index < k \
+                    and (best is None or tx.index > best.index):
+                best = tx
+        return best if best is not None else self.roster_anchor
+
+    def latest_roster(self) -> 'Transaction | None':
+        """The roster in force for the next instance."""
+        return self.roster_at(self._next_index)
+
+    @property
+    def placed_end(self) -> 'int | None':
+        """One past the highest resident index a placement certificate covers,
+        or None. Mirrors C tx_history_placed_end."""
+        ends = [tx.index + 1 for tx in self._chain
+                if tx.index is not None and tx.task_id in self.place_certs]
+        return max(ends) if ends else None
 
     def __len__(self):
         return len(self._chain)
@@ -318,20 +1433,292 @@ class TransactionHistory(Mapping):
         been evicted, so checking starts at the second resident entry."""
         return self.verify_chain_links(self._chain)
 
-    def catchup(self, chain: list[Transaction]):
-        # Reject a chain whose internal hash-linkage doesn't hold: a peer
-        # (or a corrupted transfer) cannot slip an altered committed entry
-        # past us. This is the "verifiable instead of social" sync win
-        # (reputation-vs-blockchain-analysis.md §2.1) — the received segment
-        # must be self-consistent before any of it is replayed.
-        if not self.verify_chain_links(chain):
-            return
-        for link in chain:
-            if link.index is None:
+    def catchup(self, chain: list[Transaction]) -> 'ReconcileResult':
+        """Merge a peer's reported chain. See ``reconcile``."""
+        return self.reconcile(chain)
+
+    def placement_batches(self, seg: 'list[Transaction]') -> list:
+        """The placements a segment carries certificates for, as
+        ``(k, entries, sigs)``: an entry with ``place_sigs`` closes the
+        placement that began at its ``place_from``. A placement that began
+        before the segment does is completed from our own resident entries,
+        when we hold them; ``entries`` is None when it cannot be completed.
+        The caller checks the signatures. Mirrors C tx_history_place_batches."""
+        by_index = {t.index: t for t in seg if t.index is not None}
+        ours = {t.index: t for t in self._chain}
+        out = []
+        for t in seg:
+            if t.index is None or not getattr(t, 'place_sigs', None) \
+                    or t.place_from is None:
                 continue
-            if link.index >= self._next_index:
-                self.update(link.task_id, link.p1_id, link.p1_score)
-                self.update(link.task_id, link.p2_id, link.p2_score)
+            k = int(t.place_from)
+            if k > t.index or t.index - k >= PLACE_BATCH_MAX:
+                out.append((k, None, t.place_sigs))
+                continue
+            entries = []
+            for i in range(k, t.index + 1):
+                e = by_index.get(i, ours.get(i))
+                if e is None:
+                    entries = None
+                    break
+                entries.append(e)
+            out.append((k, entries, t.place_sigs))
+        return out
+
+    def _placed_segment(self, seg, certified):
+        """Cut a placement-mode segment to what may be taken: from the
+        first certified index on (or from our own placed end, if that comes
+        first), only certified entries, up to the first that is not."""
+        cut = min([i for i in (min(certified, default=None), self.placed_end)
+                   if i is not None], default=None)
+        if cut is None:
+            return seg
+        out = []
+        for t in seg:
+            if t.index >= cut and t.index not in certified:
+                break
+            out.append(t)
+        return out
+
+    def _jump_to(self, seg) -> 'ReconcileResult':
+        """Replace the whole resident window with a certified segment that
+        starts past our next index. What we held is below the gap and is
+        tombstoned, so a late commit cannot bring it back."""
+        res = ReconcileResult()
+        dropped = list(self._chain)
+        for t in dropped:
+            self._task_mapping.pop(t.task_id, None)
+            self.attest_certs.pop(t.task_id, None)
+            self.place_certs.pop(t.task_id, None)
+            self._unmap_peers(t)
+            self._evicted_task_ids[t.task_id] = None
+        while len(self._evicted_task_ids) > self.max_chain_len:
+            self._evicted_task_ids.popitem(last=False)
+        self._chain = []
+        res.fork = seg[0].index
+        self._load_incoming(seg)
+        self._next_index = seg[-1].index + 1
+        while len(self._chain) > self.max_chain_len:
+            self._evict_oldest()
+        self._first_index = self._chain[0].index
+        self._head_hash = self._chain[-1].entry_hash()
+        res.status = ReconcileResult.ADOPTED
+        res.added = list(seg)
+        return res
+
+    def _load_incoming(self, incoming):
+        for t in incoming:
+            pending = self._task_mapping.get(t.task_id)
+            if pending is not None:
+                self._unmap_peers(pending)      # completed in place by the peer's copy
+            self._evicted_task_ids.pop(t.task_id, None)
+            self.pool_drop(t.task_id)
+            self._chain.append(t)
+            self._task_mapping[t.task_id] = t
+            self._map_peers(t)
+            if t.attested and t.attest_sigs:
+                # The caller checked the certificate before reconciling.
+                self.attest_certs[t.task_id] = dict(t.attest_sigs)
+            if getattr(t, 'place_sigs', None):
+                self.place_certs[t.task_id] = dict(t.place_sigs)
+
+    def reconcile(self, chain: 'list[Transaction]',
+                  final_end: 'int | None' = None,
+                  attested: 'tuple | None' = None,
+                  certified: 'set | None' = None) -> 'ReconcileResult':
+        """Reconcile our committed chain with a peer's verified segment by the
+        LONGEST VERIFIED CHAIN rule (ISSUES.md §2.15). Mirrors C's
+        ``tx_history_reconcile`` step for step.
+
+        Entries are taken VERBATIM (index, prev_hash, scores, channels) so that
+        two nodes that agree end up byte-identical and compute the same window
+        root. Replaying through ``update()`` would renumber them locally, which
+        is how chains forked by order in the first place.
+
+        1. The segment's links must verify (tampering rejects it whole).
+        2. The fork point ``f`` is the first index where the two differ by
+           entry hash, or where only the peer has an entry. A peer that merely
+           extends us has ``f == _next_index``.
+        3. On a real divergence, the peer wins only if its tip is higher:
+           (last index + 1), then the LOWER head hash on a tie. Every node
+           orders tips the same way, so they converge and cannot flap.
+        4. Nothing inside our finalized checkpoint window (``index <
+           final_end``) is ever rewritten.
+        4a. ``attested`` is ``(root, first_index, count)`` of a quorum-attested
+           window our own entries do NOT reproduce. A segment that reproduces
+           it wins whatever the tips say: an order fork at EQUAL length would
+           otherwise go to the lower head hash, which can be the side the
+           quorum outvoted, and never converge (moderation cohort mod-2538837,
+           2026-09-23). Mirrors C's ``tx_history_reconcile_attested``.
+        5. Adopting drops our committed entries from ``f`` on (both halves of
+           anything only we held there are lost; that is the price of the
+           rule) and loads the peer's, completing a task we held pending.
+
+        ``certified`` is given only for a chain whose group places its order
+        (doc/architecture/reputation.md, "Agreeing on an order"): the indices
+        of the segment whose placement certificates the caller verified. Then
+        a placement decides, not a length:
+
+        6. From the first certified index (or our own placed end, if that is
+           lower) on, only certified entries are taken; the segment is cut at
+           the first that is not.
+        7. Nothing below our placed end is rewritten: a peer's certified
+           entry differing there is EQUIVOCATION, an uncertified one is KEPT.
+        8. Past it, a peer's certified entry at the fork wins whatever the
+           lengths (still never below ``final_end``).
+        9. A gap is crossed only by a segment opening on a certified
+           placement: our window is then replaced (see ``_jump_to``).
+        """
+        res = ReconcileResult()
+        seg = sorted((t for t in chain if t.index is not None),
+                     key=lambda t: t.index)
+        if not seg:
+            return res
+        if not self.verify_chain_links(seg):
+            res.status = ReconcileResult.REJECTED
+            return res
+        placing = certified is not None
+        if placing:
+            seg = self._placed_segment(seg, certified)
+            if not seg:
+                return res
+        ours = {t.index: t for t in self._chain}
+        by_index = {t.index: t for t in seg}
+        if not self._chain:
+            f = seg[0].index
+        else:
+            if seg[0].index > self._next_index:
+                if placing:
+                    starts = sorted(t.place_from for t in seg
+                                    if getattr(t, 'place_sigs', None)
+                                    and t.index in certified
+                                    and t.place_from >= seg[0].index)
+                    if starts:
+                        return self._jump_to([t for t in seg
+                                              if t.index >= starts[0]])
+                res.status = ReconcileResult.REJECTED   # a gap: nothing to link to
+                return res
+            f = None
+            for t in seg:
+                if t.index < self._first_index:
+                    continue
+                o = ours.get(t.index)
+                if o is None or o.entry_hash() != t.entry_hash():
+                    f = t.index
+                    break
+            if f is None:
+                return res                              # we already hold all of it
+            # The peer's entry at f must continue OUR prefix.
+            pred = ours.get(f - 1)
+            if pred is not None:
+                if by_index[f].prev_hash != pred.entry_hash():
+                    res.status = ReconcileResult.REJECTED
+                    return res
+            elif f in ours and by_index[f].prev_hash != ours[f].prev_hash:
+                res.status = ReconcileResult.REJECTED
+                return res
+        res.fork = f
+        placed_end = self.placed_end if placing else None
+        if placing and self._chain and placed_end is not None and f < placed_end:
+            res.status = (ReconcileResult.EQUIVOCATION if f in certified
+                          else ReconcileResult.KEPT)
+            return res
+        if placing and self._chain and f < self._next_index and f in certified:
+            if final_end is not None and f < final_end:
+                res.status = ReconcileResult.REFUSED_FINAL
+                return res
+        elif self._chain and f < self._next_index:
+            s_tip, o_tip = seg[-1].index + 1, self._next_index
+            s_head = seg[-1].entry_hash()
+            quorum_chain = self._segment_reproduces(seg, attested)
+            if not quorum_chain and (
+                    s_tip < o_tip
+                    or (s_tip == o_tip and s_head >= self._head_hash)):
+                res.status = ReconcileResult.KEPT
+                return res
+            if final_end is not None and f < final_end:
+                res.status = ReconcileResult.REFUSED_FINAL
+                return res
+        incoming = [t for t in seg if t.index >= f]
+        # A task we hold COMMITTED below the fork cannot appear again above it.
+        for t in incoming:
+            held = self._task_mapping.get(t.task_id)
+            if held is not None and (len(held) == 2 or held.attested
+                                     or held.is_roster) \
+                    and held.index is not None and held.index < f:
+                res.status = ReconcileResult.REJECTED
+                return res
+        dropped = [t for t in self._chain if t.index >= f]
+        if dropped:
+            self._chain = [t for t in self._chain if t.index < f]
+            for t in dropped:
+                if self._task_mapping.get(t.task_id) is t:
+                    del self._task_mapping[t.task_id]
+                self.attest_certs.pop(t.task_id, None)
+                self.place_certs.pop(t.task_id, None)
+                self._unmap_peers(t)
+        self._load_incoming(incoming)
+        self._next_index = max(f, incoming[-1].index + 1)
+        while len(self._chain) > self.max_chain_len:
+            self._evict_oldest()
+        if self._chain:
+            self._first_index = self._chain[0].index
+            self._head_hash = self._chain[-1].entry_hash()
+        res.status = (ReconcileResult.ADOPTED if dropped
+                      else ReconcileResult.EXTENDED)
+        res.dropped = dropped
+        res.added = incoming
+        if placing:
+            res.pooled = self._pool_dropped(dropped)
+        return res
+
+    def _pool_dropped(self, dropped) -> int:
+        """Under ordered placement, what an adoption drops goes back to the
+        pool to be placed again, each half with its certificate, rather than
+        being re-proposed: its halves were committed, only its place was
+        lost. A half without a certificate is not returned (no acceptor would
+        take it). Returns how many entries went back. Mirrors the C reconcile."""
+        back = 0
+        for tx in dropped:
+            if tx.attested:
+                back += bool(self.pool_attested(tx, tx.attest_sigs))
+                continue
+            for uid, score, chan in ((tx.p1_id, tx.p1_score, tx.p1_channel),
+                                     (tx.p2_id, tx.p2_score, tx.p2_channel)):
+                if uid is not None and tx.certificate_of(uid):
+                    self.record_half(tx.task_id, uid, score, chan,
+                                     certificate=tx.certificate_of(uid))
+            back += self.pooled(tx.task_id) is not None
+        return back
+
+    @classmethod
+    def _segment_reproduces(cls, seg, attested) -> bool:
+        """True iff ``seg`` (verified, index-sorted) holds every index of the
+        attested window in order and they hash to its root."""
+        if not attested:
+            return False
+        root, first, count = attested
+        if count <= 0:
+            return False
+        window = [t for t in seg if first <= t.index < first + count]
+        if [t.index for t in window] != list(range(first, first + count)):
+            return False
+        mine = cls._mth([t.entry_hash() for t in window])
+        if isinstance(mine, bytes):
+            mine = mine.decode('ascii')
+        if isinstance(root, bytes):
+            root = root.decode('ascii')
+        return mine == root
+
+    def _unmap_peers(self, tx: Transaction):
+        for peer_id in {tx.p1_id, tx.p2_id,
+                        tx.subject_id if tx.attested else None} - {None}:
+            lst = self._peer_mapping.get(peer_id)
+            if not lst:
+                continue
+            lst[:] = [t for t in lst if t is not tx]
+            if not lst:
+                del self._peer_mapping[peer_id]
 
     # ----- Phase 2: ordered Merkle root over the resident window ----------
     # The prev_hash chain (Phase 1) makes the window tamper-EVIDENT in
@@ -385,6 +1772,19 @@ class TransactionHistory(Mapping):
         """Resident committed (bilateral, indexed) entries in chain order."""
         return [tx for tx in self._chain if tx.index is not None]
 
+    def range_root(self, first: int, count: int) -> 'bytes | None':
+        """Merkle root over our committed entries at indices [first,
+        first + count), the value a checkpoint over that window attests. None
+        unless every index in the range is resident, in order. Mirrors C's
+        ``tx_history_range_root``."""
+        if count <= 0:
+            return None
+        entries = [tx for tx in self._chain
+                   if tx.index is not None and first <= tx.index < first + count]
+        if [tx.index for tx in entries] != list(range(first, first + count)):
+            return None
+        return self._mth([tx.entry_hash() for tx in entries])
+
     def window_root(self) -> bytes:
         """Merkle root committing to every committed entry resident in the
         window. The value a Phase 2 checkpoint quorum-signs."""
@@ -432,7 +1832,8 @@ class SlashAttestation(Configuration):
     PKI-style revocation).
 
     ``reason`` ∈ {sustained_anomaly, peer_exclude, invalid_tx,
-    rehabilitate}. ``evidence_ref`` is an optional
+    rehabilitate}. (There was briefly a per-channel `refuted_*` set; evidence
+    channels no longer accuse — R+D.md §12.8.) ``evidence_ref`` is an optional
     ``(task_id, inclusion_proof)`` tying the slash to a Merkle-committed
     anomalous transaction — unused/optional in the Phase-0 trust-the-
     detector path; verified against a finalized checkpoint root once the
@@ -492,6 +1893,94 @@ class SignedSlash(Configuration):
         self.sigs = sigs if sigs is not None else {}
 
 
+class AttestedScore(Configuration):
+    """A verifier's score about a subject's work, proposed for commit without
+    the subject's half (doc/architecture/reputation.md, "Verifier-attested
+    scores"). The application that produced the finding publishes the document
+    ``evidence_digest`` names; AT carries only the digest.
+
+    ``group_uuid`` is the chain the entry is for ('' == primary). Its task id
+    is derived, never chosen (:func:`attest_task_id`)."""
+
+    def __init__(self, verifier_uuid=None, subject_uuid=None, score: float = None,
+                 channel: str = TX_CHANNEL_PROBE, evidence_digest: str = None,
+                 group_uuid: str = '', attest_scope: str = None):
+        self.verifier_uuid = verifier_uuid
+        self.subject_uuid = subject_uuid
+        self.score = score
+        self.channel = channel
+        self.evidence_digest = evidence_digest
+        self.group_uuid = group_uuid or ''
+        # Optional (64 lowercase hex): what the application says this finding
+        # is about; keys the rate cap. See Transaction.attest_scope.
+        self.attest_scope = attest_scope or None
+
+    @property
+    def task_id(self) -> UUID:
+        return attest_task_id(self.verifier_uuid, self.subject_uuid,
+                              self.evidence_digest)
+
+    def well_formed(self) -> bool:
+        """The shape every node checks before anything else: two distinct
+        parties, a score in [0, 1], an attestable channel, a valid digest."""
+        try:
+            score = float(self.score)
+        except (TypeError, ValueError):
+            return False
+        return (self.verifier_uuid is not None and self.subject_uuid is not None
+                and str(self.verifier_uuid) != str(self.subject_uuid)
+                and 0.0 <= score <= 1.0
+                and is_attestable_channel(self.channel)
+                and valid_evidence_digest(self.evidence_digest)
+                and (not self.attest_scope
+                     or valid_evidence_digest(self.attest_scope)))
+
+    @property
+    def designation(self) -> bytes:
+        """Canonical, domain-separated bytes each co-signer signs. Excludes the
+        chain position (index, prev_hash), which differs per node until the
+        chains reconcile. ``%.17g`` and lowercase uuids, as the C twin's
+        _attest_designation."""
+        out = (b'AT-ATTEST\x00'
+               + str(self.verifier_uuid).lower().encode()
+               + b'|' + str(self.subject_uuid).lower().encode()
+               + b'|' + str(self.task_id).encode()
+               + b'|' + format(float(self.score), '.17g').encode()
+               + b'|' + str(self.channel).encode()
+               + b'|' + str(self.evidence_digest).encode())
+        # The scope (64 hex) and the group (a uuid) each appear only when
+        # set, and cannot be mistaken for each other.
+        if self.attest_scope:
+            out += b'|' + str(self.attest_scope).encode()
+        if self.group_uuid:
+            out += b'|' + str(self.group_uuid).encode()
+        return out
+
+    def to_transaction(self) -> Transaction:
+        return Transaction(self.task_id, p1_id=UUID(str(self.verifier_uuid)),
+                           p1_score=float(self.score), p1_channel=self.channel,
+                           attested=True, subject_id=UUID(str(self.subject_uuid)),
+                           evidence_digest=self.evidence_digest,
+                           attest_scope=self.attest_scope)
+
+    @classmethod
+    def of_transaction(cls, tx: Transaction, group_uuid: str = '') -> 'AttestedScore':
+        return cls(verifier_uuid=str(tx.p1_id), subject_uuid=str(tx.subject_id),
+                   score=tx.p1_score, channel=tx.p1_channel,
+                   evidence_digest=tx.evidence_digest, group_uuid=group_uuid,
+                   attest_scope=getattr(tx, 'attest_scope', None))
+
+
+class SignedAttestation(Configuration):
+    """An ``AttestedScore`` and the co-signatures that certify it: voter uuid
+    str -> Ed25519 signature (ASCII hex) over its ``designation``. The
+    verifier's own signature is among them."""
+
+    def __init__(self, attestation: 'AttestedScore' = None, sigs: dict = None):
+        self.attestation = attestation
+        self.sigs = sigs if sigs is not None else {}
+
+
 class Checkpoint(Configuration):
     """A signed commitment to a peer's resident committed window: the RFC 6962
     Merkle ``root`` (``TransactionHistory.window_root``) plus the window bounds
@@ -513,7 +2002,7 @@ class Checkpoint(Configuration):
 
     def __init__(self, proposer_uuid: UUID, root: bytes, epoch: int = 0,
                  first_index: int = 0, count: int = 0, nonce: bytes = None,
-                 signature=None):
+                 signature=None, group_uuid: str = ''):
         self.proposer_uuid = proposer_uuid
         self.root = root
         self.epoch = epoch
@@ -521,26 +2010,48 @@ class Checkpoint(Configuration):
         self.count = count
         self.nonce = nonce
         self.signature = signature
+        # Which chain this checkpoint commits to: '' (the default) is the node's PRIMARY
+        # chain, and a group-uuid string is one of a gateway's child-group chains. A
+        # gateway keeps one TransactionHistory per child group, and without this a
+        # receiver could not tell which of its chains to compare the proposed root
+        # against. Follows the same optional-trailing-group_uuid shape the `committed`
+        # broadcast already uses. See doc/architecture/gateway-reputation-tree.md and
+        # doc/architecture/gateway-reputation-tree.md.
+        self.group_uuid = str(group_uuid) if group_uuid else ''
 
     @property
     def designation(self) -> bytes:
         """Canonical, domain-separated bytes the proposer signs and every
         co-signer / verifier re-derives. Excludes ``signature`` (self-ref) and
-        ``nonce`` (anti-replay only, carried alongside)."""
+        ``nonce`` (anti-replay only, carried alongside).
+
+        ``group_uuid`` is appended ONLY when non-empty, which does two things
+        at once. A primary-chain designation stays byte-identical to what it
+        was before child chains existed, so every co-signature, pinned
+        scenario and C twin keeps verifying. And a child-chain designation can
+        never collide with a primary one, so a co-signature harvested from a
+        child-group round cannot be replayed as agreement about the primary
+        chain — which it otherwise could, since two chains can perfectly well
+        produce the same root, epoch and bounds."""
         root = self.root if self.root else b''
         if isinstance(root, str):
             root = root.encode()
-        return (b'AT-CKPT\x00'
-                + str(self.proposer_uuid).encode()
-                + b'|' + root
-                + b'|' + str(int(self.epoch)).encode()
-                + b'|' + str(int(self.first_index)).encode()
-                + b'|' + str(int(self.count)).encode())
+        desig = (b'AT-CKPT\x00'
+                 + str(self.proposer_uuid).encode()
+                 + b'|' + root
+                 + b'|' + str(int(self.epoch)).encode()
+                 + b'|' + str(int(self.first_index)).encode()
+                 + b'|' + str(int(self.count)).encode())
+        if self.group_uuid:
+            desig += b'|' + self.group_uuid.encode()
+        return desig
 
     def key(self):
-        """Dedup / sig-accumulation key: proposer + epoch. Each proposer
-        numbers its own checkpoints monotonically."""
-        return (str(self.proposer_uuid), int(self.epoch))
+        """Dedup / sig-accumulation key: proposer + epoch + chain. Each
+        proposer numbers its checkpoints monotonically PER CHAIN, so the chain
+        has to be part of the key or a gateway's primary and child rounds
+        would collide at the same epoch number."""
+        return (str(self.proposer_uuid), int(self.epoch), self.group_uuid)
 
 
 class SignedCheckpoint(Configuration):
@@ -555,10 +2066,693 @@ class SignedCheckpoint(Configuration):
         self.sigs = sigs if sigs is not None else {}
 
 
+# --- Persisted evidence (reputation-history.cfg.json) ----------------------
+#
+# `reputation.cfg.json` holds the CONCLUSION -- {peer: score} -- and nothing
+# that shows how it was reached, so warm start had no way to tell an earned 0.9
+# from one typed into the file. This is the evidence beside it: the resident
+# hash-linked window plus the quorum-signed checkpoint over it. See
+# doc/architecture/reputation.md (Verifiable warm start) and doc/architecture/reputation.md.
+#
+# Deliberately PLAIN JSON rather than a `Configuration` dump: one file is read
+# by both runtimes, and Configuration's encoder emits `__type__` keys naming
+# Python classes that mean nothing to the C reader. Same reasoning as the trust
+# ladder. Field names follow the checkpoint wire payload so a reader of
+# either is reading the same vocabulary.
+#
+# Schema is pinned so a future shape change is a refusal to rebuild (which
+# degrades to capped restoration) rather than a misparse.
+EVIDENCE_SCHEMA = '1'
+EVIDENCE_FILE = 'reputation-history'
+# Per-(target, slasher) slash high-water marks. Separate from the chain
+# evidence deliberately: the evidence is an optimization of trust that a node
+# can lose harmlessly, while these marks are the memory a replayed slash has
+# to clear, so the two should not share a failure.
+SLASH_MARKS_FILE = 'reputation-slash-marks'
+
+
+def _hex_str(value) -> str:
+    """Digests are carried as 64-char lowercase hex. Python holds them as
+    hex-ASCII *bytes* (MerkleTree.get_hash), so accept either."""
+    if value is None:
+        return ''
+    if isinstance(value, bytes):
+        return value.decode('ascii')
+    return str(value)
+
+
+def evidence_to_dict(chain, signed_checkpoint=None, attest_certs=None) -> dict:
+    """The persisted-evidence document for ``chain`` (an iterable of committed
+    ``Transaction``) and the finalized ``SignedCheckpoint`` covering it.
+
+    Only entries with an assigned ``index`` are written: an index is what a
+    committed, bilateral entry has, and an un-indexed one is not evidence of
+    anything yet.
+    """
+    entries = []
+    for tx in chain:
+        if tx.index is None:
+            continue
+        entries.append({
+            'task_id': str(tx.task_id),
+            'p1_id': None if tx.p1_id is None else str(tx.p1_id),
+            'p1_score': None if tx.p1_score is None else float(tx.p1_score),
+            'p2_id': None if tx.p2_id is None else str(tx.p2_id),
+            'p2_score': None if tx.p2_score is None else float(tx.p2_score),
+            'index': int(tx.index),
+            'prev_hash': _hex_str(tx.prev_hash),
+        })
+        # Additive to schema 1, and OMITTED when absent: a reader predating
+        # channels ignores the keys, and an entry that has none serializes
+        # exactly as it did before (which is also what keeps its entry hash
+        # unchanged -- see Transaction._canonical_bytes). A verifier
+        # recomputing entry hashes from this document over an entry that DOES
+        # carry a channel needs it, or its inclusion proofs miss the root.
+        if tx.p1_channel is not None:
+            entries[-1]['p1_channel'] = str(tx.p1_channel)
+        if tx.p2_channel is not None:
+            entries[-1]['p2_channel'] = str(tx.p2_channel)
+        # A verifier-attested entry: additive and omitted otherwise, like the
+        # channels. Its quorum certificate travels beside it (outside the entry
+        # hash) so a warm start or an outside verifier can check the round.
+        if tx.attested:
+            entries[-1]['attested'] = True
+            entries[-1]['subject_id'] = str(tx.subject_id)
+            entries[-1]['evidence_digest'] = str(tx.evidence_digest)
+            if getattr(tx, 'attest_scope', None):
+                entries[-1]['attest_scope'] = str(tx.attest_scope)
+            cert = (attest_certs or {}).get(tx.task_id)
+            if cert:
+                entries[-1]['attest_sigs'] = {str(k): _hex_str(v)
+                                              for k, v in cert.items()}
+        # Commit certificates of ordinary halves: additive and omitted when
+        # absent, like the channels. They sit outside the entry hash, so a
+        # verifier ignores them to recompute the root and reads them to check
+        # the rounds.
+        elif tx.commit_sigs:
+            entries[-1]['commit_sigs'] = {
+                str(scorer): {str(k): _hex_str(v) for k, v in sigs.items()}
+                for scorer, sigs in tx.commit_sigs.items()}
+        # A roster entry: its fields are in the entry hash, its member list
+        # beside it (checked against the digest on the way back in).
+        if getattr(tx, 'roster_op', None) is not None:
+            entries[-1]['roster_op'] = str(tx.roster_op)
+            entries[-1]['roster_uuid'] = (None if tx.roster_uuid is None
+                                          else str(tx.roster_uuid))
+            entries[-1]['roster_digest'] = str(tx.roster_digest)
+            entries[-1]['roster_members'] = [list(m) for m in
+                                             tx.roster_members or []]
+        # A placement certificate, on the last entry of each placement:
+        # additive, omitted otherwise, outside the entry hash.
+        if getattr(tx, 'place_sigs', None) and tx.place_from is not None:
+            entries[-1]['place_from'] = int(tx.place_from)
+            entries[-1]['place_sigs'] = {str(k): _hex_str(v)
+                                         for k, v in tx.place_sigs.items()}
+    doc = {
+        'schema': EVIDENCE_SCHEMA,
+        'chain': entries,
+        'checkpoint': None,
+    }
+    ckpt = getattr(signed_checkpoint, 'checkpoint', None)
+    if ckpt is not None:
+        doc['checkpoint'] = {
+            'proposer_uuid': str(ckpt.proposer_uuid),
+            'root': _hex_str(ckpt.root),
+            'epoch': int(ckpt.epoch),
+            'first_index': int(ckpt.first_index),
+            'count': int(ckpt.count),
+            # Which chain the checkpoint covers ('' == primary). Part of the
+            # signed designation when non-empty, so it has to travel with the
+            # signatures or a restart could not re-derive the bytes they were
+            # made over. Additive to schema 1: a reader that predates child
+            # chains ignores it, and this reader defaults it to ''.
+            'group_uuid': str(getattr(ckpt, 'group_uuid', '') or ''),
+            'sigs': {str(k): _hex_str(v)
+                     for k, v in (signed_checkpoint.sigs or {}).items()},
+        }
+    return doc
+
+
+def _roster_fields(entry) -> dict:
+    """A persisted roster entry's fields, its member list checked against its
+    digest. Empty for any other entry."""
+    if entry.get('roster_op') is None:
+        return {}
+    members = entry.get('roster_members')
+    digest = entry.get('roster_digest')
+    if not isinstance(members, list) or roster_digest(members) != digest:
+        raise ValueError('roster members do not match their digest')
+    who = entry.get('roster_uuid')
+    return {'roster_op': str(entry['roster_op']),
+            'roster_uuid': None if who is None else UUID(str(who)),
+            'roster_digest': str(digest), 'roster_members': members}
+
+
+def evidence_from_dict(doc):
+    """Parse a persisted-evidence document into
+    ``(chain, signed_checkpoint)``.
+
+    Raises ValueError on anything malformed -- a wrong schema, a non-list
+    chain, an entry missing its index. The caller treats that as "no usable
+    evidence", which is a *safe* outcome (restoration falls back to capped),
+    so being strict here costs nothing and misreading would cost a lot.
+    """
+    if not isinstance(doc, dict):
+        raise ValueError('evidence document is not an object')
+    schema = doc.get('schema')
+    if schema != EVIDENCE_SCHEMA:
+        raise ValueError('unsupported evidence schema %r (expected %r)'
+                         % (schema, EVIDENCE_SCHEMA))
+    raw_chain = doc.get('chain')
+    if not isinstance(raw_chain, list):
+        raise ValueError('evidence chain is not a list')
+    chain = []
+    for entry in raw_chain:
+        if not isinstance(entry, dict):
+            raise ValueError('evidence chain entry is not an object')
+        if entry.get('index') is None:
+            raise ValueError('evidence chain entry has no index')
+
+        def _uuid(key):
+            raw = entry.get(key)
+            return None if raw is None else UUID(str(raw))
+
+        def _score(key):
+            raw = entry.get(key)
+            return None if raw is None else float(raw)
+
+        prev = entry.get('prev_hash') or ''
+        chain.append(Transaction(
+            task_id=UUID(str(entry['task_id'])),
+            p1_id=_uuid('p1_id'), p1_score=_score('p1_score'),
+            p2_id=_uuid('p2_id'), p2_score=_score('p2_score'),
+            index=int(entry['index']),
+            prev_hash=prev.encode('ascii') if prev else b'',
+            p1_channel=entry.get('p1_channel'),
+            p2_channel=entry.get('p2_channel'),
+            attested=bool(entry.get('attested', False)),
+            subject_id=_uuid('subject_id') if entry.get('attested') else None,
+            evidence_digest=(str(entry['evidence_digest'])
+                             if entry.get('attested')
+                             and entry.get('evidence_digest') is not None
+                             else None),
+            attest_scope=(str(entry['attest_scope'])
+                          if entry.get('attested') and entry.get('attest_scope')
+                          else None),
+            commit_sigs=(None if entry.get('attested')
+                         or not isinstance(entry.get('commit_sigs'), dict)
+                         else {str(scorer): {str(k): str(v)
+                                             for k, v in sigs.items()}
+                               for scorer, sigs in entry['commit_sigs'].items()
+                               if isinstance(sigs, dict)}),
+            place_from=(int(entry['place_from'])
+                        if isinstance(entry.get('place_from'), int)
+                        and not isinstance(entry.get('place_from'), bool)
+                        else None),
+            place_sigs=(entry['place_sigs']
+                        if isinstance(entry.get('place_sigs'), dict) else None),
+            **_roster_fields(entry)))
+    signed = None
+    raw_ck = doc.get('checkpoint')
+    if isinstance(raw_ck, dict):
+        root = raw_ck.get('root') or ''
+        ckpt = Checkpoint(
+            proposer_uuid=UUID(str(raw_ck['proposer_uuid'])),
+            root=root.encode('ascii') if root else b'',
+            epoch=int(raw_ck.get('epoch', 0)),
+            first_index=int(raw_ck.get('first_index', 0)),
+            count=int(raw_ck.get('count', 0)),
+            group_uuid=str(raw_ck.get('group_uuid', '') or ''))
+        sigs = raw_ck.get('sigs') or {}
+        if not isinstance(sigs, dict):
+            raise ValueError('evidence checkpoint sigs is not an object')
+        signed = SignedCheckpoint(checkpoint=ckpt,
+                                  sigs={str(k): str(v) for k, v in sigs.items()})
+    return chain, signed
+
+
+# --- Durable attested records (etc/at/attested/<task>.json) -----------------
+#
+# The resident window holds 200 entries and the evidence file is rewritten at
+# every checkpoint, so an attested entry is soon gone from both. An application
+# that shows a finding for longer (Stele's repo standing) needs it kept, and
+# kept in a form a verifier can check on its own: the entry with its quorum
+# certificate, the checkpoint that covers it with ITS signatures, the inclusion
+# proof from one to the other, the public keys of every signer this node held,
+# and the group sizes both quorums are counted against. Written once, when a
+# quorum-signed checkpoint first covers the entry; never rewritten. See
+# doc/architecture/reputation.md, "Verifier-attested scores".
+ATTESTED_RECORD_SCHEMA = '1'
+ATTESTED_DIR = 'attested'
+
+
+def attested_record(doc, task_id, signers, group_size, ckpt_group_size,
+                    subject_member=True) -> 'dict | None':
+    """The durable record of the attested entry ``task_id`` in the evidence
+    document ``doc`` (:func:`evidence_to_dict`), or None unless the document's
+    checkpoint covers it. ``signers`` maps voter uuid str -> Ed25519 public key
+    hex for every voter this node can name; ``group_size`` sizes the
+    attestation quorum and ``ckpt_group_size`` the checkpoint's (members, this
+    node included). Mirrors C reputation_attested_record."""
+    ck = (doc or {}).get('checkpoint')
+    if not isinstance(ck, dict):
+        return None
+    first, count = int(ck.get('first_index', 0)), int(ck.get('count', 0))
+    chain, _ = evidence_from_dict(doc)
+    window = [tx for tx in chain if tx.index is not None
+              and first <= tx.index < first + count]
+    if [tx.index for tx in window] != list(range(first, first + count)):
+        return None
+    pos = next((i for i, tx in enumerate(window)
+                if str(tx.task_id) == str(task_id)), None)
+    if pos is None or not window[pos].attested:
+        return None
+    entry = next(e for e in doc['chain'] if str(e.get('task_id')) == str(task_id))
+    if not isinstance(entry.get('attest_sigs'), dict) or not entry['attest_sigs']:
+        return None
+    proof = TransactionHistory._audit_path(pos, [tx.entry_hash() for tx in window])
+    return {'schema': ATTESTED_RECORD_SCHEMA,
+            'entry': dict(entry),
+            'checkpoint': dict(ck),
+            'proof': [{'sibling': _hex_str(sib), 'left': bool(left)}
+                      for sib, left in proof],
+            'signers': {str(k): str(v) for k, v in (signers or {}).items()},
+            'group_size': int(group_size),
+            'ckpt_group_size': int(ckpt_group_size),
+            'subject_member': bool(subject_member)}
+
+
+#: The roster file a node writes beside its attested archive (repprocess
+#: _persist_roster, C _persist_roster): the anchor a reader verifies records
+#: against instead of the keys a record carries about itself.
+ROSTER_FILE = 'roster.cfg.json'
+
+#: The smallest group an anchored verification will count a quorum against,
+#: whatever size a record claims: a record that says its group had one member
+#: still needs two of the anchor's keys behind it.
+ANCHOR_MIN_GROUP = 3
+
+
+def load_anchor(where, min_group=ANCHOR_MIN_GROUP) -> 'dict | None':
+    """The anchor for :func:`verify_attested_record`, read from a node's
+    roster file. ``where`` is the roster file itself, a config dir holding it,
+    or a node root (``<root>/etc/at/roster.cfg.json``). None when there is no
+    readable roster: a reader with no anchor has nothing to verify against."""
+    cands = [where, os.path.join(where, ROSTER_FILE),
+             os.path.join(where, 'etc', 'at', ROSTER_FILE)]
+    for path in cands:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as f:
+                doc = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(doc, dict) or not isinstance(doc.get('members'), dict):
+            return None
+        return {'group_uuid': str(doc.get('group_uuid') or ''),
+                'self': str(doc.get('self') or ''),
+                'members': {str(k): dict(v) for k, v in doc['members'].items()
+                            if isinstance(v, dict) and v.get('pubkey')},
+                'checkpoints': [c for c in doc.get('checkpoints') or []
+                                if isinstance(c, dict)],
+                'min_group': int(min_group)}
+    return None
+
+
+def verify_attested_record(record, anchor=None, details=None, exclude=None) \
+        -> 'tuple[bool, list[str]]':
+    """Check a durable attested record:
+
+    1. the entry's hash, folded up its inclusion proof, reproduces the
+       checkpoint's root;
+    2. more than half the checkpoint's group signed the checkpoint;
+    3. the verifier and a strict majority of the members other than the
+       subject signed the attestation, the subject's signature never counted.
+
+    Without ``anchor`` the signatures are checked against ``signers``, the keys
+    the record carries, and the quorums against the group sizes it claims. That
+    is only evidence for whoever trusts the node that wrote it, since a forger
+    writes its own keys and a group of one. With ``anchor``
+    (:func:`load_anchor`, the reader's own node's roster) every key comes from
+    the anchor and none from the record; a record signer whose key disagrees
+    with the anchor fails; the checkpoint must belong to the anchor's group or
+    to a chain it holds a checkpoint for; each quorum is counted against at
+    least ``anchor['min_group']``; and when the anchor holds a checkpoint over
+    the same window at the same epoch, the roots must match (``linked``).
+
+    ``exclude`` is the READER's own list of the subject's teammates (ISSUES
+    §2.54; Stele takes it from a team roster it verified). Their signatures do
+    not count, the attestation quorum is a strict majority of the members
+    other than the subject and them, and at least two signatures are needed.
+    The record's own ``excluded`` list is never read, since a forger would
+    name the outsiders there.
+
+    Returns ``(ok, reasons)``; ``reasons`` names every check that failed. When
+    ``details`` is a dict it receives ``linked`` (bool), ``anchored`` (bool),
+    and ``signers`` (the attestation voters that counted)."""
+    from nacl.encoding import HexEncoder
+    from nacl.signing import VerifyKey
+    from nacl.exceptions import BadSignatureError
+    reasons = []
+    try:
+        if record.get('schema') != ATTESTED_RECORD_SCHEMA:
+            return False, ['unknown record schema']
+        doc = {'schema': EVIDENCE_SCHEMA, 'chain': [record['entry']],
+               'checkpoint': record['checkpoint']}
+        chain, signed = evidence_from_dict(doc)
+        tx = chain[0]
+        signers = record.get('signers') or {}
+        group_size = int(record['group_size'])
+        ckpt_group_size = int(record['ckpt_group_size'])
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False, ['malformed record']
+    linked = False
+    if anchor is not None:
+        keys = {u: str(m['pubkey']) for u, m in anchor['members'].items()}
+        for voter, key in signers.items():
+            if str(voter) in keys and str(key) != keys[str(voter)]:
+                reasons.append("signer %s's key disagrees with this node's "
+                               "roster" % str(voter)[:8])
+        floor = int(anchor.get('min_group', ANCHOR_MIN_GROUP))
+        group_size = max(group_size, floor)
+        ckpt_group_size = max(ckpt_group_size, floor)
+        ck = record['checkpoint']
+        group = str(ck.get('group_uuid') or '')
+        held = [c for c in anchor.get('checkpoints') or []
+                if str(c.get('group_uuid') or '') == group]
+        if group and group != anchor.get('group_uuid') and not held:
+            reasons.append('checkpoint from a group this node does not hold')
+        for c in held:
+            if (int(c.get('epoch', -1)) == int(ck.get('epoch', -2))
+                    and int(c.get('first_index', -1)) == int(ck.get('first_index', -2))
+                    and int(c.get('count', -1)) == int(ck.get('count', -2))):
+                if _hex_str(c.get('root')) == _hex_str(ck.get('root')):
+                    linked = True
+                else:
+                    reasons.append("checkpoint root differs from the one this "
+                                   "node holds at epoch %s" % ck.get('epoch'))
+        signers = keys
+
+    def _verified(designation, sigs):
+        out = set()
+        for voter, sig in (sigs or {}).items():
+            key = signers.get(str(voter))
+            if not key:
+                continue
+            try:
+                VerifyKey(key.encode('ascii'), encoder=HexEncoder).verify(
+                    designation, HexEncoder.decode(str(sig).encode('ascii')))
+            except (BadSignatureError, ValueError, TypeError):
+                continue
+            out.add(str(voter))
+        return out
+
+    if not tx.attested or signed is None:
+        return False, reasons + ['not an attested entry under a checkpoint']
+    proof = [(p['sibling'].encode('ascii'), bool(p['left']))
+             for p in record.get('proof') or []]
+    if not TransactionHistory.verify_inclusion(tx.entry_hash(), proof,
+                                               signed.checkpoint.root):
+        reasons.append('entry not in the checkpoint window')
+    if len(_verified(signed.checkpoint.designation, signed.sigs)) \
+            <= ckpt_group_size // 2:
+        reasons.append('checkpoint short of a quorum')
+    att = AttestedScore.of_transaction(tx)
+    if not att.well_formed():
+        reasons.append('attestation malformed')
+    voters = _verified(att.designation,
+                       record['entry'].get('attest_sigs')) - {str(tx.subject_id)}
+    others = group_size - (1 if record.get('subject_member', True) else 0)
+    mates = {str(u) for u in (exclude or ())} - {str(tx.subject_id)}
+    if anchor is not None:
+        mates &= set(anchor['members'])
+    voters -= mates
+    others = max(others - len(mates), 0)
+    if str(tx.p1_id) not in voters:
+        reasons.append("the verifier's own signature is missing")
+    elif len(voters) <= others // 2 or (mates and len(voters) < 2):
+        reasons.append('attestation short of a quorum')
+    if isinstance(details, dict):
+        details.update(linked=linked and not reasons,
+                       anchored=anchor is not None, signers=sorted(voters))
+    return not reasons, reasons
+
+
+def evidence_attest_certs(doc) -> dict:
+    """The quorum certificates of the attested entries in an evidence
+    document: ``{task UUID: {voter uuid str: signature hex}}``. Empty for a
+    document without any. Kept apart from :func:`evidence_from_dict`, whose
+    ``(chain, signed_checkpoint)`` shape every caller already relies on."""
+    out = {}
+    for entry in (doc or {}).get('chain') or []:
+        if isinstance(entry, dict) and entry.get('attested') \
+                and isinstance(entry.get('attest_sigs'), dict):
+            out[UUID(str(entry['task_id']))] = {
+                str(k): str(v) for k, v in entry['attest_sigs'].items()}
+    return out
+
+
+# --- Deep resolution: one peer, on demand, at any depth
+# (doc/architecture/gateway-reputation-tree.md) ---
+#
+# A node scores a peer against the chain that peer's transactions landed in,
+# and holds chains only for groups it belongs to. Two levels down that chain
+# belongs to somebody else, so the query is relayed to whoever holds it and the
+# ANSWER CARRIES ITS OWN PROOF -- it crosses nodes the requestor has no reason
+# to trust, so a bare number would be an unfalsifiable claim.
+#
+# The proof is the whole quorum-signed window, not the queried peer's entries
+# with inclusion proofs. An audit path proves an entry IS in the window; it
+# proves nothing about what was left out, so a holder could answer with a
+# peer's three good transactions, omit the two bad ones, and pass verification.
+# Shipping the window closes that: the verifier recomputes the root from the
+# entries themselves, and an omitted entry changes the root, which then fails
+# against the signature a quorum made over it. (User's call, 2026-08-13: the
+# cost is that the requestor sees every transaction in that window, not only
+# the queried peer's.)
+
+#: Hops a resolve may travel before it is dropped. The tree is the real bound;
+#: this is the backstop that keeps a routing loop or a lying `children` claim
+#: from circulating a query forever. 4 covers any hierarchy contemplated so far
+#: (doc/architecture/gateway-reputation-tree.md) with room to spare.
+RESOLVE_TTL_DEFAULT = 4
+#: Refuse a query that arrives claiming more hops than we would ever originate:
+#: TTL is attacker-controlled, and an inflated one is an amplification lever.
+RESOLVE_TTL_MAX = 8
+
+
+def resolve_query_to_dict(query_id: str, peer_uuid, ttl: int = RESOLVE_TTL_DEFAULT,
+                          requesting_process: str = '') -> dict:
+    """A deep-resolution query. Deliberately says nothing about who is asking:
+    the relay answers to the neighbour it heard from, so the originator's
+    identity never travels and a deep holder cannot learn who wanted to know."""
+    return {
+        'query_id': str(query_id),
+        'peer_uuid': str(peer_uuid),
+        'ttl': int(ttl),
+        'requesting_process': str(requesting_process or ''),
+    }
+
+
+def resolve_query_from_dict(doc) -> dict:
+    """Parse and BOUND a query. Raises ValueError on anything malformed or on
+    a TTL above ``RESOLVE_TTL_MAX`` -- clamping silently would let a hostile
+    requestor set the fan-out budget for everyone below it."""
+    if not isinstance(doc, dict):
+        raise ValueError('resolve query is not an object')
+    qid = str(doc.get('query_id') or '')
+    peer = str(doc.get('peer_uuid') or '')
+    if not qid or not peer:
+        raise ValueError('resolve query missing query_id or peer_uuid')
+    ttl = int(doc.get('ttl', 0))
+    if ttl < 0 or ttl > RESOLVE_TTL_MAX:
+        raise ValueError('resolve query ttl %d out of range' % ttl)
+    return {'query_id': qid, 'peer_uuid': peer, 'ttl': ttl,
+            'requesting_process': str(doc.get('requesting_process') or '')}
+
+
+def resolved_to_dict(query_id: str, peer_uuid, chain, signed_checkpoint,
+                     signers=None, score=None) -> dict:
+    """An answer: the queried peer, the holder's own score for it, and the
+    quorum-signed window that backs it.
+
+    ``signers`` is a list of co-signer identities in the DRY canonical public
+    form (``public_identity_to_canonical``, which C emits byte-identically).
+    They are here because the requestor is two boundaries away and holds NO
+    identity from the answering group, so without them it could not check a
+    single signature. That form -- rather than bare keys -- because it also
+    carries each signer's ZTA credential, which is what lets the verifier tie
+    a signer to an anchor it accepts. The identities are not trusted for being
+    present: an answer that ships its own freshly-minted quorum is exactly
+    what the anchor check in ``verify_resolved`` refuses.
+
+    ``score`` is the holder's own value, carried as a cross-check and NOT as
+    the answer: the EMA is weighted by per-capability transaction weights that
+    live in a node-local cache and are not part of any hashed entry, so a
+    remote verifier cannot re-derive them. The attested window is the real
+    payload; the requestor computes its own score from it."""
+    doc = evidence_to_dict(chain, signed_checkpoint)
+    doc['query_id'] = str(query_id)
+    doc['peer_uuid'] = str(peer_uuid)
+    doc['score'] = None if score is None else float(score)
+    doc['signers'] = [dict(s) for s in (signers or []) if isinstance(s, dict)]
+    return doc
+
+
+def resolved_from_dict(doc):
+    """Parse an answer into ``(query_id, peer_uuid, score, chain,
+    signed_checkpoint, signers)``. Raises ValueError on anything malformed;
+    the caller treats that as no answer rather than a bad one."""
+    if not isinstance(doc, dict):
+        raise ValueError('resolved answer is not an object')
+    chain, signed = evidence_from_dict(doc)
+    qid = str(doc.get('query_id') or '')
+    peer = str(doc.get('peer_uuid') or '')
+    if not qid or not peer:
+        raise ValueError('resolved answer missing query_id or peer_uuid')
+    raw_score = doc.get('score')
+    signers = doc.get('signers') or []
+    if not isinstance(signers, list):
+        raise ValueError('resolved answer signers is not a list')
+    return (qid, peer, None if raw_score is None else float(raw_score),
+            chain, signed, [s for s in signers if isinstance(s, dict)])
+
+
+def window_root_of(chain) -> bytes:
+    """The RFC 6962 root over an ordered list of committed ``Transaction`` --
+    the same value ``TransactionHistory.window_root`` produces for a resident
+    window, computed from a bare list so a verifier that never held the chain
+    can reproduce it."""
+    entries = [tx for tx in chain if tx.index is not None]
+    return TransactionHistory._mth([tx.entry_hash() for tx in entries])
+
+
+def consensus_score_from_window(peer_uuid, chain, half_life: int,
+                                weights=None):
+    """The deterministic consensus EMA for ``peer_uuid`` over an ordered
+    window. Returns None when the window holds no bilateral entry for the peer
+    (the caller decides what a no-evidence answer means -- there is no local
+    baseline to fall back to when the chain is somebody else's).
+
+    Extracted so ONE implementation serves both the holder computing its own
+    score and a verifier recomputing it from attested evidence; the C twin
+    mirrors this function rather than the method around it. Keep the fold
+    identical to ``ReputationProcess._consensus_reputation``.
+
+    ``weights`` (task-id-str -> int) reproduces the per-capability transaction
+    weight. A verifier across a trust boundary has no way to know them and
+    passes None, i.e. weight 1 for everything: its number is then the
+    unweighted consensus over the same attested entries, which is why the
+    holder's own score travels alongside as a cross-check rather than as
+    something to be asserted equal."""
+    alpha = 1.0 - 0.5 ** (1.0 / float(half_life))
+    ema = None
+    ordered = sorted(chain, key=lambda t: (t.index if t.index is not None else 0))
+    for tx in ordered:
+        about = tx.about(peer_uuid)
+        if about is None:
+            continue
+        cp_score = about[0]
+        w = (weights or {}).get(str(tx.task_id), 1)
+        for _ in range(max(1, int(w))):
+            if ema is None:
+                ema = float(cp_score)
+            else:
+                ema = alpha * float(cp_score) + (1.0 - alpha) * ema
+    return ema
+
+
+def verify_resolved(chain, signed_checkpoint, signers, verify_signature,
+                    trust_signer=None, min_signers: int = 1):
+    """Check an answer's evidence. Returns ``(ok, reason)`` -- a reason string
+    even on success, because an operator reading "unverified" needs to know
+    WHICH check failed and a caller may accept a weaker answer knowingly (see
+    feedback_operator_diagnostics).
+
+    Three gates, in order of what they buy:
+
+    1. **The window reproduces the signed root.** This is the load-bearing
+       one: it makes both fabrication and OMISSION detectable, since any edit
+       to the entry list moves the root away from the bytes a quorum signed.
+    2. **The co-signatures verify** over the checkpoint's designation, via the
+       caller's ``verify_signature(designation, uuid, sig, signer)`` where
+       ``signer`` is that voter's canonical identity dict (or None if the
+       answer did not carry one).
+    3. **Each signer is trusted**, via the caller's ``trust_signer(uuid,
+       signer)`` -- in practice "this signer's credential chains to an anchor
+       we accept". Without it, gate 2 proves only that somebody holding some
+       key signed, and an answer can carry its own invented quorum.
+
+    NOT checked here, and it cannot be from this side: whether the verified
+    signers are a MAJORITY of the group whose chain this is. Quorum sizing
+    needs that group's membership, and an opaque subtree is precisely what
+    does not disclose it. The count is returned in the reason so the caller
+    can apply its own bar."""
+    ckpt = getattr(signed_checkpoint, 'checkpoint', None)
+    if ckpt is None:
+        return False, 'no checkpoint: the window is unattested'
+    root = ckpt.root
+    if isinstance(root, str):
+        root = root.encode('ascii')
+    if not root:
+        return False, 'checkpoint carries no root'
+    recomputed = window_root_of(chain)
+    if recomputed != root:
+        return False, ('window does not reproduce the signed root '
+                       '(entries added, altered or withheld)')
+    sigs = getattr(signed_checkpoint, 'sigs', None) or {}
+    designation = ckpt.designation
+    by_uuid = {str(s.get('uuid')): s for s in (signers or [])
+               if isinstance(s, dict) and s.get('uuid')}
+    verified = set()
+    for voter, sig in sigs.items():
+        voter = str(voter)
+        signer = by_uuid.get(voter)
+        if not verify_signature(designation, voter, sig, signer):
+            continue
+        if trust_signer is not None and not trust_signer(voter, signer):
+            continue
+        verified.add(voter)
+    if len(verified) < max(1, int(min_signers)):
+        return False, ('%d signer(s) verified and trusted, needed %d'
+                       % (len(verified), max(1, int(min_signers))))
+    return True, ('root reproduced; %d signer(s) verified and trusted '
+                  '(quorum size not checkable across a boundary)'
+                  % len(verified))
+
+
 class Reputation(Configuration):
     def __init__(self, peer_id: UUID, score: float):
         self.peer_id = peer_id
         self.score = score
+
+
+class PeerReputation(Configuration):
+    """AT → app: one peer's earned reputation, with whether AT holds one.
+
+    Mirror of the C twin's `peer_reputation_msg_t` (`utilities/msg_types.h`) and
+    the flat `at_app_reputation_t` an app decodes (`app_events.h`);
+    doc/architecture/app-peer-carrier.md,
+    asked for by kith-covenant and ethne (D18).
+
+    `rated` is the load-bearing field. AT's scale is anchored by fixed constants
+    (PREREP_NEUTRAL, the comm cut-off, the tier floors) rather than normalized
+    across the peer population, so `score` crosses as-is — but a peer AT has
+    never scored reads as exactly PREREP_NEUTRAL, which is *also* a score a peer
+    can genuinely earn. Collapsing those two lets a consumer treat "no
+    information" as a real, mid-range rating.
+
+    Local IPC only, exactly like the C twin: this does NOT change `Reputation`
+    or the peer-to-peer `rep_resp` wire form.
+    """
+
+    def __init__(self, peer_uuid, score, rated: bool = True):
+        self.peer_uuid = peer_uuid
+        self.rated = bool(rated)
+        # Zeroed when unrated, as C's _publish_reputation does, so a consumer
+        # that ignores the flag cannot silently read a plausible-looking number.
+        self.score = float(score) if self.rated else 0.0
 
 
 class Reputations(Configuration):

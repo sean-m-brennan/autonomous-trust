@@ -1,0 +1,32 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: directory-request-verifies
+description: A contact request signed by its sender's key, unexpired, verifies; its sender and handle read back.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: dir_verify
+    what: request
+    now: 1790000000
+    wire:
+      body: '{"v":1,"typename":"at-contact-request","from":"bbbbbbbb-0000-4000-8000-0000000000b2","key":"88df556413538b002015e9619b01bdb5cc48c7215645792563f5460f7307a763","to":"aaaaaaaa-0000-4000-8000-0000000000a1","handle":"alice@example.org","nonce":"0123456789abcdef0123456789abcdef","expiry":4102444800,"relays":["relay://203.0.113.7:27790"]}'
+      sig: 1adac2b936745c610898700a3ae5fa001e2192cec3539dc8101da03adaceee987f638a5f477766fada39f36e3a297638325c5692bf2cd3b32d537584ca8ce405
+steps:
+- id: 1
+  from: host
+  to: host
+  function: dir_verify
+  description: 'trigger: dir_verify'
+expected_state:
+  host:
+    dir_status: ok
+    handle: alice@example.org
+    uuid: bbbbbbbb-0000-4000-8000-0000000000b2

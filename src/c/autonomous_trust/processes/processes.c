@@ -18,20 +18,25 @@
 #include <string.h>
 #include <fcntl.h>
 #include <sys/types.h>
-#include <sys/msg.h>
 #include <errno.h>
+#include <stdlib.h>   /* EXIT_SUCCESS / EXIT_FAILURE */
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
 
 #include <jansson.h>
+#include <sodium.h>
 
 #define PROCESSES_IMPL
 #include "processes/processes.h"
+#include "utilities/send_retry.h"
 // #include "protobuf/processes.pb-c.h"
 #include "config/configuration.h"
 #include "structures/map.h"
+#include "processes/capabilities_priv.h"   /* peer_capabilities_take */
 #include "utilities/msg_types_priv.h"
 #include "utilities/probes.h"
 #include "utilities/util.h"
@@ -44,6 +49,117 @@ const char *sig_quit = "quit";
 int process_child_extra_flags = 0;
 
 const long cadence = 500000L; // microseconds
+
+/* ---- in-process subsystems ----------------------------------------------
+ * When the node runs in-process (messaging_in_process(): AT_IN_PROCESS=1, and
+ * always on Windows), a subsystem's runner runs on a thread of this process
+ * instead of in a forked child. process_setup then does not daemonize, so the
+ * runner takes its child path, and returns only when its loop ends (the quit
+ * signal). The daemon's pid bookkeeping is kept: each thread gets a small id
+ * in place of a pid, and process_liveness / process_force_stop answer for it
+ * what kill(pid, 0) and SIGKILL answered for a child. */
+typedef struct proc_thread
+{
+    pid_t id;
+    pthread_t thread;
+    atomic_bool done;
+    int rc;
+    process_t *proc;
+    directory_t *queues;
+    /* Copied: the caller's is on its stack, which a fork duplicated and a
+     * thread would outlive. */
+    char sig[SIG_NAME_LEN + 1];
+    logger_t *logger;
+    struct proc_thread *next;
+} proc_thread_t;
+
+static pthread_mutex_t g_threads_mu = PTHREAD_MUTEX_INITIALIZER;
+static proc_thread_t *g_threads = NULL;
+static pid_t g_next_thread_id = 1;
+
+static void *_proc_thread_main(void *arg)
+{
+    proc_thread_t *t = arg;
+    t->rc = t->proc->runner(t->proc, t->queues, t->sig, t->logger);
+    atomic_store(&t->done, true);
+    return NULL;
+}
+
+static pid_t _start_thread(process_t *proc, directory_t *queues, const char *sig,
+                           logger_t *logger)
+{
+    proc_thread_t *t = calloc(1, sizeof(*t));
+    if (t == NULL)
+        return EXCEPTION(ENOMEM);
+    t->proc = proc;
+    t->queues = queues;
+    snprintf(t->sig, sizeof(t->sig), "%s", sig);
+    t->logger = logger;
+    atomic_init(&t->done, false);
+    pthread_mutex_lock(&g_threads_mu);
+    t->id = g_next_thread_id++;
+    int err = pthread_create(&t->thread, NULL, _proc_thread_main, t);
+    if (err != 0)
+    {
+        pthread_mutex_unlock(&g_threads_mu);
+        free(t);
+        return EXCEPTION(err);
+    }
+    t->next = g_threads;
+    g_threads = t;
+    pthread_mutex_unlock(&g_threads_mu);
+    return t->id;
+}
+
+int process_liveness(pid_t id)
+{
+    if (!messaging_in_process())
+    {
+#ifdef _WIN32
+        return 0;   /* never: Windows nodes are always in-process */
+#else
+        if (kill(id, 0) == 0)
+            return 1;
+        return errno == ESRCH ? 0 : -1;
+#endif
+    }
+    pthread_mutex_lock(&g_threads_mu);
+    proc_thread_t **link = &g_threads;
+    while (*link != NULL && (*link)->id != id)
+        link = &(*link)->next;
+    proc_thread_t *t = *link;
+    int alive = 0;
+    if (t != NULL && !atomic_load(&t->done))
+        alive = 1;
+    else if (t != NULL)
+    {
+        /* Finished: reap it, as waitpid would a child. */
+        (void)pthread_join(t->thread, NULL);
+        *link = t->next;
+        free(t);
+    }
+    pthread_mutex_unlock(&g_threads_mu);
+    return alive;
+}
+
+void process_force_stop(pid_t id, logger_t *logger)
+{
+    if (!messaging_in_process())
+    {
+#ifndef _WIN32
+        kill(id, SIGKILL);
+#endif
+        return;
+    }
+    /* A thread cannot be killed without taking the process's state with it.
+     * Leave it to end with the process, and say so. */
+    pthread_mutex_lock(&g_threads_mu);
+    for (proc_thread_t *t = g_threads; t != NULL; t = t->next)
+        if (t->id == id && !atomic_load(&t->done))
+            log_warn(logger, "Subsystem %s did not stop; it ends with the process\n",
+                     t->proc->name);
+    pthread_mutex_unlock(&g_threads_mu);
+}
 
 typedef bool (*msg_handler_t)(const process_t *proc, directory_t *queues, generic_msg_t *msg);
 
@@ -105,7 +221,7 @@ int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs
     if (orig > 0)
     {
         char pid_str[32] = {0};
-        snprintf(pid_str, 31, "%d", orig);
+        snprintf(pid_str, 31, "%d", (int)orig);
         if (procs_lock != NULL)
             pthread_mutex_lock(procs_lock);
         int rc = map_remove(procs, pid_str);
@@ -134,7 +250,38 @@ int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs
     char sig[SIG_NAME_LEN + 1] = {0};
     process_name_to_signal(pname, sig);
 
-    pid_t pid = proc->runner(proc, queues, sig, logger);
+    /* The runner FORKS (process_setup -> daemonize) and returns in BOTH processes: the
+     * caller gets the new subsystem's pid, the subsystem itself gets whatever its own
+     * run loop returned once that loop ends — which is at shutdown.
+     *
+     * A subsystem must therefore never RETURN from here. Returning resumes this
+     * function, and then the daemon's start-every-subsystem loop (autonomous_trust.c),
+     * inside the subsystem process — so at shutdown each exiting subsystem forks a
+     * fresh generation of subsystems, which are orphaned when the daemon goes. That is
+     * doc/architecture/process-architecture.md: a stopped daemon leaving live processes
+     * behind, still logging identity and network work on a node the operator believes
+     * is down.
+     *
+     * Detected by comparing pids across the call rather than by the runner's return
+     * value: the value means different things in the two processes and differs per
+     * runner, while "am I the process that called this" is exactly the question and is
+     * never ambiguous. Fixing it here rather than in each of the six runners keeps the
+     * next runner from inheriting the bug by omission.
+     *
+     * _exit, not exit: this process is a fork of the daemon and shares its atexit
+     * handlers and stdio buffers. Running them here would flush and tear down state the
+     * daemon still owns. The runner has already closed its own descriptors by this
+     * point. */
+    pid_t pid;
+    if (messaging_in_process())
+        pid = _start_thread(proc, queues, sig, logger);
+    else
+    {
+        pid_t caller = getpid();
+        pid = proc->runner(proc, queues, sig, logger);
+        if (getpid() != caller)
+            _exit(pid == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
+    }
     if (pid == -1)
     {
         log_error(logger, "Error starting process '%s'\n", pname);
@@ -143,7 +290,7 @@ int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs
 
     // record pids for monitoring
     char pid_str[32] = {0};
-    snprintf(pid_str, 31, "%d", pid);
+    snprintf(pid_str, 31, "%d", (int)pid);
     // data_t *key_val = string_data(pname, strlen(pname));
     data_t *proc_val = object_ptr_data(proc, sizeof(process_t));
     if (procs_lock != NULL)
@@ -191,8 +338,13 @@ int set_process_name(const char *name_in)
 {
     char name[PROC_NAME_LEN + 1] = {0};
     strncpy(name, name_in, PROC_NAME_LEN - 1);
+#ifdef __APPLE__
+    /* Darwin's takes the name only, and can name only the calling thread. */
+    int err = pthread_setname_np(name);
+#else
     pthread_t tid = pthread_self();
     int err = pthread_setname_np(tid, name);
+#endif
     if (err != 0)
         return EXCEPTION(err);
     return 0;
@@ -279,22 +431,132 @@ int process_apply_handler_config(const process_t *proc)
     return 0;
 }
 
+static bool _uuid_in_map(map_t *map, const char *uuid_str)
+{
+    data_t *value = NULL;
+    return map != NULL && map->items != NULL && map_size(map) > 0
+        && map_get(map, (map_key_t)uuid_str, &value) == 0;
+}
+
+/* Whether a peer counts in consensus: it is in the address map of this node's
+ * group or of a child group it gateways. A first-contact direct peer is a peer
+ * but a member of neither, so it never sizes a quorum, signs into one, or
+ * enters a logged roster (R+D.md §13.5 D2). Before this node holds a group
+ * with a member map, every peer counts, as before. Caller holds the peers read
+ * lock. Mirrors Python ReputationProcess._roster_peers. */
+bool processes_peer_is_member(const process_t *proc, const public_identity_t *peer)
+{
+    if (proc == NULL || peer == NULL)
+        return false;
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer->uuid, key);
+    map_t *own = (map_t *)&proc->protocol.group.address_map;
+    bool any = own->items != NULL && map_size(own) > 0;
+    bool found = _uuid_in_map(own, key);
+    if (!found && proc->protocol.child_groups != NULL)
+    {
+        map_key_t ck = NULL;
+        data_t *cv = NULL;
+        map_entries_for_each(proc->protocol.child_groups, ck, cv)
+        {
+            void *gp = NULL;
+            if (!found && data_object_ptr(cv, &gp) == 0 && gp != NULL)
+            {
+                map_t *m = &((group_t *)gp)->address_map;
+                any = any || (m->items != NULL && map_size(m) > 0);
+                found = _uuid_in_map(m, key);
+            }
+        }
+        map_end_for_each
+    }
+    return found || !any;
+}
+
+bool processes_remove_peer(process_t *proc, const unsigned char *uuid)
+{
+    if (proc == NULL || uuid == NULL)
+        return false;
+    bool removed = false;
+    peers_write_lock(proc);
+    size_t n = proc->protocol.num_peers;
+    for (size_t i = 0; i < n; i++) {
+        if (memcmp(proc->protocol.peers[i].uuid, uuid, sizeof(uuid_t)) != 0)
+            continue;
+        size_t tail = n - i - 1;
+        memmove(&proc->protocol.peers[i], &proc->protocol.peers[i + 1],
+                tail * sizeof(proc->protocol.peers[0]));
+        memmove(&proc->protocol.peer_rtt_ms[i], &proc->protocol.peer_rtt_ms[i + 1],
+                tail * sizeof(proc->protocol.peer_rtt_ms[0]));
+        memmove(&proc->protocol.peer_absent[i], &proc->protocol.peer_absent[i + 1],
+                tail * sizeof(proc->protocol.peer_absent[0]));
+        memset(&proc->protocol.peers[n - 1], 0, sizeof(proc->protocol.peers[0]));
+        proc->protocol.peer_rtt_ms[n - 1] = 0;
+        proc->protocol.peer_absent[n - 1] = false;
+        proc->protocol.num_peers = n - 1;
+        removed = true;
+        break;
+    }
+    peers_write_unlock(proc);
+    return removed;
+}
+
 /* Frama-C: skipped — [func-ptr] msg_handler_t callback dispatch */
 bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, generic_msg_t *msg)
 {
     switch (msgtype)
     {
-    case GROUP:
+    case GROUP: {
+        /* Name the key a sibling installs when it changes, so a process left
+         * on a stale key (rep-2368077: both network processes on a retired
+         * epoch-1 key while identity held epoch 2) is visible beside
+         * identity's own rotation lines. */
+        const group_t *was = &proc->protocol.group;
+        const group_t *now = &msg->info.group;
+        if (was->key_epoch != now->key_epoch
+            || memcmp(was->encryptor.public, now->encryptor.public,
+                      sizeof(now->encryptor.public)) != 0)
+        {
+            char wfp[17] = {0}, nfp[17] = {0};
+            sodium_bin2hex(wfp, sizeof(wfp), was->encryptor.public, 8);
+            sodium_bin2hex(nfp, sizeof(nfp), now->encryptor.public, 8);
+            log_info(proc->logger,
+                     "%s: installed group key %s… epoch %lld (was %s… epoch "
+                     "%lld)\n", proc->name, nfp, (long long)now->key_epoch,
+                     wfp, (long long)was->key_epoch);
+        }
         proc->protocol.group = msg->info.group;
         return true;
+    }
+    case CHILD_GROUP: {
+        /* A cohort this node GATEWAYS, not its primary group — so it must
+         * never land in protocol.group. The reputation process keys a separate
+         * transaction chain off this map (gateway-reputation-tree.md). */
+        if (proc->protocol.child_groups == NULL
+            && map_create(&proc->protocol.child_groups) != 0)
+            return true;
+        group_t *copy = calloc(1, sizeof(group_t));
+        if (copy == NULL)
+            return true;
+        *copy = msg->info.group;
+        char cg_uuid[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(copy->uuid, cg_uuid);
+        data_t *gd = object_ptr_data(copy, sizeof(group_t));
+        if (gd == NULL || map_set(proc->protocol.child_groups, cg_uuid, gd) != 0)
+            free(copy);
+        return true;
+    }
     case PEER:
         peers_write_lock(proc);
         if (proc->protocol.num_peers < DEFAULT_MAX_PEERS)
         {
             memcpy(&proc->protocol.peers[proc->protocol.num_peers], &msg->info.peer, sizeof(public_identity_t));
+            proc->protocol.peer_absent[proc->protocol.num_peers] = false;
             proc->protocol.num_peers++;
         }
         peers_write_unlock(proc);
+        return true;
+    case PEER_REMOVED:
+        (void)processes_remove_peer(proc, msg->info.peer_removed.peer_uuid);
         return true;
     case PEER_RTT_UPDATE: {
         /* Net-proc → us: the authoritative RTT estimate for a peer. Look
@@ -317,10 +579,46 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
             log_debug(proc->logger, "%s: rtt_update for unknown peer\n", proc->name);
         return true;
     }
-    case PEER_CAPABILITIES:
-        // pproc->peer_capabilities = message
+    case PEER_PRESENCE: {
+        /* Net-proc → us: a peer went quiet or came back. Advisory only:
+         * nothing leaves the roster (doc/architecture/peer-presence.md). A
+         * presence that outran the PEER message finds nobody and is dropped;
+         * the network process re-emits on the next transition. */
+        const peer_presence_msg_t *pp = &msg->info.peer_presence;
+        peers_write_lock(proc);
+        for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+            if (memcmp(proc->protocol.peers[i].uuid, pp->peer_uuid,
+                       sizeof(uuid_t)) == 0) {
+                proc->protocol.peer_absent[i] = !pp->present;
+                break;
+            }
+        }
+        peers_write_unlock(proc);
         return true;
+    }
+    case PEER_CAPABILITIES: {
+        /* Identity's view of which peer offers what (_publish_peer_
+         * capabilities), the C counterpart of Python's matrix put on the
+         * negotiation queue. Adopted whole, replacing the last one; negotiation
+         * fans an invitation out only to the peers it names. */
+        peer_capabilities_matrix_t *fresh =
+            peer_capabilities_take(&msg->info.peer_capabilities);
+        if (fresh == NULL)
+            return true;
+        peer_capabilities_matrix_t *old = proc->protocol.peer_capabilities;
+        proc->protocol.peer_capabilities = fresh;
+        if (old != NULL)
+            map_free(old);
+        return true;
+    }
     default: {
+        /* Only a NET_MESSAGE carries a net_msg. Anything else reaching here --
+         * a registered feature type, or a core type this process has no arm
+         * for -- used to be read as one anyway, comparing payload bytes
+         * against the process name and, on a chance match, calling through
+         * whatever sat where net_msg.function would be. */
+        if (msgtype != NET_MESSAGE)
+            return false;
         net_msg_t *nmsg = &msg->info.net_msg;
         if (strcmp(nmsg->process, proc->name) == 0)
         {
@@ -396,6 +694,11 @@ void sleep_until(const process_t *proc, long how_long)
     struct timeval now;
     gettimeofday(&now, NULL);
 
+    /* Every process's tick passes here, so it is where the one-shot frames a
+     * full queue refused are retried (utilities/send_retry.h, ISSUES §2.40 /
+     * §2.14): one try each, oldest first, until they land or age out. */
+    at_send_retry_drain(proc, NULL, (double)now.tv_sec);
+
     long delta = how_long - timeval_subtract(&now, (struct timeval *)&proc->start);
     if (delta > 0)
         usleep(delta);
@@ -413,21 +716,26 @@ int process_setup(process_t *proc, queue_id_t signal, logger_t *logger,
     /* In foreground mode the daemon keeps stderr; propagate that to children so
      * their post-daemonize log output isn't redirected to /dev/null. */
     proc->flags |= process_child_extra_flags;
-    int err = daemonize(data_path, proc->flags, &ctx->fd1, &ctx->fd2);
-    if (err != 0)
-        return err;
+    /* In-process this already IS the subsystem's thread (_start_thread): no
+     * fork, no descriptor sweep, and the shared logger stays open. */
+    if (!messaging_in_process())
+    {
+        int err = daemonize(data_path, proc->flags, &ctx->fd1, &ctx->fd2);
+        if (err != 0)
+            return err;
 
-    /* Child only (daemonize returned 0). When the close-all-fds sweep ran
-     * (NO_CLOSE_FILES unset, the default for everything but net_proc), it
-     * closed the descriptor under a file-backed logger — re-open it so this
-     * child's log output keeps reaching the log file in daemon mode. No-op for
-     * a stderr/terminal logger (file_name empty). net_proc sets NO_CLOSE_FILES
-     * to keep its sockets, which also preserves its log fd, so skip it there. */
-    if (!(proc->flags & NO_CLOSE_FILES))
-        logger_reopen(logger);
+        /* Child only (daemonize returned 0). When the close-all-fds sweep ran
+         * (NO_CLOSE_FILES unset, the default for everything but net_proc), it
+         * closed the descriptor under a file-backed logger — re-open it so this
+         * child's log output keeps reaching the log file in daemon mode. No-op for
+         * a stderr/terminal logger (file_name empty). net_proc sets NO_CLOSE_FILES
+         * to keep its sockets, which also preserves its log fd, so skip it there. */
+        if (!(proc->flags & NO_CLOSE_FILES))
+            logger_reopen(logger);
+    }
 
     pid_t pid = getpid();
-    log_debug(logger, "Child pid %d\n", pid);
+    log_debug(logger, "Child pid %d\n", (int)pid);
     if (messaging_init(proc->name, &ctx->my_q) != 0)
         log_exception(logger);
     messaging_assign(&ctx->my_q);
@@ -446,13 +754,12 @@ int process_setup(process_t *proc, queue_id_t signal, logger_t *logger,
 int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
                  process_ctx_t *ctx)
 {
-    array_t unprocessed;
-    array_init(&unprocessed);
+    generic_msg_t buf = {0};
     while (keep_running(proc, &ctx->sig_q, logger))
     {
         sleep_until(proc, cadence);
 
-        generic_msg_t buf = {0};
+        messaging_recv_release(&buf);   /* the previous pass's */
         int err = messaging_recv(&buf);
         if (err == -1) {
             log_debug(proc->logger, "%s: message receive error\n", proc->name);
@@ -481,21 +788,18 @@ int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
                                  buf.info.net_msg.function,
                                  "unhandled", "proc", proc->name, NULL);
             }
-            size_t size = message_size(buf.type);
-            void *msg = smrt_create(size);
-            if (msg == NULL)
-            {
-                log_debug(proc->logger, "%s: skipping unhandled message type %ld\n", proc->name, buf.type);
-                continue;
-            }
-            memcpy(msg, &buf.info, size);
-            data_t *m_dat = object_ptr_data(msg, size);
-            array_append(&unprocessed, m_dat);
+            /* Then dropped, as Python's processes drop theirs. The next
+             * pass's release frees the buffer. */
+            log_debug(proc->logger, "%s: unhandled message type %ld\n",
+                      proc->name, buf.type);
         }
         // Hook point for sub-process specific post-message activity (e.g. periodic tasks)
     }
-    array_free(&unprocessed);
-    array_free(queues);
+    messaging_recv_release(&buf);
+    /* A forked subsystem frees its own copy; in-process the directory is the
+     * daemon's, still in use by every other subsystem thread. */
+    if (!messaging_in_process())
+        array_free(queues);
     if (ctx->fd1 > 0)
         close(ctx->fd1);
     if (ctx->fd2 > 0)

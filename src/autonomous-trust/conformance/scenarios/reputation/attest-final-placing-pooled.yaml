@@ -1,0 +1,38 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-final-placing-pooled
+byte_pinning: false
+description: |
+    Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+    order"). A certified attestation (the verifier plus a quorum of the other
+    members, without the subject) goes to the pool, ready to be placed, rather
+    than to the chain.
+    Placement-mode twin of attest-final-certificate-commits.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+fixtures: {}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest final
+    payload:
+      subject: carol
+      score: 0.3
+      channel: probe
+      cosigners: [alice, bob]
+
+expected_state:
+  bob:
+    committed_tx_count: 0
+    chain_tasks: []
+    pool_count: 1

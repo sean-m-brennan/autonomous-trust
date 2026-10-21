@@ -57,7 +57,14 @@ CENV=autonomous_trust
 # Conformance runs in a Miniforge container by default (matches conformance.yml's
 # setup-miniconda, and needs no host conda). Override the tag with --conda-image
 # or CI_LOCAL_CONDA_IMAGE; force the host's conda instead with --host-conda.
-CONDA_IMAGE="${CI_LOCAL_CONDA_IMAGE:-condaforge/miniforge3:latest}"
+# Default comes from the recorded pin (config/cfg/toolchain-pins.env) so a local run mirrors
+# the same toolchain the images and CI use, rather than whatever `latest` is
+# today; explicit overrides still win.
+if [ -f "$REPO/config/cfg/toolchain-pins.env" ]; then
+    # shellcheck source=../config/cfg/toolchain-pins.env
+    source "$REPO/config/cfg/toolchain-pins.env"
+fi
+CONDA_IMAGE="${CI_LOCAL_CONDA_IMAGE:-${MINIFORGE_IMAGE:-condaforge/miniforge3:latest}}"
 # Persisted across runs so the (heavy) env solve happens once. Override with
 # CI_LOCAL_CACHE. Holds the conda envs + package cache used by the container.
 CI_CACHE="${CI_LOCAL_CACHE:-$HOME/.cache/ci-local}"
@@ -249,7 +256,11 @@ _run_host_conda() {
   export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
   local rc=0
-  bash -c "$commands" || rc=$?
+  # Prepend the same `set -euo pipefail` the containerized path gets from
+  # _container_prelude. The job strings are written for a fail-fast shell: a
+  # failing early step (e.g. the protobuf regen) must abort the job rather than
+  # let the suites below run against stale or absent bindings.
+  bash -c "set -euo pipefail"$'\n'"$commands" || rc=$?
   conda deactivate || true
   return $rc
 }
@@ -293,6 +304,13 @@ job_tests() {
   _run_conda_job tests '
 echo "[ci-local] Generating protobuf Python interfaces ..."
 bash scripts/build-py.sh proto-only
+# Measured FFI check, inside the env and after codegen because it compiles a
+# probe against the real headers and needs the generated *.pb-c.h. The preflight
+# above compares field NAMES, which cannot see a type-width or padding change;
+# this one measures sizeof/offsetof. It skips with a message if the compiler or
+# cffi is absent, so it never blocks for environmental reasons.
+echo "[ci-local] FFI ABI measurement (audit-ffi-drift.py --only abi) ..."
+python3 scripts/audit-ffi-drift.py --only abi
 echo "[ci-local] Python package test suites (test-packages.sh --quick) ..."
 bash scripts/test-packages.sh --quick
 echo "[ci-local] C unit tests (test-c-exe.sh) ..."

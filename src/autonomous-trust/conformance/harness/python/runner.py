@@ -22,8 +22,11 @@ records, and emits a result JSON in the corpus's `results/` directory.
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -34,6 +37,24 @@ from ..common.scenario_loader import Case, discover
 
 from .adapters.agreement import AgreementAdapter
 from .adapters.bootstrap import BootstrapAdapter
+from .adapters.physics import PhysicsAdapter
+from .adapters.calibration import CalibrationAdapter
+from .adapters.prequential import PrequentialAdapter
+from .adapters.certificate import CertificateAdapter
+try:
+    # First contact is an extension (FEATURE_SPLIT_PLAN Phase 7): without it,
+    # its contacts protocol has no adapter and skips, as C's does without
+    # libat_first_contact.
+    from .adapters.contacts import ContactsAdapter
+except ImportError:
+    ContactsAdapter = None
+try:
+    # DTN is an extension (FEATURE_SPLIT_PLAN Phase 9): without it, its dtn
+    # protocol has no adapter and skips, as C's does without libat_dtn.
+    from .adapters.dtn import DtnAdapter
+except ImportError:
+    DtnAdapter = None
+from .adapters.replication import ReplicationAdapter
 from .adapters.identity import IdentityAdapter
 from .adapters.negotiation import NegotiationAdapter
 from .adapters.network import NetworkAdapter
@@ -98,7 +119,67 @@ def _adapters() -> dict[str, Any]:
         'negotiation': NegotiationAdapter(corpus_root=CORPUS_ROOT),
         'reputation': ReputationAdapter(corpus_root=CORPUS_ROOT),
         'bootstrap': BootstrapAdapter(corpus_root=CORPUS_ROOT),
+        'physics': PhysicsAdapter(corpus_root=CORPUS_ROOT),
+        'certificate': CertificateAdapter(corpus_root=CORPUS_ROOT),
+        'calibration': CalibrationAdapter(corpus_root=CORPUS_ROOT),
+        'prequential': PrequentialAdapter(corpus_root=CORPUS_ROOT),
+        'replication': ReplicationAdapter(corpus_root=CORPUS_ROOT),
+        **({'contacts': ContactsAdapter(corpus_root=CORPUS_ROOT)}
+           if ContactsAdapter is not None else {}),
+        **({'dtn': DtnAdapter(corpus_root=CORPUS_ROOT)}
+           if DtnAdapter is not None else {}),
+        **_plugin_adapters(),
     }
+
+
+#: A conformance plug-in contributes its own protocol from outside this tree
+#: (doc/architecture/extensions.md, "External extensions"): a directory holding
+#: `scenarios/<protocol>/*.yaml` and a `conformance_plugin.py` that sets
+#: ``SYS_PATH`` (directories to prepend, e.g. its Python distribution) and
+#: defines ``adapters()`` -> {protocol: adapter class}. Listed, os.pathsep-
+#: separated, in this variable. Without a plug-in its protocol is simply not in
+#: the corpus.
+PLUGINS_ENV = 'AT_CONFORMANCE_PLUGINS'
+PLUGIN_MODULE = 'conformance_plugin.py'
+
+
+def plugin_roots() -> list[Path]:
+    """The plug-in corpus roots named by $AT_CONFORMANCE_PLUGINS."""
+    return [Path(p).resolve() for p in os.environ.get(PLUGINS_ENV, '').split(os.pathsep)
+            if p.strip()]
+
+
+def _load_plugin(root: Path):
+    path = root / PLUGIN_MODULE
+    if not path.is_file():
+        raise RuntimeError(f'{PLUGINS_ENV}: no {PLUGIN_MODULE} in {root}')
+    name = f'_at_conformance_plugin_{abs(hash(str(root)))}'
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        for entry in reversed(getattr(module, 'SYS_PATH', ())):
+            entry = str((root / entry).resolve())
+            if entry not in sys.path:
+                sys.path.insert(0, entry)
+    return module
+
+
+def _plugin_adapters() -> dict[str, Any]:
+    found: dict[str, Any] = {}
+    for root in plugin_roots():
+        for protocol, cls in _load_plugin(root).adapters().items():
+            if protocol in found:
+                raise RuntimeError(f'{PLUGINS_ENV}: two plug-ins own protocol {protocol!r}')
+            found[protocol] = cls(corpus_root=root)
+    return found
+
+
+def discover_all() -> list[Case]:
+    """AT's corpus and every plug-in's, as one list."""
+    return discover(CORPUS_ROOT, plugin_roots())
 
 
 def run_case(case: Case, adapters: dict[str, Any]) -> CaseResult:
@@ -136,7 +217,7 @@ def run_case(case: Case, adapters: dict[str, Any]) -> CaseResult:
 
 def run_all() -> Report:
     """Discover and execute every case under CORPUS_ROOT. Returns the report."""
-    cases = discover(CORPUS_ROOT)
+    cases = discover_all()
     adapters = _adapters()
     report = Report()
     for case in cases:

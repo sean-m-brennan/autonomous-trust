@@ -23,6 +23,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>                  /* getenv, for SLASH_ENABLED */
 #include <uuid/uuid.h>
 #include <jansson.h>
 
@@ -31,6 +32,7 @@
 #include "identity/identity.h"
 #include "utilities/exception.h"
 #include "processes/capabilities.h"   /* CAP_NAMELEN */
+#include "reputation/tx_channel.h"   /* TX_CHANNEL_* */
 #include "autonomous_trust/algorithms/paxos.h"
 
 /****************************
@@ -51,10 +53,14 @@
  * Python↔C interop. See BUGS.md §P9.
  ****************************/
 
-extern char REP_PROTO_REQUEST[];
-extern char REP_PROTO_GRANT[];
-extern char REP_PROTO_NACK[];
-extern char REP_PROTO_BACKDATE[];
+/* The half round's Phase 1, retired 2026-10-16 with every group placing its
+ * order. A node on a build that still runs it sends these; they are dropped
+ * and logged once per sender (handle_retired). Mirrors Python
+ * ReputationProtocol.retired. */
+extern char REP_PROTO_RETIRED_REQUEST[];
+extern char REP_PROTO_RETIRED_GRANT[];
+extern char REP_PROTO_RETIRED_NACK[];
+extern char REP_PROTO_RETIRED_BACKDATE[];
 extern char REP_PROTO_TX[];
 extern char REP_PROTO_ACCEPTED[];
 /* Phase 3 — proposer broadcasts the committed (task_id, peer_id,
@@ -73,6 +79,9 @@ extern char REP_PROTO_REP_RESP[];
  * response dispatch consumes it unchanged. Mirrors Python's
  * ReputationProtocol.consensus_rep_req — string must match verbatim. */
 extern char REP_PROTO_CONSENSUS_REP_REQ[];
+/** Batched consensus request: many subjects in one message, one roster back.
+ * Mirrors Python ReputationProtocol.consensus_rep_batch_req. */
+extern char REP_PROTO_CONSENSUS_REP_BATCH_REQ[];
 extern char REP_PROTO_LOCAL_QUERY[];
 extern char REP_PROTO_LOCAL_RESP[];
 extern char REP_PROTO_APP_ROSTER[];
@@ -85,6 +94,9 @@ extern char REP_PROTO_APP_ROSTER[];
 extern char REP_PROTO_SLASH_PROPOSE[];
 extern char REP_PROTO_SLASH_SIGN[];
 extern char REP_PROTO_SLASH_FINAL[];
+extern char REP_PROTO_ATTEST_PROPOSE[];
+extern char REP_PROTO_ATTEST_SIGN[];
+extern char REP_PROTO_ATTEST_FINAL[];
 /* Phase 2 quorum-signed Merkle checkpoint ops
  * (ReputationProtocol.checkpoint_propose / checkpoint_sign / checkpoint_final).
  * A member co-signs only when its own transaction_window_root matches the
@@ -93,6 +105,25 @@ extern char REP_PROTO_SLASH_FINAL[];
 extern char REP_PROTO_CHECKPOINT_PROPOSE[];
 extern char REP_PROTO_CHECKPOINT_SIGN[];
 extern char REP_PROTO_CHECKPOINT_FINAL[];
+
+/* Deep resolution: one peer, on demand, at any depth (doc/architecture/gateway-reputation-tree.md).
+ * A node holds chains only for its own groups, so a peer two levels down is
+ * unscoreable locally; the query is relayed toward whoever holds its chain and
+ * the answer comes back along the reverse path carrying the quorum-signed
+ * window that backs it. Wire strings match Python ReputationProtocol
+ * verbatim -- see the REP_PROTO alignment note above. */
+extern char REP_PROTO_REP_RESOLVE[];
+extern char REP_PROTO_REP_RESOLVED[];
+
+/* Ordered placement (doc/architecture/reputation.md, "Agreeing on an order"):
+ * classic Paxos per chain index, only in a group that declares it. Wire
+ * strings match Python ReputationProtocol.place_*. */
+extern char REP_PROTO_PLACE_REQUEST[];
+extern char REP_PROTO_PLACE_GRANT[];
+extern char REP_PROTO_PLACE_NACK[];
+extern char REP_PROTO_PLACE[];
+extern char REP_PROTO_PLACE_ACCEPTED[];
+extern char REP_PROTO_PLACED[];
 
 /****************************
  * Reputation tuning constants — mirror Python class attributes in
@@ -141,6 +172,48 @@ double reputation_env_double(const char *name, double dflt);
 #define COMM_CUTOFF (reputation_env_double("AT_REP_COMM_CUTOFF", COMM_CUTOFF_DEFAULT))
 #define PREREP_SHRINKAGE_K 3.0
 
+/* The scale every absolute measure in AT — and in the tiers above it — assumes.
+ * Mirror of TX_SCORE_MIN / TX_SCORE_MAX in repprocess.py's reputation.py.
+ *
+ * The [0, 1] score bound, enforced (doc/architecture/reputation.md; asked for by
+ * kith-covenant's erosion-legibility audit). The
+ * bound was a convention rather than something checked, so an out-of-range score
+ * was GRADED rather than rejected — folded into the weighted average, moving a
+ * reputation by an unbounded amount. @ref tx_score_in_range rejects instead of
+ * clamping: a submitter sending 5.0 has a bug, and quietly recording 1.0 hides
+ * it while still rewarding the peer more than any honest score could. */
+#define TX_SCORE_MIN 0.0
+#define TX_SCORE_MAX 1.0
+
+/** True iff @p score is a real number on AT's [0, 1] scale.
+ *
+ * NaN fails by the same comparison that rejects 5.0 (every comparison against
+ * NaN is false), which matters because NaN is the value that would otherwise
+ * poison an average with no way back. */
+static inline bool tx_score_in_range(double score)
+{
+    return score >= TX_SCORE_MIN && score <= TX_SCORE_MAX;
+}
+
+/* --- Slashing: OFF unless armed (R+D.md §12.8) ---
+ * Slashing pins a peer's reputation from outside the EMA, on one detector's
+ * say-so plus a quorum co-signature. Nothing arms it automatically: the
+ * evidence-channel accusation that used to (a hard-falsification channel
+ * scoring defection-grade) was removed at the user's direction, because a
+ * transaction scored poorly WITH ITS REASON is something every peer can see
+ * and judge for itself, and the EMA plus the tier machinery is already
+ * graduated discipline.
+ *
+ * What remains is an explicit act -- the behaviour governor's
+ * human-on-the-loop path, or an operator exclude/rehabilitate -- so the
+ * protocol they use is explicit too. Unarmed, a node originates nothing,
+ * declines to co-sign a peer's proposal, and ignores a finalized slash rather
+ * than applying its floor. Same name and same default as Python's
+ * ReputationProcess.SLASH_ENABLED, so the two runtimes behave identically
+ * under the same environment; arm it fleet-wide, since a group where only
+ * some members are armed will disagree about the floor. */
+#define SLASH_ENABLED (getenv("AT_SLASH_ENABLED") != NULL)
+
 /* EMA half-life (in committed bilateral txs) for reputation_consensus.
  * Smaller → faster crash on a peer that begins producing bad scores,
  * slower rebuild for the rest. 20 gives α ≈ 0.034. */
@@ -171,6 +244,24 @@ typedef struct {
      * Python TransactionScore.capability_name. See
      * doc/architecture/trust-tiers.md §4.4. */
     char capability_name[CAP_NAMELEN+1];
+    /* Which evidence channel produced this score (R+D.md §12.8). Empty
+     * string == absent, which normalizes to TX_CHANNEL_TASK_OUTCOME via
+     * tx_channel_or_default -- every producer predating this field was
+     * grading a completed task. Carried and logged only: nothing in the
+     * reputation algebra branches on it. Mirrors Python
+     * TransactionScore.channel. See reputation/tx_channel.h. */
+    char channel[TX_CHANNEL_NAMELEN+1];
+    /* The learned EMA weight multiplier for the subject peer on this
+     * capability (R+D.md §12.5), stamped by the process that observed the
+     * forecast and staged here for the same reason the channel is: the weight
+     * is recorded twice, once when the round starts and once when
+     * _propose_half re-records our own round, and the two must agree or the EMA would depend
+     * on which path last wrote the cache.
+     *
+     * Zero or negative == absent -> 1.0, the authored transaction_weight
+     * verbatim. Mirrors Python TransactionScore.competence. See
+     * prequential/prequential.h. */
+    double competence;
 } tx_score_t;
 
 /****************************
@@ -182,6 +273,21 @@ typedef struct {
  * Python's MerkleTree.get_hash output (nacl blake2b, HexEncoder, 32-byte
  * digest). Keep in lockstep so the languages agree on entry hashes. */
 #define TX_HASH_HEX_LEN 64
+
+/* A verifier-attested entry's evidence digest: lowercase hex of a 32-byte
+ * blake2b over the document the finding rests on. Mirrors Python
+ * ATTEST_DIGEST_HEX_LEN. See doc/architecture/reputation.md,
+ * "Verifier-attested scores". */
+#define TX_ATTEST_DIGEST_HEX_LEN 64
+
+/* Room for transaction_canonical_bytes at its longest: three uuids, two
+ * scores, an index, two channels, and the attested block (a marker, a fourth
+ * uuid, a digest and an optional scope). */
+#define TX_CANON_MAX (UUID_STRING_LEN * 5 + 200 + 2 * (TX_CHANNEL_NAMELEN + 1) \
+                      + 3 * (TX_ATTEST_DIGEST_HEX_LEN + 1))
+
+/* A roster entry's op ("genesis", "add", "restate") plus NUL. */
+#define TX_ROSTER_OP_LEN 8
 
 typedef struct {
     uuid_t task_uuid;
@@ -198,7 +304,108 @@ typedef struct {
      * resident entry whose predecessor has been evicted). Assigned when the
      * tx goes bilateral. Mirrors Python Transaction.prev_hash. */
     char   prev_hash[TX_HASH_HEX_LEN + 1];
+    /* Evidence channel of each side's score (R+D.md §12.8). Empty string ==
+     * absent, which normalizes to TX_CHANNEL_TASK_OUTCOME -- every producer
+     * predating channels was grading a completed task. Mirrors Python
+     * Transaction.p1_channel / p2_channel.
+     *
+     * On the ENTRY, not just on the tx_score_t that produced it, because the
+     * reason a score was poor is what lets every other peer judge that score
+     * for itself; before this field the `committed` broadcast carried a bare
+     * score and every acceptor's history kept the number and dropped the
+     * reason. Covered by transaction_canonical_bytes, hence by the entry
+     * hash, the chain link and the quorum-signed window root over them --
+     * see there for why the coverage is conditional.
+     *
+     * APPENDED after prev_hash rather than placed beside the scores: the
+     * struct is mirrored field-for-field in the CFFI declaration
+     * (_native/_ffi.py) and appending keeps every existing field at the
+     * offset the mirror already agrees on. */
+    char   p1_channel[TX_CHANNEL_NAMELEN + 1];
+    char   p2_channel[TX_CHANNEL_NAMELEN + 1];
+    /* A VERIFIER-ATTESTED entry (doc/architecture/reputation.md,
+     * "Verifier-attested scores"): p1 is the verifier, p2 is never set, and
+     * it commits on a quorum certificate rather than on the subject's half.
+     * An ordinary entry names only its two scorers and the subject is "the
+     * other side"; a one-sided entry has none, hence subject_uuid.
+     * evidence_digest names the document the finding rests on. Both are
+     * covered by transaction_canonical_bytes. APPENDED, for the CFFI mirror
+     * (see p1_channel). Mirrors Python Transaction.attested / subject_id /
+     * evidence_digest. */
+    bool   attested;
+    uuid_t subject_uuid;
+    char   evidence_digest[TX_ATTEST_DIGEST_HEX_LEN + 1];
+    /* An attested entry's optional SCOPE (64 lowercase hex, "" for none):
+     * what the attesting application says the finding is about. Keys the
+     * rate cap (one per verifier, subject, channel and scope) and is covered
+     * by transaction_canonical_bytes ONLY when set, so an unscoped entry
+     * hashes as it always did. APPENDED, for the CFFI mirror. Mirrors Python
+     * Transaction.attest_scope. */
+    char   attest_scope[TX_ATTEST_DIGEST_HEX_LEN + 1];
+    /* A ROSTER entry (doc/architecture/reputation.md, "Who is in the group"):
+     * who the group is from the next index on. No scorer, no score. roster_op
+     * is "genesis", "add" or "restate"; roster_uuid the member an add adds
+     * (zero otherwise); roster_digest covers the member list, which is kept
+     * beside the chain in tx_history_t.rosters, keyed by this digest, like a
+     * certificate. Covered by transaction_canonical_bytes. APPENDED, for the
+     * CFFI mirror. Mirrors Python Transaction.roster_op / roster_uuid /
+     * roster_digest. */
+    bool   roster;
+    char   roster_op[TX_ROSTER_OP_LEN];
+    uuid_t roster_uuid;
+    char   roster_digest[TX_HASH_HEX_LEN + 1];
 } transaction_t;
+
+/* Committed: bilateral, or attested and indexed. The one test every reader of
+ * the chain uses, so a one-sided attested entry is not mistaken for a pending
+ * half. */
+static inline bool tx_is_committed(const transaction_t *t)
+{
+    return (t->p1_set && t->p2_set) || (t->attested && t->p1_set && t->index >= 0)
+        || (t->roster && t->index >= 0);
+}
+
+/* The score @p tx holds ABOUT @p peer_uuid, and who gave it (@p author, may be
+ * NULL). An ordinary committed entry is about each side, scored by the other;
+ * an attested one is about its subject only, scored by the verifier in p1.
+ * Returns false when the entry holds no score about the peer. Mirrors Python
+ * Transaction.about. */
+bool transaction_score_about(const transaction_t *tx, const uuid_t peer_uuid,
+                             double *score, uuid_t author);
+
+/* Is @p op one a roster entry may record? */
+bool tx_roster_op_valid(const char *op);
+
+/* The digest of a roster member list (doc/architecture/reputation.md, "Who is
+ * in the group"): blake2b over "AT-ROSTER\0" and one "uuid:key" line per
+ * member, sorted by uuid, lowercase. @p members is a JSON array of [uuid,
+ * signing key hex] pairs. Writes the canonical (sorted, lowercase) list to
+ * @p norm_out when it is not NULL (caller decrefs). Returns 0, or -1 for a
+ * malformed, empty or repeated list. Mirrors Python roster_digest. */
+int roster_digest(const json_t *members, char out[TX_HASH_HEX_LEN + 1],
+                  json_t **norm_out);
+
+/* uuid5(AT_ROSTER_NS, "prev|op|member|digest"), "null" for an absent prev or
+ * member: the task id a roster entry carries, so two members proposing the
+ * same change propose the same value. Mirrors Python roster_task_id. */
+void tx_roster_task_uuid(const uuid_t prev, const char *op, const uuid_t member,
+                         const char *digest, uuid_t out);
+
+/* uuid5(AT_ATTEST_NS, "verifier|subject|digest"): the task id an attested
+ * entry must carry. Mirrors Python attest_task_id. */
+void tx_attest_task_uuid(const uuid_t verifier, const uuid_t subject,
+                         const char *evidence_digest, uuid_t out);
+
+/* uuid5(AT_PAIR_NS, "task|executor"): the reputation task id for ONE
+ * requester-executor pair of a negotiation task. A task fanned out to N
+ * executors is N transactions, each pairing the requester's half about that
+ * executor with that executor's half; under the bare task id the N+1 halves
+ * were paired by arrival and nodes forked (ISSUES §2.50). Used for every task,
+ * since an executor cannot tell a fan-out. Mirrors Python pair_task_id. */
+void tx_pair_task_uuid(const uuid_t task, const uuid_t executor, uuid_t out);
+
+/* True iff @p digest is TX_ATTEST_DIGEST_HEX_LEN lowercase hex chars. */
+bool tx_attest_digest_valid(const char *digest);
 
 /****************************
  * Transaction history (block chain)
@@ -261,7 +468,82 @@ typedef struct {
      * rewrites it (it tracks the tail), so the link survives the sliding
      * window. Mirrors Python TransactionHistory._head_hash. */
     char          head_hash[TX_HASH_HEX_LEN + 1];
+    /* Quorum certificates of attested entries: task uuid_str -> the JSON text
+     * of {voter uuid: signature hex}. OUTSIDE the entry hash, as a
+     * checkpoint's co-signatures are outside its root; dropped on eviction.
+     * Mirrors Python TransactionHistory.attest_certs. */
+    map_t         attest_certs;
+    /* Commit certificates of ORDINARY halves (doc/architecture/reputation.md,
+     * "Commit certificates"): "<task uuid>|<scorer uuid>" -> the JSON text of
+     * {voter uuid: signature hex over commit_designation}. Two per entry, one
+     * per round. Outside the entry hash, like attest_certs; dropped on
+     * eviction. Mirrors Python Transaction.commit_sigs. */
+    map_t         commit_certs;
+    /* Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+     * order"). Committed halves and certified attestations wait in the POOL,
+     * by task, until a decided placement writes their entry; nothing in it is
+     * in chain[], task_map or peer_map, so no score reads it. Bounded FIFO,
+     * oldest first. Mirrors Python TransactionHistory._pool. */
+    transaction_t pool[MAX_CHAIN_LEN];
+    int           pool_len;
+    /* Certificates of pooled entries: "<task>|<scorer>" -> commit certificate
+     * JSON of a half, "<task>" -> quorum certificate JSON of an attestation.
+     * Moved beside the entry when it is placed. */
+    map_t         pool_certs;
+    /* Bumped on every change to the pool, so the process persists it
+     * (reputation-pool.cfg.json) only when there is something new. Mirrors
+     * Python TransactionHistory.pool_rev. */
+    unsigned      pool_rev;
+    /* Decided placements that arrived ahead of the chain: "<first index>" ->
+     * the entries (a tx_decided_t), and "<first index>" -> the placement
+     * certificate JSON. Applied in order. Mirrors Python _decided. */
+    map_t         decided;
+    map_t         decided_sigs;
+    /* Placement certificates: task uuid of a placement's LAST entry -> JSON
+     * {voter: signature hex over place_designation}. Outside the entry hash;
+     * dropped on eviction. Mirrors Python place_certs. */
+    map_t         place_certs;
+    /* The index each of those placements began at: task uuid of its LAST
+     * entry -> integer. Travels with the certificate as "place_from" on the
+     * catch-up wire and in evidence, so a receiver can rebuild the value the
+     * quorum signed. Mirrors Python Transaction.place_from. */
+    map_t         place_from;
+    /* Roster member lists (doc/architecture/reputation.md, "Who is in the
+     * group"): roster digest -> canonical JSON [[uuid, key], ...]. Stored only
+     * after checking the list against its digest. Mirrors the member list a
+     * Python roster Transaction carries. */
+    map_t         rosters;
+    /* A roster taken as in force below every resident roster entry, with no
+     * index ("" for none): its digest, the list in `rosters`. How a
+     * conformance fixture stands for a roster logged before the scenario
+     * starts. Mirrors Python TransactionHistory.roster_anchor. */
+    char          roster_anchor[TX_HASH_HEX_LEN + 1];
 } tx_history_t;
+
+/* Upper bound on the entries one placement decides. Mirrors Python
+ * PLACE_BATCH_MAX. */
+#define PLACE_BATCH_MAX 32
+/* Room for place_value_bytes at its longest. */
+#define PLACE_VALUE_MAX (16 + PLACE_BATCH_MAX * (TX_CANON_MAX + 1))
+/* Room for place_designation: tag, index, two hex digests, separators. */
+#define PLACE_DESIG_MAX (16 + 24 + 2 * TX_HASH_HEX_LEN)
+
+/* tx_history_record_half's outcomes. Mirrors the Python strings. */
+typedef enum {
+    TX_HALF_PENDING = 0,   /* the task has one half */
+    TX_HALF_READY,         /* both: its entry can be placed */
+    TX_HALF_DUP,           /* this scorer's half (or a whole entry) is held */
+    TX_HALF_PLACED,        /* the task is in the chain */
+    TX_HALF_TOMBSTONED     /* it was, and has been evicted */
+} tx_half_status_t;
+
+/* tx_history_apply_placed's outcomes. Mirrors the Python strings. */
+typedef enum {
+    TX_PLACE_APPLIED = 0,  /* written, with any buffered placements after it */
+    TX_PLACE_BUFFERED,     /* ahead of the chain: held until its turn */
+    TX_PLACE_OLD,          /* behind the chain */
+    TX_PLACE_EMPTY         /* no entries */
+} tx_place_status_t;
 
 /*@
   requires \valid(hist);
@@ -292,17 +574,138 @@ int  tx_history_init(tx_history_t *hist);
 */
 void tx_history_destroy(tx_history_t *hist);
 
+/* @p channel is the evidence channel of this score (R+D.md §12.8): NULL or ""
+ * for absent, otherwise one of TX_CHANNEL_ALL. An unknown spelling is REFUSED
+ * (EINVAL) rather than coerced to the default, mirroring Python's
+ * validate_tx_channel raising in Transaction: the channel is part of the entry
+ * hash, so accepting a spelling the group does not share would fork this
+ * node's chain instead of merely mislabelling it. */
 /*@
   requires \valid(hist);
   requires score >= 0.0 && score <= 1.0;
+  requires channel == \null || \valid_read(channel);
   assigns hist->chain[0 .. MAX_CHAIN_LEN - 1],
           hist->chain_len, hist->committed_count,
           hist->next_index, hist->first_index,
           hist->task_map, hist->peer_map;
-  ensures \result == 0;
+  ensures \result == 0 || \result != 0;
 */
+/* Commit a verifier-attested entry. @p tx carries the verifier in p1 (uuid,
+ * score in [0,1], an attestable channel), p2 unset, attested, a subject other
+ * than the verifier, a valid digest, and the derived task id; index and
+ * prev_hash are assigned here. @p cert_json (may be NULL) is the quorum
+ * certificate's JSON text, kept beside the entry. Returns 0, or EINVAL and
+ * changes nothing when the entry is malformed or its task id was ever held.
+ * The quorum is the CALLER's to check. Mirrors Python
+ * TransactionHistory.append_attested. */
+int  tx_history_append_attested(tx_history_t *hist, const transaction_t *tx,
+                                const char *cert_json);
+
+/* The certificate kept for an attested entry (JSON text), or NULL. */
+const char *tx_history_attest_cert(const tx_history_t *hist, const uuid_t task_uuid);
+
+/* Put a committed half in the pool, with its commit certificate JSON
+ * (@p cert_json, may be NULL). Returns a tx_half_status_t, or -1 for a NULL
+ * history or an unknown channel. Nothing here touches the chain. Mirrors
+ * Python TransactionHistory.record_half. */
+int  tx_history_record_half(tx_history_t *hist, const uuid_t task_uuid,
+                            const uuid_t peer_uuid, double score,
+                            const char *channel, const char *cert_json);
+/* Put a certified attested entry in the pool, ready to be placed. Returns 0,
+ * or EINVAL and changes nothing when it is malformed or its task was ever
+ * held. Mirrors Python TransactionHistory.pool_attested. */
+int  tx_history_pool_attested(tx_history_t *hist, const transaction_t *tx,
+                              const char *cert_json);
+/* The pooled entry for @p task_uuid, or NULL. Borrowed. */
+const transaction_t *tx_history_pooled(const tx_history_t *hist,
+                                       const uuid_t task_uuid);
+/* The certificate kept for @p scorer's pooled half of @p task_uuid (for an
+ * attested entry, @p scorer is ignored and its quorum certificate returned),
+ * or NULL. Borrowed. */
+const char *tx_history_pool_cert(const tx_history_t *hist,
+                                 const uuid_t task_uuid, const uuid_t scorer);
+/* Take @p task_uuid out of the pool with its certificates. Returns 0, or -1
+ * when it is not pooled. */
+int  tx_history_pool_drop(tx_history_t *hist, const uuid_t task_uuid);
+/* Up to @p max_out pooled entries that can be placed now, as placement
+ * entries, by task id, into @p out. Returns how many. Mirrors Python
+ * TransactionHistory.ready_items. */
+int  tx_history_ready_items(const tx_history_t *hist, transaction_t *out,
+                            int max_out);
+/* @p in as a placement writes it into @p out: no index or link, and the two
+ * halves of an ordinary entry ordered by scorer uuid. Mirrors Python
+ * placement_entry. */
+void placement_entry(const transaction_t *in, transaction_t *out);
+/* The canonical bytes of a placement's value: @p n placement entries written
+ * at chain indices k, k+1, ... Returns the length, or 0 if @p cap is too
+ * small. Mirrors Python place_value_bytes. */
+size_t place_value_bytes(const transaction_t *entries, int n, int k,
+                         uint8_t *out, size_t cap);
+/* blake2b of place_value_bytes, lowercase hex ("" on failure). */
+void place_value_digest(const transaction_t *entries, int n, int k,
+                        char out[TX_HASH_HEX_LEN + 1]);
+/* The bytes an acceptor signs to certify a placement:
+ * "AT-PLACE\0" k "|" prev_hash "|" digest. Returns the length, or 0 if
+ * @p cap is too small. Mirrors Python place_designation. */
+size_t place_designation(int k, const char *prev_hash, const char *digest,
+                         uint8_t *out, size_t cap);
+/* Write a decided placement, @p n entries at chain indices k, k+1, ...,
+ * exactly as given, with its certificate JSON (@p sigs_json, may be NULL) on
+ * the last. Returns a tx_place_status_t, or -1 for bad arguments. Validity
+ * was settled before the placement was decided. Mirrors Python
+ * TransactionHistory.apply_placed. */
+int  tx_history_apply_placed(tx_history_t *hist, int k,
+                             const transaction_t *entries, int n,
+                             const char *sigs_json);
+/* One past the highest resident index a placement certificate covers, or -1.
+ * Mirrors Python placed_end. */
+int  tx_history_placed_end(const tx_history_t *hist);
+/* The placement certificate kept on @p task_uuid's entry (JSON), or NULL. */
+const char *tx_history_place_cert(const tx_history_t *hist,
+                                  const uuid_t task_uuid);
+/* Keep a roster member list, checked against its digest. Writes the digest to
+ * @p digest_out when not NULL. Returns 0, or -1 for a malformed list. */
+int  tx_history_roster_put(tx_history_t *hist, const json_t *members,
+                           char digest_out[TX_HASH_HEX_LEN + 1]);
+/* The roster in force for instance @p k: the latest resident roster entry
+ * below index @p k, copied to @p out. Returns 0, or -1 when the window holds
+ * none. Mirrors Python TransactionHistory.roster_at. */
+int  tx_history_roster_at(const tx_history_t *hist, int k, transaction_t *out);
+/* The canonical member list (JSON text) kept for @p digest, or NULL. */
+const char *tx_history_roster_members(const tx_history_t *hist,
+                                      const char *digest);
+
+/**
+ * @brief The bytes an acceptor signs to certify ONE half of an ordinary
+ *        commit: "AT-COMMIT\0" scorer "|" task "|" %.17g score "|" channel.
+ *
+ * Lowercase uuids, and the channel normalized (NULL / "" == task_outcome), so
+ * an absent channel and an explicit default are one claim with one signature.
+ * The group is not covered; see Python commit_designation for why.
+ *
+ * @return the designation's length, or 0 if @p cap is too small.
+ */
+size_t commit_designation(const uuid_t scorer, const uuid_t task, double score,
+                          const char *channel, uint8_t *out, size_t cap);
+/**
+ * @brief Keep @p cert_json ({voter: sig hex}) as the commit certificate of
+ *        @p scorer's half of @p task. The caller has verified it.
+ *
+ * Nothing is kept unless the history holds that half of an ordinary entry, so
+ * a certificate cannot outlive or precede what it certifies.
+ *
+ * @return 0 when kept, -1 otherwise.
+ */
+int tx_history_attach_commit_cert(tx_history_t *hist, const uuid_t task,
+                                  const uuid_t scorer, const char *cert_json);
+/** @brief The commit certificate held for @p scorer's half of @p task, as JSON
+ *         text, or NULL. Borrowed: valid until the history next changes. */
+const char *tx_history_commit_cert(const tx_history_t *hist, const uuid_t task,
+                                   const uuid_t scorer);
+
 int  tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
-                       const uuid_t peer_uuid, double score);
+                       const uuid_t peer_uuid, double score,
+                       const char *channel);
 
 /*@
   requires \valid(hist);
@@ -363,6 +766,15 @@ typedef struct {
 int  transaction_window_proof(const tx_history_t *hist, int abs_index,
                               tx_merkle_step_t *steps, int *n_steps);
 
+/* The audit path proving the committed entry at absolute `abs_index` belongs to
+ * the root over indices [first, first + count) -- a CHECKPOINT's window, which
+ * tx_history_range_root computes, rather than the whole resident window.
+ * Returns 0, or -1 unless every index in the range is resident, in order, and
+ * abs_index is inside it. Mirrors Python TransactionHistory._audit_path over
+ * attested_record's window. */
+int  tx_history_range_proof(const tx_history_t *hist, int first, int count,
+                            int abs_index, tx_merkle_step_t *steps, int *n_steps);
+
 /* Fold a leaf entry_hash up its audit path and check it reproduces root_hex.
  * Mirrors Python TransactionHistory.verify_inclusion. */
 bool tx_merkle_verify(const char leaf_hex[TX_HASH_HEX_LEN + 1],
@@ -411,6 +823,108 @@ void tx_history_free(tx_history_t *hist);
 int  tx_history_era_to_json(const tx_history_t *hist, int start_idx, int end_idx,
                             json_t **out);
 int  tx_history_era_from_json(tx_history_t *hist, const json_t *arr);
+
+/** What tx_history_reconcile did. Mirrors Python's ReconcileResult. */
+typedef enum {
+    TX_RECONCILE_NONE = 0,       /**< nothing new: we hold all of it */
+    TX_RECONCILE_EXTENDED,       /**< the peer's chain continued ours */
+    TX_RECONCILE_ADOPTED,        /**< forked; the peer's tip won, ours from `fork` dropped */
+    TX_RECONCILE_KEPT,           /**< forked; our tip won */
+    TX_RECONCILE_REFUSED_FINAL,  /**< forked inside our finalized checkpoint */
+    TX_RECONCILE_REJECTED,       /**< links, a gap, or an impossible duplicate */
+    /** Ordered placement: the peer's CERTIFIED entry differs from one we hold
+     *  inside our own placed prefix. Two quorums signed two values at one
+     *  index; never resolved by rule. */
+    TX_RECONCILE_EQUIVOCATION,
+} tx_reconcile_status_t;
+
+typedef struct {
+    tx_reconcile_status_t status;
+    int fork;      /**< fork index, or -1 */
+    int dropped;   /**< our committed entries removed */
+    int added;     /**< peer entries loaded */
+    /** Copies of the @ref dropped entries, in chain order, or NULL when none
+     *  were dropped. Owned by the result: release it with
+     *  tx_reconcile_result_free. What an adoption drops is what this node's
+     *  caller re-proposes (its own half of each), so a partition's losing
+     *  island keeps the reputation it earned (Agora Phase 4 DDIL). Mirrors
+     *  Python's ReconcileResult.dropped. */
+    transaction_t *dropped_entries;
+    /** Under ordered placement: dropped entries returned to the pool, each
+     *  half with its certificate, to be placed again. */
+    int pooled;
+} tx_reconcile_result_t;
+
+/** Free what a reconcile result owns (its dropped_entries). Safe on a result
+ *  that owns nothing, and idempotent. */
+void tx_reconcile_result_free(tx_reconcile_result_t *res);
+
+/** Reconcile @p hist with a peer's reported chain @p arr by the LONGEST
+ *  VERIFIED CHAIN rule (ISSUES.md §2.15). Entries are taken verbatim. Nothing
+ *  at an index below @p final_end (one past our finalized checkpoint window,
+ *  or -1 for none) is ever rewritten. Returns 0, or an error for a non-array
+ *  or allocation failure; @p out (may be NULL) says what happened. */
+int  tx_history_reconcile(tx_history_t *hist, const json_t *arr,
+                          int final_end, tx_reconcile_result_t *out);
+
+/** A quorum-attested window this node's own entries do NOT reproduce: the
+ *  group finalized a chain ours lost to. */
+typedef struct {
+    char root[TX_HASH_HEX_LEN + 1];
+    int  first_index;
+    int  count;
+} tx_attested_t;
+
+/** tx_history_reconcile, plus: when @p attested is non-NULL and the peer's
+ *  segment reproduces attested->root over its window, the peer wins whatever
+ *  the tips say. An order fork at EQUAL length otherwise goes to the lower
+ *  head hash, which can be the side the quorum outvoted, and it then never
+ *  converges (moderation cohort mod-2538837, 2026-09-23). */
+int  tx_history_reconcile_attested(tx_history_t *hist, const json_t *arr,
+                                   int final_end,
+                                   const tx_attested_t *attested,
+                                   tx_reconcile_result_t *out);
+
+/** tx_history_reconcile_attested for a chain whose group places its order
+ *  (doc/architecture/reputation.md, "Agreeing on an order"). @p certified
+ *  lists the segment's indices whose placement certificates the caller
+ *  verified (@p n_certified of them, any order); NULL means the legacy rule.
+ *  Then: from the first certified index (or our placed end, if lower) on,
+ *  only certified entries are taken; nothing below our placed end is
+ *  rewritten (a certified rival there is TX_RECONCILE_EQUIVOCATION, an
+ *  uncertified one KEPT); past it a certified entry at the fork wins whatever
+ *  the lengths; a gap is crossed only by a segment opening on a certified
+ *  placement, which replaces our window. Mirrors Python
+ *  TransactionHistory.reconcile(certified=...). */
+int  tx_history_reconcile_placed(tx_history_t *hist, const json_t *arr,
+                                 int final_end,
+                                 const tx_attested_t *attested,
+                                 const int *certified, int n_certified,
+                                 tx_reconcile_result_t *out);
+
+/** One placement a catch-up segment carries a certificate for. */
+typedef struct {
+    int  k;                  /**< the index it began at */
+    int  n;                  /**< its entries; 0 when it cannot be completed */
+    bool whole;              /**< every entry came from the segment itself */
+    transaction_t entries[PLACE_BATCH_MAX];
+    const json_t *sigs;      /**< borrowed from the segment */
+} tx_place_batch_t;
+
+/** The placements segment @p arr carries certificates for: an entry with
+ *  "place_sigs" closes the placement begun at its "place_from". One begun
+ *  before the segment is completed from our resident entries when we hold
+ *  them. *@p out is allocated (free it); *@p n_out is its length. The caller
+ *  checks the signatures. Mirrors Python placement_batches. */
+int  tx_history_place_batches(const tx_history_t *hist, const json_t *arr,
+                              tx_place_batch_t **out, int *n_out);
+
+/** Merkle root over our committed entries at indices [first, first + count),
+ *  the value a checkpoint over that window attests. Returns -1 unless every
+ *  index in the range is resident, in order. Mirrors Python's
+ *  TransactionHistory.range_root. */
+int  tx_history_range_root(const tx_history_t *hist, int first, int count,
+                           char out[TX_HASH_HEX_LEN + 1]);
 
 /****************************
  * Reputations map
@@ -561,6 +1075,183 @@ typedef struct {
 int reputation_consensus_by_tier(const tx_history_t *hist, const uuid_t peer_uuid,
                                  const map_t *task_tiers, const map_t *task_weights,
                                  tier_score_t *out, int max_out);
+
+/****************************
+ * Persisted reputation evidence (verifiable warm start)
+ ****************************/
+
+/* `reputation.cfg.json` records a CONCLUSION -- {peer: score} -- and nothing
+ * about how it was reached. Reloading it makes trust durable, not verifiable:
+ * on its own the file says only that some process with write access to the
+ * config directory believed a number, which is as true of a hand-edited file
+ * as of an earned one. The evidence is persisted beside it in
+ * `reputation-history.cfg.json`: the hash-linked committed window plus the
+ * quorum-signed Merkle checkpoint over it.
+ *
+ * ONE file serves BOTH runtimes, so this is plain JSON with the field names
+ * Python's evidence_to_dict writes -- deliberately NOT the C config framework
+ * (whose `typename` envelope Python cannot read) and deliberately NOT the
+ * `task`/`p1`/`p1_set` key names of the tx catch-up wire form. Same reasoning
+ * as the trust ladder (doc/architecture/trust-tiers.md). Mirrors
+ * src/autonomous-trust/.../reputation/reputation.py EVIDENCE_* and
+ * See doc/architecture/reputation.md, warm start.
+ *
+ * The schema is pinned so a future shape change is a refusal to rebuild --
+ * which degrades safely to clamped restoration -- rather than a misparse. */
+#define REP_EVIDENCE_SCHEMA "1"
+#define REP_EVIDENCE_FILE   "reputation-history"
+
+/* Per-(target, slasher) slash high-water marks. A separate file from the chain
+ * evidence deliberately: the evidence is an optimization of trust that a node
+ * can lose harmlessly, while these marks are the memory a replayed slash has to
+ * clear, so the two must not share a failure. */
+#define REP_SLASH_MARKS_FILE "reputation-slash-marks"
+
+/* Hex length of a detached Ed25519 signature (crypto_sign_BYTES * 2). Defined
+ * here rather than only in rep_proc.c because the evidence document carries
+ * these signatures across the file boundary. */
+#define REP_EVIDENCE_SIG_HEX_LEN 128
+
+/** A finalized checkpoint plus the co-signatures that finalized it —
+ *  the C mirror of Python's Checkpoint/SignedCheckpoint pair, flattened
+ *  because C has no need for the two-level object. */
+typedef struct {
+    bool    present;      /**< false when the document carried no checkpoint */
+    char    proposer_uuid[UUID_STRING_LEN + 1];
+    char    root[TX_HASH_HEX_LEN + 1];
+    int64_t epoch;
+    int     first_index;
+    int     count;
+    /** Which chain this checkpoint commits to: "" is the node's PRIMARY chain,
+     *  a group-uuid is one of a gateway's child-group chains. A gateway keeps
+     *  one history per child group, so without this a receiver could not tell
+     *  which of its chains to compare the proposed root against. Mirrors
+     *  Python Checkpoint.group_uuid (doc/architecture/gateway-reputation-tree.md). */
+    char    group_uuid[UUID_STRING_LEN + 1];
+    /** voter uuid-str -> string_data(detached hex signature over the
+     *  checkpoint designation). Same voter-keyed shape as rep_state's
+     *  checkpoint_sigs, and for the same reason: a signature that cannot be
+     *  attributed cannot be counted. */
+    map_t   sigs;
+} rep_checkpoint_t;
+
+/** Initialize (zero + map_init). Every rep_checkpoint_t must be initialized
+ *  before use and released with rep_checkpoint_free. */
+int  rep_checkpoint_init(rep_checkpoint_t *ckpt);
+void rep_checkpoint_free(rep_checkpoint_t *ckpt);
+
+/** Canonical bytes a checkpoint co-signer signs, byte-identical to Python
+ *  `Checkpoint.designation`:
+ *    "AT-CKPT\0" proposer "|" root "|" epoch "|" first_index "|" count
+ *    ["|" group_uuid ]
+ *  `nonce` is excluded on both sides (anti-replay only, carried alongside).
+ *
+ *  @p group_uuid is appended ONLY when non-empty (NULL/"" = the primary chain),
+ *  which does two things at once. A primary-chain designation stays
+ *  byte-identical to what it was before child chains existed, so every existing
+ *  co-signature, pinned corpus scenario and the Python twin keep verifying. And
+ *  a child-chain designation can never collide with a primary one, so a
+ *  co-signature harvested from a child-group round cannot be replayed as
+ *  agreement about the primary chain — which it otherwise could, since two
+ *  chains can perfectly well produce the same root, epoch and bounds.
+ *
+ *  Returns the byte count written, or 0 on truncation/bad input. */
+size_t rep_checkpoint_designation(const char *proposer, const char *root,
+                                  int64_t epoch, int64_t first_index,
+                                  int64_t count, const char *group_uuid,
+                                  uint8_t *out, size_t cap);
+
+/** Build the persisted-evidence document for @p hist and @p ckpt.
+ *
+ *  Only entries with an assigned index are written: an index is what a
+ *  committed bilateral entry has, and an un-indexed one is not evidence of
+ *  anything yet. Pass a @p ckpt with `present == false` (or NULL) to write a
+ *  document whose `checkpoint` is null. Caller owns *out (json_decref). */
+int  reputation_evidence_to_json(const tx_history_t *hist,
+                                 const rep_checkpoint_t *ckpt, json_t **out);
+
+/** Parse a persisted-evidence document into @p hist_out and @p ckpt_out.
+ *
+ *  Returns non-zero on anything malformed — wrong schema, non-array chain, an
+ *  entry with no index — and on a chain whose hash-linkage does not hold. The
+ *  caller treats that as "no usable evidence", which is a SAFE outcome
+ *  (restoration falls back to clamped), so strictness costs nothing here while
+ *  a misparse would cost a great deal.
+ *
+ *  @p hist_out is loaded preserving each entry's on-disk index and prev_hash —
+ *  it must be, or the Merkle root could not be reproduced. */
+int  reputation_evidence_from_json(const json_t *doc, tx_history_t *hist_out,
+                                   rep_checkpoint_t *ckpt_out);
+
+/** Merkle root over the sub-window of @p hist that @p ckpt commits to.
+ *
+ *  The window is selected by ABSOLUTE index rather than taken as the whole
+ *  chain: a persisted chain may legitimately run past its checkpoint (commits
+ *  land after the checkpoint finalizes, and the file is rewritten when the
+ *  fuller co-signature set arrives). It may not fall SHORT — a missing entry
+ *  makes the root unreproducible — so this returns non-zero unless exactly
+ *  `ckpt->count` contiguous entries are present. */
+int  reputation_checkpoint_window_root(const tx_history_t *hist,
+                                       const rep_checkpoint_t *ckpt,
+                                       char out[TX_HASH_HEX_LEN + 1]);
+
+/** Per-peer upper bound on a restored score, derived from the attested window
+ *  and NOTHING else: writes uuid_str -> float_data(ceiling) into @p out.
+ *
+ *  Appearing in an attested window is not the same as having earned a number.
+ *  Verifying only presence leaves the original hole open — a score hand-raised
+ *  in `reputation.cfg.json` is still restored in full, because the peer really
+ *  does transact. So the evidence bounds the VALUE: the mean of the
+ *  counterparty-side scores the window records for the peer, shrunk toward
+ *  PREREP_NEUTRAL by REP_RESTORE_SHRINKAGE_K. Shrinkage is what makes a SHORT
+ *  attested history unable to justify a high score, so a forger cannot mint
+ *  the shortest window that verifies.
+ *
+ *  @p self_uuid_str is excluded (our own score is not a peer judgement); pass
+ *  NULL to include every peer. Mirrors Python
+ *  ReputationProcess._evidence_ceilings. */
+int  reputation_evidence_ceilings(const tx_history_t *hist,
+                                  const rep_checkpoint_t *ckpt,
+                                  const char *self_uuid_str, map_t *out);
+
+/* Committed bilateral transactions a peer needs inside the attested window
+ * before the evidence bounds its score at all; below this it is uncovered and
+ * clamped to the unverified tier. Mirrors RESTORE_EVIDENCE_MIN_TX. */
+#define REP_RESTORE_EVIDENCE_MIN_TX 1
+/* Pseudo-count shrinking the evidence-derived ceiling toward PREREP_NEUTRAL.
+ * This is the security parameter of the whole mechanism: it sets how MUCH
+ * attested history a peer needs before the window can justify an elevated
+ * restored tier. Larger -> more history required. Mirrors Python
+ * RESTORE_SHRINKAGE_K; override with AT_REP_RESTORE_SHRINKAGE_K. */
+#define REP_RESTORE_SHRINKAGE_K_DEFAULT 3.0
+#define REP_RESTORE_SHRINKAGE_K \
+    (reputation_env_double("AT_REP_RESTORE_SHRINKAGE_K", \
+                           REP_RESTORE_SHRINKAGE_K_DEFAULT))
+
+/****************************
+ * Staleness decay (why warm start is safe)
+ ****************************/
+
+/* Earned reputation is a MEMORY, and memory must fade: otherwise a
+ * warm-started score would be trusted forever on the strength of activity
+ * hours or days old. These mirror repprocess.py's REPUTATION_DECAY_*.
+ *
+ * ASYMMETRIC by design: decay only erodes reputation ABOVE the asymptote. A
+ * score at or below it is returned unchanged, because mere absence must never
+ * rehabilitate a distrusted node. */
+#define REP_DECAY_ASYMPTOTE_DEFAULT 0.21   /* just above neutral, above cut-off */
+#define REP_DECAY_ASYMPTOTE \
+    (reputation_env_double("AT_REP_DECAY_ASYMPTOTE", REP_DECAY_ASYMPTOTE_DEFAULT))
+#define REP_DECAY_ONSET      3600.0        /* s idle before decay begins */
+#define REP_DECAY_HALF_LIFE  86400.0       /* s for the above-asymptote gap to halve */
+#define REP_DECAY_SWEEP_INTERVAL 60.0      /* min s between live sweeps */
+
+/** Relax an operational reputation toward almost-neutral as a function of
+ *  idle time. A score at or below REP_DECAY_ASYMPTOTE is returned unchanged;
+ *  above it, the gap decays exponentially after the onset grace period and
+ *  never overshoots below the asymptote. Pure function — mirrors Python
+ *  ReputationProcess._decayed_score. */
+double reputation_decayed_score(double score, double idle_seconds);
 
 /* paxos_id_index is provided by algorithms/paxos.h */
 

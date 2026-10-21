@@ -59,19 +59,25 @@ struct process_s
          * See at_timeout_scale_ms() in utilities/timeout.h. Indices align
          * with peers[] and are covered by the same rwlock. */
         int peer_rtt_ms[DEFAULT_MAX_PEERS];
+        /* Parallel array: the network process has heard nothing from
+         * peers[i] for AT_PRESENCE_ABSENT_SEC (PEER_PRESENCE,
+         * doc/architecture/peer-presence.md). Advisory: the peer stays on the
+         * roster and in every quorum; negotiation stops inviting it. Indices
+         * align with peers[] and are covered by the same rwlock. */
+        bool peer_absent[DEFAULT_MAX_PEERS];
         map_t *peer_capabilities;
         int phase;
         array_t *unhandled_messages;
-        /* Border-guard flag (identity process only; ISSUES.md §3.1-c).
+        /* Border-guard flag (identity process only; doc/architecture/identity-protocol.md).
          * Mirrors Python IdentityProcess.border_guard_mode. When true (the
          * default, set in identity_register_handlers) this peer welcomes
          * newcomers AND votes on received proposals; when false it abstains
          * from voting (Policy B — border-guards-only). Non-identity
          * processes never read it. */
         bool border_guard_mode;
-        /* Two-phase admission quorum (identity process only; ISSUES.md
-         * §3.1-a). Mirrors Python IdentityProcess._admission_quorum. A member
-         * withholds the group key from a peer until this many DISTINCT
+        /* Two-phase admission quorum (identity process only;
+         * doc/architecture/identity-protocol.md). Mirrors Python
+         * IdentityProcess._admission_quorum. A member withholds the group key from a peer until this many DISTINCT
          * border-guards have confirmed the admission. Default 1 (set in
          * identity_register_handlers) = promote on first confirm = historical
          * behavior. Non-identity processes never read it. */
@@ -137,6 +143,24 @@ static inline void peers_write_unlock(process_t *proc)
 }
 
 #define SIG_NAME_LEN PROC_NAME_LEN + 2
+
+/* How many queued messages one pass of a process loop may take before it goes
+ * back to its per-tick work.
+ *
+ * A process loop that takes ONE message per cadence tick drains at ~2/s while
+ * every sender writes into an AF_UNIX SOCK_DGRAM queue holding 10
+ * (net.unix.max_dgram_qlen) with MSG_DONTWAIT — so a burst of more than ten
+ * inside a tick is simply lost, and the sender's only sign of it is an EAGAIN
+ * most callers drop. That is not a theoretical backlog: in the P3.3 staff
+ * cohort it lost an admitted PEER handoff (leaving the network process unable
+ * to place a peer whose every frame it then deferred) and, once that was
+ * fixed, showed up again as dozens of inbound frames refused by the identity,
+ * negotiation and reputation queues in a single run.
+ *
+ * The bound keeps a flooded queue from starving a loop's periodic work, and
+ * sits far above the kernel's queue depth so that in practice a tick empties
+ * what is waiting. */
+#define PROC_DRAIN_MAX 64
 
 /*@
   requires name != \null && \valid_read(name);
@@ -229,6 +253,22 @@ int start_process(char *pname, handler_ptr_t runner, map_t *configs, tracker_t *
 
 int restart_process(pid_t orig, char *pname, proc_context_t *ctx);
 
+/**
+ * @brief Is a started subsystem still running?
+ *
+ * The pid a subsystem was started under (start_process) answers kill(pid, 0)
+ * for a forked child; for an in-process subsystem it names a thread, and a
+ * finished thread is reaped here.
+ * @return 1 running, 0 gone, -1 on an error probing it (errno set).
+ */
+int process_liveness(pid_t id);
+
+/**
+ * @brief Stop a subsystem that ignored the quit signal: SIGKILL for a child.
+ *        A thread cannot be killed; it is logged and ends with the process.
+ */
+void process_force_stop(pid_t id, logger_t *logger);
+
 
 /**
  * @brief 
@@ -305,9 +345,11 @@ extern const long cadence;
 */
 bool keep_running(const process_t *proc, queue_t *sig_q, logger_t *logger);
 
+/** Sleep out the rest of this pass's @p how_long, after one drain of the
+ *  process's kept one-shot frames (utilities/send_retry.h): every loop calls
+ *  this once per tick, so that is where they are retried. */
 /*@
   requires \valid(proc);
-  assigns \nothing;
 */
 void sleep_until(const process_t *proc, long how_long);
 
@@ -319,6 +361,33 @@ void sleep_until(const process_t *proc, long how_long);
   ensures \result == \true || \result == \false;
 */
 bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, generic_msg_t *msg);
+
+/**
+ * @brief Forget the peer @p uuid: remove it from peers[] and its slot in the
+ * parallel peer_rtt_ms[], keeping the others in order.
+ *
+ * The inverse of what a PEER message does, and the only way out of peers[],
+ * which used to be append-only. Takes the peers write lock. Safe because no
+ * process keeps a peers[] INDEX across an unlock -- every per-peer array
+ * outside this struct is a stack snapshot taken under the read lock.
+ *
+ * The removed entry's operator_key_binding is not freed: entries are
+ * memcpy'd between messages and processes, so no one copy owns that pointer.
+ *
+ * @return true if a peer was removed, false if none matched.
+ */
+bool processes_remove_peer(process_t *proc, const unsigned char *uuid);
+
+/**
+ * @brief Whether @p peer counts in consensus: it is in the address map of this
+ * node's group or of a child group it gateways.
+ *
+ * A first-contact direct peer is in peers[] but in no group, so it never sizes
+ * a quorum or an admission, signs into one, or enters a logged roster (R+D.md
+ * §13.5 D2). While no group holds a member map, every peer counts. Caller
+ * holds the peers read lock.
+ */
+bool processes_peer_is_member(const process_t *proc, const public_identity_t *peer);
 
 /**
  * @brief Context for split process setup/loop lifecycle

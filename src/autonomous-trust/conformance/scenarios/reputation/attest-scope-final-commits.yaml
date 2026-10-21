@@ -1,0 +1,39 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-scope-final-commits
+byte_pinning: false
+description: |
+    A scoped attestation commits with its scope, and the scope is part of the
+    committed fact: it is in the designation the quorum signed and in the
+    entry's canonical bytes, after the evidence digest. The bytes are pinned
+    by attest-scope-entry-canonical-bytes, since a pooled entry is hashed only
+    when it is placed.
+
+    A committed attestation waits in the pool for its placement, as every
+    entry does now that every group places its order.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest final
+    payload:
+      subject: carol
+      score: 0.3
+      scope: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      cosigners: [alice, bob]
+    description: alice broadcasts a certified, scoped attestation about carol.
+
+expected_state:
+  bob:
+    committed_tx_count: 0
+    pool_count: 1

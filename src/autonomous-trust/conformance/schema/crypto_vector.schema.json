@@ -19,7 +19,8 @@
         "nacl_box",
         "nacl_box_open",
         "nacl_secretbox",
-        "nacl_secretbox_open"
+        "nacl_secretbox_open",
+        "relay_roster_verify"
       ]
     },
     "input": {

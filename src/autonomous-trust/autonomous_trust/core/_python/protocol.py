@@ -21,8 +21,10 @@ import icontract
 
 from .system import CfgIds, QueueType
 from .util import ClassEnumMeta
-from .identity import Group, ChildGroupSet, Peers
+from .identity import Group, ChildGroupSet, Peers, PeerStanding
+from .identity.peer_standing import standing_source_valid
 from .network import Message
+from .network.presence import PeerPresence
 from .capabilities import Capabilities, PeerCapabilities
 
 
@@ -38,6 +40,16 @@ class Protocol(object, metaclass=ClassEnumMeta):
         # Empty on leaf nodes; kept separate from self.group so the
         # primary/parent group slot is never clobbered.
         self.child_groups = {}
+        # "<peer-uuid>|<source>" -> PeerStanding, propagated from IdentityProcess
+        # (doc/architecture/zta-integration.md). This node's OWN findings about its peers, never
+        # anything a peer asserted about itself; reputation reads it to bound
+        # a peer whose credential ZTA has not actually proved.
+        self.peer_standing = {}
+        # Peer uuids (str) the network process has heard nothing from lately
+        # (PeerPresence, doc/architecture/peer-presence.md). Advisory: they
+        # stay on every roster and in every quorum; negotiation stops inviting
+        # them.
+        self.absent_peers = set()
         if configurations is not None:
             if CfgIds.peers in configurations:
                 self.peers = configurations[CfgIds.peers]
@@ -55,10 +67,41 @@ class Protocol(object, metaclass=ClassEnumMeta):
     @icontract.require(lambda message: message is not None)
     def run_message_handlers(self, queues: dict[str, QueueType], message: Message):
         if isinstance(message, Group):
+            # Name the key a sibling installs when it changes, so a process
+            # left on a stale key is visible beside identity's rotation lines.
+            # Mirrors the C GROUP handler in processes.c.
+            was = self.group
+            now_key = message.encryptor.publish()[:16].decode()
+            was_key = (was.encryptor.publish()[:16].decode() if was is not None
+                       else '0' * 16)
+            was_epoch = was.key_epoch if was is not None else 0
+            if now_key != was_key or message.key_epoch != was_epoch:
+                self.logger.info('%s: installed group key %s… epoch %d (was %s… epoch %d)',
+                                 self.proc_name, now_key, message.key_epoch,
+                                 was_key, was_epoch)
             self.group = message
+            return True
+        if isinstance(message, PeerPresence):
+            if message.present:
+                self.absent_peers.discard(str(message.peer_uuid))
+            else:
+                self.absent_peers.add(str(message.peer_uuid))
             return True
         if isinstance(message, ChildGroupSet):
             self.child_groups = message.groups
+            return True
+        if isinstance(message, PeerStanding):
+            # Last writer wins WITHIN ONE AUTHORITY, deliberately: findings
+            # arrive in the order they are learned, so the newest verdict from
+            # a given source is the current one (doc/architecture/zta-integration.md).
+            # Keyed per (peer, source) -- a ZTA re-verification must not lift a
+            # bound some other authority placed on the same peer.
+            if not standing_source_valid(message.source):
+                self.logger.warning(
+                    'refusing a standing about %s from unknown authority %r',
+                    message.peer_uuid[:8], message.source)
+                return True
+            self.peer_standing[message.key] = message
             return True
         if isinstance(message, Peers):
             self.peers = message

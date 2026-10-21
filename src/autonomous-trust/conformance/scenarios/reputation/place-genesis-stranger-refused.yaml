@@ -1,0 +1,40 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: place-genesis-stranger-refused
+byte_pinning: false
+description: |
+    Membership recorded in the chain (doc/architecture/reputation.md, "Who is
+    in the group"). A genesis naming a member bob does not see is refused.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  roster: {}          # an unfounded chain: no roster in force
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: place
+    payload:
+      k: 0
+      ballot: {n: 5, by: alice}
+      head: ""
+      value:
+        - {roster: genesis, members: [alice, bob, stranger]}
+  - id: 2
+    from: bob
+    to: alice
+    function: place accepted
+    in_response_to: 1
+    expect_none: true
+    payload: {}

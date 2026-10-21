@@ -1,0 +1,37 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-final-placing-sub-quorum-refused
+byte_pinning: false
+description: |
+    Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+    order"). An attestation short of its quorum is not pooled: only the
+    verifier signed.
+    Placement-mode twin of attest-final-sub-quorum-refused.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+fixtures: {}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest final
+    payload:
+      subject: carol
+      score: 0.3
+      channel: probe
+      cosigners: [alice]
+
+expected_state:
+  bob:
+    committed_tx_count: 0
+    chain_tasks: []
+    pool_count: 0

@@ -1,0 +1,37 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: placed-before-genesis-refused
+byte_pinning: false
+description: |
+    Membership recorded in the chain (doc/architecture/reputation.md, "Who is
+    in the group"). An ordinary placement learned on a chain with no roster
+    has nothing to be judged by: signed by everyone, it is still not written.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  roster: {}          # an unfounded chain: no roster in force
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: placed
+    payload:
+      k: 0
+      value:
+        - {task_id: t-1, p1: carol, p1_score: 0.9, p2: dave, p2_score: 0.7}
+      signers: [alice, bob, carol, dave]
+
+expected_state:
+  bob:
+    committed_tx_count: 0

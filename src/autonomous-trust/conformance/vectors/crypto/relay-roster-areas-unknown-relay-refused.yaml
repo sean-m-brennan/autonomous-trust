@@ -1,0 +1,16 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: crypto_vector
+protocol: network
+name: relay-roster-areas-unknown-relay-refused
+description: Areas may name only the roster's own relays; a hub it does not list refuses the whole roster, as an unpinned entry does.
+primitive: relay_roster_verify
+input:
+  roster: '{"body":"{\"v\":1,\"typename\":\"at-relay-roster\",\"issuer\":\"48075a597e721a156e2e0799de5cc0c5324dc6e7eaf1cdd46250868ec53215dd\",\"seq\":4,\"relays\":[\"relay://00000000-0000-4000-8000-000000000001:abababababababababababababababab@198.51.100.1:27790\",\"relay://00000000-0000-4000-8000-000000000002:abababababababababababababababab@198.51.100.2:27790\"],\"areas\":{\"relay://00000000-0000-4000-8000-000000000009:abababababababababababababababab@198.51.100.9:1\":[\"u4pr\"]}}","sig":"a34c1a84afa19c6cb6262391fd9c2242fb0d47c989506fcf0db3b7fa40e69a019af13eb8cd7122b3e5033f2dbfc7a5adaec104374f22301ecdd222c2c4099d0c"}'
+  issuers:
+  - 48075a597e721a156e2e0799de5cc0c5324dc6e7eaf1cdd46250868ec53215dd
+expected:
+  valid: false

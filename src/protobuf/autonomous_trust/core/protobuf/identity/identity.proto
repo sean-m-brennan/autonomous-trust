@@ -112,6 +112,19 @@ message Identity {
   repeated ZtaCredential zta_credentials = 16;
 }
 
+// Which envelope encoding a group's members speak (ISSUES.md §2.3). Mirrors
+// Python's NetWireFormat and C's net_wire_format_t; the JSON group wire form
+// carries the same choice as the lowercase strings "json" / "proto".
+//
+// NET_WIRE_JSON is 0 SO THAT IT IS FREE: proto3 omits default-valued fields, so
+// a JSON group encodes to exactly the bytes it did before this field existed
+// and every byte-pinned group vector stays valid. It is also the right default
+// on read -- a group from a peer that predates this field is a JSON group.
+enum NetWireFormat {
+  NET_WIRE_JSON = 0;
+  NET_WIRE_PROTO = 1;
+}
+
 message Group {
   bytes uuid = 1;
   string address = 2;  // Legacy single address (first of address_map); kept so
@@ -125,4 +138,27 @@ message Group {
   // Group age for the merge size-tie tiebreaker (§3.1-b): epoch seconds, or 0
   // when unknown. Mirrors the canonical JSON `created`.
   double created = 5;
+  // The envelope encoding this group's members speak (§2.3). Group-carried
+  // rather than per-node so a cohort cannot end up half in one format: a
+  // joiner adopts this at admission, and AT_NET_WIRE_MODE only stamps a group
+  // its node MINTS. Absent/0 = json.
+  NetWireFormat wire_format = 6;
+  // 7 and 8 were commit_certificates and ordered_placement, retired
+  // 2026-10-16: every group places its order and certifies its commits
+  // (doc/architecture/reputation.md, "Agreeing on an order").
+  reserved 7, 8;
+  reserved "commit_certificates", "ordered_placement";
+  // ON-NODE ONLY: the C identity process's GROUP hand-off to its sibling
+  // processes, which never leaves the node. Never set these on a wire
+  // encoding: previous_keys holds retired PRIVATE keys. A sibling needs both
+  // to decrypt a frame sent under a key it retired in the last
+  // GROUP_PREVIOUS_KEY_GRACE seconds (group_decrypt), and to log the epoch it
+  // holds. Absent = epoch 0, nothing retired, so a group that has never
+  // rotated encodes to the bytes it did before these fields.
+  message RetiredKey {
+    bytes secret = 1;       // the raw box private key
+    double retired_at = 2;  // epoch seconds
+  }
+  int64 key_epoch = 9;
+  repeated RetiredKey previous_keys = 10;  // newest first
 }

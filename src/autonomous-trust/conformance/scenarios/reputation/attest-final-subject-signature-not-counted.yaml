@@ -1,0 +1,35 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-final-subject-signature-not-counted
+byte_pinning: false
+description: |
+    The subject's signature never counts toward an attestation's quorum.
+
+    alice's finalizer carries her own signature and carol's, and carol is the
+    subject. Two signatures, but one of them is the party the entry is about,
+    and its consent is not what the quorum measures. bob counts one, which is
+    short of a majority of the two non-subjects, and refuses.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest final
+    payload:
+      subject: carol
+      score: 0.3
+      cosigners: [alice, carol]
+    description: a finalizer whose second signature is the subject's.
+
+expected_state:
+  bob:
+    committed_tx_count: 0

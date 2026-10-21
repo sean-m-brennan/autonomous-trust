@@ -55,12 +55,54 @@ protobuf_src=src/protobuf
 protobuf_py_dir=src/autonomous-trust
 protobuf_py=$protobuf_py_dir/autonomous_trust/core/protobuf
 
-protoc --python_out=$protobuf_py_dir -I $protobuf_src $(find $protobuf_src -name "*.proto")
-leaves=$(find $protobuf_py -type d | sort -r | awk 'index(a,$0)!=1{a=$0;print}' | sort)
-for leaf in $leaves; do
-  touch "$leaf/__init__.py"
-done
-touch "$protobuf_py/__init__.py"
+# Check protoc's status explicitly. This script does not run under `set -e`,
+# and the steps below it (touch, and the sdist build) succeed regardless, so
+# without this a missing protoc or a malformed .proto exits 0 while leaving the
+# bindings untouched -- callers see success and go on to build or test against
+# the PREVIOUS .proto.
+if ! protoc --python_out=$protobuf_py_dir -I $protobuf_src $(find $protobuf_src -name "*.proto"); then
+  echo "ERROR: protoc failed; the Protobuf interfaces in" >&2
+  echo "  $protobuf_py" >&2
+  echo "  are unchanged and do NOT reflect $protobuf_src." >&2
+  echo "  protoc: $(command -v protoc || echo 'not found on PATH')" >&2
+  echo "  It is supplied by the 'autonomous_trust' env via libprotobuf." >&2
+  exit 1
+fi
+# protoc emits no __init__.py, so every directory of the generated tree needs
+# one seeded here to be importable.
+#
+# Two things this must get right, both learned the hard way:
+#   - NEVER seed one into a __pycache__. That makes __pycache__ an importable
+#     package, and `PackageHash` (core/_python/system.py) walks core with
+#     pkgutil.walk_packages, so it imports it -- writing a NESTED
+#     __pycache__/__pycache__, which the next run of this script then seeds in
+#     turn. That ratchet added one level per run and reached 33 levels / 315
+#     stray __init__.py. Worse, each stray file joins the walked module set, so
+#     the package digest came to depend on how many times this script had run:
+#     two nodes off identical source disagreed, and idprocess.py rejects a
+#     mismatched digest as a counterfeit peer.
+#   - Seed EVERY directory, not just the leaves. The former leaves-only scan
+#     silently stopped seeding the real package dirs from run 2 onward, because
+#     once a __pycache__ exists it is the leaf and its parent no longer is.
+while IFS= read -r -d '' dir; do
+  touch "$dir/__init__.py"
+done < <(find "$protobuf_py" -type d -name '__pycache__' -prune -o -type d -print0)
+
+# The DTN extension's µD3TN AAP 2.0 bindings (src/autonomous-trust-dtn), from
+# the vendored schema its C twin also builds from. A single module, beside the
+# backend that imports it, so no __init__.py seeding.
+aap2_src=src/c/extensions/dtn/proto
+aap2_py=src/autonomous-trust-dtn/autonomous_trust/dtn/_python
+if [[ -f $aap2_src/aap2.proto ]]; then
+  if ! protoc --python_out=$aap2_py -I $aap2_src $aap2_src/aap2.proto; then
+    echo "ERROR: protoc failed on $aap2_src/aap2.proto; $aap2_py/aap2_pb2.py is unchanged." >&2
+    exit 1
+  fi
+else
+  # The schema is a symlink into the ud3tn submodule.
+  echo "WARNING: $aap2_src/aap2.proto is missing (git submodule update --init" >&2
+  echo "  src/c/third_party/ud3tn); the DTN extension's ud3tnv2 backend will refuse to open." >&2
+fi
 
 if [[ "$*" != *"proto-only"* ]]; then
   # Create and extract distros
@@ -68,6 +110,11 @@ if [[ "$*" != *"proto-only"* ]]; then
   mkdir -p dist
   dist_dir=$(cd dist; pwd)
   poetry build --format sdist -C src/autonomous-trust -o $dist_dir
+  poetry build --format sdist -C src/autonomous-trust-oracle -o $dist_dir
+  poetry build --format sdist -C src/autonomous-trust-zta -o $dist_dir
+  poetry build --format sdist -C src/autonomous-trust-rendezvous -o $dist_dir
+  poetry build --format sdist -C src/autonomous-trust-first-contact -o $dist_dir
+  poetry build --format sdist -C src/autonomous-trust-dtn -o $dist_dir
   poetry build --format sdist -C src/autonomous-trust-inspector -o $dist_dir
   poetry build --format sdist -C src/autonomous-trust-services -o $dist_dir
   poetry build --format sdist -C src/autonomous-trust-simulator -o $dist_dir

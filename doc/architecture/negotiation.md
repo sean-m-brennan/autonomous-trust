@@ -1,26 +1,43 @@
-[< Identity Protocol](identity-protocol.md)
+*Previous: [Rendezvous](rendezvous.md)*
 
-# Task Negotiation
+# Getting work done
 
-The negotiation subsystem handles distributed task assignment, parameter haggling, execution monitoring, and result collection.
+Membership is not the point. A node joins a group so that work can be shared,
+and the negotiation subsystem is where the sharing actually happens: somebody
+wants something done, finds the peers able to do it, agrees terms with them,
+waits, and collects the answer.
 
-## Protocol messages
+We call it negotiation rather than dispatch on purpose. A worker here is not a
+subordinate. It can decline, it can counter-propose, and it can be found
+unauthorized partway through and dropped. The requester has no power to compel
+anything, because there is no authority for it to borrow, so every task is an
+agreement between two parties who each keep a veto.
+
+That framing produces the second thing this chapter is about. Because the worker
+decides for itself whether to accept, the decision is the place where trust
+becomes operational. A worker checks whether it holds the capability, whether
+the requester stands high enough to ask for it, and whether the request looks
+like a flood. All three are refusals the worker issues on its own judgment, with
+nothing consulted outside the node.
+
+## The task lifecycle
+
+A task moves through a small number of states, and these are the messages that
+move it.
 
 | Message | Constant | Direction | Purpose |
 |---------|----------|-----------|---------|
-| `spawn task` | `start` | main -> negotiation | Local: initiate a new task |
-| `invitation` | `announce` | requester -> capable peers | Invite peers to execute a task |
-| `haggle` | `response` | peer -> requester | Counter-propose modified parameters |
-| `task info` | `task` |, | (reserved) |
-| `ack` | `acceptance` | peer -> requester | Peer accepts the task |
-| `nack` | `refusal` | peer -> requester | Peer refuses the task |
-| `status request` | `status_req` | requester -> peer | Check long-running task status |
-| `status response` | `status_resp` | peer -> requester | Report task execution status |
-| `report results` | `result` | peer -> requester | Deliver task results |
+| `spawn task` | `start` | main to negotiation | Local: initiate a new task |
+| `invitation` | `announce` | requester to capable peers | Invite peers to execute a task |
+| `haggle` | `response` | peer to requester | Counter-propose modified parameters |
+| `ack` | `acceptance` | peer to requester | Peer accepts the task |
+| `nack` | `refusal` | peer to requester | Peer refuses the task |
+| `status request` | `status_req` | requester to peer | Check a long-running task |
+| `status response` | `status_resp` | peer to requester | Report execution status |
+| `report results` | `result` | peer to requester | Deliver task results |
 
-## Task lifecycle
-
-The diagram below is generated from `conformance/scenarios/negotiation/negotiation-canonical.yaml` by `scripts/build-docs.sh`: it cannot drift from the executable corpus. The canonical pins the invite → ack → poll happy path; the rest of the protocol (refuse, haggle, result reporting) is documented as separate scenarios linked below.
+The happy path below is generated from a conformance scenario by the
+documentation build, so it cannot drift from the executable corpus.
 
 <!-- at_diagram:start protocol=negotiation scenario=negotiation-canonical -->
 ```mermaid
@@ -38,46 +55,267 @@ sequenceDiagram
 ```
 <!-- at_diagram:end -->
 
-**Channel semantics.** `invitation`, `ack`, `nack`, `haggle`, `status request`, `status response`, and `report results` all travel on the **encrypted peer-to-peer channel** between the requester and each worker. The local `spawn task` hop (Main Orchestrator → NegotiationProcess) is in-process via the IPC queue, not on the wire.
+Every message above except the first travels on the encrypted peer-to-peer
+channel between the requester and each worker. The first hop, from the
+orchestrator to the negotiation process, is in-process over the queue rather
+than on the wire.
 
-**Refuse branches** (not in the canonical, pinned by separate scenarios):
+Fan-out works from capability rather than from a roster. A locally spawned task
+arrives at the negotiation process, which registers it and sends invitations to
+every peer whose registered capabilities include the one the task needs. Nobody
+is invited who could not have done the work.
 
-- **Not capable.** If the worker doesn't have the requested capability registered, `handle_invite` short-circuits and emits `nack`. Trace: [`invite-refuse-not-capable.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-refuse-not-capable.yaml).
-- **Below required tier.** The worker derives the sender's trust tier from reputation and refuses if `sender_tier < capability.required_tier` (`handle_invite`, negprocess.py:178-179). A capability with `required_tier = 0` admits everyone; higher-tier capabilities gate out low-tier/low-reputation peers. The **local** `Capability` is the authoritative source of `required_tier`: a serialized one off the wire is not trusted. (AT v1 used a binary "peer level 0 ⇒ refuse" floor: still pinned by `invite-refuse-low-rep.yaml`; the gate is now the per-capability tier comparison.) Traces: [`invite-refuse-low-rep.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-refuse-low-rep.yaml), [`invite-refuse-below-required-tier.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-refuse-below-required-tier.yaml). See [Trust Tiers §7](trust-tiers.md).
-- **Flood threshold.** Past `max_task_duplicates = 5` invites of the same task uuid, `handle_invite` emits `nack` and short-circuits (refuse-and-return). The flood counter persists across admissions (BUGS.md §P7) and is canonical AT v1 behavior on both Python and C. Trace: [`invite-flood-past-threshold.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-flood-past-threshold.yaml).
+Several steps are part of the protocol and never appear on the wire. Having
+accepted, the worker pushes the task onto a priority queue ordered by scheduled
+execution time. When the scheduled moment arrives it pops the task, runs the
+capability, and the answer flows back out as a report. It also submits its own
+half of the bilateral transaction — its claim to have done the job, which is
+worth whatever the requester's score for the same task says it was worth.
 
-**Haggle branch.** When the worker's parameters disagree with the requester's (timing window or content), `handle_invite` emits `haggle` carrying a counter-proposed `Task`. The requester's `handle_haggle` either re-announces with the adjusted parameters (if `flexible: true`) or cancels the participant. Trace: [`invite-haggle-counterprop.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-haggle-counterprop.yaml).
+On the requester side a returned result is scored and the score goes to the
+reputation process, which is where the negotiation and reputation protocols
+compose end to end. Two things ride along with that score. The capability that
+produced it, so the reputation process can apply that capability's configured
+transaction weight rather than a default of one. And the evidence channel, being
+how the number was arrived at, which keeps a failed proof, a failed known-answer
+challenge and a task that simply came back empty distinguishable downstream when
+all three are the same number.
 
-**Result reporting.** When the worker completes the task, it emits `report results` carrying the `TaskResult` (and ZKP where applicable). The requester's `handle_results` records the per-peer result, forwards to the main queue when all participants have reported, then deletes the `my_tasks` entry so further results are rejected. Trace: [`report-results-forwarded.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/report-results-forwarded.yaml).
+The judgment reads the challenge from the requester's own retained record of the
+task, never from anything on the reply. That is not a defensive nicety, it is
+the whole property. A peer that computed the wrong answer would report the
+challenge its answer *does* satisfy, so a check that trusted the reply's account
+of what was asked would verify nothing at all.
 
-**Spawn fan-out.** A locally-spawned task hits the negotiation process via the main → negotiation queue with `function: spawn task`. The handler registers the task in `my_tasks` and fan-outs `invitation` messages to every peer whose capabilities include the task's capability. Trace: [`spawn-task-fanout.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/spawn-task-fanout.yaml).
+The two runtimes place that scoring differently, and the difference is worth
+knowing when reading either one. Python scores in its orchestrator, which is
+also where it verifies any proof attached to the result. C scores in its
+negotiation process, because that is where C keeps the requester's record; its
+orchestrator is a router that knows nothing about capabilities, and moving the
+capability and the challenge to it would have meant widening an inter-process
+struct to carry a fact that was already in hand. What the conformance corpus
+pins across the two is therefore the scoring rules rather than a shared call
+site. C attaches no proofs, so it always takes the arm Python takes when proofs
+are unavailable: score on completion, and say so.
 
-**Internal steps not on the wire** (omitted from the diagram, but part of the protocol):
+## Three ways to say no
 
-- After receiving `invitation` and emitting `ack`, the worker's `_add_task` pushes the task onto its `JobQueue` priority queue, ordered by scheduled execution time.
-- When `now() >= job.when`, the worker pops the task and hands it to its Main Orchestrator for capability execution. The result (with ZKP) flows back into the negotiation process before being emitted as `report results`.
-- The requester's Main Orchestrator submits a `TransactionScore` to the Reputation process after verifying the ZKP: that's where the Negotiation and Reputation protocols compose end-to-end.
+A worker refuses for three distinct reasons, and the distinctions matter because
+each one guards something different.
 
-**Tier loss and task cancellation.** When ReputationProcess demotes a peer it emits a `tier_lost` IPC, which NegotiationProcess handles in `handle_tier_lost` (negprocess.py:342). It walks two surfaces and cancels work the demoted peer is no longer authorised for: `task_stack` (jobs I scheduled to run on the peer's behalf) and `my_tasks` (trackers for tasks I requested from the peer). A task/participant is dropped when its `capability.required_tier` now exceeds the peer's new tier. This keeps the tier gate enforced for the *lifetime* of a task, not just at invite time. Trace: [`tier-loss-cancels-running-task.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/tier-loss-cancels-running-task.yaml). See [Trust Tiers §7](trust-tiers.md).
+Firstly, *not capable*. If the worker has not registered the requested
+capability, it refuses immediately. This is bookkeeping rather than judgment,
+and it catches stale capability maps rather than adversaries.
 
-**Replay idempotency.** Re-delivering the same `invitation` is canonical and survives: the flood counter advances but the task admission is unchanged. Trace: [`invite-replay-survives.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-replay-survives.yaml).
+Second, *below the required tier*. The worker derives the trust tier of the
+sender from reputation and refuses when that tier falls short of what the
+capability requires. A capability declaring a required tier of zero admits
+everyone; higher-tier capabilities gate out peers with low standing. One detail
+carries the security of this check. The authoritative source of the required
+tier is the *local* capability definition, never a serialized one arriving off
+the wire, because a requester that could name the tier its own request requires
+would face no gate at all.
 
-## Key components
+Third, *flood threshold*. Past five invitations carrying the same task
+identifier, the worker refuses and stops processing that invitation. The counter
+persists across admissions, so a peer cannot reset it by leaving and rejoining.
+It counts *distinct* invitations, since a replayed one is turned away earlier,
+by the freshness check described below, and never reaches the counter at all.
 
-### JobQueue
+Refusal is not the only alternative to acceptance. When the parameters the
+worker would prefer disagree with the ones the requester sent, whether over
+timing or over content, the worker haggles, sending back a counter-proposed
+task. The requester then either re-announces with the adjusted parameters, if
+the task was declared flexible, or cancels that participant.
 
-A priority queue of `Job` objects ordered by scheduled execution time. Tasks are popped when `now() >= job.when`. Duplicate tasks are limited to `max_task_duplicates` (5) to prevent spam.
+## The gate holds for the life of the task
 
-### PeerCapabilities
+Checking the trust tier at invitation time alone would leave an obvious hole. A
+task that runs for an hour would be authorized by standing the peer held an hour
+ago, and a peer demoted meanwhile would go on working under an authorization it
+no longer merits.
 
-Maps capability names to lists of peer UUIDs. When a task is started, the negotiation process looks up which peers have registered the required capability and sends invitations only to those peers.
+So demotion reaches into running work. When the reputation process demotes a
+peer, it emits a notification that the negotiation process handles by walking
+two surfaces, being the jobs this node scheduled on behalf of the demoted peer
+and the trackers for tasks this node requested from it. Any task whose
+capability now requires a tier above what the peer holds is dropped.
 
-### TaskTracker
+This is the principle the whole framework runs on, applied one level down. Trust
+is a live value, so an authorization derived from trust has to be live too, and
+an authorization that was correct when granted is not thereby correct now.
 
-Tracks outstanding remote tasks by UUID, storing expected results per peer. A task is complete when results from all expected participants are collected.
+## When a task goes quiet
 
-### Spam protection
+The requester keeps a tracker for each task it asked for, until every invitee
+has answered. A participant that never answers would keep that tracker alive
+forever, so the requester runs a deadline sweep.
 
-Once a peer sends more than `max_task_duplicates` (5) duplicate invitations for the same task uuid, `handle_invite` emits `nack` and short-circuits further processing for that invite. The per-task flood counter persists across admissions (BUGS.md §P7) and is canonical AT v1 behavior on both Python and C (refuse-and-return).
+A task's deadline is its scheduled time plus its duration plus its timeout. Once
+that has passed, the requester sends a `status request` to every participant
+that accepted and still owes a result. A live answer (running, sleeping or
+pending) moves the deadline out by one extension: the task's timeout, else a
+tenth of its duration, else two minutes. That extension is spent from the
+outstanding request, so a replayed or unsolicited answer extends nothing.
+Without a live answer the requester asks again once an extension's worth of
+time has gone by, and after three such rounds it gives the task up.
 
-[Reputation Consensus >](reputation.md)
+Giving up is quiet. The tracker and everything kept beside it are dropped and a
+warning is logged, but no result goes to the orchestrator and nobody is scored,
+because silence is not evidence: a frame lost in transit looks exactly like a
+peer that walked away. A task nobody accepted has no one to ask, and is given
+up at its deadline.
+
+The answers mean what they say, in both runtimes. A worker answers `pending`
+for a task still queued and `running` while it executes; the C worker runs each
+job on a thread of its own so that it stays free to answer while it works.
+`unknown` says only that the worker is not tracking the task, which is also
+what it says once it has finished and its result is on the way, so it neither
+extends nor cancels: a cancel there would drop that result as uninvited.
+`dead`, `zombie` and `stopped` cancel the participant.
+
+## Components, and what each protects
+
+Four pieces carry the subsystem, and each one exists to bound a specific
+failure.
+
+The *job queue* is a priority queue of scheduled work, ordered by execution
+time, with duplicates capped. It bounds how much a single requester can commit a
+worker to.
+
+The *peer capabilities* map associates capability names with the peers that
+registered them, so invitations reach only plausible workers. It bounds
+invitation traffic.
+
+The *task tracker* records outstanding remote tasks by identifier, the results
+expected from each participant, and what the requester asked for — the
+capability and the invocation's arguments — because a returned answer can only
+be judged against the question. Once the task completes the entry is deleted,
+which is what makes later results for the same task rejected rather than
+accepted.
+
+What counts as complete is one of the few places the two runtimes still
+disagree. Python forwards on the first reply, C waits for every peer it invited.
+For a directed probe, addressed to exactly one peer, the two coincide. See
+ISSUES.md.
+
+*Spam protection* is the flood counter described above, refusing and returning
+rather than merely logging. It is canonical behavior in both the Python and C
+implementations, which matters because a defense present in one runtime and
+absent in the other is a defense an adversary selects around.
+
+A re-delivered invitation is refused rather than counted. Every invitation
+carries a freshness sequence, the requester's monotonic counter stamped into the
+task itself, and the worker keeps the highest it has accepted from that
+requester, refusing anything at or below it. A duplicate on an unreliable
+transport costs nothing, because the task was already admitted the first time,
+and a deliberate replay buys nothing, because it never reaches the working parts
+of the handler at all.
+
+That check runs *before* the flood counter, and the order is the security
+property rather than an implementation detail. Behind the counter, replaying one
+captured invitation six times would trip the flood refusal, and a refusal is
+what the requester reads as the worker dropping out, which it acts on by
+canceling that participant. A replay would then be a way to evict an honest
+worker from work it had already accepted. Ahead of the counter, the counter
+counts what we built it to count: distinct invitations for one task, which is a
+requester misbehaving rather than an attacker echoing.
+
+An invitation carrying no sequence at all is refused too, with no lenient path
+for senders predating the field. A worker that accepted unstamped invitations
+would be a worker an attacker selects by simply not stamping, and what that buys
+is execution of work on somebody else's node.
+
+## What a payload looks like
+
+Every negotiation verb carries a serialized task object, and both runtimes write
+the same one, being Python's `__type__`-tagged `Configuration` dump. An
+`invitation`, `nack`, `ack`, `haggle` and `status request` each carry a `Task`;
+a `status response` carries a `TaskStatus`, which is a `Task` plus the status;
+`report results` carries a `TaskResult`, which extends `TaskInfo` and so has no
+`parameters` at all.
+
+That last omission is deliberate. The requester supplies what it asked for from
+its own record when the result arrives, never from the reply, since reading the
+challenge back off the answer would verify nothing.
+
+The status on a `status response` rides as the enum's member *name* rather than
+its value, because the name is what rebuilds an enum on the other side. An
+integer would arrive as an integer.
+
+### The requestor is the exception
+
+One field is not the tagged form. The `requestor` is the flat canonical *public*
+identity, the same shape the `peer_accepted` and `full_history` payloads use.
+
+The reason is that the tagged form would leak. A task's requestor is the
+requesting node's own `Identity` object, and that object is the private one, so
+serializing it whole hands out the Ed25519 signing seed and the Curve25519
+secret, because `Signature.to_dict()` returns the private seed for a key that is
+not public-only. It also carries the petname, which is a local name and belongs
+to nobody but the node that assigned it. The envelope has always been careful
+here, publishing only public keys, and the payload now is too.
+
+A peer that receives an identity it does not already know cannot reply to it
+anyway, so nothing is lost by carrying public material only.
+
+### Why this is pinned
+
+The two runtimes' payloads once shared no key but `seq`. C hand-built a flat
+object mirroring `negotiation/task.proto`, a schema Python does not use, so a C
+worker could not read a Python requester's invitation and a Python requester
+could not read a C worker's result. Negotiation between them did not work at
+all, and nothing looked wrong. An invitation arriving with every key missing
+left `seq` at zero, and an unstamped invitation is refused rather than
+misexecuted.
+
+The corpus did not catch it because only the message *envelope* was byte-pinned.
+Each adapter built its own runtime's payload from the scenario step, so every
+case passed with the two shapes mutually unreadable.
+
+The payload vectors close that. Each is one fixture that is both the input and
+the expectation, fed to both runtimes: parse it, re-emit it through your own
+serializer, and land back on the fixture. Neither side can drift without
+failing.
+
+| Payload | Vector |
+|---|---|
+| `invitation` — a `Task` | [`negotiation-invitation.yaml`](../../src/autonomous-trust/conformance/vectors/wire/negotiation-invitation.yaml) |
+| `status response` — a `TaskStatus` | [`negotiation-status-response.yaml`](../../src/autonomous-trust/conformance/vectors/wire/negotiation-status-response.yaml) |
+| `report results` — a `TaskResult` | [`negotiation-task-result.yaml`](../../src/autonomous-trust/conformance/vectors/wire/negotiation-task-result.yaml) |
+
+## Pinned scenarios
+
+The executable corpus that holds the behavior above. Each is a recorded trace
+both runtimes must reproduce.
+
+| Behavior | Scenario |
+|---|---|
+| Happy path, invite to poll | [`negotiation-canonical.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/negotiation-canonical.yaml) |
+| Spawn fan-out to capable peers | [`spawn-task-fanout.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/spawn-task-fanout.yaml) |
+| Refuse, capability not held | [`invite-refuse-not-capable.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-refuse-not-capable.yaml) |
+| Refuse, below required tier | [`invite-refuse-below-required-tier.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-refuse-below-required-tier.yaml) |
+| Refuse, v1 peer-level floor | [`invite-refuse-low-rep.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-refuse-low-rep.yaml) |
+| Refuse, past the flood threshold | [`invite-flood-past-threshold.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-flood-past-threshold.yaml) |
+| Haggle, counter-proposal | [`invite-haggle-counterprop.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-haggle-counterprop.yaml) |
+| Results forwarded on completion | [`report-results-forwarded.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/report-results-forwarded.yaml) |
+| Demotion cancels running work | [`tier-loss-cancels-running-task.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/tier-loss-cancels-running-task.yaml) |
+| Invitation replay refused, worker keeps the task | [`invite-replay-survives.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-replay-survives.yaml) |
+| Unstamped invitation refused | [`invite-unstamped-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-unstamped-refused.yaml) |
+
+The v1 binary floor, refusing whenever the peer level was zero, is still pinned
+alongside the per-capability tier comparison that replaced it.
+
+## Further reading
+
+- [Standing turned into capability](trust-tiers.md): where the required tier on a
+  capability comes from, and what each tier admits.
+- [Earning standing](reputation.md): what happens to the transaction score the
+  requester submits once the result has been verified.
+- [Networking](networking.md): the peer-to-peer channel these messages travel on.
+- [Integration testing](integration-testing.md): how the task lifecycle is
+  exercised end to end.
+
+---
+
+*Next: [Earning standing](reputation.md)*

@@ -23,9 +23,9 @@
 #include <jansson.h>
 
 #include "msg_types_priv.h"
+#include "msg_registry.h"
 #include "logger.h"
 
-#include "fleet/update_proposal.h"
 #include "identity/identity_priv.h"
 #include "processes/capabilities_priv.h"
 #include "negotiation/task_priv.h"
@@ -43,11 +43,15 @@ size_t message_size(message_type_t type)
     case SIGNAL:
         return sizeof(signal_t);
     case GROUP:
+    case CHILD_GROUP:
         return sizeof(group_t);
     case PEER:
         return sizeof(public_identity_t);
     case PEER_CAPABILITIES:
-        return sizeof(capability_t) * DEFAULT_MAX_PEERS * MAX_CAPABILITIES;
+        /* The union arm, not the matrix it describes: this size is what
+         * processes.c copies out of a generic_msg_t, and the matrix is a map
+         * handle. The old product (3.4 MB) overran the 1.7-6.4 KB message. */
+        return sizeof(peer_capabilities_matrix_t);
     case NET_MESSAGE:
         return sizeof(net_msg_t);
     case TASK:
@@ -58,25 +62,27 @@ size_t message_size(message_type_t type)
         return sizeof(task_result_msg_t);
     case TRANSACTION_SCORE:
         return sizeof(tx_score_msg_t);
-    case UPDATE_PROPOSAL:
-        return sizeof(update_proposal_t);
-    case UPDATE_VOTE:
-        return sizeof(update_vote_msg_t);
-    case UPDATE_ACCEPTED:
-        return sizeof(update_accepted_msg_t);
     case PEER_RTT_UPDATE:
+    case PEER_RTT_OBSERVED:
         return sizeof(peer_rtt_update_msg_t);
     case PEER_OBSERVED:
         return sizeof(peer_observed_msg_t);
     case PEER_REPUTATION:
         return sizeof(peer_reputation_msg_t);
-#ifdef AT_ZTA_ENABLED
-    case ZTA_REVOCATION_ALERT:
-    case ZTA_VERIFICATION_RESULT:
-        return sizeof(zta_event_msg_t);
-#endif
+    case PEER_STANDING:
+        return sizeof(peer_standing_msg_t);
+    case PEER_REMOVED:
+        return sizeof(peer_removed_msg_t);
+    case PEER_PRESENCE:
+        return sizeof(peer_presence_msg_t);
+    case MSG_TYPE_RETIRED_10:   /* fleet's old slots: never sent (Phase 8) */
+    case MSG_TYPE_RETIRED_11:
+    case MSG_TYPE_RETIRED_12:
     default:
-        return 0;
+    {
+        const at_msg_vtable_t *vt = at_msg_type_lookup((long)type);
+        return vt != NULL ? vt->size : 0;
+    }
     }
 }
 
@@ -93,6 +99,8 @@ char *message_type_to_string(message_type_t type)
         return (char*)"SIGNAL";
     case GROUP:
         return (char*)autonomous_trust__core__protobuf__identity__group__descriptor.c_name;
+    case CHILD_GROUP:
+        return (char*)"CHILD_GROUP";
     case PEER:
         return (char*)autonomous_trust__core__protobuf__identity__identity__descriptor.c_name;
     case PEER_CAPABILITIES:
@@ -107,26 +115,30 @@ char *message_type_to_string(message_type_t type)
         return (char*)"TASK_RESULT";
     case TRANSACTION_SCORE:
         return (char*)"TRANSACTION_SCORE";
-    case UPDATE_PROPOSAL:
-        return (char*)"UPDATE_PROPOSAL";
-    case UPDATE_VOTE:
-        return (char*)"UPDATE_VOTE";
-    case UPDATE_ACCEPTED:
-        return (char*)"UPDATE_ACCEPTED";
     case PEER_RTT_UPDATE:
         return (char*)"PEER_RTT_UPDATE";
+    case PEER_RTT_OBSERVED:
+        return (char*)"PEER_RTT_OBSERVED";
     case PEER_OBSERVED:
         return (char*)"PEER_OBSERVED";
     case PEER_REPUTATION:
         return (char*)"PEER_REPUTATION";
-#ifdef AT_ZTA_ENABLED
-    case ZTA_REVOCATION_ALERT:
-        return (char*)"ZTA_REVOCATION_ALERT";
-    case ZTA_VERIFICATION_RESULT:
-        return (char*)"ZTA_VERIFICATION_RESULT";
-#endif
+    /* Paired with the string_to_message_type() arm below — the two are a
+     * round trip, and renaming one without the other breaks it silently. */
+    case PEER_STANDING:
+        return (char*)"PEER_STANDING";
+    case PEER_REMOVED:
+        return (char*)"PEER_REMOVED";
+    case PEER_PRESENCE:
+        return (char*)"PEER_PRESENCE";
+    case MSG_TYPE_RETIRED_10:   /* fleet's old slots: never sent (Phase 8) */
+    case MSG_TYPE_RETIRED_11:
+    case MSG_TYPE_RETIRED_12:
     default:
-        return (char*)"";
+    {
+        const at_msg_vtable_t *vt = at_msg_type_lookup((long)type);
+        return (char*)(vt != NULL ? vt->name : "");
+    }
     }
 }
 
@@ -140,7 +152,7 @@ char *message_type_to_string(message_type_t type)
   requires str != \null && \valid_read(str);
   assigns \nothing;
 */
-message_type_t string_to_message_type(const char *str)
+message_type_t message_type_core_by_name(const char *str)
 {
     if (strcmp(str, "SIGNAL") == 0)
         return SIGNAL;
@@ -160,27 +172,48 @@ message_type_t string_to_message_type(const char *str)
         return TASK_RESULT;
     if (strcmp(str, "TRANSACTION_SCORE") == 0)
         return TRANSACTION_SCORE;
-    if (strcmp(str, "UPDATE_PROPOSAL") == 0)
-        return UPDATE_PROPOSAL;
-    if (strcmp(str, "UPDATE_VOTE") == 0)
-        return UPDATE_VOTE;
-    if (strcmp(str, "UPDATE_ACCEPTED") == 0)
-        return UPDATE_ACCEPTED;
     if (strcmp(str, "PEER_RTT_UPDATE") == 0)
         return PEER_RTT_UPDATE;
+    if (strcmp(str, "PEER_RTT_OBSERVED") == 0)
+        return PEER_RTT_OBSERVED;
     if (strcmp(str, "PEER_OBSERVED") == 0)
         return PEER_OBSERVED;
     if (strcmp(str, "PEER_REPUTATION") == 0)
         return PEER_REPUTATION;
+    /* CHILD_GROUP was encoded by message_type_to_string but had no arm here,
+     * so over real IPC it decoded to -1 and was dropped: gateway child-group
+     * chains never reached their process (the two ZTA types had the same
+     * defect before they moved to the registry). The conformance hook
+     * bypasses serialization, which is why no scenario saw it. */
+    if (strcmp(str, "CHILD_GROUP") == 0)
+        return CHILD_GROUP;
+    if (strcmp(str, "PEER_STANDING") == 0)
+        return PEER_STANDING;
+    if (strcmp(str, "PEER_REMOVED") == 0)
+        return PEER_REMOVED;
+    if (strcmp(str, "PEER_PRESENCE") == 0)
+        return PEER_PRESENCE;
     return -1;  // No matching message type found (all valid types are > 0)
+}
+
+/* The inverse of message_type_to_string over BOTH halves of the name space:
+ * the core chain above, then whatever features registered. */
+message_type_t string_to_message_type(const char *str)
+{
+    message_type_t t = message_type_core_by_name(str);
+    if (t != (message_type_t)-1)
+        return t;
+    return (message_type_t)at_msg_type_by_name(str);
 }
 
 int signal_to_proto(const signal_t *msg, void **data_ptr, size_t *data_len_ptr)
 {
     char data_str[1024];
-    sprintf(data_str, "%d-%s", msg->sig, msg->descr);
+    snprintf(data_str, sizeof(data_str), "%d-%s", msg->sig, msg->descr);
     *data_len_ptr = strlen(data_str) + 1;
-    *data_ptr = smrt_create(*data_len_ptr);
+    *data_ptr = malloc(*data_len_ptr);
+    if (*data_ptr == NULL)
+        return EXCEPTION(ENOMEM);
     strcpy(*data_ptr, data_str);
     return 0;
 }
@@ -198,7 +231,7 @@ int net_msg_pack_json(net_msg_t *msg, json_t *json)
     if (str == NULL)
         return -1;
     size_t slen = strlen(str);
-    msg->obj = smrt_create(slen + 1);
+    msg->obj = malloc(slen + 1);   /* plain buffer: see net_msg_t.obj */
     if (msg->obj == NULL)
     {
         free(str);
@@ -210,6 +243,15 @@ int net_msg_pack_json(net_msg_t *msg, json_t *json)
     return 0;
 }
 
+void net_msg_free_obj(net_msg_t *msg)
+{
+    if (msg == NULL)
+        return;
+    free(msg->obj);
+    msg->obj = NULL;
+    msg->len = 0;
+}
+
 int net_msg_unpack_json(const net_msg_t *msg, json_t **json)
 {
     if (msg->obj == NULL || msg->len == 0)
@@ -218,7 +260,10 @@ int net_msg_unpack_json(const net_msg_t *msg, json_t **json)
     /* JSON_DECODE_ANY mirrors the JSON_ENCODE_ANY in net_msg_pack_json so a
      * scalar-root payload (the partition_signal from_addr) round-trips.
      * Object/array payloads decode identically. */
-    *json = json_loads((const char *)msg->obj, JSON_DECODE_ANY, &error);
+    /* Bounded by len, never by a terminator: obj is a buffer plus a length,
+     * and a copy that kept only len bytes (identity's held updates did) made
+     * the parse run on into whatever followed it on the heap. */
+    *json = json_loadb((const char *)msg->obj, msg->len, JSON_DECODE_ANY, &error);
     if (*json == NULL)
         return -1;
     return 0;
@@ -234,7 +279,32 @@ int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr
     json_object_set_new(root, "process", json_string(msg->process));
     json_object_set_new(root, "function", json_string(msg->function ? msg->function : ""));
     json_object_set_new(root, "encrypt", json_boolean(msg->encrypt));
+    /* Group-multicast routing flag (Increment 7). Omitted-on-read defaults to
+     * false, so a peer predating this field stays byte-compatible. */
+    if (msg->group_multicast)
+        json_object_set_new(root, "group_multicast", json_boolean(true));
     json_object_set_new(root, "return_to", json_string(msg->return_to));
+    /* THE SIGNATURE VERDICT, and why it must cross this hop.
+     *
+     * net_proc verifies a frame's Ed25519 signature at parse time and records
+     * the answer in net_msg_t. Everything that ACTS on that answer — the group
+     * key rotation gate, the hierarchy gate — lives in the identity process,
+     * on the far side of this AF_UNIX hop. These two fields were never
+     * serialized, so the receiving process read them as false for EVERY
+     * message it has ever handled: a verdict computed correctly and then
+     * thrown away one queue short of the code that needed it.
+     *
+     * Cost, measured: across 25 preserved live-cohort runs, 107 group-key
+     * rotations were minted and NOT ONE was ever adopted, because
+     * handle_group_update's `nmsg->verified` could not be true. A cohort whose
+     * members rotate simultaneously then stays forked forever.
+     *
+     * This is LOCAL IPC between our own processes on one node, so carrying the
+     * verdict is not a trust extension — the alternative is not "safer", it is
+     * a gate that can never open. Omitted-on-read defaults to false, so an
+     * older peer of this serializer stays compatible. */
+    json_object_set_new(root, "verified", json_boolean(msg->verified));
+    json_object_set_new(root, "has_signature", json_boolean(msg->has_signature));
 
     char uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(msg->from_whom.uuid, uuid_str);
@@ -267,7 +337,7 @@ int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr
         return -1;
 
     size_t slen = strlen(str);
-    *data_ptr = smrt_create(slen + 1);
+    *data_ptr = malloc(slen + 1);
     if (*data_ptr == NULL)
     {
         free(str);
@@ -288,19 +358,20 @@ int wrap_in_any(message_type_t type, void *data_in, size_t data_in_len, void **d
     pb_msg.value.len = data_in_len;
 
     *data_len_ptr = google__protobuf__any__get_packed_size(&pb_msg);
-    *data_ptr = smrt_create(*data_len_ptr);
+    *data_ptr = malloc(*data_len_ptr > 0 ? *data_len_ptr : 1);
     if (*data_ptr == NULL)
     {
-        smrt_deref(data_in);
+        free(data_in);
         return EXCEPTION(ENOMEM);
     }
     size_t packed = google__protobuf__any__pack(&pb_msg, *data_ptr);
+    free(data_in);
     if (packed == 0)
     {
-        smrt_deref(*data_ptr);
+        free(*data_ptr);
+        *data_ptr = NULL;
         return EXCEPTION(EINVAL);
     }
-    smrt_deref(data_in);
     return 0;
 }
 
@@ -318,7 +389,9 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         break;
     }
     case GROUP:
+    case CHILD_GROUP:
     {
+        /* Same payload as GROUP -- only the routing differs (see the enum). */
         if (group_to_proto(&msg->info.group, &subdata, &subdata_len) != 0)
             return -1;
         break;
@@ -350,47 +423,44 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
     case TASK_STATUS:
     {
         subdata_len = sizeof(task_status_msg_t);
-        subdata = smrt_create(subdata_len);
+        subdata = malloc(subdata_len);
         if (subdata == NULL) return EXCEPTION(ENOMEM);
         memcpy(subdata, &msg->info.task_status, subdata_len);
         break;
     }
     case TASK_RESULT:
     {
-        subdata_len = sizeof(task_result_msg_t);
-        subdata = smrt_create(subdata_len);
+        /* The struct, then its result bytes. result_data is a pointer, and
+         * every process is a fork: copying the struct whole sent the
+         * pointer's VALUE, which names nothing in the receiver (and pointed
+         * at negotiation's thread-local result buffer, which the next result
+         * overwrites). The pointer travels zeroed. */
+        const task_result_msg_t *tr = &msg->info.task_result;
+        size_t blob = (tr->result_data != NULL) ? tr->result_len : 0;
+        subdata_len = sizeof(task_result_msg_t) + blob;
+        subdata = malloc(subdata_len);
         if (subdata == NULL) return EXCEPTION(ENOMEM);
-        memcpy(subdata, &msg->info.task_result, subdata_len);
+        task_result_msg_t head = *tr;
+        head.result_data = NULL;
+        head.result_len = blob;
+        memcpy(subdata, &head, sizeof(head));
+        if (blob > 0)
+            memcpy((uint8_t *)subdata + sizeof(head), tr->result_data, blob);
         break;
     }
     case TRANSACTION_SCORE:
     {
         subdata_len = sizeof(tx_score_msg_t);
-        subdata = smrt_create(subdata_len);
+        subdata = malloc(subdata_len);
         if (subdata == NULL) return EXCEPTION(ENOMEM);
         memcpy(subdata, &msg->info.tx_score, subdata_len);
         break;
     }
-    case UPDATE_VOTE:
-    {
-        subdata_len = sizeof(update_vote_msg_t);
-        subdata = smrt_create(subdata_len);
-        if (subdata == NULL) return EXCEPTION(ENOMEM);
-        memcpy(subdata, &msg->info.update_vote, subdata_len);
-        break;
-    }
-    case UPDATE_ACCEPTED:
-    {
-        subdata_len = sizeof(update_accepted_msg_t);
-        subdata = smrt_create(subdata_len);
-        if (subdata == NULL) return EXCEPTION(ENOMEM);
-        memcpy(subdata, &msg->info.update_accepted, subdata_len);
-        break;
-    }
     case PEER_RTT_UPDATE:
+    case PEER_RTT_OBSERVED:
     {
         subdata_len = sizeof(peer_rtt_update_msg_t);
-        subdata = smrt_create(subdata_len);
+        subdata = malloc(subdata_len);
         if (subdata == NULL) return EXCEPTION(ENOMEM);
         memcpy(subdata, &msg->info.peer_rtt_update, subdata_len);
         break;
@@ -398,7 +468,7 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
     case PEER_OBSERVED:
     {
         subdata_len = sizeof(peer_observed_msg_t);
-        subdata = smrt_create(subdata_len);
+        subdata = malloc(subdata_len);
         if (subdata == NULL) return EXCEPTION(ENOMEM);
         memcpy(subdata, &msg->info.peer_observed, subdata_len);
         break;
@@ -406,27 +476,57 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
     case PEER_REPUTATION:
     {
         subdata_len = sizeof(peer_reputation_msg_t);
-        subdata = smrt_create(subdata_len);
+        subdata = malloc(subdata_len);
         if (subdata == NULL) return EXCEPTION(ENOMEM);
         memcpy(subdata, &msg->info.peer_reputation, subdata_len);
         break;
     }
-#ifdef AT_ZTA_ENABLED
-    case ZTA_REVOCATION_ALERT:
-    case ZTA_VERIFICATION_RESULT:
+    case PEER_STANDING:
     {
-        subdata_len = sizeof(zta_event_msg_t);
-        subdata = smrt_create(subdata_len);
+        subdata_len = sizeof(peer_standing_msg_t);
+        subdata = malloc(subdata_len);
         if (subdata == NULL) return EXCEPTION(ENOMEM);
-        memcpy(subdata, &msg->info.zta_event, subdata_len);
+        memcpy(subdata, &msg->info.peer_standing, subdata_len);
         break;
     }
-#endif
-    case UPDATE_PROPOSAL:
-        /* UPDATE_PROPOSAL uses its own JSON serialization, not proto */
+    case PEER_REMOVED:
+    {
+        subdata_len = sizeof(peer_removed_msg_t);
+        subdata = malloc(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.peer_removed, subdata_len);
+        break;
+    }
+    case PEER_PRESENCE:
+    {
+        subdata_len = sizeof(peer_presence_msg_t);
+        subdata = malloc(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.peer_presence, subdata_len);
+        break;
+    }
+    case MSG_TYPE_RETIRED_10:   /* fleet's old slots: never sent (Phase 8) */
+    case MSG_TYPE_RETIRED_11:
+    case MSG_TYPE_RETIRED_12:
         return -1;
     default:
-        return -1;
+    {
+        /* A feature's type: its payload rides the opaque arm. */
+        const at_msg_vtable_t *vt = at_msg_type_lookup(msg->type);
+        if (vt == NULL)
+            return -1;
+        if (vt->to_proto != NULL)
+        {
+            if (vt->to_proto(msg->info.payload, &subdata, &subdata_len) != 0)
+                return -1;
+            break;
+        }
+        subdata_len = vt->size;
+        subdata = malloc(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, msg->info.payload, subdata_len);
+        break;
+    }
     }
     return wrap_in_any(msg->type, subdata, subdata_len, data, data_len);
 }
@@ -511,12 +611,22 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
     {
         /* strcpy is bounded: the destination was just allocated for
          * strlen(func) + 1 bytes.  Not a missing-bounds-check site. */
-        net_msg->function = smrt_create(strlen(func) + 1);
+        net_msg->function = malloc(strlen(func) + 1);
         if (net_msg->function != NULL)
             strcpy(net_msg->function, func);
     }
 
     net_msg->encrypt = json_boolean_value(json_object_get(root, "encrypt"));
+    /* Group-multicast routing flag (Increment 7); absent -> false. */
+    net_msg->group_multicast =
+        json_boolean_value(json_object_get(root, "group_multicast"));
+
+    /* See net_msg_to_proto: the wire-parse signature verdict, absent here for
+     * as long as this serializer has existed. Defaults false when the field is
+     * missing, so a message from an older sender behaves exactly as before. */
+    net_msg->verified = json_boolean_value(json_object_get(root, "verified"));
+    net_msg->has_signature =
+        json_boolean_value(json_object_get(root, "has_signature"));
 
     const char *ret = json_string_value(json_object_get(root, "return_to"));
     if (ret)
@@ -562,7 +672,7 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
     json_int_t obj_len = json_integer_value(json_object_get(root, "obj_len"));
     if (obj_str && obj_len > 0)
     {
-        net_msg->obj = smrt_create((size_t)obj_len + 1);
+        net_msg->obj = malloc((size_t)obj_len + 1);
         if (net_msg->obj != NULL)
         {
             memcpy(net_msg->obj, obj_str, (size_t)obj_len);
@@ -576,6 +686,29 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
 }
 
 /* Frama-C: skipped — [serialization] protobuf unpack with union unpacking */
+/** Copy a fixed-size payload struct, refusing a payload too short to hold it.
+ *
+ * The length check is not defensive tidiness: `value` is peer-supplied, and
+ * without it this memcpy read `sizeof(T)` bytes out of a smaller heap
+ * allocation -- measured under valgrind as "Invalid read of size 8" on a
+ * TRANSACTION_SCORE whose value carried 8 of the 112 bytes the struct wants,
+ * and ACCEPTED with return 0. Whatever followed the payload then flowed onward
+ * as a score, a uuid or an app event. `type_url` selects which struct size is
+ * copied, so the remote also chooses how far past the end to read. */
+#define COPY_FIXED_PAYLOAD(field, type)                                        \
+    do {                                                                       \
+        if (pb_msg->value.len < sizeof(type))                                  \
+        {                                                                      \
+            log_error(NULL, "proto_to_generic_msg: %s payload is %zu bytes, "  \
+                      "needs %zu; dropping\n", #type,                          \
+                      pb_msg->value.len, sizeof(type));                        \
+            ret = -1;                                                          \
+            break;                                                             \
+        }                                                                      \
+        memcpy(&msg->info.field, pb_msg->value.data, sizeof(type));            \
+        ret = 0;                                                               \
+    } while (0)
+
 int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
 {
     Google__Protobuf__Any *pb_msg;
@@ -587,55 +720,125 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
     message_type_t type = string_to_message_type(pb_msg->type_url);
     msg->type = type;
     msg->size = message_size(msg->type);
+    /* Single exit, because the unpacked Any must be freed on EVERY path. It used
+     * to be freed on none: each arm returned directly, leaking 74 bytes
+     * (48 direct + 26 indirect, measured) per inbound message -- unbounded in a
+     * daemon whose whole job is to keep receiving. The `proto_to_*` helpers
+     * unpack their own sub-message and copy out (see proto_to_peer), so nothing
+     * they produce points into `value.data` and freeing it here cannot dangle. */
+    int ret;
     switch (type)
     {
     case SIGNAL:
-        return proto_to_signal(pb_msg->value.data, pb_msg->value.len, &msg->info.signal);
+        ret = proto_to_signal(pb_msg->value.data, pb_msg->value.len, &msg->info.signal);
+        break;
     case GROUP:
-        return proto_to_group(pb_msg->value.data, pb_msg->value.len, &msg->info.group);
+    case CHILD_GROUP:
+        ret = proto_to_group(pb_msg->value.data, pb_msg->value.len, &msg->info.group);
+        break;
     case PEER:
-        return proto_to_peer(pb_msg->value.data, pb_msg->value.len, &msg->info.peer);
+        ret = proto_to_peer(pb_msg->value.data, pb_msg->value.len, &msg->info.peer);
+        break;
     case PEER_CAPABILITIES:
-        return proto_to_peer_capabilities(pb_msg->value.data, pb_msg->value.len, &msg->info.peer_capabilities);
+        ret = proto_to_peer_capabilities(pb_msg->value.data, pb_msg->value.len, &msg->info.peer_capabilities);
+        break;
     case NET_MESSAGE:
-        return proto_to_net_msg(pb_msg->value.data, pb_msg->value.len, &msg->info.net_msg);
+        ret = proto_to_net_msg(pb_msg->value.data, pb_msg->value.len, &msg->info.net_msg);
+        break;
     case TASK:
-        return proto_to_task(pb_msg->value.data, pb_msg->value.len, &msg->info.task);
+        ret = proto_to_task(pb_msg->value.data, pb_msg->value.len, &msg->info.task);
+        break;
     case TASK_STATUS:
-        memcpy(&msg->info.task_status, pb_msg->value.data, sizeof(task_status_msg_t));
-        return 0;
+        COPY_FIXED_PAYLOAD(task_status, task_status_msg_t);
+        break;
     case TASK_RESULT:
-        memcpy(&msg->info.task_result, pb_msg->value.data, sizeof(task_result_msg_t));
-        return 0;
+        COPY_FIXED_PAYLOAD(task_result, task_result_msg_t);
+        if (ret != 0)
+            break;
+        {
+            /* The result bytes follow the struct (generic_msg_to_proto). A
+             * sender's result_data is never trusted: it was a pointer into
+             * another process. messaging_recv_release frees the copy. */
+            task_result_msg_t *tr = &msg->info.task_result;
+            size_t blob = tr->result_len;
+            tr->result_data = NULL;
+            if (blob == 0)
+                break;
+            if (pb_msg->value.len - sizeof(task_result_msg_t) < blob) {
+                log_error(NULL, "proto_to_generic_msg: task_result claims %zu"
+                          " result bytes, carries %zu; dropping\n", blob,
+                          pb_msg->value.len - sizeof(task_result_msg_t));
+                tr->result_len = 0;
+                ret = -1;
+                break;
+            }
+            tr->result_data = malloc(blob);
+            if (tr->result_data == NULL) {
+                tr->result_len = 0;
+                ret = -1;
+                break;
+            }
+            memcpy(tr->result_data,
+                   pb_msg->value.data + sizeof(task_result_msg_t), blob);
+        }
+        break;
     case TRANSACTION_SCORE:
-        memcpy(&msg->info.tx_score, pb_msg->value.data, sizeof(tx_score_msg_t));
-        return 0;
-    case UPDATE_VOTE:
-        memcpy(&msg->info.update_vote, pb_msg->value.data, sizeof(update_vote_msg_t));
-        return 0;
-    case UPDATE_ACCEPTED:
-        memcpy(&msg->info.update_accepted, pb_msg->value.data, sizeof(update_accepted_msg_t));
-        return 0;
+        COPY_FIXED_PAYLOAD(tx_score, tx_score_msg_t);
+        break;
     case PEER_RTT_UPDATE:
-        memcpy(&msg->info.peer_rtt_update, pb_msg->value.data, sizeof(peer_rtt_update_msg_t));
-        return 0;
+    case PEER_RTT_OBSERVED:
+        COPY_FIXED_PAYLOAD(peer_rtt_update, peer_rtt_update_msg_t);
+        break;
     case PEER_OBSERVED:
-        memcpy(&msg->info.peer_observed, pb_msg->value.data, sizeof(peer_observed_msg_t));
-        return 0;
+        COPY_FIXED_PAYLOAD(peer_observed, peer_observed_msg_t);
+        break;
     case PEER_REPUTATION:
-        memcpy(&msg->info.peer_reputation, pb_msg->value.data, sizeof(peer_reputation_msg_t));
-        return 0;
-#ifdef AT_ZTA_ENABLED
-    case ZTA_REVOCATION_ALERT:
-    case ZTA_VERIFICATION_RESULT:
-        memcpy(&msg->info.zta_event, pb_msg->value.data, sizeof(zta_event_msg_t));
-        return 0;
-#endif
-    case UPDATE_PROPOSAL:
-        /* UPDATE_PROPOSAL uses its own JSON serialization, not proto */
-        return -1;
+        COPY_FIXED_PAYLOAD(peer_reputation, peer_reputation_msg_t);
+        break;
+    case PEER_STANDING:
+        COPY_FIXED_PAYLOAD(peer_standing, peer_standing_msg_t);
+        break;
+    case PEER_REMOVED:
+        COPY_FIXED_PAYLOAD(peer_removed, peer_removed_msg_t);
+        break;
+    case PEER_PRESENCE:
+        COPY_FIXED_PAYLOAD(peer_presence, peer_presence_msg_t);
+        break;
+    case MSG_TYPE_RETIRED_10:   /* fleet's old slots: never sent (Phase 8) */
+    case MSG_TYPE_RETIRED_11:
+    case MSG_TYPE_RETIRED_12:
+        ret = -1;
+        break;
     default:
-        return -1;
+    {
+        const at_msg_vtable_t *vt = at_msg_type_lookup(msg->type);
+        if (vt == NULL)
+        {
+            ret = -1;
+            break;
+        }
+        if (vt->from_proto != NULL)
+        {
+            ret = vt->from_proto(pb_msg->value.data, pb_msg->value.len,
+                                 msg->info.payload) != 0 ? -1 : 0;
+            break;
+        }
+        /* The same length check COPY_FIXED_PAYLOAD makes, for the same reason:
+         * the sender picks type_url, so it would otherwise pick how far past
+         * the end of value.data this reads. */
+        if (pb_msg->value.len < vt->size)
+        {
+            log_error(NULL, "proto_to_generic_msg: %s payload is %zu bytes, "
+                      "needs %zu; dropping\n", vt->name, pb_msg->value.len,
+                      vt->size);
+            ret = -1;
+            break;
+        }
+        memcpy(msg->info.payload, pb_msg->value.data, vt->size);
+        ret = 0;
+        break;
     }
-    return 0;
+    }
+    google__protobuf__any__free_unpacked(pb_msg, NULL);
+    return ret;
 }

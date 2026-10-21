@@ -1,0 +1,42 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: directory-accept-unsolicited-is-ignored
+byte_pinning: false
+description: |
+    An accept from Alice, with her own valid invitation, but Bob never asked
+    her. An accept is a key into Bob's contacts; he takes one only in answer to
+    a request of his own, so this one sends no hello.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  # Strangers, each alone in a cohort: nobody here is a peer of anybody.
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000d0a00"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000d0a01"
+      size: 1
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: first_contact_accept
+    payload:
+      nonce: 0ac0c0c0c0c0c0c0c0c0c0c0c0c0c0c0
+      minted_by: alice
+    description: |
+        An accept, with Alice's own invitation, that answers nothing.
+
+expected_state:
+  bob:
+    first_contact_hellos_emitted: 0

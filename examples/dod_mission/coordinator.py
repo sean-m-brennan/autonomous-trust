@@ -53,6 +53,7 @@ from autonomous_trust.core.system import now, queue_cadence
 from autonomous_trust.inspector.transitive_trust import (
     TransitiveTrustMixin, PEER_PAIR_QUERY_SEC)
 from autonomous_trust.evaluation.scenarios.recording import EventRecorder
+from autonomous_trust.core import LOG_FORMAT, LOG_DATEFMT
 
 def _roster_name_of(peer):
     """Bare roster name for a peer == the local-part of its ONLINE nickname.
@@ -1362,8 +1363,10 @@ class DoDMissionCoordinator(TransitiveTrustMixin, AutonomousTrust):
 
         * *Substitution* — a directional reading whose SUBJECT is a pre-trusted
           asset with no earned bilateral history yet is a cold-start neutral
-          (0.5 in pure mode, PREREP_NEUTRAL 0.0 in tit-for-tat), the same reason
-          its Reputations-panel score is warm-started (reconcile_rep_score).
+          (PREREP_NEUTRAL on both the pure and tit-for-tat paths, which the
+          reverted signed-scale framing once split into 0.5 and 0.0), the same
+          reason its Reputations-panel score is warm-started
+          (reconcile_rep_score).
           ``warm_start_edge_score`` surfaces the seeded prior so it draws an edge
           instead of dropping off the graph. A real reading — including earned
           skepticism — is left as-is, so the skepticism-wins min-combine still
@@ -1774,7 +1777,7 @@ def main():
     logging.basicConfig(
         level=logging.INFO,
         stream=sys.stderr,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format=LOG_FORMAT, datefmt=LOG_DATEFMT,
     )
 
     setup_mode = "--setup" in sys.argv

@@ -1,0 +1,50 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: invite-child-group-member-uses-earned-tier
+byte_pinning: false
+description: |
+    FIRST_CONTACT_PLAN §10.3, the child-group exemption: Alice is a member of a
+    child group Bob gateways, and she has no contact record at all -- an ordinary
+    child member, who never went through first contact. The tier cap does not
+    touch her: the tier-2 capability is served on the tier 4 she earned.
+    
+    This case is what caught Python ignoring child groups entirely: the
+    negotiation process had no `child_groups` for capped_tier to read, so every
+    child member was capped as a stranger while C exempted them. The pair below
+    (unverified / verified contact) pins the other side of the rule.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  first_contact:
+    enabled: true
+  child_group_members:
+    bob: [alice]
+  capabilities:
+    bob: [chat, file_share]
+  capability_tiers:
+    chat: 1
+    file_share: 2
+  peer_tiers:
+    alice: 4
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: file_share
+      task_id: t-cgm-share
+  - id: 2
+    from: bob
+    to: alice
+    function: ack
+    in_response_to: 1
+    payload:
+      task_id: t-cgm-share

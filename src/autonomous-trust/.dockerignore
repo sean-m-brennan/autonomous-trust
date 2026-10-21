@@ -1,0 +1,17 @@
+# Build context for `docker build ... $AT_DIR`: build_test (Dockerfile-test) in
+# scripts/build-docker.sh. Dockerfile-test copies only tests/, tox.ini,
+# requirements.txt, tests_require.txt and MANIFEST.in, but the context root is
+# this directory -- which also holds .venv (~1.2G), .tox (~97M) and
+# rust/target (~337M). The repo-root .dockerignore does not apply here.
+# A `#` comment must own its whole line; trailing text is part of the pattern.
+
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.tox/
+**/.venv/
+**/.rustup/
+**/node_modules/
+**/.pytest_cache/
+*.egg-info/
+**/rust/target/

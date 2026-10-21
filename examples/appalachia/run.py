@@ -50,6 +50,7 @@ from datetime import timedelta
 
 from autonomous_trust.simulator.simulator import Simulator
 from autonomous_trust.simulator import default_port, default_steps
+from autonomous_trust.core import LOG_FORMAT, LOG_DATEFMT
 from .scenario import (
     create_appalachian_config, load_terrain_matrix,
     HILLTOP_NODES, VALLEY_NODES,
@@ -87,7 +88,7 @@ def main():
 
     log_level = getattr(logging, args.log_level.upper())
     logging.basicConfig(level=log_level,
-                        format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+                        format=LOG_FORMAT, datefmt=LOG_DATEFMT)
     logger = logging.getLogger('run_scenario')
 
     nodes = list(HILLTOP_NODES)

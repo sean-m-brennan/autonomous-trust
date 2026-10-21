@@ -1,0 +1,50 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: place-value-cert-judged-by-roster
+byte_pinning: false
+description: |
+    Membership recorded in the chain (doc/architecture/reputation.md, "Who is
+    in the group"). An acceptor judges each half's commit certificate against
+    the roster in force for the instance, not its live view. With the roster
+    {alice, bob, carol}, one co-signature besides the scorer's (bob's) is a
+    majority; bob's live view of five would need two. bob accepts the value.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+  - id: erin
+    role: member
+
+fixtures:
+  roster:
+    bob: [alice, bob, carol]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: place
+    payload:
+      k: 0
+      ballot: {n: 5, by: alice}
+      head: ""
+      value:
+          - {task_id: t-1, p1: carol, p1_score: 0.9, p2: dave, p2_score: 0.7, cosigners: [bob]}
+  - id: 2
+    from: bob
+    to: alice
+    function: place accepted
+    in_response_to: 1
+    no_propagate: true
+    payload: {}
+
+expected_state:
+  bob:
+    place_promised: {n: 5, by: alice}

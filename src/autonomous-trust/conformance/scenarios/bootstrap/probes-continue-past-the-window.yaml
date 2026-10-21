@@ -1,0 +1,92 @@
+schema_version: "1"
+kind: scenario
+protocol: bootstrap
+name: probes-continue-past-the-window
+byte_pinning: false
+description: |
+    Honeypot probing continues after the bootstrap window closes, and spreads
+    across peers and capabilities (R+D.md §12.7; doc/verification_oracle.md
+    "Anchoring and the adversarial fraction").
+
+    Why this matters: the bootstrap corpus applied the known-answer pattern
+    only at cold start, so a peer had to misbehave inside its first window to
+    ever meet a challenge whose answer was already known. A peer that degraded
+    later — or that behaved well precisely until it was trusted — was never
+    challenged again. The probe is the one piece of evidence that does not
+    weaken as the adversarial fraction rises (every other channel is
+    ultimately an aggregate over peers, and a majority cannot be beaten
+    without an external reference), so confining it to the first 30 seconds
+    gave away the anchor.
+
+    Shape: one host, three peers, `pairs_target: 1` so the window closes after
+    a single invitation, then twelve ticks of continuous probing with the rate
+    limit removed. The trigger is the same non-message-driven shape as
+    `bootstrap-corpus-runs-on-admission`; each adapter builds the worker from
+    `fixtures.bootstrap`, ticks it, and asserts the per-host observables.
+
+    The three probe observables are the allocation contract:
+      - `probes_issued: 12` — probing did not stop with the window (the old
+        behavior scores 0 here), and the rate limit is respected exactly once
+        per tick at interval 0.
+      - `distinct_peers_probed: 3` — probes SPREAD. A prober that piles onto
+        one peer leaves the others unchallenged, which is the failure the
+        allocation rule exists to prevent; UCB over per-peer counts puts the
+        least-probed peer first, so twelve probes over three peers reach all
+        three.
+      - `probe_caps_fired: 3` — every capability keeps being exercised.
+        `weight / (count + 1)` settles at per-capability counts proportional
+        to weight, and with the three bootstrap caps at equal weight that is a
+        round-robin. Ranking by weight alone, or multiplying weight by the UCB
+        bonus (which allocates proportional to weight *squared*), would let a
+        heavier capability crowd the others out and leave an adversary a single
+        challenge to answer correctly.
+
+    Cross-language: unlike the window's coverage pin, probe allocation is
+    deterministic in BOTH twins — argmax over counts, no PRNG — so the two
+    runtimes issue the same *number* of probes to the same *number* of peers.
+    The assertions are aggregate rather than sequence-level only because the
+    two index peers differently (Python by uuid ordering, C by position), so
+    "which peer went first" is not a shared fact while "all three were
+    probed, evenly" is.
+
+    Not covered here, and deliberately: whether a probe's answer is CHECKED.
+    That is a requestor-side scoring concern rather than a worker concern, it
+    exists only in the Python runtime (C has no task-result → reputation path
+    at all), and it is pinned by unit tests on both sides —
+    `tests/a_unit/test_probe_verification.py` and
+    `src/c/test/bootstrap_capabilities_test.c`.
+
+participants:
+  - id: self
+    role: new_node
+  - id: peer_a
+    role: border_guard
+  - id: peer_b
+    role: border_guard
+  - id: peer_c
+    role: border_guard
+
+fixtures:
+  bootstrap:
+    seed: 12345
+    ticks: 13
+    pairs_target: 1
+    duration_sec: 999
+    continuous: true
+    probe_interval_sec: 0
+
+steps:
+  - id: 1
+    from: self
+    to: self
+    function: run_bootstrap_window
+    description: |
+        Trigger. Tick 1 opens the window and issues the single bootstrap pair,
+        which closes the window by budget; ticks 2-13 issue directed probes.
+
+expected_state:
+  self:
+    pairs_issued: 1
+    probes_issued: 12
+    distinct_peers_probed: 3
+    probe_caps_fired: 3

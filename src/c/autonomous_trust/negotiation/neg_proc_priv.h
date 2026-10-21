@@ -101,6 +101,20 @@ int negotiation_get_task_stack_size(void);
  *  Python adapter's `if not self.process.confirmed` check. */
 bool negotiation_has_confirmed_any(void);
 
+/** One pass of the deadline sweep at wall-clock time @p present: ask the
+ *  participants of every task of ours past its deadline for status, and give
+ *  up (forget, unscored) a task after NEG_STATUS_ASKS unanswered rounds or
+ *  when nobody is left to ask. Returns the number given up. negotiation_run's
+ *  loop calls it once per pass; @p present is a parameter so a test can
+ *  advance the clock. */
+size_t negotiation_status_sweep(const process_t *proc, double present);
+
+/** One pass of the worker side: report the jobs whose threads have finished,
+ *  then start every due job a slot is free for. Returns the number of jobs
+ *  still holding a slot. negotiation_run's loop runs this each pass; exposed
+ *  so a test can step it. */
+size_t negotiation_run_due_jobs(const process_t *proc);
+
 /** Returns true iff the shared `my_tasks` map has an entry keyed by
  *  the given uuid (its string form, as the production code stores).
  *  For the `has_my_task: <slug>` expected_state assertion in the
@@ -120,7 +134,139 @@ bool negotiation_has_my_task_uuid(const uuid_t uuid);
  *  assertion exercised by the flood-probe scenario. */
 int negotiation_get_task_flood_count(const uuid_t uuid);
 
+/** Score a returned task result the way the requestor-side path does, and
+ *  name the evidence channel it came from (R+D.md §12.7 / §12.8).
+ *
+ *  @p cap_name and @p kwargs_json are what the REQUESTOR asked for -- in
+ *  production, the record `handle_results` reads off the task tracker, never
+ *  anything the responder sent back. A known-answer capability is checked
+ *  against its expected value (0.9 correct / 0.5 forgivable clock drift / 0.1
+ *  wrong) and reports the `probe` channel; anything else is scored on
+ *  completion (0.8 with a result, 0.3 without) and reports `task_outcome`.
+ *
+ *  Between those two, physical consistency (R+D.md §12.2): a claim that is
+ *  impossible, or that no consistent story leaves honest, reports `physical`
+ *  (0.1); a peer implicated by a conflict that does not name it uniquely
+ *  reports `swarm_disagreement` (0.3). The layer speaks only to refute, so a
+ *  claim it has nothing to say about falls through to the completion arm.
+ *  @p subject is the peer the observation is filed under -- NULL for a fan-out,
+ *  which runs only the checks needing no identity -- and @p now is monotonic
+ *  seconds, a parameter rather than a clock read so a replay produces the
+ *  verdicts the live path did.
+ *
+ *  Then the coverage audit (R+D.md §12.4): @p prediction_json is the peer's
+ *  attached prediction set and claimed coverage, judged against the record of
+ *  its OWN previously resolved predictions — `calibration` at 0.1 for a
+ *  coverage claim the exact test rejects, 0.3 for a capability declared
+ *  predictive that produced no usable set. Falsification only; a peer that has
+ *  not been caught over-claiming earns nothing here.
+ *
+ *  Then certificate-carrying interfaces (R+D.md §12.3): @p certificate_json is
+ *  the witness the peer attached, checked against the problem in
+ *  @p kwargs_json -- OUR record, never the peer's account of it -- to give
+ *  `certificate` at 0.9 (proved right), 0.1 (proved wrong) or 0.3 (declared to
+ *  certify and did not). @p seed is this verifier's challenge for the one
+ *  probabilistic checker and must not be derivable from the problem
+ *  (::at_cert_verifier_seed draws one).
+ *
+ *  The layers are separate libraries reached through negotiation/neg_oracle.h;
+ *  one that is not linked contributes nothing, exactly as if undeclared.
+ *
+ *  Exported so tests and the conformance adapter exercise the same function
+ *  production does. @p channel_out may be NULL. */
+double negotiation_score_task_result(const char *cap_name,
+                                     const char *kwargs_json,
+                                     const char *result_str, size_t result_len,
+                                     const char *certificate_json,
+                                     const char *prediction_json,
+                                     const char *subject, double now,
+                                     uint64_t seed,
+                                     const char **channel_out);
+
+/** @ref negotiation_score_task_result, with @p issued_at: when this requestor
+ *  recorded the request (task_tracker_t.issued_at), so at.time-attest is
+ *  judged over the round trip rather than at the scoring instant alone
+ *  (ISSUES §2.53). 0 = unknown, which is what the shorter form passes. */
+double negotiation_score_task_result_at(const char *cap_name,
+                                        const char *kwargs_json,
+                                        double issued_at,
+                                        const char *result_str, size_t result_len,
+                                        const char *certificate_json,
+                                        const char *prediction_json,
+                                        const char *subject, double now,
+                                        uint64_t seed,
+                                        const char **channel_out);
+
+/** The learned EMA weight multiplier for @p subject on @p cap_name
+ *  (R+D.md §12.5), NOT a score.
+ *
+ *  Prequential competence is deliberately not one of the arms of
+ *  ::negotiation_score_task_result: a peer whose forecasts are wide or wrong
+ *  has told no lie, so it earns no evidence channel and no score. What it
+ *  produces is a multiplier on how much this score weighs in the EMA,
+ *  composed with the capability's authored `transaction_weight` and §12.8's
+ *  channel weight in the reputation process.
+ *
+ *  Confined to the declared band around 1.0, and exactly
+ *  ::NEG_NEUTRAL_COMPETENCE (1.0, the authored weight verbatim) with the
+ *  layer off or its library absent, the capability undeclared, @p subject unknown or NULL, or the
+ *  peer's record shorter than `min_samples`. @p subject is a peer uuid string,
+ *  the same key ::negotiation_score_task_result files observations under.
+ *
+ *  Exported for the same reason the scorer is: tests and the conformance
+ *  adapter must exercise the function production uses.
+ *  See doc/architecture/prequential-competence.md. */
+double negotiation_competence_weight(const char *cap_name,
+                                     const char *subject);
+
+/** Python type tags carried by every negotiation payload (doc/architecture/negotiation.md).
+ *
+ *  Shared constants rather than language artifacts -- the same argument that
+ *  keeps the wire protocol strings byte-identical to Python's enum values.
+ *  Declared here, not inside neg_proc.c, so the conformance adapter builds its
+ *  inbound payloads from the SAME tags the serializer emits: a mirrored copy is
+ *  a copy that can drift, and a drifted adapter is exactly how the two
+ *  runtimes' payload shapes stayed divergent through a green corpus.
+ *  @{ */
+#define PY_NEG_MOD          "autonomous_trust.core._python.negotiation.negotiation."
+#define PY_TYPE_TASK        PY_NEG_MOD "Task"
+#define PY_TYPE_TASK_STATUS PY_NEG_MOD "TaskStatus"
+#define PY_TYPE_TASK_RESULT PY_NEG_MOD "TaskResult"
+#define PY_TYPE_TASK_PARAMS PY_NEG_MOD "TaskParameters"
+#define PY_TYPE_CAPABILITY  "autonomous_trust.core._python.capabilities.Capability"
+#define PY_ENUM_STATUS      "Enumcfg:" PY_NEG_MOD "Status"
+/** @} */
+
+/** @brief Parse a negotiation payload and re-emit it, for the corpus's
+ *         byte-pinned payload-shape vectors.
+ *
+ *  Negotiation payloads are Python's `__type__`-tagged Configuration dump,
+ *  except `requestor`, which is the flat DRY canonical PUBLIC identity
+ *  (doc/architecture/negotiation.md). The corpus pins that shape by round-tripping ONE fixture
+ *  through both runtimes: parse the pinned bytes, re-emit, compare. Neither
+ *  side can then drift without failing, which is exactly what the
+ *  envelope-only pinning allowed for months.
+ *
+ *  @param verb      NEG_PROTO_RESULT for a TaskResult, NEG_PROTO_STAT_RSP for
+ *                   a TaskStatus, anything else for a Task.
+ *  @param in_json   The payload to parse.
+ *  @param requestor Identity the re-emitted `requestor` field is built from;
+ *                   production resolves it from the peer table instead.
+ *  @param out_json  Receives a compact, key-sorted dump. Caller frees.
+ *  @return 0, or EINVAL / ENOMEM.
+ */
+int negotiation_payload_roundtrip(const char *verb, const char *in_json,
+                                  const public_identity_t *requestor,
+                                  char **out_json);
+
 #define ENEG_NOPEERS 243
 DECLARE_ERROR(ENEG_NOPEERS, "No capable peers available");
+
+
+/** Seconds since the epoch for a task's datetime_t, honouring its recorded
+ *  offset. Exposed for testing: the conversion MUST NOT go through mktime,
+ *  which applies the host's timezone to what is a UTC struct. See
+ *  test_task_start_epoch_ignores_the_host_timezone. */
+time_t negotiation_dt_epoch(const datetime_t *dt);
 
 #endif  /* NEG_PROC_PRIV_H */

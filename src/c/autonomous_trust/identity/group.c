@@ -15,7 +15,9 @@
  *******************/
 
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <errno.h>
 
 #include <uuid/uuid.h>
@@ -38,6 +40,8 @@ int group_init(uuid_t *uuid, char *address, group_t *group)
     strncpy(group->address, address, ADDR_LEN);
     group->address[ADDR_LEN] = '\0';   /* strncpy does not terminate when src is >= ADDR_LEN */
     map_init(&group->address_map);
+    /* Explicit rather than left to zeroed storage: a group initialized here
+     * has declared nothing, whatever memory it was handed. */
     unsigned char *eseed = encryptor_generate();
     if (eseed == NULL)
         return -1;
@@ -67,7 +71,193 @@ int group_encrypt(const group_t *ident, const msg_str_t *in, const group_t *whom
 /* Frama-C: skipped — [solver-timeout] libsodium decrypt preconditions */
 int group_decrypt(const group_t *ident, const msg_str_t *cipher, const group_t *whom, const unsigned char *nonce, unsigned char *out)
 {
-    return crypto_box_open_easy(out, cipher->msg, cipher->len, nonce, whom->encryptor.public, ident->encryptor.private);
+    int rc = crypto_box_open_easy(out, cipher->msg, cipher->len, nonce,
+                                  whom->encryptor.public, ident->encryptor.private);
+    if (rc == 0)
+        return rc;
+    /* A rotation is not synchronous across a cohort: a member that has not yet
+     * processed the key update is still sending under the old one. Retry the
+     * recently retired keys rather than drop those frames. Bounded by age, so a
+     * retired key stops working soon after it is retired — an unbounded
+     * fallback would make rotation decorative. Mirrors Python Group.decrypt.
+     *
+     * Each retired key is tried as the pair it was: its own public with its own
+     * private, which is how a group frame is sealed (the shared key to itself).
+     * The network process passes the group as `whom`, so pairing the retired
+     * private with whom's public meant the CURRENT public, and no frame sealed
+     * under a retired key ever opened. */
+    double stamp = (double)time(NULL);
+    for (size_t i = 0; i < ident->num_previous_keys; i++)
+    {
+        if (stamp - ident->previous_retired_at[i] > GROUP_PREVIOUS_KEY_GRACE)
+            continue;
+        if (crypto_box_open_easy(out, cipher->msg, cipher->len, nonce,
+                                 ident->previous_keys[i].public,
+                                 ident->previous_keys[i].private) == 0)
+            return 0;
+    }
+    return rc;
+}
+
+/* Whether this group holds the shared PRIVATE key (and can therefore decrypt
+ * cohort traffic). Same predicate group_to_json uses to decide which key to
+ * emit — one spelling, so "we own this group" cannot mean two things. Mirrors
+ * Python Group.owns_private_key. */
+static bool _group_owns_private(const group_t *group)
+{
+    return group != NULL
+        && !sodium_is_zero(group->encryptor.private, crypto_box_SECRETKEYBYTES);
+}
+
+/* Mint a fresh shared key, retiring the current one into the grace window.
+ * Returns the new epoch, or -1 when we do not hold the current private key —
+ * a public-only view of somebody else's group has no standing to rotate it,
+ * and silently minting a key here would fork the cohort into two halves that
+ * cannot hear each other — or when minting fails. Mirrors Python
+ * Group.rotate_key.
+ *
+ * The new key is minted BEFORE the current one is retired. Retiring first left
+ * a failed mint holding a live key that was also in its own retired list, and
+ * group_rotation_refusal then refused every update carrying that key, the
+ * cohort's winner included, as "a key we already retired". */
+int64_t group_rotate_key(group_t *group)
+{
+    if (!_group_owns_private(group))
+        return -1;
+    unsigned char *seed = encryptor_generate();
+    if (seed == NULL)
+        return -1;
+    encryptor_t minted = {0};
+    int rc = encryptor_init_from_private(&minted, seed,
+                                         crypto_box_SECRETKEYBYTES * 2);
+    sodium_memzero(seed, crypto_box_SECRETKEYBYTES * 2);
+    free(seed);
+    if (rc != 0)
+    {
+        sodium_memzero(&minted, sizeof(minted));
+        return -1;
+    }
+
+    size_t keep = group->num_previous_keys;
+    if (keep > GROUP_PREVIOUS_KEY_MAX - 1)
+        keep = GROUP_PREVIOUS_KEY_MAX - 1;
+    for (size_t i = keep; i > 0; i--)
+    {
+        group->previous_keys[i] = group->previous_keys[i - 1];
+        group->previous_retired_at[i] = group->previous_retired_at[i - 1];
+    }
+    group->previous_keys[0] = group->encryptor;
+    group->previous_retired_at[0] = (double)time(NULL);
+    group->num_previous_keys = keep + 1;
+
+    /* The key fields only: the embedded smrt header stays the group's. */
+    memcpy(group->encryptor.private, minted.private, sizeof(minted.private));
+    memcpy(group->encryptor.public, minted.public, sizeof(minted.public));
+    memcpy(group->encryptor.public_hex, minted.public_hex,
+           sizeof(minted.public_hex));
+    sodium_memzero(&minted, sizeof(minted));
+    group->key_epoch += 1;
+    return group->key_epoch;
+}
+
+/* True when @p key is one this group has already retired. A key we rotated AWAY
+ * from must never come back — that is the whole point of rotation, and it is the
+ * property the epoch was introduced to protect. Checked by public half: the
+ * public key identifies the keypair, and a retired key is not a secret.
+ *
+ * The window is only GROUP_PREVIOUS_KEY_MAX deep, which is enough for the case
+ * that matters: a replay that is dangerous must name an epoch we have not yet
+ * passed, and those keys are exactly the recent ones. Anything older is refused
+ * by the epoch comparison long before it gets here. */
+static bool _group_key_is_retired(const group_t *group, const encryptor_t *key)
+{
+    size_t held = group->num_previous_keys;
+    if (held > GROUP_PREVIOUS_KEY_MAX)
+        held = GROUP_PREVIOUS_KEY_MAX;
+    for (size_t i = 0; i < held; i++)
+        if (memcmp(group->previous_keys[i].public, key->public,
+                   crypto_box_PUBLICKEYBYTES) == 0)
+            return true;
+    return false;
+}
+
+/* Adopt @p other's shared key if it supersedes ours. Same group, and the sender
+ * must actually hold the private key. Authenticating WHO may rotate is the
+ * caller's job. Mirrors Python Group.accept_rotation.
+ *
+ * A LOWER epoch is a replay: accepting one would let a captured old key be
+ * reinstated over a newer one, which is precisely what rotation forecloses.
+ *
+ * An EQUAL epoch needs a deterministic tiebreak rather than a flat refusal,
+ * because two members can legitimately rotate at the same moment and a flat
+ * refusal makes that fork PERMANENT. It happens whenever two nodes admit each
+ * other simultaneously — ordinary mesh discovery: each runs _peer_accepted,
+ * each mints its own epoch N+1, and each then refuses the other's. Same group
+ * uuid, same epoch number, different keys, and no further admission to carry
+ * anyone to epoch N+2, so every group multicast fails its MAC forever. Observed
+ * live 2026-09-17 (agora business-ad cohort: the first live group multicast the
+ * project had ever sent, so nothing caught it earlier).
+ *
+ * The tiebreak is the lower public key, which both sides compute identically
+ * from what is already on the wire, so they converge on ONE key without another
+ * round trip — the same deterministic-order idiom the group MERGE tiebreak
+ * already uses. It does not reopen the replay hole: a key we have already
+ * retired is refused outright, at ANY epoch, so the captured-old-key attack
+ * the epoch exists to stop still cannot land. What an equal epoch may now do
+ * is replace a live key with a DIFFERENT live key of the same generation, which
+ * is the fork we are resolving. */
+const char *group_rotation_refusal(const group_t *group, const group_t *other)
+{
+    if (group == NULL || other == NULL)
+        return "no group to compare";
+    if (uuid_compare(group->uuid, other->uuid) != 0)
+        return "a different group";
+    if (other->key_epoch < group->key_epoch)
+        return "a lower epoch (a replay)";
+    if (!_group_owns_private(other))
+        return "it carries no private key";
+    /* Never reinstate a key we rotated away from, whatever epoch it claims. */
+    if (_group_key_is_retired(group, &other->encryptor))
+        return "a key we already retired";
+    if (other->key_epoch == group->key_epoch)
+    {
+        int order = memcmp(other->encryptor.public, group->encryptor.public,
+                           crypto_box_PUBLICKEYBYTES);
+        if (order == 0)
+            return "already our key";
+        /* A real key always beats NO key at the same epoch. Holding a
+         * public-only view means we cannot read the cohort at all, so there is
+         * nothing to defend by winning a byte comparison, and a tiebreak that
+         * refused here would strand us unable to decrypt anything. (The caller
+         * only reaches an equal-epoch adoption from a VERIFIED update, so this
+         * is not a way to hand a node a key of the attacker's choosing.) */
+        if (_group_owns_private(group) && order > 0)
+            return "ours stands (the lower key wins the tiebreak)";
+    }
+    return NULL;
+}
+
+bool group_accept_rotation(group_t *group, const group_t *other)
+{
+    if (group_rotation_refusal(group, other) != NULL)
+        return false;
+    if (_group_owns_private(group))
+    {
+        size_t keep = group->num_previous_keys;
+        if (keep > GROUP_PREVIOUS_KEY_MAX - 1)
+            keep = GROUP_PREVIOUS_KEY_MAX - 1;
+        for (size_t i = keep; i > 0; i--)
+        {
+            group->previous_keys[i] = group->previous_keys[i - 1];
+            group->previous_retired_at[i] = group->previous_retired_at[i - 1];
+        }
+        group->previous_keys[0] = group->encryptor;
+        group->previous_retired_at[0] = (double)time(NULL);
+        group->num_previous_keys = keep + 1;
+    }
+    group->encryptor = other->encryptor;
+    group->key_epoch = other->key_epoch;
+    return true;
 }
 
 /* Frama-C: skipped — [solver-timeout] array precondition cascade */
@@ -104,6 +294,54 @@ int group_add_address(group_t *group, const char *uuid_str, const char *address)
 }
 
 /* Frama-C: skipped — [serialization] jansson JSON serialization */
+/* The envelope format this group speaks to `address`
+ * (doc/architecture/network-wire-format.md).
+ *
+ * The format belongs to the GROUP, so this is a membership question: a member
+ * speaks the group's format, and anything this group cannot place -- a
+ * stranger, a pre-admission newcomer, a member of a DIFFERENT group -- gets
+ * JSON, the format every AT node can read and the only safe answer when there
+ * is no group to consult.
+ *
+ * That last case is what makes a cross-group exchange work without anyone
+ * negotiating it: when two groups with DIFFERENT formats meet -- the merge
+ * handshake, where a group_key_update crosses from one cohort to another --
+ * neither can place the other's members, so both independently fall to JSON
+ * and the exchange succeeds. Pinned by conformance
+ * `network/cross-group-format-fallback`.
+ *
+ * The single copy of this rule: net_proc.c's wire_format_for_address delegates
+ * here rather than walking the address map itself, so the production selection
+ * and the pinned one cannot drift. Mirrors Python Group.wire_format_for_address.
+ */
+net_wire_format_t group_wire_format_for_address(const group_t *group,
+                                                const char *address)
+{
+    if (group == NULL || address == NULL || address[0] == '\0')
+        return NET_WIRE_JSON;
+    bool member = false;
+    map_key_t key;
+    data_t *value;
+    map_entries_for_each((map_t *)&group->address_map, key, value)
+        string_t addr = NULL;
+        if (data_string_ptr(value, &addr) == 0 && addr != NULL &&
+            strcmp((const char *)addr, address) == 0)
+            member = true;
+    map_end_for_each
+    return member ? group->wire_format : NET_WIRE_JSON;
+}
+
+bool group_refuses_formatless(const group_t *mine, const json_t *theirs)
+{
+    if (mine == NULL || theirs == NULL || mine->wire_format != NET_WIRE_PROTO)
+        return false;
+    const char *wf = json_string_value(json_object_get(theirs, "wire_format"));
+    if (wf == NULL)
+        return true;
+    return strcmp(wf, net_wire_format_name(NET_WIRE_JSON)) != 0
+           && strcmp(wf, net_wire_format_name(NET_WIRE_PROTO)) != 0;
+}
+
 int group_to_json(const void *data_struct, json_t **obj_ptr)
 {
     const group_t *ident = data_struct;
@@ -162,10 +400,24 @@ int group_to_json(const void *data_struct, json_t **obj_ptr)
     free(hex);
     json_object_set_new(obj, "encryptor", encr);
 
-    /* Group age (§3.1-b) for the merge size-tie tiebreaker. Mirrors Python
+    /* Group age for the merge size-tie tiebreaker. Mirrors Python
      * to_canonical's "created". Omitted-on-read defaults to 0 (unknown → uuid
      * tiebreak), so a peer that doesn't send it stays compatible. */
     json_object_set_new(obj, "created", json_real(ident->created));
+    /* Key rotation epoch (doc/architecture/gateway-reputation-tree.md). Additive and
+     * defaulted on read, so a peer predating rotation sends nothing and reads as epoch
+     * 0 — which is exactly "never rotated" and needs no special case. Mirrors Python
+     * to_canonical's "key_epoch". */
+    json_object_set_new(obj, "key_epoch", json_integer(ident->key_epoch));
+    /* Envelope encoding for this group's traffic
+     * (doc/architecture/network-wire-format.md), as the same
+     * lowercase name Python's to_canonical writes. This is the field a joining
+     * node ADOPTS -- it arrives with the group key, in the same message, from
+     * the member that admitted us, which is what keeps a cohort from ending up
+     * half in one format. Omitted-on-read defaults to json, so a peer that
+     * predates it stays compatible. */
+    json_object_set_new(obj, "wire_format",
+                        json_string(net_wire_format_name(ident->wire_format)));
 
     return 0;
 }
@@ -228,10 +480,18 @@ int group_from_json(const json_t *obj, void *data_struct)
     if (rc != 0)
         return -1;
 
-    /* Group age (§3.1-b): absent defaults to 0 (unknown → uuid tiebreak). */
+    /* Group age (doc/architecture/identity-protocol.md): absent defaults to 0 (unknown → uuid tiebreak). */
     json_t *created_obj = json_object_get(obj, "created");
     group->created = (created_obj != NULL && json_is_number(created_obj))
                      ? json_number_value(created_obj) : 0.0;
+    json_t *epoch_obj = json_object_get(obj, "key_epoch");
+    group->key_epoch = (epoch_obj != NULL && json_is_integer(epoch_obj))
+                       ? json_integer_value(epoch_obj) : 0;
+    /* Absent -> json, and an unrecognized name -> json too (see
+     * net_wire_format_from_name): a typo in provisioned data must tighten to
+     * the format every node can read rather than fail the load. */
+    const char *wf = json_string_value(json_object_get(obj, "wire_format"));
+    group->wire_format = net_wire_format_from_name(wf);
     return 0;
 }
 
@@ -242,9 +502,49 @@ int group_sync_out(group_t *group, AutonomousTrust__Core__Protobuf__Identity__Gr
     proto->uuid.data = group->uuid;
     proto->uuid.len = sizeof(uuid_t);
     proto->address = group->address;
-    proto->created = group->created;  /* §3.1-b group age */
+    proto->created = group->created;  /* doc/architecture/identity-protocol.md group age */
+    /* Envelope format (2.3). NET_WIRE_JSON is the proto3 default, so a JSON
+     * group still encodes to exactly the bytes it did before this field
+     * existed -- which is what keeps every byte-pinned group vector valid. */
+    proto->wire_format = (group->wire_format == NET_WIRE_PROTO)
+        ? AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__NET_WIRE_FORMAT__NET_WIRE_PROTO
+        : AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__NET_WIRE_FORMAT__NET_WIRE_JSON;
+    /* The epoch and the retired keys, so a sibling's group_decrypt has the
+     * same grace window identity's does (the network process is its only
+     * caller). On-node only, like the shared private below; the secrets are
+     * SHARED with the group and group_proto_free frees only the entries. */
+    proto->key_epoch = group->key_epoch;
+    proto->n_previous_keys = 0;
+    proto->previous_keys = NULL;
+    size_t retired = group->num_previous_keys;
+    if (retired > GROUP_PREVIOUS_KEY_MAX)
+        retired = GROUP_PREVIOUS_KEY_MAX;
+    if (retired > 0)
+    {
+        proto->previous_keys = calloc(
+            retired, sizeof(AutonomousTrust__Core__Protobuf__Identity__Group__RetiredKey *));
+        if (proto->previous_keys == NULL)
+            return EXCEPTION(ENOMEM);
+        for (size_t i = 0; i < retired; i++)
+        {
+            if (sodium_is_zero(group->previous_keys[i].private,
+                               crypto_box_SECRETKEYBYTES))
+                continue;
+            AutonomousTrust__Core__Protobuf__Identity__Group__RetiredKey *rk =
+                malloc(sizeof(*rk));
+            if (rk == NULL)
+                return EXCEPTION(ENOMEM);
+            AutonomousTrust__Core__Protobuf__Identity__Group__RetiredKey tmp_r =
+                AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__GROUP__RETIRED_KEY__INIT;
+            memcpy(rk, &tmp_r, sizeof(tmp_r));
+            rk->secret.data = group->previous_keys[i].private;
+            rk->secret.len = crypto_box_SECRETKEYBYTES;
+            rk->retired_at = group->previous_retired_at[i];
+            proto->previous_keys[proto->n_previous_keys++] = rk;
+        }
+    }
 
-    /* Full address_map (§1.4) as a proto3 map (repeated key/value entries).
+    /* Full address_map (doc/architecture/identity-protocol.md) as a proto3 map (repeated key/value entries).
      * Keys/values are SHARED with group->address_map: group_to_proto packs
      * immediately, and group_proto_free releases only the entry structs + the
      * array, never the shared strings (which the map still owns). */
@@ -282,8 +582,28 @@ int group_sync_out(group_t *group, AutonomousTrust__Core__Protobuf__Identity__Gr
     proto->encryptor = malloc(sizeof(AutonomousTrust__Core__Protobuf__Identity__Encryptor));
     AutonomousTrust__Core__Protobuf__Identity__Encryptor tmp_e = AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__ENCRYPTOR__INIT;
     memcpy(proto->encryptor, &tmp_e, sizeof(tmp_e));
-    proto->encryptor->hex_seed.data = group->encryptor.public_hex;
-    proto->encryptor->hex_seed.len = crypto_box_PUBLICKEYBYTES * 2;
+    /* group_to_proto/proto_to_group is the SAME-NODE inter-process codec
+     * (msg_types.c only — never the wire; the wire uses group_to_json). The
+     * OLD code emitted only public_hex here, and group_sync_in reconstructed
+     * nothing usable — so a group propagated to a sibling process (network,
+     * reputation) arrived with a zero encryptor and could neither ENCRYPT nor
+     * DECRYPT group multicast (Increment-7 feed posts). Carry the full key: when
+     * we own the shared private, hand siblings the RAW 32-byte private (they
+     * derive the public); a public-only view sends the 64-char public hex. The
+     * length (SECRETKEYBYTES vs PUBLICKEYBYTES*2) disambiguates on read. The
+     * private stays on-node because this codec never leaves the node. Both
+     * pointers are SHARED with the group (like the old public_hex), so
+     * group_proto_free still frees neither. */
+    if (!sodium_is_zero(group->encryptor.private, crypto_box_SECRETKEYBYTES))
+    {
+        proto->encryptor->hex_seed.data = group->encryptor.private;
+        proto->encryptor->hex_seed.len = crypto_box_SECRETKEYBYTES;
+    }
+    else
+    {
+        proto->encryptor->hex_seed.data = group->encryptor.public_hex;
+        proto->encryptor->hex_seed.len = crypto_box_PUBLICKEYBYTES * 2;
+    }
     return 0;
 }
 
@@ -293,9 +613,36 @@ int group_sync_in(AutonomousTrust__Core__Protobuf__Identity__Group *proto, group
     memcpy(group->uuid, proto->uuid.data, sizeof(uuid_t));
     strncpy(group->address, proto->address, ADDR_LEN);
     group->address[ADDR_LEN] = '\0';  /* strncpy does not terminate when src is >= ADDR_LEN */
-    group->created = proto->created;  /* §3.1-b group age */
+    group->created = proto->created;  /* doc/architecture/identity-protocol.md group age */
+    /* Absent/0 reads as json, which is what a group from a peer predating this
+     * field is (2.3). */
+    group->wire_format =
+        (proto->wire_format == AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__NET_WIRE_FORMAT__NET_WIRE_PROTO)
+        ? NET_WIRE_PROTO : NET_WIRE_JSON;
+    /* Mirror of group_sync_out: the epoch and the retired keys, newest first. */
+    group->key_epoch = proto->key_epoch;
+    group->num_previous_keys = 0;
+    for (size_t i = 0; i < proto->n_previous_keys
+                       && group->num_previous_keys < GROUP_PREVIOUS_KEY_MAX; i++)
+    {
+        const AutonomousTrust__Core__Protobuf__Identity__Group__RetiredKey *rk =
+            proto->previous_keys[i];
+        if (rk == NULL || rk->secret.len != crypto_box_SECRETKEYBYTES)
+            continue;
+        char priv_hex[crypto_box_SECRETKEYBYTES * 2 + 1];
+        sodium_bin2hex(priv_hex, sizeof(priv_hex), rk->secret.data,
+                       crypto_box_SECRETKEYBYTES);
+        int rc = encryptor_init_from_private(
+            &group->previous_keys[group->num_previous_keys],
+            (const unsigned char *)priv_hex, crypto_box_SECRETKEYBYTES * 2);
+        sodium_memzero(priv_hex, sizeof(priv_hex));
+        if (rc != 0)
+            continue;
+        group->previous_retired_at[group->num_previous_keys] = rk->retired_at;
+        group->num_previous_keys++;
+    }
 
-    /* Rebuild the full address_map (§1.4). proto_to_group deserializes into a
+    /* Rebuild the full address_map (doc/architecture/identity-protocol.md). proto_to_group deserializes into a
      * fresh (zeroed) group, so initialise the map before populating it. */
     map_init(&group->address_map);
     for (size_t i = 0; i < proto->n_address_map; i++)
@@ -304,7 +651,26 @@ int group_sync_in(AutonomousTrust__Core__Protobuf__Identity__Group *proto, group
         if (entry != NULL && entry->key != NULL && entry->value != NULL)
             group_add_address(group, entry->key, entry->value);
     }
-    memcpy(group->encryptor.public_hex, proto->encryptor->hex_seed.data, crypto_box_PUBLICKEYBYTES * 2);
+    /* Mirror of group_sync_out: hex_seed carries EITHER the raw shared private
+     * (owned view, SECRETKEYBYTES bytes) OR the public-key hex (public-only
+     * view, PUBLICKEYBYTES*2 chars); the length disambiguates. Reconstruct via
+     * the same canonical helpers group_from_json uses, so the network process
+     * gets a fully usable encryptor (private + public + public_hex) and can
+     * crypto_box group multicast (Increment-7 feed posts). */
+    if (proto->encryptor->hex_seed.len == crypto_box_SECRETKEYBYTES)
+    {
+        /* Raw shared private -> canonical private-key path (crypto_scalarmult_base). */
+        char priv_hex[crypto_box_SECRETKEYBYTES * 2 + 1];
+        sodium_bin2hex(priv_hex, sizeof(priv_hex),
+                       proto->encryptor->hex_seed.data, crypto_box_SECRETKEYBYTES);
+        if (encryptor_init_from_private(&group->encryptor,
+                                        (const unsigned char *)priv_hex,
+                                        crypto_box_SECRETKEYBYTES * 2) != 0)
+            return -1;
+    }
+    else if (public_encryptor_init(&group->encryptor, proto->encryptor->hex_seed.data,
+                                   proto->encryptor->hex_seed.len) != 0)
+        return -1;
     return 0;
 }
 
@@ -315,6 +681,9 @@ void group_proto_free(AutonomousTrust__Core__Protobuf__Identity__Group *proto)
     for (size_t i = 0; i < proto->n_address_map; i++)
         free(proto->address_map[i]);
     free(proto->address_map);
+    for (size_t i = 0; i < proto->n_previous_keys; i++)
+        free(proto->previous_keys[i]);   /* the secrets are the group's */
+    free(proto->previous_keys);
     free(proto->encryptor);
 }
 
@@ -324,7 +693,8 @@ int group_to_proto(group_t *msg, void **data_ptr, size_t *data_len_ptr)
         AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__GROUP__INIT;
     group_sync_out(msg, &proto);
     *data_len_ptr = autonomous_trust__core__protobuf__identity__group__get_packed_size(&proto);
-    *data_ptr = smrt_create(*data_len_ptr);
+    /* a plain buffer the caller free()s; smrt_create is for headered structs */
+    *data_ptr = malloc(*data_len_ptr > 0 ? *data_len_ptr : 1);
     if (*data_ptr == NULL)
         return EXCEPTION(ENOMEM);
     autonomous_trust__core__protobuf__identity__group__pack(&proto, *data_ptr);
@@ -336,8 +706,15 @@ int proto_to_group(uint8_t *data, size_t len, group_t *group)
 {
     AutonomousTrust__Core__Protobuf__Identity__Group *msg =
         autonomous_trust__core__protobuf__identity__group__unpack(NULL, len, data);
-    group_sync_in(msg, group);
-    free(msg);
+    if (msg == NULL)
+        return EXCEPTION(EINVAL);
+    /* Its status is not returned, as before: a group handed over before it
+     * holds any key fails the key parse and is still installed. */
+    (void)group_sync_in(msg, group);
+    /* group_sync_in copies everything it keeps (uuid, address, map entries,
+     * keys), so the unpacked message goes with all its nested allocations. A
+     * plain free() leaked the encryptor and every map entry per GROUP. */
+    autonomous_trust__core__protobuf__identity__group__free_unpacked(msg, NULL);
     return 0;
 }
 

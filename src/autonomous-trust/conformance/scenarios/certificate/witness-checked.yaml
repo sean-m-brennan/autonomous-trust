@@ -1,0 +1,276 @@
+schema_version: "1"
+kind: scenario
+protocol: certificate
+name: witness-checked
+byte_pinning: false
+description: |
+    An answer that arrives with a witness is checked exactly, and the verdict
+    is the same in both runtimes (R+D.md §12.3; doc/verification_oracle.md
+    "Certificates: exploit verification asymmetry";
+    doc/architecture/certificate-interfaces.md).
+
+    Why this has to agree across runtimes. This is the only layer in the oracle
+    that can return a GOOD score --- a witness that checks out means the answer
+    is *proved right*, not merely un-refuted --- and it is the layer most likely
+    to be reached, since checking is asymptotically cheaper than producing for
+    most computational work. A witness one runtime accepts and the other
+    rejects would make a peer's reputation depend on which implementation
+    happened to ask, in both directions at once.
+
+    Every row exercises one row of the oracle doc's certifying-algorithms
+    table. What the table's rows have in common is verification asymmetry; what
+    the ROWS BELOW have in common is that each pairs a valid witness with the
+    cheapest lie it must catch.
+
+      - `matrix_product` (Freivalds). A correct product passes every round; a
+        single wrong entry does not. The witness here is the VERIFIER's
+        randomness, not the peer's data, which is why the seed is a fixture
+        field: in production it comes from the requestor at check time and is
+        unpredictable to the peer, and deriving it from the matrices would let
+        a prover grind an answer that passes a challenge it could compute
+        itself. The two runtimes share `SplitMix64` so a given seed draws the
+        same challenge in both.
+      - `linear_solve`. The answer certifies itself: one matrix-vector product
+        against a solve.
+      - `lp`. The row where a bare answer is most convincingly wrong. The
+        suboptimal primal is entirely FEASIBLE --- every constraint holds ---
+        and only the duality gap reveals it is not optimal. The Farkas rows
+        certify the one claim with no answer to inspect, "there is no
+        solution", which no amount of examining a returned `x` could ever
+        check.
+      - `sat`. The asymmetry in miniature: satisfiability is certified in one
+        line, and UNSAT --- the answer a lying peer gives for free --- needs a
+        DRAT refutation. The last SAT row is the check that matters most: a
+        proof of sound lemmas that never derives the empty clause has proved
+        nothing, and accepting it would let a peer claim UNSAT by emitting
+        arbitrary valid inferences.
+      - `path`. "The path plus an admissible lower bound" is the standard
+        phrasing and is not checkable as stated: a peer returning a detour can
+        ASSERT a bound equal to its own cost. The witness is the bound's own
+        witness --- a feasible potential, the LP dual --- so the `lower_bound`
+        row is refused and the `potential` row is accepted.
+      - `flow`. A feasible flow certifies only that the peer returned *a* flow;
+        the cut is what makes it maximum.
+      - `schedule`. The under-reported makespan is the failure worth catching:
+        the schedule is entirely legal, and the peer is claiming a better one
+        than it produced.
+      - `state_estimation`. The one row of the table yielding a bound rather
+        than a proof, and the corpus says so by pinning the drifting sequence
+        as invalid and the constant one as INDETERMINATE rather than as a
+        failure.
+
+    Three verdicts are not scores, and the corpus asserts them as verdicts for
+    that reason. `absent` is "declared to certify and did not", which is a fact
+    about the peer; `indeterminate` is OUR retained inputs failing, which is
+    never the peer's fault and must never reach a score; `none` is a capability
+    nobody declared, or one declared uncertifiable. A runtime that collapsed
+    any two of those would look identical on scores alone.
+
+    Shape. Non-message-driven, like the bootstrap and physics scenarios: each
+    adapter loads `fixtures.certificates` into its own runtime and feeds
+    `fixtures.claims` through it, asserting the verdict per row. The two
+    runtimes cannot share a call site --- Python checks from its main process
+    (`automate.score_task_result`), C from its negotiation process --- so what
+    is pinned is the rules.
+
+    Inputs are spelled as JSON in the fixture and reach each runtime the way
+    that runtime carries them: Python takes the decoded values, C the compact
+    text its `report results` payload holds. `kwargs` is the problem as the
+    REQUESTOR retained it, never anything read back off the reply --- a checker
+    fed the peer's own account of the problem would be verifying that the peer
+    can solve a problem of its choosing.
+
+participants:
+  - id: requestor
+    role: new_node
+  - id: worker
+    role: peer
+
+fixtures:
+  seed: 7
+  certificates:
+    version: 1
+    capabilities:
+      d.matmul:    {checker: matrix_product, repetitions: 4}
+      d.solve:     {checker: linear_solve}
+      d.lp:        {checker: lp, tolerance: 1.0e-6}
+      d.sat:       {checker: sat}
+      d.route:     {checker: path}
+      d.flow:      {checker: flow}
+      d.sched:     {checker: schedule}
+      d.filter:    {checker: state_estimation, max_lag: 3, bound: 0.5}
+      d.opinion:   {checker: null, note: a judgement call}
+      d.migrating: {checker: sat, required: false}
+  claims:
+    #  1-3 Freivalds: right, wrong, and our own record missing
+    - capability: d.matmul
+      kwargs: {a: [[1, 2], [3, 4]], b: [[5, 6], [7, 8]]}
+      result: [[19, 22], [43, 50]]
+    - capability: d.matmul
+      kwargs: {a: [[1, 2], [3, 4]], b: [[5, 6], [7, 8]]}
+      result: [[19, 22], [43, 51]]
+    - capability: d.matmul
+      kwargs: {}
+      result: [[19, 22], [43, 50]]
+    #  4-5 linear solve: the answer certifies itself
+    - capability: d.solve
+      kwargs: {a: [[2, 1], [1, 3]], b: [3, 4]}
+      result: [1.0, 1.0]
+    - capability: d.solve
+      kwargs: {a: [[2, 1], [1, 3]], b: [3, 4]}
+      result: [1.0, 2.0]
+    #  6-10 lp: optimal, feasible-but-not-optimal, infeasible x, no dual, Farkas
+    - capability: d.lp
+      kwargs: {a: [[1, 1]], b: [2], c: [1, 1]}
+      result: {x: [2.0, 0.0]}
+      certificate: {dual: [1.0]}
+    - capability: d.lp
+      kwargs: {a: [[1, 1]], b: [2], c: [1, 1]}
+      result: {x: [3.0, 0.0]}
+      certificate: {dual: [1.0]}
+    - capability: d.lp
+      kwargs: {a: [[1, 1]], b: [2], c: [1, 1]}
+      result: {x: [0.0, 0.0]}
+      certificate: {dual: [1.0]}
+    - capability: d.lp
+      kwargs: {a: [[1, 1]], b: [2], c: [1, 1]}
+      result: {x: [2.0, 0.0]}
+    - capability: d.lp
+      kwargs: {a: [[-1]], b: [1], c: [1]}
+      result: {infeasible: true}
+      certificate: {farkas: [1.0]}
+    - capability: d.lp
+      kwargs: {a: [[1]], b: [1], c: [1]}
+      result: {infeasible: true}
+      certificate: {farkas: [1.0]}
+    # 12-16 sat: assignment, bad assignment, refutation, no refutation, bad one
+    - capability: d.sat
+      kwargs: {cnf: [[1, 2], [-1, 2], [1, -2]]}
+      result: {sat: true}
+      certificate: {assignment: [1, 2]}
+    - capability: d.sat
+      kwargs: {cnf: [[1, 2], [-1, 2], [1, -2]]}
+      result: {sat: true}
+      certificate: {assignment: [-1, -2]}
+    - capability: d.sat
+      kwargs: {cnf: [[1, 2], [-1, 2], [1, -2], [-1, -2]]}
+      result: {sat: false}
+      certificate: {proof: [[2], [-2], []]}
+    - capability: d.sat
+      kwargs: {cnf: [[1], [-1]]}
+      result: {sat: false}
+    # sound lemmas that never reach the empty clause prove nothing
+    - capability: d.sat
+      kwargs: {cnf: [[1, 2], [-1, 2], [1, -2], [-1, -2]]}
+      result: {sat: false}
+      certificate: {proof: [[2]]}
+    # 17-19 path: the potential is the witness; a bare bound is not
+    - capability: d.route
+      kwargs: {edges: [[s, a, 1], [a, t, 1], [s, t, 5]], source: s, target: t}
+      result: {path: [s, a, t]}
+      certificate: {potential: {s: 0, a: 1, t: 2}}
+    - capability: d.route
+      kwargs: {edges: [[s, a, 1], [a, t, 1], [s, t, 5]], source: s, target: t}
+      result: {path: [s, t]}
+      certificate: {potential: {s: 0, a: 1, t: 2}}
+    - capability: d.route
+      kwargs: {edges: [[s, a, 1], [a, t, 1], [s, t, 5]], source: s, target: t}
+      result: {path: [s, t]}
+      certificate: {lower_bound: 5}
+    # 20-21 flow: the cut makes it maximum
+    - capability: d.flow
+      kwargs: {edges: [[s, a, 3], [a, t, 2], [s, t, 1]], source: s, sink: t}
+      result: {flow: [[s, a, 2], [a, t, 2], [s, t, 1]], value: 3}
+      certificate: {cut: [s, a]}
+    - capability: d.flow
+      kwargs: {edges: [[s, a, 3], [a, t, 2], [s, t, 1]], source: s, sink: t}
+      result: {flow: [[s, a, 1], [a, t, 1]]}
+      certificate: {cut: [s, a]}
+    # 22-23 schedule: legal, and legal-but-under-reported
+    - capability: d.sched
+      kwargs:
+        jobs: [{id: x, duration: 2}, {id: y, duration: 3}]
+        precedences: [[x, y]]
+        capacity: 1
+      result: {start: {x: 0, y: 2}}
+      certificate: {makespan: 5}
+    - capability: d.sched
+      kwargs:
+        jobs: [{id: x, duration: 2}, {id: y, duration: 3}]
+        precedences: [[x, y]]
+        capacity: 1
+      result: {start: {x: 0, y: 2}}
+      certificate: {makespan: 3}
+    # 24-25 state estimation: a bound, and a sequence with no spectrum
+    - capability: d.filter
+      kwargs: {}
+      result: {innovations: [1, 2, 3, 4, 5, 6, 7, 8]}
+    - capability: d.filter
+      kwargs: {}
+      result: {innovations: [2, 2, 2, 2, 2, 2]}
+    # 26-28 the declaration states: uncertifiable, undeclared, optional
+    - capability: d.opinion
+      kwargs: {}
+      result: "yes"
+    - capability: d.other
+      kwargs: {}
+      result: "yes"
+    - capability: d.migrating
+      kwargs: {cnf: [[1]]}
+      result: {sat: true}
+    - capability: d.migrating
+      kwargs: {cnf: [[1]]}
+      result: {sat: true}
+      certificate: {assignment: [-1]}
+
+steps:
+  - id: 1
+    from: requestor
+    to: requestor
+    function: check_certificates
+    description: |
+        Trigger. The requestor feeds each row of `fixtures.claims` through its
+        own runtime's certificate verifier, with `fixtures.seed` as the
+        verifier's challenge.
+
+expected_state:
+  requestor:
+    claim_verdicts:
+      - valid          # correct product
+      - invalid        # one entry wrong
+      - indeterminate  # our own record missing: never the peer's fault
+      - valid          # exact solve
+      - invalid        # wrong solve
+      - valid          # optimal, with the dual that proves it
+      - invalid        # feasible but suboptimal: only the gap sees it
+      - invalid        # primal violates a constraint
+      - absent         # declared to certify, and did not
+      - valid          # Farkas certifies infeasibility
+      - invalid        # a Farkas vector that proves nothing
+      - valid          # assignment satisfies every clause
+      - invalid        # assignment leaves a clause unsatisfied
+      - valid          # DRAT refutation reaching the empty clause
+      - absent         # UNSAT claimed with no refutation at all
+      - invalid        # sound lemmas that never reach the empty clause
+      - valid          # shortest path, with a feasible potential
+      - invalid        # a detour cannot claim optimality
+      - invalid        # a bare asserted bound is not a witness
+      - valid          # max flow, with the cut that meets it
+      - invalid        # feasible but submaximal
+      - valid          # a legal schedule and an honest makespan
+      - invalid        # a legal schedule and an under-reported makespan
+      - invalid        # innovations that correlate are not white
+      - indeterminate  # a constant sequence has no spectrum
+      - none           # declared uncertifiable
+      - none           # never declared
+      - none           # optional witness, absent
+      - invalid        # optional witness, present and wrong
+    claim_scores:
+      [0.9, 0.1, null, 0.9, 0.1,
+       0.9, 0.1, 0.1, 0.3, 0.9, 0.1,
+       0.9, 0.1, 0.9, 0.3, 0.1,
+       0.9, 0.1, 0.1,
+       0.9, 0.1,
+       0.9, 0.1,
+       0.1, null,
+       null, null, null, 0.1]

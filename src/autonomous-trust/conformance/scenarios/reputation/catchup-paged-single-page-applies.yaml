@@ -1,0 +1,49 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: catchup-paged-single-page-applies
+byte_pinning: false
+description: |
+    A catch-up reply too large for one datagram goes as pages (ISSUES §2.67):
+    {page, of, head, chain}, every page of one window naming the responder's
+    head. A window that is one page long is complete as soon as it arrives, and
+    dave handles it exactly as he would the same chain sent unpaged: the links
+    verify and he catches up to all three entries.
+
+    Assembly across several pages is pinned by unit tests in each runtime
+    (test_update_pages.py, rep_update_pages_test.c); the C harness resets the
+    reputation state before every step, so pages cannot accumulate across steps
+    here.
+
+    Every entry carries the placement certificate alice and dave signed for
+    it, as every catch-up segment does now that every group places its order
+    (doc/architecture/reputation.md, "Agreeing on an order").
+
+participants:
+  - id: alice
+    role: provider
+  - id: dave
+    role: consumer
+
+fixtures:
+  num_updates:
+    dave: 1
+
+steps:
+  - id: 1
+    from: alice
+    to: dave
+    function: latest update
+    payload:
+      page: 0
+      of: 1
+      head: "aa"
+      chain:
+        - {task: a, p1: 0.7, p2: 0.5, batch: 1, placed_by: [alice, dave]}
+        - {task: b, p1: 0.9, p2: 0.3, batch: 2, placed_by: [alice, dave]}
+        - {task: c, p1: 0.6, p2: 0.4, batch: 3, placed_by: [alice, dave]}
+
+expected_state:
+  dave:
+    committed_tx_count: 3
+    window_root: "5c9aab7f06ce90acfe36fecbfac4fd06dd7a679ee43d1e342cf4f7d019edb411"

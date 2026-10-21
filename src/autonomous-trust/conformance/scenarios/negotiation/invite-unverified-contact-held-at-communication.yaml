@@ -1,0 +1,72 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: invite-unverified-contact-held-at-communication
+byte_pinning: false
+description: |
+    FIRST_CONTACT_PLAN §10.3, enforced: an unverified contact may message, and
+    higher-trust actions wait for verification.
+
+    Alice is a first-contact peer Bob has not verified (no safety-number
+    compare, no in-person exchange), and she has earned tier 4. Bob serves her
+    a tier-1 (communication) capability, and refuses a tier-2 (services) one,
+    because negotiation holds an unverified contact at tier 1 whatever it has
+    earned (Python first_contact.capped_tier, C at_first_contact_capped_tier).
+
+    Why a gate is needed at all: a direct peer is tasked by bootstrap probes
+    the moment it is admitted, and each successful probe raises its
+    reputation, so without the cap anyone holding one forwarded invitation link
+    climbs to full trust in minutes, verified or not.
+
+    The participants belong to no group, so Alice is a direct peer by
+    construction; a group member is never capped. The sender's tier comes
+    from the peer_tiers override, and the cap is applied after it on purpose,
+    so that this case can show a tier-4 sender being held.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  first_contact:
+    enabled: true
+  capabilities:
+    bob: [chat, file_share]
+  capability_tiers:
+    chat: 1
+    file_share: 2
+  peer_tiers:
+    alice: 4
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: chat
+      task_id: t-fc-chat
+  - id: 2
+    from: bob
+    to: alice
+    function: ack
+    in_response_to: 1
+    payload:
+      task_id: t-fc-chat
+  - id: 3
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: file_share
+      task_id: t-fc-share
+      seq: 2          # a fresh invitation from the same sender, not a replay
+  - id: 4
+    from: bob
+    to: alice
+    function: nack
+    in_response_to: 3
+    payload:
+      task_id: t-fc-share

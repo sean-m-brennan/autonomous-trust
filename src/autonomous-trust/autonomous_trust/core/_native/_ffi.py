@@ -24,7 +24,9 @@ native wrapper classes.  The C library is loaded once at import time via
 
 import ctypes
 import ctypes.util
+import glob
 import os
+import warnings
 
 from cffi import FFI
 
@@ -38,12 +40,13 @@ ffi = FFI()
 ffi.cdef("""
 
     /* ---- utilities/allocation.h ---- */
-    typedef struct { bool alloc; size_t refs; } smrt_ptr_t;
+    typedef struct { uint64_t magic; bool alloc; size_t refs; void (*dtor)(void *); } smrt_ptr_t;
 
     void *smrt_create(size_t size);
     int smrt_recreate(void **pptr, size_t size);
     void smrt_ref(void *ptr);
     void smrt_deref(void *ptr);
+    void at_free(void *ptr);
 
     /* ---- utilities/exception.h ---- */
     typedef struct {
@@ -131,6 +134,7 @@ ffi.cdef("""
     int    array_get(array_t *a, int index, data_t **element);
     int    array_set(array_t *a, int index, data_t *element);
     int    array_remove(array_t *a, data_t *element);
+    int    array_remove_at(array_t *a, int index);
     void   array_free(array_t *a);
 
     /* ---- structures/map.h ---- */
@@ -200,12 +204,18 @@ ffi.cdef("""
         int (*from_json)(const void *obj, void *data_struct);
         size_t data_len;
         void *data_struct;
+        /* Added 2026-08-12 (doc/architecture/native-ffi-dual-implementation.md): the proto
+         * hooks were missing, so the
+           mirror was 40 bytes against C's 56. Optional in C (NULL = no proto
+           serializer, JSON fallback), but a NULL field still occupies its slot. */
+        int (*to_proto)(const void *data_struct, void **buf_out, size_t *len_out);
+        int (*from_proto)(const void *buf, size_t len, void *data_struct);
     } config_t;
 
     extern config_t configuration_table[];
     extern size_t configuration_table_size;
 
-    /* Both gained an explicit `destlen` on 2026-08-04 (ISSUES.md §2.1.1: they
+    /* Both gained an explicit `destlen` on 2026-08-04 (the path-length overflow: they
        used to hardcode 255 as path_join's bound while taking an unsized
        `char path[]`, which overflowed a 108-byte caller). Keep the arity in step
        with the C header — `ffi.dlopen` is ABI mode, so CFFI validates nothing
@@ -221,24 +231,34 @@ ffi.cdef("""
     int  load_all_configs(char *cfg_dir, map_t *configs, logger_t *logger);
 
     /* ---- identity/identity.h ---- */
+    /* One ZTA credential (identity.h:129-136). Declared unconditionally there,
+       so it is declared unconditionally here too. */
     typedef struct {
-        bool alloc; size_t refs;  /* smrt_ptr_t */
+        uint8_t *der;
+        size_t der_len;
+        uint8_t *binding;
+        size_t binding_len;
+        char issuer[64];
+    } zta_credential_t;
+
+    typedef struct {
+        uint64_t magic; bool alloc; size_t refs; void (*dtor)(void *);  /* smrt_ptr_t */
         unsigned char private_key[64];  /* crypto_sign_SECRETKEYBYTES */
         unsigned char public_key[32];   /* crypto_sign_PUBLICKEYBYTES */
         unsigned char public_hex[65];   /* hex + NUL */
     } signature_t;
 
     typedef struct {
-        bool alloc; size_t refs;  /* smrt_ptr_t */
+        uint64_t magic; bool alloc; size_t refs; void (*dtor)(void *);  /* smrt_ptr_t */
         unsigned char private_key[32];  /* crypto_box_SECRETKEYBYTES */
         unsigned char public_key[32];   /* crypto_box_PUBLICKEYBYTES */
         unsigned char public_hex[65];   /* hex + NUL */
     } encryptor_t;
 
     typedef struct {
-        bool alloc; size_t refs;  /* smrt_ptr_t */
+        uint64_t magic; bool alloc; size_t refs; void (*dtor)(void *);  /* smrt_ptr_t */
         unsigned char uuid[16];
-        char address[33];
+        char address[46];     /* ADDR_LEN(45) + 1 == IPV6_ADDR_LEN; was 33 */
         char nickname[129];   /* NAME_LEN+1; Zooko ONLINE name (was fullname) */
         char petname[129];    /* NAME_LEN+1; local-only Zooko name -- never */
                               /* serialized (see identity.c sync_out/sync_in). */
@@ -268,13 +288,35 @@ ffi.cdef("""
         uint8_t operator_pubkey[32];
         uint8_t *operator_key_binding;
         size_t operator_key_binding_len;
-        /* ZTA credential binding (identity.h, #ifdef AT_ZTA_ENABLED). The
-           native lib is built AT_ZTA=ON (build-native.sh -DAT_ZTA=ON), so these
-           are part of the ABI layout and must be present here to match. */
+        /* ZTA credential binding (identity.h). Unconditional in C since
+           FEATURE_SPLIT_PLAN Phase 6 (D3): the fields exist in every build and
+           only their VERIFICATION is ZTA's, so this layout no longer depends on
+           how the native lib was built. */
         uint8_t zta_credential_hash[32];
         char zta_issuer[64];
         uint8_t *zta_credential;
         size_t zta_credential_len;
+        /* Multi-credential set + proved anchors (identity.h, beside the above;
+           landed with doc/architecture/zta-integration.md on 2026-08-06). MISSING here until 2026-08-10, and
+           the cost was exactly what the comment above describes for the
+           operator-key fields: the mirror ended at zta_credential_len, 840
+           bytes against the C struct's 1752, so `proto_to_peer` wrote 912 bytes
+           past the `ffi.new('public_identity_t *')` allocation and corrupted the
+           heap (`free(): corrupted unsorted chunks`, aborting pytest in
+           tests/d_comparison/test_identity_parity.py::test_proto_roundtrip).
+
+           Sizes are spelled literally because the cdef has no C macros:
+           ZTA_MAX_CREDENTIALS 4, ZTA_MAX_ANCHORS 8, ZTA_ANCHOR_NAME_LEN 64.
+           Verify a change here against the C ABI rather than by eye -- compile
+           a probe that prints sizeof/offsetof from identity.h (with
+           -fms-extensions) and compare to ffi.sizeof /
+           ffi.offsetof. `scripts/audit-ffi-drift.py` compares function ARG
+           COUNTS only and cannot see any of this
+           (doc/architecture/native-ffi-dual-implementation.md). */
+        zta_credential_t zta_credentials[4];
+        size_t num_zta_credentials;
+        char zta_anchors[8][64];
+        size_t num_zta_anchors;
     } public_identity_t;
 
     typedef struct identity_s identity_t;  /* opaque - contains private keys */
@@ -306,13 +348,16 @@ ffi.cdef("""
 
     /* ---- network/network.h ---- */
     typedef struct {
-        bool alloc; size_t refs;  /* smrt_ptr_t */
+        uint64_t magic; bool alloc; size_t refs; void (*dtor)(void *);  /* smrt_ptr_t */
         int port;
         char mac_address[18];    /* MAC_ADDR_LEN(17) + 1 */
         char ip4_cidr[20];       /* CIDR4_LEN(19) + 1 */
         char mcast4_addr[17];    /* IPV4_ADDR_LEN(16) + 1 */
         char ip6_cidr[51];       /* CIDR6_LEN(50) + 1 */
         char mcast6_addr[47];    /* IPV6_ADDR_LEN(46) + 1 */
+        bool envelope;           /* gateway relay (libat_gateway) */
+        bool group_forward;
+        bool cross_cluster;
     } network_config_t;
 
     int network_to_json(const void *data_struct, void **obj_ptr);
@@ -361,6 +406,21 @@ ffi.cdef("""
                                net_wire_msg_t *msg_out);
     void net_wire_msg_free(net_wire_msg_t *msg);
 
+    /* Envelope format (doc/architecture/network-wire-format.md). The enum is spelled `int`
+     * here because
+     * the cdef needs its WIDTH, not its identity; NET_WIRE_JSON = 0,
+     * NET_WIRE_PROTO = 1 (network/net_wire_format.h). The `_fmt` pair is what a
+     * caller with a group in hand uses; the two above stay the JSON-fixed entry
+     * points, which is what every caller outside a group wants. */
+    int  net_message_to_wire_fmt(const net_wire_msg_t *msg,
+                                 const identity_t *signer,
+                                 int fmt,
+                                 uint8_t **wire_out, size_t *wire_len);
+    int  net_message_from_wire_fmt(const uint8_t *data, size_t len,
+                                   const public_identity_t *peer,
+                                   int fmt, net_wire_msg_t *msg_out);
+    const char *net_wire_format_name(int fmt);
+
     /* ---- network/network.h ---- */
     /* Base-port resolution: config -> AT_COMM_PORT -> COMM_PORT. Declared so
        the Python side can assert it agrees with C for a given base instead of
@@ -389,6 +449,12 @@ ffi.cdef("""
     typedef struct capability_s capability_t;
 
     capability_t *find_capability(const char *name);
+    /* Result-producing invocation. `capability_function_t` returns void, so a
+       capability's answer could not be collected until this existed and a C
+       worker had nothing to report; see processes/capabilities.h. */
+    int capability_execute_result(const capability_t *cap,
+                                 const char *kwargs_json,
+                                 char *result_out, size_t result_len);
 
     /* ---- utilities/msg_types.h ---- */
     typedef enum {
@@ -415,8 +481,23 @@ ffi.cdef("""
         size_t len;
         public_identity_t to_whom;
         public_identity_t from_whom;
+        /* from_rank / trace_id / verified / has_signature were MISSING here
+           until 2026-08-12 (doc/architecture/native-ffi-dual-implementation.md): the
+           mirror was 1848 bytes against
+           C's 1888. Note where each one goes — `from_rank` sits between
+           `from_whom` and `encrypt`, and `trace_id` after `return_to`, exactly as
+           in msg_types.h. Order IS layout, so appending them at the end would
+           have left every field from `encrypt` onward reading at the wrong
+           offset, which is the same defect with a tidier diff. */
+        int from_rank;
         bool encrypt;
+        /* Present in every build since FEATURE_SPLIT_PLAN Phase 5 (it was
+           AT_SOCIAL-only, so this mirror matched only a non-social core). */
+        bool group_multicast;
         char return_to[65];
+        char trace_id[33];      /* 32-char hex + NUL; NET_TRACE_ID_LEN */
+        bool verified;
+        bool has_signature;
     } net_msg_t;
 
     typedef enum {
@@ -446,6 +527,29 @@ ffi.cdef("""
         unsigned char task_uuid[16];
         unsigned char peer_uuid[16];
         double score;
+        /* Added 2026-08-12 (doc/architecture/native-ffi-dual-implementation.md): the
+         * mirror was 40 bytes against C's
+           112. CAP_NAMELEN is PROC_NAME_LEN(64), + NUL. Carried verbatim by the
+           whole-struct memcpy in msg_types.c, so a short mirror truncates the
+           capability name that resolves the transaction weight. */
+        char capability_name[65];
+        /* Evidence channel (R+D.md §12.8). TX_CHANNEL_NAMELEN is 31, + NUL.
+           Carried verbatim by the same whole-struct memcpy, so a short or
+           missing mirror truncates the channel into an unknown spelling --
+           which the far end then refuses rather than grades, an obscure way to
+           learn the mirror drifted. Mirrors reputation/tx_channel.h. */
+        char channel[32];
+        /* Learned EMA weight multiplier (R+D.md §12.5). Same whole-struct
+           memcpy, so an absent mirror shifts nothing but loses the field and
+           silently weights every peer at the authored number. Non-positive
+           (a zeroed struct) means 1.0, which is what pre-field producers
+           meant. Local-only: this struct never crosses the wire. Mirrors
+           Python TransactionScore.competence. */
+        double competence;
+        /* verifier-attested submission (msg_types.h); appended */
+        bool attested;
+        char evidence_digest[65];
+        char attest_scope[65];   /* optional scope; appended */
     } tx_score_msg_t;
 
     size_t message_size(message_type_t type);
@@ -454,6 +558,16 @@ ffi.cdef("""
     typedef struct {
         int fd;
         char key[65];            /* MSG_KEY_LEN(64) + 1 */
+        /* WHICH socket file this queue bound, so qclose removes its own entry
+           and not the one a newer process just bound under the same name.
+           dev_t and ino_t are spelled uint64_t because CFFI knows neither, and
+           this is ABI mode: Python ALLOCATES queue_t (processes.py NativeQueue),
+           so a cdef short of C's 88 bytes means messaging_init writes these two
+           fields off the end of Python's buffer. Both are 8-byte unsigned on
+           every LP64 Linux glibc; tests/a_unit/test_audit_ffi_drift.py is the
+           gate that caught the omission. */
+        uint64_t bound_dev;      /* dev_t */
+        uint64_t bound_ino;      /* ino_t */
     } queue_t;
 
     int  messaging_init(const char *id, queue_t *queue);
@@ -465,7 +579,7 @@ ffi.cdef("""
 
     /* ---- processes/process_tracker.h ---- */
     typedef struct {
-        bool alloc; size_t refs;  /* smrt_ptr_t */
+        uint64_t magic; bool alloc; size_t refs; void (*dtor)(void *);  /* smrt_ptr_t */
         map_t *registry;
         logger_t *logger;
     } tracker_t;
@@ -480,7 +594,8 @@ ffi.cdef("""
     typedef int (*handler_ptr_t)(process_t *, array_t *, char *, logger_t *);
 
     /* The four trailing collaborators became a `proc_context_t` in the
-       2026-07-01 refactor (ISSUES.md §2.1, autonomous_trust.c:283); this cdef
+       2026-07-01 refactor (doc/architecture/process-architecture.md,
+       autonomous_trust.c:283); this cdef
        kept the old 8-arg form until 2026-08-04. Nothing calls it from Python,
        so it was LATENT rather than a live segfault — `audit-ffi-drift.py`
        classifies it exactly that way. */
@@ -501,7 +616,12 @@ ffi.cdef("""
     typedef struct task_s task_t;
 
     typedef struct {
-        task_t *task_ptr;       /* opaque pointer */
+        /* `task_t *task_ptr` used to lead this struct and does NOT exist in C
+           (negotiation.h: uuid_t task_uuid; int flood_count). Removed 2026-08-12
+           (doc/architecture/native-ffi-dual-implementation.md) — this is the one mirror
+           that was BIGGER than C, 32
+           bytes against 20, so it did not overflow; it read `task_uuid` out of
+           C's `flood_count` and past the end. */
         unsigned char task_uuid[16];
         int flood_count;
     } task_counter_t;
@@ -518,6 +638,12 @@ ffi.cdef("""
                                 const unsigned char *peer_uuid,
                                 const uint8_t *data, size_t len);
     int  task_tracker_result_count(const task_tracker_t *tracker);
+    /* What the requestor asked for, retained so the reply can be judged
+       against it (R+D.md §12.7). Python's TaskTracker subclasses Task and
+       keeps `parameters` for free. */
+    int  task_tracker_set_request(task_tracker_t *tracker,
+                                  const char *capability_name,
+                                  const char *kwargs_json);
     void task_tracker_free(task_tracker_t *tracker);
 
     /* ---- negotiation/negotiation.h ---- */
@@ -540,6 +666,28 @@ ffi.cdef("""
         double p2_score;
         bool p2_set;
         int index;
+        /* Added 2026-08-12 (doc/architecture/native-ffi-dual-implementation.md):
+         * hash-linking's prev_hash was missing,
+           so the mirror was 80 bytes against C's 152. TX_HASH_HEX_LEN(64) + NUL. */
+        char prev_hash[65];
+        /* Added 2026-09-02 (R+D.md §12.8): the evidence channel of each side's
+         * score is part of the committed fact, so it is part of this struct.
+         * TX_CHANNEL_NAMELEN(31) + NUL, appended after prev_hash exactly as C
+         * appends it. */
+        char p1_channel[32];
+        char p2_channel[32];
+        /* verifier-attested entries (reputation.md "Verifier-attested
+         * scores"); appended, as in reputation.h */
+        bool attested;
+        unsigned char subject_uuid[16];
+        char evidence_digest[65];
+        char attest_scope[65];   /* optional scope; appended */
+        /* roster entries (reputation.md "Who is in the group"); appended,
+         * as in reputation.h. TX_ROSTER_OP_LEN 8, TX_HASH_HEX_LEN + NUL. */
+        bool roster;
+        char roster_op[8];
+        unsigned char roster_uuid[16];
+        char roster_digest[65];
     } transaction_t;
 
     /* tx_history_t/reputations_t contain embedded maps/arrays — opaque */
@@ -550,7 +698,8 @@ ffi.cdef("""
     int  tx_history_init(tx_history_t *hist);
     void tx_history_destroy(tx_history_t *hist);
     int  tx_history_update(tx_history_t *hist, const unsigned char *task_uuid,
-                           const unsigned char *peer_uuid, double score);
+                           const unsigned char *peer_uuid, double score,
+                           const char *channel);
     int  tx_history_len(const tx_history_t *hist);
     void tx_history_free(tx_history_t *hist);
 
@@ -636,5 +785,31 @@ def _preload_deps():
                 pass
 
 
+def _load_extensions(core_path: str) -> list:
+    """dlopen every extension library (``libat_<feature>.so``) beside the core.
+
+    An extension (src/c/extensions/<feature>/, e.g. libat_dtn) adds itself to
+    the core from load-time constructors -- a transport, a process runner, its
+    handlers -- so loading it is all it takes. Searched beside the core .so
+    (an install) and under ``extensions/*/`` there (a build tree). A no-op
+    when there are none; one that fails to load is reported and skipped."""
+    if not os.path.isfile(core_path):  # a bare soname from the system search
+        return []
+    base = os.path.dirname(os.path.abspath(core_path))
+    found = sorted(set(glob.glob(os.path.join(base, 'libat_*.so')) +
+                       glob.glob(os.path.join(base, 'extensions', '*',
+                                              'libat_*.so'))))
+    handles = []
+    for path in found:
+        try:
+            handles.append(ctypes.CDLL(path))
+        except OSError as err:
+            warnings.warn(f'AutonomousTrust extension {path} not loaded: {err}')
+    return handles
+
+
 _preload_deps()
-lib = ffi.dlopen(_find_library())
+_core_path = _find_library()
+lib = ffi.dlopen(_core_path)
+# Held for the life of the process: a collected handle would dlclose it.
+_extension_libs = _load_extensions(_core_path)

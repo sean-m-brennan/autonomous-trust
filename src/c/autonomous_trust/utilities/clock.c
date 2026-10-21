@@ -15,6 +15,7 @@
  *******************/
 
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -143,4 +144,126 @@ int at_clock_require_synced(logger_t *logger, long max_error_us)
                  "CLOCK_REALTIME itself. [%s: continuing; set %s=1 to make this "
                  "fatal]\n", desc, why, mode, AT_CLOCK_REQUIRE_ENV);
     return 0;
+}
+
+/* --- Cohort skew ---------------------------------------------------------- *
+ * Measurement only. Nothing below writes a clock, and no offset computed here
+ * is ever applied to our own time. See clock.h and
+ * doc/architecture/cohort-clock-skew.md.                                     */
+
+at_clock_sample_t at_clock_sample_from_round_trip(double t1, double t2,
+                                                  double t3, double t4)
+{
+    at_clock_sample_t out;
+    memset(&out, 0, sizeof(out));
+
+    if (!isfinite(t1) || !isfinite(t2) || !isfinite(t3) || !isfinite(t4))
+        return out; /* valid = false: unmeasurable, so no sample at all */
+
+    out.valid = true;
+    out.offset_s = ((t2 - t1) + (t3 - t4)) / 2.0;
+    out.delay_s = (t4 - t1) - (t3 - t2);
+    /* A negative delay is arithmetically impossible, so the timestamps are
+     * wrong: a clock stepped mid-exchange, or a peer stamping dishonestly.
+     * Reported, never silently dropped, but it must not be aggregated. */
+    out.usable = out.delay_s >= 0.0;
+    return out;
+}
+
+bool at_clock_sample_exceeds(const at_clock_sample_t *sample, long bound_ms)
+{
+    if (sample == NULL || !sample->valid)
+        return false;
+    double bound_s = (double)bound_ms / 1000.0;
+    double magnitude = sample->offset_s < 0.0 ? -sample->offset_s
+                                              : sample->offset_s;
+    return magnitude > bound_s;
+}
+
+void at_clock_sample_describe(const at_clock_sample_t *sample, const char *peer,
+                              char *buf, size_t len)
+{
+    if (buf == NULL || len == 0)
+        return;
+    if (sample == NULL || !sample->valid)
+    {
+        snprintf(buf, len, "(no sample)");
+        return;
+    }
+    snprintf(buf, len, "peer=%s offset=%+.3fs delay=%.3fs%s",
+             peer != NULL ? peer : "?", sample->offset_s, sample->delay_s,
+             sample->usable ? "" : " UNUSABLE(negative delay)");
+}
+
+static int _cmp_double(const void *a, const void *b)
+{
+    double x = *(const double *)a, y = *(const double *)b;
+    if (x < y) return -1;
+    if (x > y) return 1;
+    return 0;
+}
+
+at_cohort_view_t at_clock_cohort_offset(const at_clock_sample_t *samples,
+                                        size_t count)
+{
+    at_cohort_view_t out;
+    memset(&out, 0, sizeof(out));
+    if (samples == NULL || count == 0)
+        return out;
+
+    double *offsets = calloc(count, sizeof(double));
+    if (offsets == NULL)
+        return out; /* valid = false rather than a guessed estimate */
+
+    size_t n = 0;
+    for (size_t i = 0; i < count; i++)
+        if (samples[i].valid && samples[i].usable)
+            offsets[n++] = samples[i].offset_s;
+
+    if (n == 0)
+    {
+        free(offsets);
+        return out;
+    }
+
+    qsort(offsets, n, sizeof(double), _cmp_double);
+    /* Even counts average the two middle values, matching Python's
+     * statistics.median exactly -- the two runtimes must not disagree here. */
+    out.offset_s = (n % 2 == 1) ? offsets[n / 2]
+                                : (offsets[n / 2 - 1] + offsets[n / 2]) / 2.0;
+    out.dispersion_s = offsets[n - 1] - offsets[0];
+    out.count = n;
+    out.valid = true;
+    free(offsets);
+    return out;
+}
+
+long at_clock_max_cohort_skew_ms(logger_t *logger, bool *from_env)
+{
+    if (from_env != NULL)
+        *from_env = false;
+    const char *raw = getenv(AT_CLOCK_COHORT_SKEW_ENV);
+    if (raw == NULL || raw[0] == '\0')
+        return AT_CLOCK_COHORT_SKEW_MS;
+
+    char *end = NULL;
+    errno = 0;
+    long val = strtol(raw, &end, 10);
+    if (errno != 0 || end == raw || (end != NULL && *end != '\0') ||
+        val < AT_CLOCK_COHORT_SKEW_MS_MIN || val > AT_CLOCK_COHORT_SKEW_MS_MAX)
+    {
+        /* Refused, not clamped: a value outside the range is a mistake, and
+         * silently substituting a different one hides it. */
+        if (logger != NULL)
+            log_warn(logger,
+                     "clock: refusing %s='%s' (want an integer in [%d, %d]); "
+                     "using default %d\n",
+                     AT_CLOCK_COHORT_SKEW_ENV, raw,
+                     AT_CLOCK_COHORT_SKEW_MS_MIN, AT_CLOCK_COHORT_SKEW_MS_MAX,
+                     AT_CLOCK_COHORT_SKEW_MS);
+        return AT_CLOCK_COHORT_SKEW_MS;
+    }
+    if (from_env != NULL)
+        *from_env = true;
+    return val;
 }

@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "capabilities": {
+    "demo.matmul": {
+      "checker": "matrix_product",
+      "repetitions": 4,
+      "tolerance": 1e-9
+    },
+    "demo.solve": {
+      "checker": "linear_solve",
+      "tolerance": 1e-9
+    },
+    "demo.allocate": {
+      "checker": "lp",
+      "tolerance": 1e-6,
+      "note": "answers carry the dual; infeasibility carries a Farkas vector"
+    },
+    "demo.constraint-check": {
+      "checker": "sat",
+      "max_proof_len": 100000,
+      "note": "UNSAT must arrive with a DRAT refutation"
+    },
+    "demo.route": {
+      "checker": "path",
+      "require_optimal": true,
+      "note": "optimality needs a feasible potential, not an asserted bound"
+    },
+    "demo.bandwidth": {
+      "checker": "flow",
+      "require_optimal": true
+    },
+    "demo.tasking": {
+      "checker": "schedule"
+    },
+    "demo.track": {
+      "checker": "state_estimation",
+      "max_lag": 5,
+      "bound": 0.2,
+      "note": "a whiteness bound, not a proof: the one row of the table that is statistical"
+    },
+    "demo.migrating": {
+      "checker": "linear_solve",
+      "required": false,
+      "note": "witness optional while the domain is being migrated"
+    },
+    "demo.assess": {
+      "checker": null,
+      "note": "a human judgement call; no witness exists, and this is the expensive case"
+    }
+  }
+}

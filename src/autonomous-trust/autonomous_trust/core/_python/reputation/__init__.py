@@ -14,6 +14,15 @@
 #   limitations under the License.
 # ******************
 
-from .reputation import TransactionScore
+from .reputation import (TransactionScore, PeerReputation,
+                         TX_CHANNELS, TX_CHANNEL_DEFAULT,
+                         TX_CHANNEL_TASK_OUTCOME, TX_CHANNEL_PHYSICAL,
+                         TX_CHANNEL_CERTIFICATE, TX_CHANNEL_CALIBRATION,
+                         TX_CHANNEL_SELF_CONSISTENCY,
+                         TX_CHANNEL_REPLICATION,
+                         TX_CHANNEL_SWARM_DISAGREEMENT,
+                         TX_CHANNEL_PROBE,
+                         TX_CHANNEL_WEIGHTS, tx_channel_weight,
+                         validate_tx_channel, weight_round)
 from .repprocess import ReputationProcess
 from .protocol import ReputationProtocol

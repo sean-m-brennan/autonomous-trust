@@ -1,0 +1,28 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: "1"
+kind: "scenario"
+protocol: "dtn"
+name: "broadcast-before-join"
+description: |
+  An unjoined node broadcasts to the pre-join group EID.
+byte_pinning: false
+participants:
+  - id: "host"
+    role: "recipient"
+fixtures:
+  dtn:
+    op: "broadcast_eid"
+    channel: "broadcast"
+    group_uuid: null
+steps:
+  - id: 1
+    from: "host"
+    to: "host"
+    function: "broadcast_eid"
+    description: "trigger: broadcast_eid"
+expected_state:
+  host:
+    eid: "dtn://at-group-41542d626f6f7400/bcast"

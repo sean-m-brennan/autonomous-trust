@@ -1,0 +1,39 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: committed-placing-writes-only-the-senders-half
+byte_pinning: false
+description: |
+    A `committed` broadcast may write only its sender's own half (ISSUES.md
+    §2.16, shape 2), in the pool as in the chain. alice sends a certified
+    commit naming dave's half; bob refuses it, and nothing is pooled.
+    Placement-mode twin of committed-writes-only-the-senders-half.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: proposer
+  - id: dave
+    role: member
+
+fixtures: {}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: tx committed
+    payload:
+      task_id: t-1
+      proposer: dave
+      score: 0.2
+      cosigners: [carol, dave]
+
+expected_state:
+  bob:
+    committed_tx_count: 0
+    chain_tasks: []
+    pool_tasks: []

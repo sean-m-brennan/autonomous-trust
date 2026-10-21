@@ -16,6 +16,7 @@
 
 from datetime import UTC, datetime, timedelta
 import heapq
+import time
 from enum import Enum
 from queue import Empty
 from typing import Union, Optional
@@ -25,6 +26,9 @@ import psutil
 
 from ..system import max_concurrency, now
 from ..config import Configuration
+from ..config.configuration import register_enum_type
+from ..identity.identity import (public_identity_to_canonical,
+                                 public_identity_from_canonical)
 
 
 # TODO tie clock quality to reputation. AT no longer implements NTP: a stock
@@ -32,6 +36,13 @@ from ..config import Configuration
 # (NtpTimeSource.trustworthy). A peer whose clock nothing is steering is the
 # reputation-relevant signal, not a sync AT performs itself.
 
+# Registered because the `status response` verb puts this enum ON THE WIRE
+# (`forward_status` serializes a TaskStatus whose `status` is a member).
+# `config_json_decoder` refuses any `Enumcfg:` tag that is not registered, so
+# without this every status response raised ValueError in the receiver's
+# decode -- Python-to-Python as much as cross-runtime. Found while making the
+# C twin emit this form (doc/architecture/negotiation.md).
+@register_enum_type
 class Status(Enum):
     running = 'running'
     sleeping = 'sleeping'
@@ -91,6 +102,17 @@ class TaskParameters(Configuration):
     def adjust(self):  # tailor to acceptable parameters
         pass
 
+    def extension_seconds(self) -> int:
+        """How far a live status answer moves this task's deadline, and so
+        how long the requestor's deadline sweep waits on one: the timeout,
+        else a fraction of the duration, else ``timeout_extension``. C twin:
+        ``_extension_secs`` (neg_proc.c)."""
+        if self.timeout.total_seconds() > 0:
+            return int(self.timeout.total_seconds())
+        if self.duration.total_seconds() > 0:
+            return int(self.duration.total_seconds() * self.duration_fraction / 100) + 1
+        return self.timeout_extension
+
     @property
     def capability(self):
         return self._capability
@@ -108,13 +130,80 @@ class TaskParameters(Configuration):
 
 
 class TaskInfo(Configuration):
-    def __init__(self, requestor, uuid: UUID = None, size=1, **kwargs):
+    def __init__(self, requestor, uuid: UUID = None, size=1, seq=0, **kwargs):
         self.uuid = uuid
         if uuid is None:
             self.uuid = uuid4()
+        # A requestor arriving as a dict is the flat cross-runtime PUBLIC form
+        # (`public_identity_to_canonical`) this class now emits -- from a peer
+        # of either runtime, or from one of the `Task(**task.to_dict())`
+        # round-trips TaskStatus/TaskResult/TaskCounter/TaskTracker are built
+        # from. Rebuild it into an Identity so every reader downstream keeps
+        # using `requestor.uuid` / `.nickname` / `.address` as before.
+        #
+        # A malformed dict reconstructs as None rather than being kept as a
+        # dict: `None` is what the `getattr(task, 'requestor', None)` guards
+        # already expect, whereas a dict masquerading as an identity raises
+        # AttributeError deep inside a handler.
+        if isinstance(requestor, dict):
+            requestor = public_identity_from_canonical(requestor)
         self.requestor = requestor
         self.size = size
+        # Freshness sequence of the INVITATION that carried this task; 0 means
+        # unstamped, which `handle_invite` refuses. The requestor's monotonic
+        # per-process counter (``core/freshness.py``), stamped by `start_task`
+        # and by the re-announce in `handle_haggle`, and checked against the
+        # receiver's per-(sender, verb) high-water mark.
+        #
+        # Why the task and not a separate envelope: an invitation's payload IS
+        # a serialized task, in both runtimes and in the protobuf schema
+        # (`negotiation/task.proto`, field 12), so there is nowhere else to put
+        # it without inventing a second wrapper for one verb. It lives on
+        # TaskInfo rather than Task so the field survives the
+        # `Task(**task.to_dict())` round-trips that TaskStatus, TaskResult,
+        # TaskCounter and TaskTracker are built from.
+        #
+        # Only the `announce` verb stamps it and only `handle_invite` reads it.
+        # The other verbs that reuse this serialization (acceptance, refusal,
+        # status, results) carry whatever value came in and nothing looks at
+        # it -- deliberately inert rather than zeroed, so a task object stays a
+        # faithful copy of the invitation it came from.
+        self.seq = int(seq or 0)
         # ignore kwargs
+
+    def to_dict(self):
+        """Serialize `requestor` as the flat cross-runtime PUBLIC identity form.
+
+        Two reasons, and the first is a leak. `requestor` is the requesting
+        node's OWN `Identity` object (`automate.py` passes `self.identity`,
+        which is the private one loaded from `identity.cfg.json`), and the
+        default `ConfigJSONEncoder` path dumps it whole -- including
+        `Signature.to_dict()`, which returns `self.private.encode(HexEncoder)`
+        when `public_only` is False. Every invitation, nack, ack, haggle,
+        status request/response and result therefore carried the requestor's
+        Ed25519 signing seed and Curve25519 secret to every invited peer, plus
+        the `petname`, which is a local-only Zooko name that must never be
+        serialized. The envelope was always careful about this
+        (`network/message.py` publishes only public keys); the payload was not.
+
+        Second, it is what makes the payload readable by the C twin: the flat
+        form is byte-identical to C's `public_identity_to_json`, which is
+        exactly why `public_identity_to_canonical` exists (see its docstring,
+        and the `peer_accepted` / `full_history` payloads that already use it).
+        The rest of the task keeps Python's `__type__`-tagged form, which C now
+        speaks. See doc/architecture/negotiation.md.
+
+        A requestor that is not an identity at all (tests and some conformance
+        steps pass a bare uuid string) is left exactly as it was.
+        """
+        d = super().to_dict()
+        req = d.get('requestor')
+        if req is not None and not isinstance(req, (dict, str, bytes)):
+            try:
+                d['requestor'] = public_identity_to_canonical(req)
+            except AttributeError:
+                pass  # not an Identity; leave the caller's object alone
+        return d
 
 
 class Task(TaskInfo):
@@ -139,7 +228,17 @@ class TaskStatus(Task):
 
 
 class TaskResult(TaskInfo):
-    def __init__(self, task=None, result=None, proof=None, **kwargs):
+    """A returned result. Note ``TaskInfo`` carries no ``parameters``, so a
+    TaskResult does NOT know which capability produced it or what it was
+    asked — see ``attach_requested_parameters`` for how the requestor
+    supplies that from its own record.
+    """
+
+    def __init__(self, task=None, result=None, proof=None,
+                 certificate=None, prediction=None,
+                 requested_capability_name: str = None,
+                 requested_args=None, requested_kwargs=None,
+                 requested_at: float = None, **kwargs):
         if task is None:
             task_args = {}
         else:
@@ -147,6 +246,139 @@ class TaskResult(TaskInfo):
         super().__init__(**task_args, **kwargs)
         self.result = result
         self.proof = proof
+        # The witness that makes this answer checkable (R+D.md §12.3). A
+        # SEPARATE field from `proof`, and from `result`, because the three are
+        # different claims: `result` is the answer, `certificate` is what makes
+        # the answer verifiable, and `proof` is a ZK-STARK attesting the bytes
+        # were not altered in transit. Folding the witness into the result
+        # would make every certified capability's return type a convention, and
+        # a reader that did not know the checker would see a wrapper where it
+        # expected an answer; folding it into `proof` would leave a reader
+        # sniffing bytes to tell a witness from a STARK, which is the format
+        # detection R+D.md §2.5 spent an entry proving unnecessary.
+        #
+        # UNLIKE `requested_*` and `executor_uuid`, this one is the executor's
+        # to assert and is serialized: the whole point is that the peer
+        # supplies it. That is safe precisely because it is checked rather than
+        # believed -- the checker's INPUTS come from the requestor's own record
+        # (`requested_kwargs`), so a peer can choose its witness but not the
+        # problem the witness has to satisfy.
+        self.certificate = certificate
+        # The prediction SET this answer came with, and the coverage the peer
+        # claims for it (R+D.md §12.4). A THIRD separate field, for the same
+        # reason `certificate` is separate from `proof`: `result` is the
+        # answer, `certificate` is what makes the answer checkable, `proof`
+        # attests the bytes were not altered, and this is the peer's statement
+        # about how often answers of this kind land inside the set it quotes.
+        # Only the last one is a claim about the PEER rather than about this
+        # answer, which is why the audit that reads it is historical and the
+        # others are per-result.
+        #
+        # Like `certificate` and unlike `requested_*`, this is the executor's
+        # to assert and is serialized: the whole point is that the peer commits
+        # to a coverage in advance. That is safe because it is audited rather
+        # than believed -- the OUTCOMES it is checked against are resolved by
+        # the requestor, and a peer's own report never settles its own
+        # prediction (calibration/audit.py).
+        #
+        # Shape: {"quantity": str, "coverage": float, "lo": [...], "hi": [...]}
+        self.prediction = prediction
+        # What the REQUESTOR asked for, filled in on the requestor side by
+        # `attach_requested_parameters` (R+D.md §12.7). Default None/empty:
+        # an executor building a TaskResult has no business asserting these,
+        # and a peer that sends them populated is simply ignored, because the
+        # requestor overwrites them from its own record before anything reads
+        # them. See the integrity note on that method.
+        self.requested_capability_name = requested_capability_name
+        self.requested_args = tuple(requested_args or ())
+        self.requested_kwargs = dict(requested_kwargs or {})
+        # WHEN we asked (TaskTracker.issued_at, wall clock), which opens
+        # at.time-attest's window (ISSUES §2.53). Same provenance as the rest
+        # of `requested_*`.
+        self.requested_at = requested_at
+        # WHO produced this result, stamped on the requestor side by
+        # `attach_executor` from the authenticated sender of the reply
+        # (R+D.md §12.8). Local-only: `to_dict` drops it, so it is never
+        # serialized and an executor cannot assert its own identity here --
+        # the same integrity argument as `requested_*` above, and what lets a
+        # refutation name the peer it accuses.
+        self.executor_uuid = None
+
+    def to_dict(self):
+        # `executor_uuid` is the requestor's own attribution, not part of the
+        # result: it is derived from the transport-verified sender of the
+        # reply, so serializing it would let a forwarded copy carry an
+        # assertion nobody re-checked. Same discipline as
+        # TransactionScore.subject_uuid.
+        d = super().to_dict()
+        d.pop('executor_uuid', None)
+        # Likewise the requestor's own note that this result is scored but
+        # not forwarded to the application (negprocess.handle_results).
+        d.pop('score_only', None)
+        return d
+
+    def attach_executor(self, executor_uuid) -> bool:
+        """Stamp this result with the peer that produced it.
+
+        ``executor_uuid`` comes from ``message.from_whom`` on the reply --
+        transport-authenticated and verified -- never from the payload. Pass
+        None to record explicitly that the result is NOT attributable to one
+        peer, which is the honest answer for a multi-participant task: the
+        results of a fan-out arrive from several peers and only the last one
+        to answer carries the object that gets scored, so naming it would
+        attribute the whole task's outcome to whoever happened to reply last.
+
+        Clears first, like ``attach_requested_parameters`` and for the same
+        reason. Returns True if an executor was attached.
+        """
+        self.executor_uuid = None
+        if executor_uuid is None:
+            return False
+        self.executor_uuid = str(executor_uuid)
+        return True
+
+    def attach_requested_parameters(self, original) -> bool:
+        """Stamp this result with what *we* asked for, from ``original``.
+
+        ``original`` is the requestor's own retained Task (the
+        ``TaskTracker`` in ``NegotiationProcess.my_tasks``), NOT anything
+        the responder sent. That distinction is the whole point, and it is
+        what makes a honeypot probe verifiable at all: a known-answer check
+        that reads the challenge out of the *responder's* reply verifies
+        nothing, because a peer that computed the wrong answer can simply
+        report the challenge its answer would have been right for
+        (``result=99, nonce=98`` scores as a correct increment). The
+        expected value therefore has to come from this side of the wire.
+
+        Nothing secret is being moved: the challenge was sent TO the
+        responder in the invitation, so it already knows it. The property
+        this protects is integrity, not confidentiality — which is also why
+        these fields are safe to serialize if a TaskResult is ever forwarded
+        onward.
+
+        Returns True if parameters were found and attached.
+        """
+        # Clear FIRST, unconditionally. These fields arrive from the wire on
+        # the responder's reply, where a peer is free to populate them with
+        # whatever makes its answer look right. Overwriting them only on the
+        # success path would leave those attacker-chosen values standing
+        # whenever we have no record of our own -- exactly the case where a
+        # caller most needs "unknown" rather than "the peer says". The
+        # downstream scorer treats an absent capability name as "not a probe"
+        # and falls back to ordinary task scoring, which is the safe default.
+        self.requested_capability_name = None
+        self.requested_args = ()
+        self.requested_kwargs = {}
+        self.requested_at = None
+        params = getattr(original, 'parameters', None)
+        if params is None:
+            return False
+        capability = getattr(params, 'capability', None)
+        self.requested_capability_name = getattr(capability, 'name', None)
+        self.requested_args = tuple(getattr(params, 'args', ()) or ())
+        self.requested_kwargs = dict(getattr(params, 'kwargs', {}) or {})
+        self.requested_at = getattr(original, 'issued_at', None)
+        return self.requested_capability_name is not None
 
     def generate_proof(self):
         """Generate a ZK-STARK proof of data integrity for this result.
@@ -193,7 +425,17 @@ class TaskCounter(Task):
 class TaskTracker(Task):
     def __init__(self, task):
         super().__init__(**task.to_dict())
-        self.results = {}  # keyed by peer.uuid
+        # Wall clock when we asked: at.time-attest's window opens here
+        # (ISSUES §2.53).
+        self.issued_at = time.time()
+        self.results = {}  # keyed by peer.uuid; pre-seeded with the invitees
+        # Peers whose result has been scored: one score per executor (ISSUES
+        # §2.50), and a replayed result is not scored twice.
+        self.scored = set()
+        # The deadline sweep's record: status-request rounds sent since the
+        # deadline last moved, and when the latest went out.
+        self.status_asks = 0
+        self.status_asked_at = None
 
 
 class Job(object):

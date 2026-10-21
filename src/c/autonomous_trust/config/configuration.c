@@ -102,6 +102,42 @@ int get_data_dir(char *path, size_t destlen)
     return path_join(path, destlen, rootDir(), DATA_PATH);
 }
 
+int configuration_table_append(const char *name,
+                               int (*to)(const void *, json_t **),
+                               int (*from)(const json_t *, void *),
+                               size_t len, void *struct_ptr)
+{
+    const size_t cap = sizeof(configuration_table) / sizeof(configuration_table[0]);
+    if (name == NULL || name[0] == '\0' || from == NULL)
+    {
+        fprintf(stderr, "configuration_table_append: refusing an unnamed or "
+                        "unparseable section\n");
+        return -1;
+    }
+    for (size_t i = 0; i < configuration_table_size; i++)
+        if (strcmp(configuration_table[i].name, name) == 0)
+        {
+            fprintf(stderr, "configuration_table_append: refusing %s: already in "
+                            "the table\n", name);
+            return -1;
+        }
+    if (configuration_table_size >= cap)
+    {
+        fprintf(stderr, "configuration_table_append: refusing %s: table full (%zu)\n",
+                name, cap);
+        return -1;
+    }
+    config_t *entry = &configuration_table[configuration_table_size];
+    memset(entry, 0, sizeof(*entry));
+    entry->name = name;
+    entry->to_json = to;
+    entry->from_json = from;
+    entry->data_len = len;
+    entry->data_struct = struct_ptr;
+    configuration_table_size++;
+    return 0;
+}
+
 /* Frama-C: skipped — find_configuration: 3x assigns + ensures. */
 /*@
   requires name != \null && \valid_read(name);
@@ -152,7 +188,12 @@ int all_config_files(char dir[], array_t *paths)
         struct dirent *de = readdir(d);
         if (de == NULL)
             break;
+#ifdef DT_REG
         if (de->d_type == DT_REG || de->d_type == DT_UNKNOWN)
+#else
+        /* No d_type (Windows): the extension test below is the filter. */
+        if (true)
+#endif
         {
             char *dot = strchr(de->d_name, '.');
             /* Accept all three legacy/current extensions regardless of
@@ -422,7 +463,14 @@ int load_all_configs(char *cfg_dir, map_t *configs, logger_t *logger)
         config_t *config;
         char cfg_name[CFG_NAME_SIZE + 1] = {0};
         if (load_config(filepath, &config, cfg_name, logger) < 0)
+        {
+            /* An unknown section is skipped, exactly as Python's lenient
+             * load_configs does (see the note below); a PARSE failure is
+             * still fatal, because that file was ours and it is broken. */
+            if (_exception.errnum == ECFG_NOIMPL)
+                continue;
             return -1;
+        }
 
         for (int j = 0; j < num_req_cfgs; j++)
         {
@@ -504,15 +552,35 @@ int load_config(char *filepath, config_t **config_ptr, char *cfg_name, logger_t 
     config_t *config = *config_ptr;
     if (config == NULL)
     {
-        log_error(logger, "No config for %s\n", cfg_name);
-        return -1;
+        /* Nothing registered under this name. That is not necessarily an
+         * error: a file in the config directory may belong to a subsystem
+         * that keeps its own state OUTSIDE the registry — reputation.cfg.json
+         * is exactly that (rep_proc.c reads and writes it directly, carrying
+         * Python's __type__ tag so either runtime can resume from it), and so
+         * are the freshness-*.cfg.json files.
+         *
+         * Reported as ECFG_NOIMPL rather than a bare -1 so load_all_configs
+         * can tell "I do not know this section" from "this file is broken".
+         * Before 2026-09-21 it could not, and the consequence was severe: the
+         * FIRST thing the reputation process does on shutdown is write its
+         * snapshot, so every node that had ever run reputation refused to
+         * start again — "No config for reputation", and the daemon exited
+         * 17 ms in. No cohort ever caught it because a cohort makes fresh
+         * nodes and never restarts one. */
+        log_warn(logger, "No registered config section for %s; "
+                         "leaving the file to whoever owns it\n", cfg_name);
+        return EXCEPTION(ECFG_NOIMPL);
     }
     config->data_struct = smrt_create(config->data_len);
     if (config->data_struct == NULL)
         return EXCEPTION(ENOMEM);
     if (read_config_file(abspath, config->data_struct) != 0)
     {
-        smrt_deref(config->data_struct);
+        /* free, not smrt_deref: some sections' parsers memset the struct or
+         * open it with a non-header field (timeouts, hybrid_net, zta_policy,
+         * peer_capabilities), so the header may be gone and a deref would be
+         * the canary's no-op. The block is calloc'd either way. */
+        free(config->data_struct);
         config->data_struct = NULL;
         log_exception_extra(logger, " for config named '%s'\n", cfg_name);
         return -1;

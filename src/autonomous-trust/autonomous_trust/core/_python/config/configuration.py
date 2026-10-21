@@ -80,6 +80,20 @@ def register_config_type(cls):
     _ALLOWED_CONFIG_TYPES.add(type_name)
 
 
+#: Former ``__type__`` names of configuration classes that moved, -> the class.
+#: A file written before the move still names the old path; decoding it as the
+#: class it now is beats refusing it (or, for a policy, silently disabling it).
+_CONFIG_TYPE_ALIASES: dict = {}
+
+
+def register_config_alias(old_type_name: str, cls) -> None:
+    """Let files whose ``__type__`` is ``old_type_name`` decode as ``cls``. For a
+    class an extension took out of the core (FEATURE_SPLIT_PLAN Phase 6's
+    ZtaPolicy): the extension registers its own old names, so the core names
+    none."""
+    _CONFIG_TYPE_ALIASES[str(old_type_name)] = cls
+
+
 def register_enum_type(cls):
     """Register an Enum type as allowed for deserialization."""
     type_name = cls.__module__ + '.' + cls.__qualname__
@@ -98,6 +112,45 @@ class SerializeMode(Enum):
 class WireFormat(Enum):
     BINARY = 1
     JSON = 2
+
+
+class NetWireFormat(object, metaclass=ClassEnumMeta):
+    """Which envelope encoding an inter-host network message rides in
+    (doc/architecture/network-wire-format.md). Mirrors C's ``net_wire_format_t``.
+
+    Distinct from :class:`WireFormat` above, which selects how a
+    *Configuration* serializes itself (on disk, and as a message *payload*).
+    This selects how the *envelope around* that payload is encoded, and the two
+    are independent: a proto-mode cohort still carries whatever payload form
+    ``AT_SERIALIZE_MODE`` asks for.
+
+    A node does not choose this per message or per peer -- it is a property of
+    the GROUP (``Group.wire_format``), and everything outside a group
+    (discovery, pre-admission) is :attr:`json` unconditionally. Detecting a
+    peer's format is deliberately not implemented; see
+    doc/architecture/network-wire-format.md.
+
+    Values are the strings that ride the canonical group wire form, so C's
+    ``group_to_json`` and this agree without a mapping table.
+
+    Lives here rather than in the network package because ``identity/group.py``
+    carries the value and must reach it without importing ``core.network``
+    (which imports identity -- a cycle). ``config`` is already below both.
+    """
+    json = 'json'
+    proto = 'proto'
+
+
+#: The one-byte format marker that prefixes every packed protobuf envelope
+#: (``network/net_message.proto``). A JSON envelope always begins ``{``
+#: (0x7B), so a receiver can refuse a frame in a format it does not speak
+#: WITHOUT running the other parser over peer-supplied bytes -- which is the
+#: point, given that format detection is a deliberate non-goal
+#: (doc/architecture/network-wire-format.md). It also
+#: serves as the envelope version slot: an incompatible future proto envelope
+#: takes 0xAC and is distinguishable rather than guessed. Must match C's
+#: ``NET_WIRE_PROTO_MAGIC`` (network/net_message.h).
+NET_WIRE_PROTO_MAGIC = 0xAB
 
 
 class Configuration(object):
@@ -331,6 +384,9 @@ def config_json_decoder(dct):
             module = import_module(module_name)
         cls = getattr(module, class_name)
         return cls[dct['__value__']]
+    if type_name in _CONFIG_TYPE_ALIASES:
+        kwargs = {k: v for k, v in dct.items() if k != '__type__'}
+        return _CONFIG_TYPE_ALIASES[type_name](**kwargs)
     if '.' in type_name:
         if type_name not in _ALLOWED_CONFIG_TYPES:
             raise ValueError(f"Type '{type_name}' not in allowed configuration types")

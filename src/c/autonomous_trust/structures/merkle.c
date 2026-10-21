@@ -300,9 +300,7 @@ int merkle_delete(merkle_tree_t *tree, merkle_blob_t *blob)
     if (idx < 0)
         return EXCEPTION(EMRKL_NOTFOUND);
 
-    data_t *val = NULL;
-    array_get(tree->blobs, idx, &val);
-    array_remove(tree->blobs, val);
+    array_remove_at(tree->blobs, idx);
 
     _rehash(tree);
     return 0;

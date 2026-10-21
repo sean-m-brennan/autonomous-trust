@@ -183,14 +183,14 @@ Scores live in [0, 1], with no negatives. Single-source thresholds (env-overrida
 
 ## Reputation III: consensus and slashing
 
-Agreement on reputation runs as leaderless Byzantine Multi-Paxos, so there is no coordinator to capture or lose.
+Agreement on reputation runs as Byzantine Multi-Paxos with no fixed coordinator: whoever placed the last entry leads the next, and every other member takes over in an order they all compute the same way, so there is no coordinator to capture or lose.
 
 
-| Phase | Messages                                   | Purpose                                                                                   |
-| ----- | ------------------------------------------ | ----------------------------------------------------------------------------------------- |
-| 1     | `request` → `grant` / `nack` / `backdate` | ask permission; proposal id = (timestamp, chain-index, peer) with replay-idempotent guard |
-| 2     | `transaction` → `accepted`                | on majority grant, propose the score; commit on majority accept                           |
-| 3     | `committed` (broadcast)                    | every peer writes the *same* bilateral entry                                               |
+| Phase | Messages                                                         | Purpose                                                                          |
+| ----- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| 1     | `transaction` → `accepted`                                       | propose the score; each acceptor signs it, and a majority's signatures certify it |
+| 2     | `committed` (broadcast)                                          | every peer pools the *same* certified half                                       |
+| 3     | `place request` → `place grant`, `place` → `place accepted` → `placed` | Paxos decides where each ready entry goes, and every peer writes the same chain  |
 
 - Catch-up queries the top-3 most-trusted peers and majority-votes the result, which is verifiable via chain links.
 - Slashing is the fast path: a quorum-co-signed (Ed25519), evidence-gated `SlashAttestation` floors a score immediately, instead of waiting roughly 20 transactions for the average to move. That is what catches short-lived rogues.
@@ -236,7 +236,7 @@ questions, and conflating them is a classic mistake.
 `spawn task` → `invitation` (fan-out to peers advertising the capability) → `ack` / `nack` / `haggle` (counter-offer) → `report results` (with zero-knowledge proof)
 
 - Tier-gated invites: a request is refused if the sender's tier is below the capability's `required_tier`. The *local* capability definition is authoritative.
-- Tier-loss cancellation: if a peer is demoted mid-task, work it's no longer authorized for is cancelled automatically.
+- Tier-loss cancellation: if a peer is demoted mid-task, work it's no longer authorized for is canceled automatically.
 - This is where trust composes: the requester verifies the result's ZKP, then submits a transaction score, which feeds Reputation.
 
 ---

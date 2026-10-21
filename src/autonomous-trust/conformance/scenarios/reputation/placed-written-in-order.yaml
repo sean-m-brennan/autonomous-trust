@@ -1,0 +1,45 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: placed-written-in-order
+byte_pinning: false
+description: |
+    Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+    order"): a decided placement is broadcast with a quorum certificate over its
+    designation (index, predecessor head, value digest), and every member writes
+    it at that index exactly as given.
+
+    bob's chain is empty. alice broadcasts the placement decided at index 0: two
+    completed tasks, certified by alice, bob and carol, three of four members.
+    bob writes both entries at indices 0 and 1, in the value's task-id order, and
+    the pin is the window root over them. Both runtimes must build the same entry
+    bytes from the same value, whatever order its halves reached them in.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures: {}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: placed
+    payload:
+      k: 0
+      value:
+        - {task_id: t-1, p1: carol, p1_score: 0.9, p2: dave, p2_score: 0.7}
+        - {task_id: t-2, p1: alice, p1_score: 0.8, p2: carol, p2_score: 0.6}
+      signers: [alice, bob, carol]
+
+expected_state:
+  bob:
+    chain_tasks: [t-2, t-1]
+    window_root: "bc67ac407075845fa6d0b6d41759421814a05d1bc4b9695899ef11a120f31aee"

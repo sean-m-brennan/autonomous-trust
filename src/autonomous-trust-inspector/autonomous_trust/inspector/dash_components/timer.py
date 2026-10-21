@@ -14,7 +14,7 @@
 #   limitations under the License.
 # ******************
 
-from datetime import datetime
+from datetime import datetime, timezone
 from logging import Logger
 
 import dash_bootstrap_components as dbc
@@ -31,9 +31,23 @@ class TimerTitle(DashComponent):
         self.logger = logger
         self.cohort.register_updater(self.update_time)
 
+    @staticmethod
+    def _stamp(when: datetime) -> str:
+        """Render a cohort time under the ' Z' the header claims.
+
+        `strftime`, not `isoformat(' ').rsplit('.')[0]`: cohort times are UTC-aware
+        now (a naive epoch made every `Cohort.time` subtraction raise), and with
+        microsecond=0 there is no '.' for that split to cut on, so the offset
+        survived and the header read '... 00:00:00+00:00 Z'. An aware time is
+        converted rather than trusted, since only UTC earns the Z.
+        """
+        if when.tzinfo is not None:
+            when = when.astimezone(timezone.utc)
+        return when.strftime('%Y-%m-%d %H:%M:%S') + ' Z'
+
     def update_time(self):
         if self.cohort.time is not None:
-            self.ctl.push_mods({'time': {'children': [self.cohort.time.isoformat(' ').rsplit('.')[0] + ' Z']}})
+            self.ctl.push_mods({'time': {'children': [self._stamp(self.cohort.time)]}})
 
     def div(self, title: str):
         font_size_elt = 'font-size'

@@ -43,6 +43,28 @@ typedef struct {
 
 typedef void (*capability_function_t)(thread_args_t);
 
+/** Bound on a capability's returned result, as text. Sized for the bootstrap
+ *  corpus's answers (an incremented nonce, a Unix timestamp, an echoed token)
+ *  with room to spare; a capability whose result does not fit needs a payload
+ *  channel, not a bigger scratch buffer. */
+#define CAP_RESULT_LEN 255
+
+/** Result-producing capability. @p kwargs_json is the invocation's keyword
+ *  arguments as a compact JSON object ("" for none, the C carriage of Python
+ *  @c TaskParameters.kwargs); the answer is written as text into @p result_out.
+ *  Returns 0 if a result was produced, non-zero otherwise.
+ *
+ *  Why a second function pointer rather than a return value on
+ *  ::capability_function_t: that signature returns void, so until now a C
+ *  capability could be *invoked* but its answer could not be collected, and a
+ *  worker had nothing to report. Changing it would break every existing
+ *  fire-and-forget capability; a capability may supply either shape, or both.
+ *  Python needs no equivalent because a Python capability is an ordinary
+ *  callable and its return value is the result. */
+typedef int (*capability_result_function_t)(const char *kwargs_json,
+                                            char *result_out,
+                                            size_t result_len);
+
 typedef struct
 {
     smrt_ptr_t;
@@ -50,6 +72,11 @@ typedef struct
     map_t arguments; // map of name to data_type_t
     bool local;
     capability_function_t function;
+    /** Result-producing entry point, or NULL for a capability that produces
+     *  none (every capability declared before this field existed). Not
+     *  exported over the wire -- @c capability_sync_out carries a peer's
+     *  ability, never a pointer into our address space. */
+    capability_result_function_t result_function;
     /* Trust-tier metadata — mirrors Python Capability.required_tier /
      * transaction_weight (capabilities.py). required_tier = minimum
      * peer.tier needed to invoke this capability (0 = any admitted).
@@ -95,13 +122,52 @@ int build_local_capabilities(const char *my_uuid, array_t **caps_out);
  */
 int capability_execute(const capability_t *cap, thread_args_t args);
 
+/**
+ * @brief smrt finalizer for a heap capability_t: releases its @c arguments
+ *        map. Install it as @c cap->dtor on every smrt_create'd capability,
+ *        so the last smrt_deref takes the map with it.
+ */
+void capability_dtor(void *ptr);
+
+/**
+ * @brief Invoke @p cap's result-producing entry point and collect its answer.
+ *
+ * Returns 0 with @p result_out written (NUL-terminated) on success, -1 if
+ * @p cap has no @c result_function, or the function's own non-zero status.
+ * This is what lets a worker report anything back: see the negotiation
+ * process's job drain.
+ */
+int capability_execute_result(const capability_t *cap, const char *kwargs_json,
+                             char *result_out, size_t result_len);
+
 /* Reflection placeholder consumed by scripts/preprocess.py to emit a
  * `capability_table[]` static initializer from `DECLARE_CAPABILITY(...)`
  * call sites. Currently no call sites exist — the table is populated
  * dynamically via register_ability-style helpers — so the macro is a
  * no-op declaration. See `capability_table_priv.h.in` for the LIST__
  * expansion shape if/when call sites get added. */
-#define DECLARE_CAPABILITY(cap_name, func)
+#define DECLARE_CAPABILITY(cap_name, cap_func, cap_res_func)
+
+/**
+ * @brief Add a capability at load time, for an extension library whose
+ *        sources the table generator does not scan (FEATURE_SPLIT_PLAN
+ *        Phase 8). The row is what DECLARE_CAPABILITY would have generated:
+ *        local, with @p fn and @p res_fn (either may be NULL).
+ *
+ * Refuses (-1, with a line on stderr) a NULL, empty or over-long name, a name
+ * already in the table, and a full table. Not locked: constructors run before
+ * main().
+ */
+int capability_table_append(const char *name, capability_function_t fn,
+                            capability_result_function_t res_fn);
+
+/** Register a capability at load time (what @ref capability_table_append
+ *  does for an extension). */
+#define DEFINE_CAPABILITY(cap_name, cap_fn, cap_res_fn)                            \
+    static void __attribute__((constructor)) register_capability_##cap_name(void) \
+    {                                                                            \
+        (void)capability_table_append(QUOTE(cap_name), (cap_fn), (cap_res_fn));    \
+    }
 
 #define QUOTE(x) #x
 

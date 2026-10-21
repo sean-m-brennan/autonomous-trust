@@ -25,8 +25,8 @@
 
 #include "autonomous_trust.h"
 #include "autonomous_trust/utilities/message.h"
-#include "autonomous_trust/fleet/update_proposal.h"
-#include "autonomous_trust/fleet/fleet_proc.h"
+#include "fleet/update_proposal.h"
+#include "fleet/fleet_proc.h"
 
 /* ------------------------------------------------------------------ */
 /* CLI helpers                                                         */
@@ -101,12 +101,9 @@ static void inject_self_update(at_node_t *node)
     if (fleet_store_artifact(self_path, "test-1.0.0", log, hash, hash_hex) != 0)
         return;
 
-    /* Propose update with throwaway keypair (test only) */
-    uint8_t pk[crypto_sign_PUBLICKEYBYTES];
-    uint8_t sk[crypto_sign_SECRETKEYBYTES];
-    crypto_sign_keypair(pk, sk);
-
-    fleet_propose_update(hash, "test-1.0.0", "test", pk, sk, log);
+    /* Signed as this node: the other members check it under the key they
+     * hold for it, and only an operator-bound member may propose. */
+    fleet_propose_update_as_node(hash, "test-1.0.0", "test", log);
 }
 
 /* ------------------------------------------------------------------ */

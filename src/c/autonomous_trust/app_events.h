@@ -27,6 +27,10 @@
  *
  * Only the app-facing subset crosses. Internal traffic stays internal.
  *
+ * This header is the CORE's half and is the same in every build. A feature
+ * adds its own kinds in its own header -- the Agora social feature's are in
+ * at_agora.h -- carried in @ref at_app_event_t's fixed-size payload arm.
+ *
  * Usage:
  *   at_app_events_t *ev = at_app_events_open("at_to_extern");
  *   at_app_events_request_roster(ev, "extern_to_at");   // optional; RETRY
@@ -73,7 +77,21 @@ typedef enum {
     /** A peer as this node observes it (@c peer). */
     AT_APP_EVENT_PEER_OBSERVED = 1,
     /** A peer's earned reputation (@c reputation). */
-    AT_APP_EVENT_PEER_REPUTATION = 2
+    AT_APP_EVENT_PEER_REPUTATION = 2,
+    /** A peer's latest round-trip time (@c rtt). A network-latency proximity
+     *  proxy, in milliseconds — NOT a geographic distance. */
+    AT_APP_EVENT_PEER_RTT = 3,
+    /** A peer went quiet or came back (@c presence). Advisory: an absent peer
+     *  is still a member. The first of the core's 100..199 block. */
+    AT_APP_EVENT_PEER_PRESENCE = 100,
+    /* Kinds 4..15 are the Agora social feature's -- at_agora.h, with their
+     * payloads and accessors. Reserved so nobody collides with them:
+     *   0..99      core, and Agora's 4..15 grandfathered (Agora appends 16..99)
+     *   100..199   future core kinds
+     *   1000..1099 first contact (at_first_contact.h; 1000..1018 used)
+     *   1100..1109 fleet (fleet/at_fleet.h)
+     *   1110..     further features, one block each (doc/architecture/extensions.md)
+     * Values are frozen across ALL of these: only ever append. */
 } at_app_event_kind_t;
 
 /** One observed peer. Mirrors `peer_observed_msg_t` in flat, fixed-width form. */
@@ -105,6 +123,21 @@ typedef struct {
      *  is: a guardian identity on a node with no verified human is a
      *  contradiction. */
     uint8_t operator_pubkey[AT_APP_SIGNING_KEY_LEN];
+    /** True iff this peer shares OUR group (its address is in our group's
+     *  address_map). The app surfaces it as an "in your group" indicator,
+     *  distinct from an explicit connection edge. Appended LAST. Always present
+     *  (ABI v2), false when the core is built without the social feature. */
+    bool    in_group;
+    /** True iff this peer is LOCALLY BLOCKED on this node (Phase 4 P4.1).
+     *
+     *  Identity's own state, reported by identity. Compose it with
+     *  @ref at_app_reputation_t::effective_tier exactly as the core does: a
+     *  blocked peer's effective tier is 0 whatever they have earned.
+     *
+     *  Before P4.1 a block emitted nothing at all, so the app could not see
+     *  one — it re-derives tier from the score, and a block leaves the score
+     *  untouched. Appended LAST; always present, false without the social feature. */
+    bool    blocked;
 } at_app_peer_t;
 
 /** One peer's earned reputation. Mirrors `peer_reputation_msg_t`. */
@@ -116,16 +149,99 @@ typedef struct {
      *  information. An unrated peer would otherwise be indistinguishable
      *  from one genuinely rated at AT's neutral prior. */
     bool    rated;
+    /** The trust tier this score yields AFTER any standing ceiling, 0..4
+     *  (Phase 4 P4.1).
+     *
+     *  This header has said since Increment 3 that the app derives tier from
+     *  reputation, and it still may — but only reputation knows about a
+     *  CEILING, and a ceiling is not a function of the score. A peer bounded
+     *  by an authority reads as an ordinary score with a tier the app cannot
+     *  compute, so the tier reputation actually used crosses here. */
+    int32_t effective_tier;
+    /** The ceiling in force on this peer, or a NEGATIVE sentinel for none.
+     *
+     *  Lets the app tell "low because they have earned little" from "bounded
+     *  by a community decision" — different things to show a person.
+     *
+     *  @warning A consumer that memsets its event and forgets to write this
+     *  reports 0.0, which reads as "floored at zero". It must be written
+     *  explicitly on every path. */
+    double  standing_ceiling;
 } at_app_reputation_t;
 
-/** A decoded app-facing event. */
+/** One peer's latest round-trip time. Mirrors `peer_rtt_update_msg_t`. */
 typedef struct {
-    at_app_event_kind_t kind;
+    uint8_t peer_uuid[AT_APP_UUID_LEN];
+    /** Latest RTT estimate in milliseconds. 0 means unknown / not yet
+     *  measured (net_proc's fast-LAN default) — read it as "unknown", never as
+     *  "0 ms". A network-latency proxy for proximity, not a geographic distance. */
+    int32_t rtt_ms;
+} at_app_rtt_t;
+
+/** Whether this node has heard from a peer recently. Mirrors
+ *  `peer_presence_msg_t`. Sent when it changes, and once per peer on a roster
+ *  pull. */
+typedef struct {
+    uint8_t peer_uuid[AT_APP_UUID_LEN];
+    /** False once nothing has been heard from the peer for
+     *  AT_PRESENCE_ABSENT_SEC (default 90 s). AT keeps the peer as a member
+     *  and only stops asking it to do work, so read this as "quiet", not
+     *  "gone". */
+    bool    present;
+    /** Epoch seconds of the last frame from the peer; 0 = none yet. Grade it
+     *  against your own clock. */
+    double  last_heard;
+} at_app_presence_t;
+
+
+/** Bytes of @ref at_app_event_t's opaque payload arm. A feature's event (e.g.
+ *  the Agora kinds in at_agora.h) is carried there and read through that
+ *  feature's accessors. Fixed so that the event is ONE size in every build
+ *  and a foreign mirror never depends on which features the core was built
+ *  with. Changing it is an app-ABI change: bump @ref AT_APP_ABI_VERSION. */
+#define AT_APP_EVENT_PAYLOAD_MAX 8192
+
+/** The app ABI's version, bumped on any change to a struct or constant a
+ *  foreign mirror hard-codes. 1 was the unversioned layout whose size swung
+ *  with AT_SOCIAL (104 B vs several KB); 2 is the fixed-size event, with
+ *  @ref at_app_peer_t's social fields always present. Check it against
+ *  @ref at_app_abi_version at load. */
+#define AT_APP_ABI_VERSION 2
+
+#ifdef __cplusplus
+#define AT_APP_ALIGN8 alignas(8)
+#define AT_APP_STATIC_ASSERT static_assert
+#else
+#define AT_APP_ALIGN8 _Alignas(8)
+#define AT_APP_STATIC_ASSERT _Static_assert
+#endif
+
+/** A decoded app-facing event.
+ *
+ *  @c kind is an @ref at_app_event_kind_t for the core's kinds and a
+ *  feature's own constant otherwise (at_agora.h), so it is a plain
+ *  fixed-width integer rather than the enum type. */
+typedef struct {
+    int32_t kind;
     union {
         at_app_peer_t       peer;
         at_app_reputation_t reputation;
+        at_app_rtt_t        rtt;
+        at_app_presence_t   presence;
+        /** A feature's event; read it through that feature's accessors. */
+        AT_APP_ALIGN8 uint8_t payload[AT_APP_EVENT_PAYLOAD_MAX];
     } data;
 } at_app_event_t;
+
+/* Pinned so a mirror in another language can assert the same numbers. */
+AT_APP_STATIC_ASSERT(sizeof(at_app_event_t) == 8 + AT_APP_EVENT_PAYLOAD_MAX,
+                     "at_app_event_t is 8 + AT_APP_EVENT_PAYLOAD_MAX bytes");
+AT_APP_STATIC_ASSERT(offsetof(at_app_event_t, data) == 8,
+                     "at_app_event_t.data is at offset 8");
+
+/** @brief The @ref AT_APP_ABI_VERSION this library was built with. A consumer
+ *  built against a different header must refuse to read events. */
+uint32_t at_app_abi_version(void);
 
 /** Opaque handle; owns the bound queue. */
 typedef struct at_app_events_s at_app_events_t;
@@ -206,6 +322,38 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
  *       bind, so it is the common one. See @ref at_app_node_ready.
  */
 int at_app_events_request_roster(at_app_events_t *handle, const char *q_out);
+
+
+/**
+ * @brief Hand the core an AUTHORITY FINDING about a peer's standing (P4.1).
+ *
+ * Sends @ref AT_APP_PEER_STANDING with {"peer", "standing", "ceiling",
+ * "source", "reason"}; identity validates it and republishes it to reputation
+ * as a @ref PEER_STANDING, which BOUNDS what that peer may hold.
+ *
+ * A ceiling, never a score. The caller has decided something AT's [0, 1] scale
+ * cannot express — a community expelled this member — and a scalar penalty has
+ * no representation on that scale; the predecessor of this mechanism tried one
+ * and it was discarded at the boundary. @ref AT_ETHNE_EXPEL_CEILING is the
+ * bound an expulsion carries.
+ *
+ * @p standing is "proved", "capped" or "failed". "proved" means REINSTATED and
+ * lifts only THIS source's ceiling — one authority never clears another's.
+ * @p ceiling is in [0, 1], or negative for "no bound". @p source names the
+ * authority and may not be @ref PEER_STANDING_SOURCE_ZTA: an app cannot know
+ * what a credential authority proved, so claiming to speak as one is refused.
+ *
+ * The core verifies NOTHING about the finding itself — an Ethne expulsion is
+ * proved by co-signatures inside a record it cannot parse. What it trusts is
+ * that this arrived on the local app queue.
+ *
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound, -1 on
+ *         a bad argument (including an off-scale ceiling or a ZTA source).
+ */
+int at_app_events_peer_standing(at_app_events_t *handle, const char *q_out,
+                                const uint8_t peer_uuid[AT_APP_UUID_LEN],
+                                const char *standing, double ceiling,
+                                const char *source, const char *reason);
 
 /** @brief Close the queue and release the handle. NULL-safe. */
 void at_app_events_close(at_app_events_t *handle);

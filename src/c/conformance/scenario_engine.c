@@ -88,12 +88,24 @@ static int _build_and_deliver(sce_run_ctx_t *ctx, int step_id,
                 if (strcmp(ctx->participants[i].id, from) == 0) continue;
                 snprintf(ctx->current_dispatcher, sizeof(ctx->current_dispatcher),
                          "%s", ctx->participants[i].id);
-                ctx->dispatch(ctx, &ctx->participants[i], &inbound);
+                /* An adapter that fails a dispatch has already written
+                 * ctx->err. Discarding the return here left that error
+                 * invisible and surfaced instead as an empty outbox two steps
+                 * later -- a failure that says nothing about its own cause.
+                 * Python's engine propagates (the dispatch raises), so this is
+                 * also what keeps the two harnesses reporting alike. */
+                if (ctx->dispatch(ctx, &ctx->participants[i], &inbound) != 0) {
+                    ctx->outbox_end[step_id] = (int)ctx->captured_count;
+                    return -1;
+                }
             }
         } else {
             snprintf(ctx->current_dispatcher, sizeof(ctx->current_dispatcher),
                      "%s", unicast_target->id);
-            ctx->dispatch(ctx, unicast_target, &inbound);
+            if (ctx->dispatch(ctx, unicast_target, &inbound) != 0) {
+                ctx->outbox_end[step_id] = (int)ctx->captured_count;
+                return -1;
+            }
         }
     }
     ctx->outbox_end[step_id] = (int)ctx->captured_count;
@@ -150,6 +162,20 @@ static int _drive_assertion(sce_run_ctx_t *ctx, json_t *step, int in_resp) {
             break;
         }
     }
+    /* Optional expect_none: a refusal that must stay silent. Nothing of the
+     * kind may be in the parent's outbox, and nothing is delivered. */
+    if (json_is_true(json_object_get(step, "expect_none"))) {
+        if (match) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "step %d: expected no %.31s->%.31s:%.63s in response to "
+                     "step %d, but one was sent",
+                     sid, from, to, function, in_resp);
+            return -1;
+        }
+        ctx->outbox_start[sid] = (int)ctx->captured_count;
+        ctx->outbox_end[sid] = (int)ctx->captured_count;
+        return 0;
+    }
     if (!match) {
         char captured[256] = {0};
         size_t off = 0;
@@ -195,8 +221,11 @@ static int _drive_assertion(sce_run_ctx_t *ctx, json_t *step, int in_resp) {
      * adapter callback for type-safety). `repeat` is meaningless on an
      * assertion step (the inbound message is whatever the source emitted,
      * once), so pin to 1. */
-    return _build_and_deliver(ctx, sid, from, to, function,
-                              json_object_get(step, "payload"), 1);
+    ctx->responding = true;
+    int rc = _build_and_deliver(ctx, sid, from, to, function,
+                                json_object_get(step, "payload"), 1);
+    ctx->responding = false;
+    return rc;
 }
 
 static int _check_expected_state(sce_run_ctx_t *ctx) {

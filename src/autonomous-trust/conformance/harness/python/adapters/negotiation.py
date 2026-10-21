@@ -30,6 +30,7 @@ are out of scope for this pass.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import os
 import queue
 import tempfile
@@ -50,7 +51,8 @@ from autonomous_trust.core.network.message import Message
 from autonomous_trust.core.processes import ProcessTracker
 from autonomous_trust.core.system import CfgIds, PackageHash
 
-from ...common.scenario_loader import Case
+from ...common.canonical import canonicalize
+from ...common.scenario_loader import Case, load_testdata_bytes
 from ..scenario_engine import (
     CapturedMessage,
     ParticipantHandle,
@@ -61,6 +63,11 @@ from ..scenario_engine import (
 
 _NS = UUID('00000000-0000-0000-0000-000000000aaa')
 
+
+
+#: The operator key the contact_devices fixture certifies devices under. Same
+#: as the C adapter's.
+_HARNESS_OPERATOR_SEED = bytes([0x33]) * 32
 
 class _CapturingQueue:
     def __init__(self, sink: list[Any]) -> None:
@@ -165,6 +172,47 @@ class _Participant:
                         f'{self.id}: flood_count for slug {slug!r} '
                         f'(uuid={want_uuid}) = {got}, expected {want}'
                     )
+            elif key == 'results_scored':
+                # {task: <slug>, executors: [<pid>, ...]}: the requestor scored
+                # exactly these executors' results, each once (ISSUES §2.50).
+                # Python scores in its main process, so what is observable
+                # here is each result handed to main, stamped with its
+                # executor; C scores in negotiation and asserts the
+                # TRANSACTION_SCORE it sends, under the pair task id.
+                slug = expected.get('task')
+                want = sorted(expected.get('executors') or [])
+                task_uuid = uuid5(_NS, f'task:{slug}')
+                by_uuid = {str(i.uuid): pid
+                           for pid, i in _PARTICIPANT_IDENTITIES.items()}
+                sink = self.queues[CfgIds.main]._sink
+                got = sorted(by_uuid.get(str(getattr(r, 'executor_uuid', None)), '?')
+                             for r in sink
+                             if str(getattr(r, 'uuid', '')) == str(task_uuid)
+                             and getattr(r, 'executor_uuid', None) is not None)
+                if got != want:
+                    raise AssertionError(
+                        f'{self.id}: results_scored for {slug!r} = {got}, '
+                        f'expected {want}')
+            elif key == 'results_forwarded':
+                # {task: <slug>, executors: [<pid>, ...]}: the results handed
+                # on toward the app, in order, by executor (ISSUES §2.8: the
+                # first reply only). Python hands every result to main and
+                # marks all but the first `score_only`, which automate.py does
+                # not forward; C sends main only the first.
+                slug = expected.get('task')
+                want = list(expected.get('executors') or [])
+                task_uuid = uuid5(_NS, f'task:{slug}')
+                by_uuid = {str(i.uuid): pid
+                           for pid, i in _PARTICIPANT_IDENTITIES.items()}
+                sink = self.queues[CfgIds.main]._sink
+                got = [by_uuid.get(str(getattr(r, 'executor_uuid', None)), '?')
+                       for r in sink
+                       if str(getattr(r, 'uuid', '')) == str(task_uuid)
+                       and not getattr(r, 'score_only', False)]
+                if got != want:
+                    raise AssertionError(
+                        f'{self.id}: results_forwarded for {slug!r} = {got}, '
+                        f'expected {want}')
             else:
                 raise AssertionError(f'{self.id}: unsupported expected_state key {key!r}')
 
@@ -176,19 +224,49 @@ def _to_captured(msg: Any, emitter_id: str) -> CapturedMessage:
             function=f'__ipc__/{type(msg).__name__}', payload=msg, raw=msg,
         )
     to_id = _resolve_to_id(msg)
+    # Stamp the sender, which is what the network process does on the way out
+    # (it signs as self and writes the envelope's from_* fields). The engine
+    # re-delivers this very object to the target instead of serializing it, so
+    # without this the receiver sees `from_whom is None` -- and a handler that
+    # reads the sender off it, as handle_stat_resp does, gets nothing. Only
+    # ever fills a blank; a message that already names its sender is untouched.
+    if getattr(msg, 'from_whom', None) is None:
+        sender = _PARTICIPANT_IDENTITIES.get(emitter_id)
+        if sender is not None:
+            msg.from_whom = sender
     return CapturedMessage(
         from_id=emitter_id, to_id=to_id,
         function=msg.function, payload=msg.obj, raw=msg,
     )
 
 
+# Scenario-scoped uuid -> participant-slug map, populated by
+# `_build_participants`. Recipient resolution keys on the UUID, matching the C
+# adapter's `_resolve_to_id`, because the petname it used to read is a
+# LOCAL-ONLY Zooko name and is therefore not reliably the scenario's slug: a
+# `requestor` that arrived over the wire is rebuilt by
+# `public_identity_from_canonical`, which assigns a freshly DERIVED petname
+# (`derive_local_petname`). `forward_status` and `forward_result` address their
+# replies to that rebuilt identity, so matching on petname reported
+# `alice.neg-0242` where the scenario said `alice`. The uuid is the identity;
+# the petname is one node's private label for it.
+_PARTICIPANT_IDS: dict[str, str] = {}
+# Slug -> Identity, for the `from_whom` stamp in `_to_captured`.
+_PARTICIPANT_IDENTITIES: dict[str, Identity] = {}
+
+
 def _resolve_to_id(msg: Message) -> str:
     to = msg.to_whom
-    if isinstance(to, Identity):
-        return getattr(to, 'petname', '') or str(to.uuid)
     if isinstance(to, list) and to:
-        first = to[0]
-        return getattr(first, 'petname', '') or str(getattr(first, 'uuid', first))
+        to = to[0]
+    if to is None:
+        return 'broadcast'
+    uuid_str = str(getattr(to, 'uuid', '') or '')
+    resolved = _PARTICIPANT_IDS.get(uuid_str)
+    if resolved is not None:
+        return resolved
+    if isinstance(to, Identity):
+        return uuid_str or getattr(to, 'petname', '') or 'unknown'
     return 'broadcast'
 
 
@@ -202,7 +280,85 @@ class NegotiationAdapter:
         # Slug -> UUID, populated as scenarios reference task slugs.
         self._task_uuids: dict[str, UUID] = {}
 
+    def run_wire_vector(self, case: Case) -> None:
+        """Byte-pin a negotiation PAYLOAD's shape (doc/architecture/negotiation.md).
+
+        The fixture is both the input and the expectation, and the same file
+        feeds the C adapter: parse it, re-emit it through this runtime's own
+        serializer, and require the result to canonicalize back to the
+        fixture. That is what envelope-only pinning could not do -- each
+        adapter used to build its own runtime's payload from the scenario
+        step, so the corpus stayed green while a Python requestor's invitation
+        and a C worker's result had no key in common.
+
+        Checking the reconstructed object, not just the bytes, is deliberate:
+        a payload that round-trips to the right JSON but rebuilds as a plain
+        dict is exactly the failure a C-emitted payload used to produce on
+        this side, and the handlers then raise on `task.uuid`.
+        """
+        from autonomous_trust.core.config.configuration import from_json_string
+
+        spec = case.data
+        ctor = spec.get('constructor')
+        if not ctor:
+            raise AssertionError('wire_vector missing required field: constructor')
+        if ctor not in ('Task', 'TaskStatus', 'TaskResult'):
+            raise NotImplementedError(
+                f'negotiation wire_vector constructor {ctor!r} not supported')
+
+        fixture_path = (spec.get('input') or {}).get('json_wire')
+        if not fixture_path:
+            raise AssertionError('wire_vector missing input.json_wire')
+        fixture = load_testdata_bytes(self.corpus_root, fixture_path)
+
+        obj = from_json_string(fixture.decode('utf-8'))
+        assert type(obj).__name__ == ctor, (
+            f'{ctor}: fixture rebuilt as {type(obj).__name__}, not {ctor} '
+            '-- the payload is not a tagged Configuration this runtime knows')
+        # The requestor has to come back as an Identity, not the canonical
+        # dict: every handler downstream reads `.uuid` / `.nickname` /
+        # `.address` off it, and `forward_result` addresses its reply to it.
+        requestor = getattr(obj, 'requestor', None)
+        assert isinstance(requestor, Identity), (
+            f'{ctor}: requestor rebuilt as {type(requestor).__name__}, '
+            'not Identity')
+        assert getattr(requestor, 'public_only', True) is not False, (
+            f'{ctor}: requestor carries PRIVATE key material')
+
+        emitted = obj.to_json_string()
+        assert 'public_only' not in emitted, (
+            f'{ctor}: re-emitted payload carries a Signature/Encryptor dump, '
+            'which serializes the private seed for a non-public-only key')
+        self._assert_byte_pin(spec, emitted.encode('utf-8'), ctor)
+
+    def _assert_byte_pin(self, spec: dict[str, Any], actual: bytes,
+                         label: str) -> None:
+        """Compare emitted bytes to the pinned fixture, canonically.
+
+        Canonical rather than lexical, matching the network adapter and the C
+        side's ``at_byte_pin_json``: key order and integer-vs-float spelling
+        are not the contract, the key set and the values are.
+        """
+        if not spec.get('byte_pinning'):
+            return
+        expected_path = (spec.get('expected') or {}).get('json_wire')
+        if not expected_path:
+            raise AssertionError(
+                f'{label}: byte_pinning=true but expected.json_wire missing')
+        expected = canonicalize(load_testdata_bytes(self.corpus_root, expected_path))
+        actual_canonical = canonicalize(actual)
+        if actual_canonical != expected:
+            raise AssertionError(
+                f'{label}: payload diverges from pinned fixture '
+                f'{expected_path!r}\n  expected: {expected!r}\n'
+                f'  actual:   {actual_canonical!r}')
+
     def run_scenario(self, case: Case) -> None:
+        if 'first_contact' in (case.data.get('fixtures') or {}) \
+                and importlib.util.find_spec('autonomous_trust.first_contact') is None:
+            # First contact's tier-cap scenarios need its distribution
+            # (FEATURE_SPLIT_PLAN Phase 7), as C's need libat_first_contact.
+            raise NotImplementedError('first-contact scenario skipped: autonomous-trust-first-contact is not installed (put src/autonomous-trust-first-contact on the path to run it symmetrically)')
         self._scratch = tempfile.TemporaryDirectory(prefix='at-conformance-neg-')
         self._task_uuids = {}
         try:
@@ -210,6 +366,8 @@ class NegotiationAdapter:
             os.makedirs(os.path.join(self._scratch.name, 'etc/at'), exist_ok=True)
 
             participants = self._build_participants(case)
+            self._apply_groups(case, participants)
+            fc_env = self._apply_first_contact(case)
             ctx = ScenarioContext(
                 case=case,
                 participants=participants,
@@ -218,8 +376,89 @@ class NegotiationAdapter:
             )
             run_scenario(ctx)
         finally:
+            if 'fc_env' in locals() and fc_env:
+                os.environ.pop('AT_FIRST_CONTACT', None)
             self._scratch.cleanup()
             self._scratch = None
+
+    @staticmethod
+    def _apply_first_contact(case: Case) -> bool:
+        """``first_contact: {enabled: true}``, ``verified_contacts`` and
+        ``unverified_contacts`` (each ``{<holder>: [<pid>, ...]}``): turn the
+        optional feature on -- which brings its §10.3 tier cap into
+        negotiation's gate -- and write the listed contact records into this
+        scenario's scratch root. Participants belong to no group unless
+        ``group_members`` / ``child_group_members`` put them in one (see
+        _apply_groups). Returns True if the environment was changed. Mirrors
+        the C adapter's _apply_first_contact."""
+        fixtures = case.data.get('fixtures', {}) or {}
+        if not (fixtures.get('first_contact') or {}).get('enabled'):
+            return False
+        os.environ['AT_FIRST_CONTACT'] = '1'
+        from autonomous_trust.first_contact import Contact, Contacts, Provenance
+        store = Contacts()
+        for key, verified in (('verified_contacts', True),
+                              ('unverified_contacts', False)):
+            for _holder, pids in (fixtures.get(key) or {}).items():
+                for pid in pids or []:
+                    ident = _PARTICIPANT_IDENTITIES.get(pid)
+                    if ident is None:
+                        continue
+                    contact = Contact(ident.publish(), petname=pid,
+                                      provenance=Provenance.in_person if verified
+                                      else Provenance.token)
+                    if verified:
+                        contact.mark_verified()
+                    store.add(contact)
+        # contact_devices: {<first device pid>: [<further device pid>, ...]}
+        # (Phase 4). Certified under a fixed harness operator key and filed by
+        # the production adopt_operator / link_device, so a refused link shows
+        # up as a capped device rather than as a fixture that lied.
+        devices = fixtures.get('contact_devices') or {}
+        if devices:
+            from nacl.signing import SigningKey
+            from autonomous_trust.first_contact import (adopt_operator, create_device_cert,
+                                                        link_device)
+            operator = SigningKey(_HARNESS_OPERATOR_SEED)
+            for first, others in devices.items():
+                ident = _PARTICIPANT_IDENTITIES.get(first)
+                contact = store.get(str(ident.uuid)) if ident is not None else None
+                if contact is None:
+                    continue
+                adopt_operator(contact, create_device_cert(operator, ident), store)
+                for pid in others or []:
+                    dev = _PARTICIPANT_IDENTITIES.get(pid)
+                    if dev is not None:
+                        link_device(store, dev.publish(), create_device_cert(operator, dev))
+        store.save()
+        return True
+
+    @staticmethod
+    def _apply_groups(case: Case, handles) -> None:
+        """``group_members: {<holder>: [<pid>, ...]}`` puts the listed
+        participants in the holder's OWN group; ``child_group_members`` in a
+        child group the holder gateways. What the tier cap reads to tell a
+        cohort member from a stranger. Mirrors the C adapter's _apply_groups."""
+        fixtures = case.data.get('fixtures', {}) or {}
+        for key in ('group_members', 'child_group_members'):
+            for holder, pids in (fixtures.get(key) or {}).items():
+                handle = handles.get(holder)
+                if handle is None:
+                    continue
+                members = {}
+                for pid in pids or []:
+                    ident = _PARTICIPANT_IDENTITIES.get(pid)
+                    if ident is not None:
+                        members[str(ident.uuid)] = ident.address
+                gid = uuid5(_NS, 'neg:%s:%s' % (key, holder))
+                seed = hashlib.sha256(b'neg:grp:' + str(gid).encode()).hexdigest()
+                grp = Group(gid, members, '%s-%s' % (holder, key),
+                            Encryptor(seed.encode('ascii'), public_only=False))
+                proto = handle.impl.process.protocol
+                if key == 'group_members':
+                    proto.group = grp
+                else:
+                    proto.child_groups = {str(gid): grp}
 
     def run_wire_vector(self, case: Case) -> None:  # noqa: ARG002
         raise NotImplementedError('negotiation wire_vector kind not implemented (Phase E: scenarios only)')
@@ -256,6 +495,8 @@ class NegotiationAdapter:
         cap_tier_fix: dict[str, int] = fixtures.get('capability_tiers', {}) or {}
 
         identities: dict[str, Identity] = {}
+        _PARTICIPANT_IDS.clear()
+        _PARTICIPANT_IDENTITIES.clear()
         for idx, spec in enumerate(spec_participants):
             pid = spec['id']
             sig = hashlib.sha256(b'neg:sig:' + pid.encode()).hexdigest().encode('ascii')
@@ -267,6 +508,8 @@ class NegotiationAdapter:
                 Encryptor(enc, public_only=False),
                 pid, False, 0, 'authority',
             )
+            _PARTICIPANT_IDS[str(identity.uuid)] = pid
+            _PARTICIPANT_IDENTITIES[pid] = identity
             identities[pid] = identity
 
         handles: dict[str, ParticipantHandle] = {}
@@ -401,8 +644,18 @@ class NegotiationAdapter:
         flexible = bool(payload.get('flexible', True))
         params = TaskParameters(cap, _flexible=flexible, when=when)
 
+        # Freshness sequence for the invitation (TaskInfo.seq; field 12 of
+        # negotiation/task.proto). Defaults to 1 so existing single-invite
+        # scenarios are unchanged. `unstamped: true` sends 0 -- the shape a
+        # peer that has not been rebuilt emits, and the shape an attacker
+        # produces by stripping the field; both runtimes must refuse it rather
+        # than fall back to a lenient path. A replay is expressed by
+        # delivering the SAME seq twice (`repeat: 2`, which builds the inbound
+        # once); a genuine flood is distinct, increasing seqs across steps.
+        seq = 0 if payload.get('unstamped') else int(payload.get('seq', 1))
+
         if function == 'spawn task':
-            task = Task(params, sender_identity, uuid=task_uuid)
+            task = Task(params, sender_identity, uuid=task_uuid, seq=seq)
             obj = task
         elif function in ('invitation', 'haggle', 'ack', 'nack', 'status request'):
             # `Task.requestor` is the original inviter. The requestor
@@ -418,7 +671,7 @@ class NegotiationAdapter:
             # similarly routes by task.requestor.
             requestor_is_sender = function in ('invitation', 'status request')
             requestor = sender_identity if requestor_is_sender else recipient
-            task = Task(params, requestor, uuid=task_uuid)
+            task = Task(params, requestor, uuid=task_uuid, seq=seq)
             obj = task
         elif function == 'status response':
             from autonomous_trust.core.negotiation.negotiation import Status
@@ -446,10 +699,19 @@ class NegotiationAdapter:
         else:
             raise AssertionError(f'unsupported negotiation function {function!r}')
 
+        to_whom = recipient
+        if function == 'spawn task':
+            # On a start message `to_whom` is the peer the task is ADDRESSED
+            # to, and production's main process sends none. A spawn step goes
+            # requestor -> requestor, so copying its recipient addressed every
+            # task to ourselves. `target: <pid>` addresses it. Mirrors C.
+            target = payload.get('target')
+            to_whom = (participants[target].impl.identity
+                       if target in participants else None)
         msg = Message(
             CfgIds.negotiation, function, obj,
             from_whom=sender_identity,
-            to_whom=recipient,
+            to_whom=to_whom,
             encrypt=True,
         )
         return msg

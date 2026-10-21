@@ -1,0 +1,65 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: device-link-lifted-cert
+description: 'Mallory presents Alice''s laptop cert on her own node: the cert does not name her, so it links nothing.'
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: device
+    mode: link
+    store:
+      typename: contacts
+      version: 1
+      contacts:
+        dddddddd-0000-4000-8000-000000000051:
+          identity:
+            typename: identity
+            uuid: dddddddd-0000-4000-8000-000000000051
+            address: ''
+            nickname: alice-phone
+            signature:
+              hex_seed: c050c5637a44fa8629fff3cccce2300cb362a63d99d95fc54145266f4332445a
+            encryptor:
+              hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+          petname: alice-phone
+          verified: true
+          provenance: token
+          trust_seed: 0.3
+          rendezvous: []
+          nonce: ''
+          added_at: 1.0
+          verified_at: 2.0
+          operator_key: 17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce
+    identity:
+      typename: identity
+      uuid: dddddddd-0000-4000-8000-000000000053
+      address: ''
+      nickname: mallory
+      signature:
+        hex_seed: f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0
+      encryptor:
+        hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+    cert:
+      body: '{"v":1,"typename":"at-device-cert","operator":"17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce","uuid":"dddddddd-0000-4000-8000-000000000052","key":"2012cb90ca60e8e5d8daf66e2272d2233e0486d557e8c66141ed8920177d7eb7","issued_at":1790000000}'
+      sig: c600b61d077ddbf7f1d1d2202919e4584a0c87fa588e203d1a7d0c38178452814847a212d618bfaca8b96447e3455dc84df608c3620a235bcd0b6fe0c2d49e08
+steps:
+- id: 1
+  from: host
+  to: host
+  function: device
+  description: 'trigger: device link'
+expected_state:
+  host:
+    device_status: mismatch
+    devices_of:
+      dddddddd-0000-4000-8000-000000000051: []
+    resolves:
+      dddddddd-0000-4000-8000-000000000053: null

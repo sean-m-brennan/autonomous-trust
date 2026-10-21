@@ -1,0 +1,44 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: direct-peer-not-in-admission-denominator
+byte_pinning: false
+description: |
+    An admission needs a majority of the MEMBERS, this node included (R+D.md
+    §13.5 D2). A first-contact direct peer is in bg's peer list and in no
+    group, and it never votes. Counting it raised the bar by one per contact:
+    here bg's own vote was one of two, short of a majority, and the newcomer
+    waited on a vote that could not come.
+
+    bg is the group's only member, so its own vote admits. C counts the
+    roster (`ADMISSION_QUORUM`); Python's accumulator does not count, and
+    admits on bg's vote either way.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: contact
+    role: member
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  direct_peers:
+    bg: [contact]
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    description: |
+        newcomer asks bg for access.
+
+  - id: 2
+    from: bg
+    to: newcomer
+    function: full_history
+    in_response_to: 1
+    description: |
+        bg's own vote is the members' majority, so the admission completes and
+        the group key goes to the newcomer.

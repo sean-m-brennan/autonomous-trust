@@ -1,0 +1,63 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: first-contact-ack-wrong-nonce-ignored
+byte_pinning: false
+description: |
+    A pending hello is answered only by an ack for THAT ticket.
+
+    Bob has redeemed Alice's invitation and is waiting on her -- so an ack
+    from Alice is expected. But this one echoes a nonce Bob never presented.
+    Honoring it would make the pending entry a blank cheque: any ack under the
+    inviter's name, for any ticket, while one hello is outstanding. The gate
+    compares the echoed nonce with the ticket's and refuses a mismatch.
+
+    Companion to first-contact-unsolicited-ack-ignored (nothing pending at
+    all). The third condition, the inviter's SIGNING KEY, is pinned by unit
+    tests on both runtimes rather than here: a fixture cannot mint a second key
+    for a participant's uuid.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000000a8"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000000b8"
+      size: 1
+
+steps:
+  - id: 1
+    from: bob
+    to: bob
+    function: trigger_first_contact_initiate
+    payload:
+      minted_by: alice
+      nonce: fc-presented
+      expiry: 0
+      rendezvous:
+        - 10.0.0.1
+    description: |
+        Pseudo-step: Bob redeems Alice's invitation and sends his hello, so a
+        hello to Alice is now pending on Bob's side.
+  - id: 2
+    from: alice
+    to: bob
+    function: first_contact_hello_ack
+    payload:
+      nonce: fc-some-other-ticket
+    description: |
+        Alice's name, the wrong ticket. Refused.
+
+expected_state:
+  bob:
+    direct_peers:
+      alice: false

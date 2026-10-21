@@ -154,11 +154,15 @@ size_t map_key2index(map_t *map, map_key_t key)
 int reindex(map_t *map)
 {
     size_t old_capacity = map->capacity;
-    map->capacity = increment_capacity(map->capacity);
-    map_item_t *items = smrt_create(map->capacity * sizeof(map_item_t));
+    size_t new_capacity = increment_capacity(map->capacity);
+    /* increment_capacity returns UINT64_MAX when its prime search runs out */
+    if (new_capacity == 0 || new_capacity > SIZE_MAX / sizeof(map_item_t))
+        return EXCEPTION(ENOMEM);
+    /* plain calloc: the items buffer is an array, not an smrt struct */
+    map_item_t *items = calloc(new_capacity, sizeof(map_item_t));
     if (items == NULL)
         return EXCEPTION(ENOMEM);
-    memset(items, 0, map->capacity * sizeof(map_item_t));
+    map->capacity = new_capacity;
     /*@
       loop invariant 0 <= i <= old_capacity;
       loop assigns i, items[0 .. map->capacity - 1];
@@ -186,7 +190,7 @@ int reindex(map_t *map)
             items[idx] = entry;
         }
     }
-    free(map->items); // no deref, force free
+    free(map->items);
     map->items = items;
     //@ assert map->length <= map->capacity;
     return 0;
@@ -203,9 +207,12 @@ int map_init(map_t *map)
     map->length = 0;
     crypto_shorthash_keygen(map->hashkey);
     array_init(&map->keys);
+    map->magic = 0;
     map->alloc = false;
     map->refs = 0;
-    map->items = smrt_create(map->capacity * sizeof(map_item_t));
+    /* A plain array: items[0] used to double as an smrt header that every
+     * insert, shift and reindex overwrote, so the closing deref leaked it. */
+    map->items = calloc(map->capacity, sizeof(map_item_t));
     if (map->items == NULL)
         return EXCEPTION(ENOMEM);
     //@ assert map->length == 0;
@@ -225,9 +232,18 @@ int map_create(map_t **map_ptr)
         return EXCEPTION(ENOMEM);
 
     int err = map_init(map);
+    /* map_init zeroes the smrt header for the embedded case (a stack map_t or
+     * a struct member, whose header no allocator wrote); this struct IS an
+     * smrt allocation, so restore what smrt_create established or map_free's
+     * closing deref -- and the error deref below -- would never free it.
+     * Mirrors array_create. */
+    map->magic = SMRT_MAGIC;
+    map->alloc = true;
+    map->refs = 1;
     if (err != 0)
     {
         smrt_deref(map);
+        *map_ptr = NULL;
         return err;
     }
     return err;
@@ -265,6 +281,63 @@ int map_get(map_t *map, const map_key_t key, data_t **value)
     return EXCEPTION(EMAP_NOKEY);
 }
 
+/* The key index (map->keys) records insertion order for map_keys and
+ * map_entries_for_each. map_remove leaves a removed key in it, so a loop may
+ * remove entries while it walks the index without anything moving under it;
+ * the walk skips the dead key because its map_get fails. Dead keys are
+ * dropped here instead, on the next NEW key, once they are at least as many
+ * as the live ones: the index stays under twice the live count, and only a
+ * new key added to a map while walking that same map could see it move.
+ * A key set again after its removal reuses its dead entry rather than
+ * appearing twice. */
+static bool _key_live(data_t *k, void *ctx)
+{
+    char *s = NULL;
+    data_t *v = NULL;
+    return data_string_ptr(k, &s) == 0 && s != NULL
+        && map_get((map_t *)ctx, s, &v) == 0;
+}
+
+typedef struct {
+    map_t *map;
+    map_t *seen;
+} key_once_ctx_t;
+
+/* _key_live, and the first time this key is met in the index. */
+static bool _key_live_once(data_t *k, void *vctx)
+{
+    key_once_ctx_t *ctx = vctx;
+    if (!_key_live(k, ctx->map))
+        return false;
+    char *s = NULL;
+    data_t *v = NULL;
+    data_string_ptr(k, &s);
+    if (map_get(ctx->seen, s, &v) == 0)
+        return false;
+    map_set(ctx->seen, s, integer_data(1));
+    return true;
+}
+
+/* @return true when @p key already sits (dead) in the index; otherwise
+ * compacts the index if dead keys are now at least as many as live ones.
+ * Called for a NEW key, before its item is written. */
+static bool _keys_before_insert(map_t *map, const char *key)
+{
+    size_t indexed = array_size(&map->keys);
+    if (indexed <= map->length)
+        return false;   /* no dead keys: nothing to reuse or drop */
+    for (size_t i = 0; i < indexed; i++)
+    {
+        char *s = NULL;
+        if (data_string_ptr(map->keys.array[i], &s) == 0 && s != NULL
+            && strcmp(s, key) == 0)
+            return true;
+    }
+    if (indexed - map->length >= map->length)
+        array_keep_if(&map->keys, _key_live, map);
+    return false;
+}
+
 /* Frama-C: skipped — [alloc-pattern] hash bucket manipulation with realloc */
 int map_set(map_t *map, const map_key_t key, data_t *value)
 {
@@ -294,8 +367,15 @@ int map_set(map_t *map, const map_key_t key, data_t *value)
             break;
         if (strcmp(key, map->items[index].key) == 0)
         {
-            smrt_ref(value);
+            /* Overwrite: the map ADOPTS the caller's reference (see the
+             * ownership note on map_set in map.h) and releases the value it
+             * is displacing — that one is leaving the map and nothing else
+             * holds it. Guarded against a self-assign, where deref'ing first
+             * would free the value we are about to store. */
+            data_t *displaced = map->items[index].value;
             map->items[index].value = value;
+            if (displaced != value)
+                smrt_deref(displaced);
             return 0;
         }
         index++;
@@ -304,18 +384,21 @@ int map_set(map_t *map, const map_key_t key, data_t *value)
     }
 
     // new entry
+    bool indexed = _keys_before_insert(map, key);
     map_item_t *item = &map->items[index];
     map_key_t key_cpy = strdup(key);
     if (key_cpy == NULL)
         return EXCEPTION(ENOMEM);
     item->key = key_cpy; // map owns this strdup'd copy; freed in map_delete/map_free
     item->hash = hash;
-    smrt_ref(value);
-    item->value = value;
-    data_t *str_dat = string_data(key_cpy, strlen(key_cpy));
-    int err = array_append(&map->keys, str_dat);
-    if (err != 0)
-        return err;
+    item->value = value;  /* adopted, not referenced; see map.h */
+    if (!indexed)
+    {
+        data_t *str_dat = string_data(key_cpy, strlen(key_cpy));
+        int err = array_append(&map->keys, str_dat);
+        if (err != 0)
+            return err;
+    }
     map->length++;
 
     //@ assert map->length <= map->capacity;
@@ -337,11 +420,16 @@ int map_remove(map_t *map, map_key_t key)
     {
         if (strcmp(key, map->items[index].key) == 0)
         {
+            /* The dropped value's reference is the map's to release. A caller
+             * moving a value to another map must smrt_ref it before the
+             * map_set, or this deref is the last one (see peers_promote). */
+            data_t *dropped = map->items[index].value;
             free(map->items[index].key);
             map->items[index].key = NULL;
             map->items[index].value = NULL;
             map->items[index].hash = 0;
             map->length--;
+            smrt_deref(dropped);
 
             //@ assert map->length < \old(map->length);
 
@@ -395,7 +483,7 @@ void map_free(map_t *map)
      *   map->items[i].key points into heap memory that was strdup'd when the
      *   entry was inserted (see map_set). Those key strings are independent
      *   allocations from the items array itself. We MUST free every key
-     *   before smrt_deref'ing map->items, because once items is freed the
+     *   before freeing map->items, because once items is freed the
      *   items[i].key pointers are no longer dereferenceable — even reading
      *   them to pass to free() would be a use-after-free.
      *
@@ -413,8 +501,19 @@ void map_free(map_t *map)
     {
         if (map->items[i].key != NULL)
             free(map->items[i].key);
+        /* The map holds one reference per stored value (map_set adopts the
+         * caller's), so tearing the map down releases them — the same
+         * contract array_free has always had for its elements. Without this
+         * every value ever stored in any map outlived its map. */
+        if (map->items[i].value != NULL)
+            smrt_deref(map->items[i].value);
     }
-    smrt_deref(map->items);
+    /* The parallel array of key copies is the map's too. Safe now that
+     * array_init initializes the smrt header of an embedded array_t: this is
+     * a struct member, so array_free's closing deref must find alloc=false
+     * and do nothing rather than free() an interior pointer. */
+    array_free(&map->keys);
+    free(map->items);
     smrt_deref(map);
 }
 
@@ -468,13 +567,15 @@ int map_sync_in(AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap, map_
         data_t *elt = smrt_create(sizeof(data_t));
         if (elt == NULL)
             return EXCEPTION(ENOMEM);
-        char *key = smrt_create(strlen(dmap->map[i]->key) + 1);
-        if (key == NULL)
-            return EXCEPTION(ENOMEM);
-        strcpy(key, dmap->map[i]->key);
-        data_sync_in(dmap->map[i]->value, elt);
-        if (map_set(map, key, elt) != 0)
+        /* map_set strdup's the key, so no copy of our own */
+        if (data_sync_in(dmap->map[i]->value, elt) != 0) {
+            smrt_deref(elt);
             return -1;
+        }
+        if (map_set(map, dmap->map[i]->key, elt) != 0) {
+            smrt_deref(elt);
+            return -1;
+        }
     }
     return 0;
 }
@@ -504,8 +605,23 @@ int map_to_json(const void *data_struct, json_t **obj_ptr)
     }
     json_object_set_new(obj, "hashkey", hash_arr);
 
+    /* Live keys only: the dead ones map_remove leaves in the index are not
+     * part of the map. */
+    array_t live;
+    array_init(&live);
+    for (size_t i = 0; i < map->keys.size; i++)
+    {
+        data_t *k = map->keys.array[i];
+        if (_key_live(k, (map_t *)map))
+        {
+            smrt_ref(k);
+            array_append(&live, k);
+        }
+    }
     json_t *keys;
-    if (array_to_json(&map->keys, &keys) < 0)
+    int kerr = array_to_json(&live, &keys);
+    array_free(&live);
+    if (kerr < 0)
         return -1;
     json_object_set_new(obj, "keys", keys);
 
@@ -547,7 +663,9 @@ int map_from_json(const json_t *obj, void *data_struct)
     map_t *map = data_struct;
     map->length = json_integer_value(json_object_get(obj, "length"));
     map->capacity = json_integer_value(json_object_get(obj, "capacity"));
-    map->items = smrt_create(map->capacity * sizeof(map_item_t));
+    map->items = calloc(map->capacity > 0 ? map->capacity : 1, sizeof(map_item_t));
+    if (map->items == NULL)
+        return -1;
 
     json_t *hash_arr = json_object_get(obj, "hashkey");
     /*@
@@ -583,9 +701,23 @@ int map_from_json(const json_t *obj, void *data_struct)
                 map->items[i].key = NULL;
                 continue;
             }
-            map->items[i].value = calloc(1, sizeof(data_t));
+            /* smrt_create, not calloc: map_free/map_remove release values
+             * with smrt_deref, which on a calloc'd header (refs 0, alloc
+             * false) underflowed refs and never freed the value. */
+            map->items[i].value = smrt_create(sizeof(data_t));
+            if (map->items[i].value == NULL)
+                return -1;
             data_from_json(json_object_get(elt, "value"), map->items[i].value);
         }
+    }
+    /* Output from before the index was kept compact can carry dead keys, and
+     * a key removed and set again twice over; keep each live key once. */
+    map_t seen;
+    if (map_init(&seen) == 0)
+    {
+        key_once_ctx_t ctx = { map, &seen };
+        array_keep_if(&map->keys, _key_live_once, &ctx);
+        map_free(&seen);
     }
     //@ assert map->length <= map->capacity;
     return 0;

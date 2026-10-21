@@ -23,10 +23,8 @@ project(autonomous_trust_examples C CXX)
 option(AT_ZTA "Enable Zero Trust Architecture credential integration" OFF)
 option(AT_STATIC "Link demos fully statically" OFF)
 
-# OpenSSL imported targets must be visible in this scope for linking
-if(AT_ZTA)
-    find_package(OpenSSL REQUIRED)
-endif()
+# OpenSSL comes with libat_zta (src/c/extensions/zta), which makes its
+# imported targets global.
 
 # Build the library as a subdirectory.
 # This makes autonomous_trust_static (and its include dirs, compile defs,
@@ -58,9 +56,45 @@ set(AT_INCLUDE_DIRS
 function(add_at_example target source)
     add_executable(${target} ${source})
     target_include_directories(${target} PRIVATE ${AT_INCLUDE_DIRS})
+    # Extension libraries (AT_NET_DTN builds libat_dtn, AT_NET_GATEWAY
+    # libat_gateway, AT_ORACLE_* the libat_<layer> verification layers) link
+    # whole too, ahead of the core, so their
+    # registration constructors are in the binary.
+    set(_at_ext_libs)
+    if(TARGET at_dtn_static)
+        list(APPEND _at_ext_libs at_dtn_static)
+    endif()
+    if(TARGET at_gateway_static)
+        list(APPEND _at_ext_libs at_gateway_static)
+    endif()
+    if(TARGET at_first_contact_static)
+        list(APPEND _at_ext_libs at_first_contact_static)
+    endif()
+    if(TARGET at_rendezvous_static)
+        list(APPEND _at_ext_libs at_rendezvous_static)
+    endif()
+    if(TARGET at_fleet_static)
+        list(APPEND _at_ext_libs at_fleet_static)
+    endif()
+    if(TARGET at_data_source_static)
+        list(APPEND _at_ext_libs at_data_source_static)
+    endif()
+    # ZTA (AT_ZTA builds libat_zta, which brings OpenSSL).
+    set(_at_ext_deps)
+    if(TARGET at_zta_static)
+        list(APPEND _at_ext_libs at_zta_static)
+        list(APPEND _at_ext_deps OpenSSL::SSL OpenSSL::Crypto)
+        target_include_directories(${target} PRIVATE ${AT_LIB_DIR}/extensions)
+    endif()
+    # The verification layers (AT_ORACLE_*, libat_<layer>).
+    foreach(_layer physics calibration certificates prequential replication)
+        if(TARGET at_${_layer}_static)
+            list(APPEND _at_ext_libs at_${_layer}_static)
+        endif()
+    endforeach()
     target_link_libraries(${target} PRIVATE
-        -Wl,--whole-archive autonomous_trust_static -Wl,--no-whole-archive
-        ${DEPENDENCIES}
+        -Wl,--whole-archive ${_at_ext_libs} autonomous_trust_static -Wl,--no-whole-archive
+        ${DEPENDENCIES} ${_at_ext_deps}
     )
     # -fms-extensions is REQUIRED, not cosmetic: the library headers embed
     # smrt_ptr_t (and struct tm / thread_args_t / public_identity_t) as
@@ -86,9 +120,12 @@ endfunction()
 add_at_example(at_example ../src/c/example.c)
 
 # ----- Demo app (fleet update, containerized) -----
-add_at_example(at_demo demo/src/at_demo.c)
-if(AT_STATIC)
-    target_link_libraries(at_demo PRIVATE -static stdc++ m)
+# It drives fleet's update pipeline, so it needs libat_fleet (AT_FLEET_LIB).
+if(TARGET at_fleet_static)
+    add_at_example(at_demo demo/src/at_demo.c)
+    if(AT_STATIC)
+        target_link_libraries(at_demo PRIVATE -static stdc++ m)
+    endif()
 endif()
 
 # ----- ZTA demo app (DDIL, OCSP, delegated verification) -----

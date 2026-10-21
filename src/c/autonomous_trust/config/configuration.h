@@ -99,7 +99,7 @@ const char *rootDir(void);
  *       own correct bounds check ran against a number up to 147 bytes too large.
  *       `unix_addr` passes a 108-byte `sun_path`-sized buffer, and a long
  *       `AUTONOMOUS_TRUST_ROOT` therefore smashed the caller's stack. See
- *       ISSUES.md §2.1.1. The ACSL below said `CFG_PATH_LEN` too, so the contract
+ *       the startup stack overflow. The ACSL below said `CFG_PATH_LEN` too, so the contract
  *       was contradicted by a caller and nothing noticed.
  */
 /*@
@@ -177,15 +177,29 @@ extern size_t configuration_table_size;
  * @param struct_ptr  Address of the backing struct instance.
  */
 #define DEFINE_CONFIGURATION(cfg_name, to, from, len, struct_ptr)                    \
-    void __attribute__((constructor)) CONCAT(register_configuration_, __COUNTER__)() \
+    static void __attribute__((constructor)) CONCAT(register_configuration_, __COUNTER__)(void) \
     {                                                                                \
-        configuration_table[configuration_table_size].name = QUOTE(cfg_name);        \
-        configuration_table[configuration_table_size].to_json = to;                  \
-        configuration_table[configuration_table_size].from_json = from;              \
-        configuration_table[configuration_table_size].data_len = len;                \
-        configuration_table[configuration_table_size].data_struct = struct_ptr;      \
-        configuration_table_size++;                                                  \
+        (void)configuration_table_append(QUOTE(cfg_name), (to), (from), (len),       \
+                                         (struct_ptr));                              \
     }
+
+/** Free configuration-table slots beyond the generated entries, for sections an
+ *  extension library adds with @ref DEFINE_CONFIGURATION (the generator does not
+ *  scan an extension's sources). */
+#define AT_CONFIG_EXT_MAX 8
+
+/**
+ * @brief Add a configuration section at load time (what @ref
+ *        DEFINE_CONFIGURATION expands to).
+ *
+ * Refuses (-1, with a line on stderr) a NULL or empty name, a NULL @p from, a
+ * name already in the table, and a full table. Not locked: constructors run
+ * before main().
+ */
+int configuration_table_append(const char *name,
+                               int (*to)(const void *, json_t **),
+                               int (*from)(const json_t *, void *),
+                               size_t len, void *struct_ptr);
 
 /**
  * @brief Load a single config file into the provided struct.

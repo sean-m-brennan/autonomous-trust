@@ -24,10 +24,12 @@
 #include <sys/wait.h>
 #include <string.h>
 #include <signal.h>
+#include <time.h>
 
 #include "version.h"
 #include "at_route_priv.h"
 #include "utilities/message.h"
+#include "utilities/send_retry.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/logger.h"
 #include "utilities/sighandler.h"
@@ -52,6 +54,12 @@ void user1_handler() { /* reserved: SIGUSR1 — user-defined action */ }
 void user2_handler() { /* reserved: SIGUSR2 — user-defined action */ }
 
 
+/* Every send in this file goes through at_send with AT_SEND_NOW: one try,
+ * and a refused frame is KEPT and retried on this loop's tick
+ * (utilities/send_retry.h, ISSUES §2.14) rather than lost. These are an app's
+ * verbs on their way in and AT's events on their way out, and nothing sends
+ * either again. A TASK cannot be kept (task_t owns a map and an array), so a
+ * full negotiation queue still loses one, loudly. */
 int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
 {
     if (msg == NULL)
@@ -60,45 +68,85 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
     {
     case TASK:
         /* Route tasks to negotiation process */
-        if (messaging_send("negotiation", TASK, msg, false) != 0)
+        if (at_send(NULL, "negotiation", msg,
+                    "an app task", "negotiation", 0, NULL, NULL, 0) != 0)
             log_exception(logger);
         return 0;
     case TASK_STATUS:
         /* Route task status queries to negotiation */
-        if (messaging_send("negotiation", TASK_STATUS, msg, false) != 0)
-            log_exception(logger);
-        return 0;
-    case UPDATE_PROPOSAL:
-        /* Route update proposals to fleet process */
-        if (messaging_send("fleet", UPDATE_PROPOSAL, msg, false) != 0)
+        if (at_send(NULL, "negotiation", msg,
+                    "an app task status", "negotiation",
+                    AT_SEND_NOW, NULL, NULL, 0) != 0)
             log_exception(logger);
         return 0;
     case NET_MESSAGE:
     {
-        /* An app may invoke exactly ONE local verb, at a fixed pair of
-         * processes. Forwarding a NET_MESSAGE to whatever process it names
-         * would hand an app the whole internal verb surface. */
-        if (msg->info.net_msg.function == NULL
-            || strcmp(msg->info.net_msg.function, AT_APP_ROSTER_REQUEST) != 0)
+        /* An app may invoke only a small, explicit allowlist of local verbs,
+         * each at a fixed set of processes. Forwarding a NET_MESSAGE to whatever
+         * process it names would hand an app the whole internal verb surface. */
+        const char *fn = msg->info.net_msg.function;
+        if (fn != NULL && strcmp(fn, AT_APP_ROSTER_REQUEST) == 0)
         {
-            log_warn(logger, "AutonomousTrust: refused extern net_msg '%s'\n",
-                     msg->info.net_msg.function == NULL
-                         ? "(none)" : msg->info.net_msg.function);
-            return -1;
+            /* All three carrier producers answer: identity holds the peer facts
+             * (and now positions), reputation the scores, network the RTT and presence. Each
+             * copy is addressed to its own process, since dispatch matches
+             * net_msg.process against proc->name. */
+            static const char *const roster_targets[] = { "identity", "reputation", "network" };
+            for (size_t i = 0; i < sizeof(roster_targets) / sizeof(*roster_targets); i++)
+            {
+                generic_msg_t fwd = *msg;
+                snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
+                         "%s", roster_targets[i]);
+                if (at_send(NULL, roster_targets[i], &fwd,
+                            "the app's roster request", roster_targets[i],
+                            AT_SEND_NOW, NULL, NULL, 0) != 0)
+                    log_exception(logger);
+            }
+            return 0;
         }
-        /* Both halves of the carrier answer: identity holds the peer facts,
-         * reputation holds the scores. Each copy is addressed to its own
-         * process, since dispatch matches net_msg.process against proc->name. */
-        static const char *const roster_targets[] = { "identity", "reputation" };
-        for (size_t i = 0; i < sizeof(roster_targets) / sizeof(*roster_targets); i++)
         {
+            /* A feature's app verbs (msg_registry.h). Each is forwarded ONLY
+             * to the one process it registered -- the same allowlist the
+             * social verbs used to be hand-listed into here, so an app still
+             * reaches no verb that nobody registered. */
+            const char *target = fn != NULL ? at_app_verb_target(fn) : NULL;
+            if (target != NULL)
+            {
+                generic_msg_t fwd = *msg;
+                snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
+                         "%s", target);
+                if (at_send(NULL, target, &fwd,
+                            "an app verb", target, AT_SEND_NOW, NULL, NULL, 0) != 0)
+                    log_exception(logger);
+                return 0;
+            }
+        }
+        if (fn != NULL && strcmp(fn, AT_APP_PEER_STANDING) == 0)
+        {
+            /* Phase 4 P4.1: an authority finding the APP decided — an Ethne
+             * expulsion or a reinstatement — bounding what a peer may hold.
+             * Forwarded ONLY to identity, which validates it and republishes
+             * it to reputation as a PEER_STANDING.
+             *
+             * Through identity rather than straight to reputation because
+             * identity is already the standing producer (_publish_zta_standing)
+             * and is the only process that can resolve the uuid against the
+             * admitted-peer table.
+             *
+             * A core verb, not a registered one, on purpose: a governance
+             * tier bounding a peer is not an Agora-specific idea. */
             generic_msg_t fwd = *msg;
             snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
-                     "%s", roster_targets[i]);
-            if (messaging_send(roster_targets[i], NET_MESSAGE, &fwd, false) != 0)
+                     "%s", "identity");
+            if (at_send(NULL, "identity", &fwd,
+                        "an app peer standing", "identity",
+                        AT_SEND_NOW, NULL, NULL, 0) != 0)
                 log_exception(logger);
+            return 0;
         }
-        return 0;
+        log_warn(logger, "AutonomousTrust: refused extern net_msg '%s'\n",
+                 fn == NULL ? "(none)" : fn);
+        return -1;
     }
     default:
         log_warn(logger, "AutonomousTrust: unexpected extern message type %ld\n",
@@ -126,11 +174,166 @@ int at_route_queue_msg(array_t *unhandled, generic_msg_t *msg)
 }
 
 
+/****************************
+ * App-bound events while no app is attached
+ ****************************/
+/* The app binds q_out (at_app_events_open), not the node, so between an app's
+ * sessions -- before it first opens, across a restart, or between a cohort's
+ * short-lived drivers -- every send found no socket. Each was a WARNING and an
+ * ENOENT (about a thousand a cohort run), and a one-time event (a DM, a post,
+ * a co-sign ask) was lost. Now, while nothing is bound, a state event the
+ * roster pull re-emits is counted and dropped, and a one-time event is held,
+ * oldest dropped past AT_APP_HELD_MAX, and sent in order once an app binds.
+ * One line reports each gap when it ends. */
+static generic_msg_t g_app_held[AT_APP_HELD_MAX];
+static size_t g_app_held_n = 0;
+static bool g_app_attached = false;     /* until a send or a probe says so */
+static size_t g_gap_state = 0;          /* state events dropped this gap */
+static size_t g_gap_overflow = 0;       /* held events dropped this gap */
+static time_t g_gap_since = 0;
+
+bool at_app_event_replayed(long type)
+{
+    switch (type)
+    {
+    case PEER_OBSERVED:      /* identity_emit_all_peers */
+    case PEER_REPUTATION:    /* reputation_emit_all */
+    case PEER_RTT_OBSERVED:  /* net_emit_all_rtts */
+    case PEER_PRESENCE:      /* net_emit_all_presence */
+        return true;
+    case TASK_RESULT:
+    case TRANSACTION_SCORE:
+        return false;
+    default:
+        break;
+    }
+    const at_msg_vtable_t *vt = at_msg_type_lookup(type);
+    return vt != NULL && vt->app_replayed;
+}
+
+static void _app_detached(logger_t *logger, const char *q_out)
+{
+    g_app_attached = false;
+    g_gap_state = 0;
+    g_gap_overflow = 0;
+    g_gap_since = time(NULL);
+    log_info(logger, "AutonomousTrust: no app attached to %s; holding one-time "
+             "events until one is\n", q_out);
+}
+
+static void _app_hold(const generic_msg_t *msg, logger_t *logger)
+{
+    if (at_app_event_replayed(msg->type))
+    {
+        g_gap_state++;
+        return;
+    }
+    if (g_app_held_n == AT_APP_HELD_MAX)
+    {
+        at_msg_copy_release(&g_app_held[0]);
+        memmove(&g_app_held[0], &g_app_held[1],
+                (AT_APP_HELD_MAX - 1) * sizeof(g_app_held[0]));
+        g_app_held_n--;
+        g_gap_overflow++;
+    }
+    if (at_msg_copy(msg, &g_app_held[g_app_held_n]) == 0)
+        g_app_held_n++;
+    else
+    {
+        g_gap_overflow++;
+        log_warn(logger, "AutonomousTrust: could not hold an app event of type "
+                 "%ld for the app; it is lost\n", msg->type);
+    }
+}
+
+size_t at_app_flush_held(const char *q_out, logger_t *logger)
+{
+    if (q_out == NULL || g_app_attached || !messaging_bound(q_out))
+        return 0;
+    size_t held = g_app_held_n, sent = 0;
+    while (sent < g_app_held_n)
+    {
+        /* 0 is sent or kept (a full app queue files it with send_retry, which
+         * keeps the order); anything else leaves the rest for the next pass. */
+        if (at_send(NULL, q_out, &g_app_held[sent], "a held app event", q_out,
+                    AT_SEND_NOW, NULL, NULL, 0) != 0)
+            break;
+        at_msg_copy_release(&g_app_held[sent]);
+        sent++;
+    }
+    memmove(&g_app_held[0], &g_app_held[sent],
+            (g_app_held_n - sent) * sizeof(g_app_held[0]));
+    g_app_held_n -= sent;
+    if (g_app_held_n > 0)
+        return sent;    /* still flushing; the gap ends when it is empty */
+    g_app_attached = true;
+    if (held > 0 || g_gap_state > 0 || g_gap_overflow > 0)
+        log_info(logger, "AutonomousTrust: an app attached to %s after %lld s: "
+                 "delivered %zu held event(s); %zu state event(s) were not "
+                 "delivered (the roster pull replays them); %zu held event(s) "
+                 "dropped past the hold of %d\n", q_out,
+                 (long long)(g_gap_since ? time(NULL) - g_gap_since : 0),
+                 sent, g_gap_state, g_gap_overflow, AT_APP_HELD_MAX);
+    g_gap_state = 0;
+    g_gap_overflow = 0;
+    return sent;
+}
+
+size_t at_app_held_count(void)
+{
+    return g_app_held_n;
+}
+
+void at_app_hold_reset(void)
+{
+    for (size_t i = 0; i < g_app_held_n; i++)
+        at_msg_copy_release(&g_app_held[i]);
+    g_app_held_n = 0;
+    g_app_attached = false;
+    g_gap_state = 0;
+    g_gap_overflow = 0;
+    g_gap_since = 0;
+}
+
+/* Deliver one app-bound event, or hold or count it while no app is attached.
+ * Returns 1 when sent (or kept by send_retry for a full queue). */
+static int _to_app(const char *q_out, generic_msg_t *msg, logger_t *logger)
+{
+    if (!g_app_attached)
+        (void)at_app_flush_held(q_out, logger);
+    if (g_app_attached)
+    {
+        if (at_send(NULL, q_out, msg, "an app event", q_out,
+                    AT_SEND_NOW | AT_SEND_QUIET_FAULT, NULL, NULL, 0) == 0)
+            return 1;
+        if (messaging_bound(q_out))
+        {
+            /* A real fault, with an app attached: lost, as before. */
+            log_warn(logger, "AutonomousTrust: could not send an app event to "
+                     "%s (send failed) — it is lost\n", q_out);
+            return 0;
+        }
+        _app_detached(logger, q_out);
+    }
+    else if (g_gap_since == 0)
+    {
+        g_gap_since = time(NULL);
+        log_info(logger, "AutonomousTrust: no app attached to %s yet; holding "
+                 "one-time events until one is\n", q_out);
+    }
+    _app_hold(msg, logger);
+    return 0;
+}
+
 int at_route_internal_msgs(array_t *unhandled, const char *q_out,
                            logger_t *logger)
 {
     if (unhandled == NULL)
         return 0;
+    /* Every pass, so held events reach an app that attaches while AT is
+     * quiet. Free while one is attached. */
+    if (q_out != NULL && !g_app_attached)
+        (void)at_app_flush_held(q_out, logger);
     int sent = 0;
     while (array_size(unhandled) > 0)
     {
@@ -148,41 +351,57 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
         {
             switch (inner->type)
             {
-            case TASK_RESULT:
-                /* Task results go to reputation for scoring */
-                if (messaging_send("reputation", TASK_RESULT, inner, false) != 0)
-                    log_exception(logger);
-                break;
             case TASK_STATUS:
                 /* Task status updates go to negotiation */
-                if (messaging_send("negotiation", TASK_STATUS, inner, false) != 0)
+                if (at_send(NULL, "negotiation", inner,
+                            "a task status", "negotiation",
+                            AT_SEND_NOW, NULL, NULL, 0) != 0)
                     log_exception(logger);
                 break;
             /* App-bound: sent as we drain, in FIFO order. Batching them into a
              * second array and sending one message after the loop is what
-             * silently dropped every message but the last. */
+             * silently dropped every message but the last.
+             *
+             * TASK_RESULT joined this group when the C twin gained a scoring
+             * path. It used to be forwarded to the reputation process "for
+             * scoring", but nothing there ever handled it -- that process
+             * dispatches net_msg payloads by function name plus its own
+             * locally-submitted TRANSACTION_SCORE, so every result was
+             * received and dropped. The score is now raised where the
+             * requestor's own record of the task lives (neg_proc.c
+             * handle_results, which submits the TRANSACTION_SCORE itself), and
+             * this hop delivers the result to whoever asked for the work --
+             * mirroring automate.py putting the TaskResult on the app's
+             * external-feedback queue. */
+            case TASK_RESULT:
             case TRANSACTION_SCORE:
-            case UPDATE_ACCEPTED:
             case PEER_OBSERVED:
             case PEER_REPUTATION:
+            case PEER_RTT_OBSERVED:
+            case PEER_PRESENCE:
                 if (q_out == NULL)
-                    break;   /* no app attached; nothing to do */
-                if (messaging_send(q_out, (message_type_t)inner->type, inner, false) != 0)
-                    log_exception(logger);
-                else
-                    sent++;
+                    break;   /* no app queue configured; nothing to do */
+                sent += _to_app(q_out, inner, logger);
                 break;
             default:
+            {
+                /* A feature's type is app-bound iff it registered as such
+                 * (msg_registry.h) -- the registry replaces hand-listing each
+                 * one above, which is how app events used to go missing. */
+                const at_msg_vtable_t *vt = at_msg_type_lookup(inner->type);
+                if (vt == NULL || !vt->app_bound || q_out == NULL)
+                    break;
+                sent += _to_app(q_out, inner, logger);
                 break;
             }
+            }
         }
-        if (array_remove(unhandled, msg_dat) != 0) {
+        /* Removing releases the array's reference, which is the only one:
+         * the routed message is freed here. */
+        if (array_remove_at(unhandled, 0) != 0) {
             log_exception(logger);
             break;  // guard against infinite loop if remove fails
         }
-        /* array_remove unlinks but does not free; without this the daemon
-         * leaks one data_t per message routed. */
-        smrt_deref(msg_dat);
     }
     return sent;
 }
@@ -283,9 +502,16 @@ int run_autonomous_trust(char *q_in, char *q_out,
          * controlling terminal / container stream instead of /dev/null. */
         process_child_extra_flags |= NO_STDERR_REDIRECT;
     }
-    int err = daemonize(data_dir, flags, &fd1, &fd2);
-    if (err != 0)
-        return err;
+    /* In-process the caller's process IS the node (agorad, or a host that
+     * runs the node on a thread): nothing forks, and this returns at shutdown
+     * with 0 instead of returning the daemon's pid at once. */
+    int err = 0;
+    if (!messaging_in_process())
+    {
+        err = daemonize(data_dir, flags, &fd1, &fd2);
+        if (err != 0)
+            return err;
+    }
 
     const char *name = AT_MAIN_QUEUE;
     logger_t logger = {0};
@@ -305,7 +531,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
     FILE *pid_fp = (pid_path[0] != '\0') ? fopen(pid_path, "w") : NULL;
     if (pid_fp != NULL)
     {
-        fprintf(pid_fp, "%d\n", my_pid);
+        fprintf(pid_fp, "%d\n", (int)my_pid);
         fclose(pid_fp);
     }
     else
@@ -349,6 +575,11 @@ int run_autonomous_trust(char *q_in, char *q_out,
         .queues = &queues,
         .logger = &logger,
     };
+    /* A subsystem a feature library provides, configured on a node built
+     * without that library: refuse to start rather than run without it
+     * (FEATURE_SPLIT_PLAN Phase 8). */
+    if (tracker_check_subsystem_libraries(&tracker, &logger) != 0)
+        return -1;
     int num_err = 0;
     map_entries_for_each(tracker.registry, key, impl_val)
     {
@@ -382,7 +613,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
         log_exception(&logger);
     messaging_assign(&my_q);
     queue_t extern_q = {0};
-    if (messaging_init(q_in, &extern_q) != 0)
+    if (messaging_init_external(q_in, &extern_q) != 0)
         log_exception(&logger);
 
     log_info(&logger, "%s:                                          Ready.\n", name);
@@ -406,22 +637,19 @@ int run_autonomous_trust(char *q_in, char *q_out,
         map_entries_for_each(&procs, key, str_val)
         {
             pid_t pid = atoi(key);
-            err = kill(pid, 0);
-            if (err == 0)
+            int live = process_liveness(pid);
+            if (live == 1)
                 continue;
-            if (err == -1)
+            if (live == 0)
             {
-                if (errno == ESRCH)
-                {
-                    data_t *key_dat = string_data((char *)key, strlen(key) + 1);
-                    if (array_append(&dead_keys, key_dat) != 0)
-                        log_exception(&logger);
-                }
-                else
-                {
-                    SYS_EXCEPTION();
+                data_t *key_dat = string_data((char *)key, strlen(key) + 1);
+                if (array_append(&dead_keys, key_dat) != 0)
                     log_exception(&logger);
-                }
+            }
+            else
+            {
+                SYS_EXCEPTION();
+                log_exception(&logger);
             }
         }
         map_end_for_each
@@ -454,29 +682,65 @@ int run_autonomous_trust(char *q_in, char *q_out,
             break;
         }
 
+        /* BOTH QUEUES ARE DRAINED, not sipped one message per tick. This loop
+         * is the app's only door in either direction — extern_q carries every
+         * app verb inward (request_cosign among them) and the internal queue
+         * carries every app event outward — and both are AF_UNIX SOCK_DGRAM
+         * queues that hold 10 (net.unix.max_dgram_qlen) with non-blocking
+         * senders. Taking one per tick means a burst larger than the queue is
+         * not delayed, it is DROPPED at the sender, which sees only an EAGAIN.
+         * Same fault the process loops had; see PROC_DRAIN_MAX. */
+
         // check for extern messages
         generic_msg_t task_msg = {0};
-        ret = messaging_recv_on(&extern_q, &task_msg, NULL, false);
-        if (ret == -1)
-            log_exception(&logger);
-        else if (ret == 0)
+        for (int taken = 0; taken < PROC_DRAIN_MAX; taken++)
+        {
+            messaging_recv_release(&task_msg);   /* the previous pass's */
+            ret = messaging_recv_on(&extern_q, &task_msg, NULL, false);
+            if (ret == -1)
+            {
+                log_exception(&logger);
+                break;
+            }
+            if (ret != 0)
+                break;   /* nothing waiting */
             at_route_extern_msg(&task_msg, &logger);
+        }
+        messaging_recv_release(&task_msg);
 
         // get results from internal procs
         generic_msg_t result_msg = {0};
-        ret = messaging_recv(&result_msg);
-        if (ret == -1)
-            log_exception(&logger);
-        else if (ret == 0)
+        for (int taken = 0; taken < PROC_DRAIN_MAX; taken++)
         {
-            /* Queued by reference; the drain below consumes it in this same
-             * iteration, before result_msg is reused. */
+            messaging_recv_release(&result_msg);   /* the previous pass's */
+            ret = messaging_recv(&result_msg);
+            if (ret == -1)
+            {
+                log_exception(&logger);
+                break;
+            }
+            if (ret != 0)
+                break;   /* nothing waiting */
+            /* Queued by REFERENCE — at_route_queue_msg stores this stack
+             * struct's address and copies nothing — so it must be routed
+             * before the next iteration reuses the storage. Hence the route
+             * call inside the loop rather than one batch after it; the drain
+             * empties the array every time. */
             if (at_route_queue_msg(&unhandled_msgs, &result_msg) != 0)
                 log_exception(&logger);
+            at_route_internal_msgs(&unhandled_msgs, q_out, &logger);
         }
 
-        // Drain: process every pending message in FIFO order, removing as we go.
+        /* Anything a previous pass could not route (a read error abandons the
+         * drain mid-array) leaves the queue here, in FIFO order. */
         at_route_internal_msgs(&unhandled_msgs, q_out, &logger);
+        /* Only now: the queue holds result_msg by reference. */
+        messaging_recv_release(&result_msg);
+
+        /* This loop sleeps with usleep, not sleep_until, so it drains its own
+         * kept frames (the app-verb hand-offs and the hop to the app's queue;
+         * utilities/send_retry.h, ISSUES §2.14). */
+        at_send_retry_drain(NULL, NULL, (double)time(NULL));
 
         if (usleep(cadence) == -1)
         {
@@ -522,7 +786,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
             pthread_mutex_lock(&procs_lock);
             map_entries_for_each(&procs, pkey, pstr)
             {
-                if (kill((pid_t)atoi(pkey), 0) == 0)
+                if (process_liveness((pid_t)atoi(pkey)) == 1)
                 {
                     any_alive = true;
                     break;
@@ -542,10 +806,10 @@ int run_autonomous_trust(char *q_in, char *q_out,
         map_entries_for_each(&procs, pkey, pstr)
         {
             pid_t pid = (pid_t)atoi(pkey);
-            if (kill(pid, 0) == 0)
+            if (process_liveness(pid) == 1)
             {
                 log_warn(&logger, "Shutdown: pid %d did not exit; sending SIGKILL\n", pid);
-                kill(pid, SIGKILL);
+                process_force_stop(pid, &logger);
             }
         }
         map_end_for_each

@@ -1,0 +1,30 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: area-card-identity-not-holder
+description: 'A card that carries someone else''s identity under its own key is a mismatch: a finder would address its request to the wrong person.'
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: dir_verify
+    what: area_card
+    now: 1790000000
+    wire:
+      body: '{"v":1,"typename":"at-area-card","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","key":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5","area":"u4pr","bucket":"u4pru","name":"","seq":1,"expiry":1790003600,"identity":{"typename":"identity","uuid":"eeeeeeee-0000-4000-8000-0000000000e5","address":"","nickname":"eve","signature":{"hex_seed":"4e6008b01b74e49e38d8b11392bfaccc7b5bff86ca2048cbb0f783633a61e2dd"},"encryptor":{"hex_seed":"7777777777777777777777777777777777777777777777777777777777777777"}}}'
+      sig: bec8f042648b36735884f7a559eaa85b668be993c812ef3570cc68bce34b68472a237ff2e85c2ce711c94cc43f429b44b67960d8bb5f0f74796e66bd4105660b
+steps:
+- id: 1
+  from: host
+  to: host
+  function: dir_verify
+  description: 'trigger: dir_verify'
+expected_state:
+  host:
+    dir_status: mismatch

@@ -1,0 +1,38 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: commit-placing-uncertified-half-refused
+byte_pinning: false
+description: |
+    Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+    order") requires commit certificates, whether or not the group declares
+    them: an acceptor would refuse to place a half that carries none. alice's
+    commit carries no certificate, so bob pools nothing.
+    Placement-mode twin of commit-cert-uncertified-commit-refused.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: proposer
+  - id: dave
+    role: member
+
+fixtures: {}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: tx committed
+    payload:
+      task_id: t-1
+      score: 0.8
+
+expected_state:
+  bob:
+    committed_tx_count: 0
+    chain_tasks: []
+    pool_tasks: []

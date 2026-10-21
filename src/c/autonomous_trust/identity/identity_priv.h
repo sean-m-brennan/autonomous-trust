@@ -23,6 +23,7 @@
 
 #include "algorithms/algorithms.h"
 #include "identity/identity.h"
+#include "identity/group.h"
 
 
 #ifndef __FRAMAC__
@@ -41,16 +42,52 @@ int identity_from_json(const json_t *obj, void *data_struct);
 /** Serialize a published-form identity (no private key material) to a
  *  fresh JSON object. Caller takes ownership of @p *obj_ptr. Used by
  *  id_proc.c when building the peer-bundle inside the ID_HISTORY wire
- *  payload (matches Python `p.publish()` in idprocess.py:507). */
+ *  payload (matches Python `p.publish()` in idprocess.py:507), and by
+ *  rep_proc.c to carry co-signer identities inside a deep-resolution answer
+ * (doc/architecture/gateway-reputation-tree.md) -- a requestor two boundaries away holds
+ * no identity from
+ *  the answering group, so the answer must bring the keys its signatures are
+ *  checked against. This is the DRY canonical form shared with Python's
+ *  public_identity_to_canonical; rebuilding it anywhere else would be a second
+ *  copy of a wire shape that must not drift.
+ *
+ *  Stays in the PRIVATE header: the public identity.h does not include
+ *  jansson, and pulling it in there to widen this declaration would put a
+ *  json dependency on every consumer of the public API. */
 int public_identity_to_json(const public_identity_t *p, json_t **obj_ptr);
 
 /** Inverse of @ref public_identity_to_json. Writes into the
  *  caller-owned @p p (which is zeroed first). Returns 0 on success. */
 int public_identity_from_json(const json_t *obj, public_identity_t *p);
 
+/** Mint a local petname for a received identity whose @p nickname is known
+ *  but whose petname is not -- the case of a sender reconstructed from an
+ *  envelope's flat from_* fields, which carry no petname (none ever crosses
+ *  the wire). Same derivation the decoders use; mirrors Python
+ *  derive_local_petname. */
+void public_identity_derive_petname(const char *nickname, char *out,
+                                    size_t outlen);
+
 int group_to_json(const void *data_struct, json_t **obj_ptr);
 
 int group_from_json(const json_t *obj, void *data_struct);
+
+/**
+ * @brief Whether a node holding @p mine must refuse the canonical group
+ *        @p theirs rather than read it.
+ *
+ * True when @p mine speaks proto and @p theirs does not name a format this
+ * build knows ("json" or "proto"). An absent wire_format reads as JSON, which
+ * is right in a JSON cohort; in a proto cohort it makes a member that took the
+ * group speak JSON to peers that refuse it, and nothing surfaces it
+ * (doc/architecture/network-wire-format.md). Mirrors Python
+ * Group.refuses_formatless.
+ *
+ * @param mine   Our group; NULL never refuses.
+ * @param theirs The peer's group in canonical JSON form; NULL never refuses.
+ * @return true to refuse.
+ */
+bool group_refuses_formatless(const group_t *mine, const json_t *theirs);
 
 /*@
   requires len > 0;

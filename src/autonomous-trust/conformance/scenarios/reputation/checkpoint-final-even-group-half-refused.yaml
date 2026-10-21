@@ -1,0 +1,41 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: checkpoint-final-even-group-half-refused
+byte_pinning: false
+description: |
+    Checkpoint finality needs a MAJORITY OF THE WHOLE GROUP, this node included
+    (Agora Phase 4 DDIL, 2026-09-25). One signature short of that, both halves
+    of an even partition finalized their own windows, and at the heal each
+    refused to rewrite inside its finality, so the chains never converged.
+    Odd-sized groups are unchanged; Paxos grants and slashing are untouched.
+
+    Two of a four-member group is HALF, not a majority, so bob refuses the
+    root. The old bar, num_peers / 2 with num_peers counting the roster WITHOUT
+    this node, was 1 here, and two signatures cleared it.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: member
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: checkpoint final
+    payload:
+      root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+      epoch: 7
+      first_index: 0
+      count: 3
+      cosigners: [alice, bob]
+
+expected_state:
+  bob:
+    checkpoint_root: ""

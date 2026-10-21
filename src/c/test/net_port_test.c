@@ -29,8 +29,11 @@
  * deliberate: with the option set on both sockets this kernel permits two
  * binds to the identical addr:port and delivers every datagram to the LAST
  * binder (measured). A plain socket therefore reports occupancy truthfully
- * where a reuse socket would report nothing at all. See
- * test_same_base_same_address_binds_silently for that hazard, pinned.
+ * where a reuse socket would report nothing at all. The transport's UNICAST
+ * peer recv socket now makes the same choice for the same reason — see
+ * test_same_base_same_address_bind_is_loud. The group recv socket is a
+ * different animal: it binds the segment broadcast address on base+1, so its
+ * occupancy is asked there — see group_port_is_taken.
  */
 
 #define DEBUG_TESTS 1
@@ -87,6 +90,22 @@ static bool port_is_taken(const char *addr, int port)
     if (s < 0) return true;
     close(s);
     return false;
+}
+
+/* Occupancy of the GROUP recv socket. It does not sit on the node's unicast
+ * address: the group channel rides the same delivery mode as discovery, so in
+ * broadcast mode the transport binds the segment BROADCAST address on base+1
+ * (net_transport_udp.c, "Group recv socket") — a unicast bind there would never
+ * see a broadcast frame. Probing 127.0.0.1:base+1 therefore reports a free port
+ * and proves nothing; ask where the transport actually bound. The socket does
+ * carry SO_REUSEADDR, but a plain probe still reports it taken (measured), so
+ * port_is_taken answers truthfully here too. */
+static bool group_port_is_taken(const char *cidr, int base)
+{
+    char bcast[IPV4_ADDR_LEN];
+    /* cidr_split strdups, so a literal argument is safe. */
+    if (cidr4_to_broadcast((char *)cidr, bcast) != 0) return false;
+    return port_is_taken(bcast, base + 1);
 }
 
 static void set_env_port(const char *val)
@@ -250,7 +269,7 @@ DEFINE_TEST(test_non_default_port_reaches_every_socket)
      * leaves the default pair alone. */
     const int base = 31500;
     ck_assert(!port_is_taken("127.0.0.1", base));
-    ck_assert(!port_is_taken("127.0.0.1", base + 1));
+    ck_assert(!group_port_is_taken("127.0.0.1/8", base));
 
     network_config_t net_cfg;
     net_transport_ctx_t *ctx = NULL;
@@ -258,10 +277,10 @@ DEFINE_TEST(test_non_default_port_reaches_every_socket)
     ck_assert(t != NULL);
 
     ck_assert(port_is_taken("127.0.0.1", base));
-    ck_assert(port_is_taken("127.0.0.1", base + 1));
+    ck_assert(group_port_is_taken("127.0.0.1/8", base));
     /* And nothing landed on the compile-time default. */
     ck_assert(!port_is_taken("127.0.0.1", COMM_PORT));
-    ck_assert(!port_is_taken("127.0.0.1", COMM_PORT + 1));
+    ck_assert(!group_port_is_taken("127.0.0.1/8", COMM_PORT));
 
     t->close(ctx);
 }
@@ -278,7 +297,7 @@ DEFINE_TEST(test_env_port_reaches_every_socket_when_config_silent)
     const net_transport_t *t = open_udp(&ctx, &net_cfg, "127.0.0.1/8", 0);
     ck_assert(t != NULL);
     ck_assert(port_is_taken("127.0.0.1", base));
-    ck_assert(port_is_taken("127.0.0.1", base + 1));
+    ck_assert(group_port_is_taken("127.0.0.1/8", base));
     ck_assert(!port_is_taken("127.0.0.1", COMM_PORT));
 
     t->close(ctx);
@@ -303,9 +322,9 @@ DEFINE_TEST(test_two_nodes_different_bases_coexist)
 
     /* Each holds its own pair, and the two pairs do not overlap. */
     ck_assert(port_is_taken("127.0.0.1", 31700));
-    ck_assert(port_is_taken("127.0.0.1", 31701));
+    ck_assert(group_port_is_taken("127.0.0.1/8", 31700));
     ck_assert(port_is_taken("127.0.0.1", 31800));
-    ck_assert(port_is_taken("127.0.0.1", 31801));
+    ck_assert(group_port_is_taken("127.0.0.1/8", 31800));
 
     tb->close(ctx_b);
     ta->close(ctx_a);
@@ -332,32 +351,88 @@ DEFINE_TEST(test_two_nodes_same_base_different_addresses_coexist)
 }
 END_TEST_DEFINITION()
 
-DEFINE_TEST(test_same_base_same_address_binds_silently)
+DEFINE_TEST(test_same_base_same_address_bind_is_loud)
 {
-    /* PINNING A KNOWN DEFECT, not endorsing it.
+    /* doc/architecture/networking.md, socket layout: two nodes given the same base on the same
+     * address no longer both succeed.
      *
-     * Two nodes given the same base on the same address both bind and neither
-     * is told. net_transport_ip.c sets SO_REUSEADDR on every bind, and with the
-     * option on both sockets this kernel permits the duplicate and delivers
-     * every datagram to the LAST binder — so the first node goes deaf with no
-     * error anywhere. Measured, not assumed: without SO_REUSEADDR on both, the
-     * second bind fails EADDRINUSE.
+     * The defect this replaces: net_transport_ip.c set SO_REUSEADDR on EVERY
+     * bind, and with the option on both sockets this kernel permits the
+     * duplicate and delivers every datagram to the LAST binder — so the first
+     * node went deaf with no error anywhere. The fix is per-socket, because
+     * the option is load-bearing for the shared broadcast/multicast sockets:
+     * the PEER recv socket now binds WITHOUT it and the second node fails
+     * EADDRINUSE at open, which is what this asserts. (The group recv socket
+     * moved to the segment broadcast address and keeps SO_REUSEADDR, so it is
+     * no longer the one that refuses the duplicate — see group_port_is_taken.)
      *
-     * This predates the port resolver and is not caused by it; the resolver is
-     * what lets an operator avoid it by choosing distinct bases. Recorded in
-     * ISSUES.md. If someone later makes a genuine collision loud (dropping
-     * SO_REUSEADDR on the unicast sockets, or SO_REUSEPORT with an explicit
-     * policy), this test is the one that should fail and be rewritten. */
+     * Co-location itself still works — that is what the rest of this file
+     * covers — provided the operator gives each node a distinct base. */
     network_config_t cfg_a, cfg_b;
     net_transport_ctx_t *ctx_a = NULL, *ctx_b = NULL;
 
     const net_transport_t *ta = open_udp(&ctx_a, &cfg_a, "127.0.0.1/8", 32000);
     ck_assert(ta != NULL);
-    const net_transport_t *tb = open_udp(&ctx_b, &cfg_b, "127.0.0.1/8", 32000);
-    ck_assert(tb != NULL);   /* today: succeeds, silently */
+    ck_assert(ctx_a != NULL);
 
-    tb->close(ctx_b);
+    /* The second node must FAIL to open, not bind silently over the first. */
+    const net_transport_t *tb = open_udp(&ctx_b, &cfg_b, "127.0.0.1/8", 32000);
+    ck_assert(tb == NULL);
+    /* And a failed open must leave no context behind. */
+    ck_assert(ctx_b == NULL);
+
+    /* And the first node still holds its ports — the failed open must not have
+     * closed anything out from under it. */
+    ck_assert(port_is_taken("127.0.0.1", 32000));
+    ck_assert(group_port_is_taken("127.0.0.1/8", 32000));
+
     ta->close(ctx_a);
+
+    /* Once it is gone, the same base is free again: the refusal is about
+     * live occupancy, not a lingering reservation. */
+    const net_transport_t *tc = open_udp(&ctx_b, &cfg_b, "127.0.0.1/8", 32000);
+    ck_assert(tc != NULL);
+    tc->close(ctx_b);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_broadcast_socket_keeps_reuseaddr)
+{
+    /* The counterpart to the test above: the fix had to be per-socket. The
+     * broadcast/multicast recv socket is SHARED by every listener on the
+     * segment, so it keeps SO_REUSEADDR — and the proof is that an ordinary
+     * non-reuse probe cannot take the broadcast addr:port away from a running
+     * node, while a reuse socket can still join it.
+     *
+     * Asserted through the transport rather than by reading the setsockopt
+     * call, so it fails if someone extends the unicast change across all
+     * three sockets. */
+    network_config_t cfg;
+    net_transport_ctx_t *ctx = NULL;
+
+    const net_transport_t *t = open_udp(&ctx, &cfg, "127.0.0.1/8", 32100);
+    ck_assert(t != NULL);
+
+    /* The node bound the broadcast address for 127.0.0.1/8, which cidr4_to_broadcast
+     * derives; ask the same question the transport did. */
+    char bcast[IPV4_ADDR_LEN];
+    cidr4_to_broadcast(cfg.ip4_cidr, bcast);
+
+    int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ck_assert(s >= 0);
+    int one = 1;
+    ck_assert_int_eq(setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)), 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)32100);
+    a.sin_addr.s_addr = inet_addr(bcast);
+    /* A second reuse socket must still be able to share the broadcast
+     * addr:port — that is precisely what SO_REUSEADDR is there for. */
+    ck_assert_int_eq(bind(s, (struct sockaddr *)&a, sizeof(a)), 0);
+    close(s);
+
+    t->close(ctx);
 }
 END_TEST_DEFINITION()
 
@@ -560,6 +635,139 @@ DEFINE_TEST(test_ping_at_request_is_refused_on_its_own_selector)
 }
 END_TEST_DEFINITION()
 
+/****************************
+ * Network tunables (doc/architecture/networking.md)
+ ****************************/
+
+/* Test seam in net_proc.c: the AT_NET_* / AT_MYSTERY_* lookups are
+ * read-once-and-cached, same as AT_COMM_PORT. */
+extern void net_knobs_resolve_reset(void);
+
+static void set_env_knob(const char *name, const char *val)
+{
+    if (val == NULL) unsetenv(name);
+    else setenv(name, val, 1);
+    net_knobs_resolve_reset();
+}
+
+DEFINE_TEST(test_tunables_resolve_env_then_default)
+{
+    net_knob_source_t src;
+
+    /* Nothing set → the compile-time defaults, reported as such. */
+    set_env_knob("AT_NET_ANNOY_LIMIT", NULL);
+    set_env_knob("AT_NET_RECV_POLL_MS", NULL);
+    set_env_knob("AT_MYSTERY_MAX_AGE_SEC", NULL);
+    ck_assert_int_eq(net_annoy_limit_resolve(&src, &test_logger), NET_ANNOY_LIMIT);
+    ck_assert_int_eq(src, KNOB_SRC_DEFAULT);
+    ck_assert_int_eq(net_recv_poll_ms_resolve(&src, &test_logger), NET_RECV_POLL_MS);
+    ck_assert_int_eq(src, KNOB_SRC_DEFAULT);
+    ck_assert_int_eq(net_mystery_max_age_resolve(&src, &test_logger),
+                     NET_MYSTERY_MAX_AGE_SEC);
+    ck_assert_int_eq(src, KNOB_SRC_DEFAULT);
+
+    /* Set → the override, reported as env. */
+    set_env_knob("AT_NET_ANNOY_LIMIT", "100");
+    ck_assert_int_eq(net_annoy_limit_resolve(&src, &test_logger), 100);
+    ck_assert_int_eq(src, KNOB_SRC_ENV);
+    set_env_knob("AT_NET_RECV_POLL_MS", "250");
+    ck_assert_int_eq(net_recv_poll_ms_resolve(&src, &test_logger), 250);
+    ck_assert_int_eq(src, KNOB_SRC_ENV);
+    set_env_knob("AT_MYSTERY_MAX_AGE_SEC", "90");
+    ck_assert_int_eq(net_mystery_max_age_resolve(&src, &test_logger), 90);
+    ck_assert_int_eq(src, KNOB_SRC_ENV);
+
+    set_env_knob("AT_NET_ANNOY_LIMIT", NULL);
+    set_env_knob("AT_NET_RECV_POLL_MS", NULL);
+    set_env_knob("AT_MYSTERY_MAX_AGE_SEC", NULL);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_tunables_refuse_degenerate_values)
+{
+    /* A refused override keeps the default. The zero cases matter most: an
+     * annoy limit of 0 blacklists a peer on its first duplicate, and a poll
+     * timeout of 0 turns every receiver thread into a busy-wait. Neither
+     * should be reachable by typo. */
+    static const char *bad[] = { "abc", "100x", "0", "-1", "0.1", "" };
+    net_knob_source_t src;
+
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        set_env_knob("AT_NET_ANNOY_LIMIT", bad[i]);
+        ck_assert_int_eq(net_annoy_limit_resolve(&src, &test_logger), NET_ANNOY_LIMIT);
+        ck_assert_int_eq(src, KNOB_SRC_DEFAULT);
+
+        set_env_knob("AT_NET_RECV_POLL_MS", bad[i]);
+        ck_assert_int_eq(net_recv_poll_ms_resolve(&src, &test_logger), NET_RECV_POLL_MS);
+        ck_assert_int_eq(src, KNOB_SRC_DEFAULT);
+
+        set_env_knob("AT_MYSTERY_MAX_AGE_SEC", bad[i]);
+        ck_assert_int_eq(net_mystery_max_age_resolve(&src, &test_logger),
+                         NET_MYSTERY_MAX_AGE_SEC);
+        ck_assert_int_eq(src, KNOB_SRC_DEFAULT);
+    }
+
+    /* Out of range on the high side, one past each documented max. */
+    set_env_knob("AT_NET_ANNOY_LIMIT", "10001");
+    ck_assert_int_eq(net_annoy_limit_resolve(NULL, &test_logger), NET_ANNOY_LIMIT);
+    set_env_knob("AT_NET_RECV_POLL_MS", "60001");
+    ck_assert_int_eq(net_recv_poll_ms_resolve(NULL, &test_logger), NET_RECV_POLL_MS);
+    set_env_knob("AT_MYSTERY_MAX_AGE_SEC", "86401");
+    ck_assert_int_eq(net_mystery_max_age_resolve(NULL, &test_logger),
+                     NET_MYSTERY_MAX_AGE_SEC);
+
+    /* And the bounds themselves are accepted, so the range is inclusive. */
+    set_env_knob("AT_NET_ANNOY_LIMIT", "10000");
+    ck_assert_int_eq(net_annoy_limit_resolve(NULL, &test_logger), 10000);
+    set_env_knob("AT_NET_ANNOY_LIMIT", "1");
+    ck_assert_int_eq(net_annoy_limit_resolve(NULL, &test_logger), 1);
+
+    set_env_knob("AT_NET_ANNOY_LIMIT", NULL);
+    set_env_knob("AT_NET_RECV_POLL_MS", NULL);
+    set_env_knob("AT_MYSTERY_MAX_AGE_SEC", NULL);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_annoy_limit_override_reaches_the_blacklist)
+{
+    /* The point of the whole entry: a knob that never reaches its comparison
+     * is decorative. Drive the real pest counter and watch WHERE the
+     * blacklist promotion happens, rather than asserting the resolver twice. */
+    set_env_knob("AT_NET_ANNOY_LIMIT", NULL);
+    net_proc_test_reset_pests();
+
+    /* Default 5: promotion on the 6th (the comparison is `count > limit`). */
+    for (int i = 0; i < NET_ANNOY_LIMIT; i++) {
+        net_proc_test_track_annoy("10.5.0.1");
+        ck_assert(!net_proc_test_is_rejected("10.5.0.1"));
+    }
+    net_proc_test_track_annoy("10.5.0.1");
+    ck_assert(net_proc_test_is_rejected("10.5.0.1"));
+
+    /* Raised to 8: the same address survives past the OLD limit, which it
+     * could not if the macro were still being read at the comparison. */
+    set_env_knob("AT_NET_ANNOY_LIMIT", "8");
+    net_proc_test_reset_pests();
+    for (int i = 0; i < 8; i++) {
+        net_proc_test_track_annoy("10.5.0.2");
+        ck_assert(!net_proc_test_is_rejected("10.5.0.2"));
+    }
+    net_proc_test_track_annoy("10.5.0.2");
+    ck_assert(net_proc_test_is_rejected("10.5.0.2"));
+
+    /* Lowered to 1: promotion on the 2nd. */
+    set_env_knob("AT_NET_ANNOY_LIMIT", "1");
+    net_proc_test_reset_pests();
+    net_proc_test_track_annoy("10.5.0.3");
+    ck_assert(!net_proc_test_is_rejected("10.5.0.3"));
+    net_proc_test_track_annoy("10.5.0.3");
+    ck_assert(net_proc_test_is_rejected("10.5.0.3"));
+
+    net_proc_test_reset_pests();
+    set_env_knob("AT_NET_ANNOY_LIMIT", NULL);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(NetPort,
           test_resolve_default_when_nothing_set,
           test_resolve_config_beats_env,
@@ -571,9 +779,13 @@ RUN_TESTS(NetPort,
           test_env_port_reaches_every_socket_when_config_silent,
           test_two_nodes_different_bases_coexist,
           test_two_nodes_same_base_different_addresses_coexist,
-          test_same_base_same_address_binds_silently,
+          test_same_base_same_address_bind_is_loud,
+          test_broadcast_socket_keeps_reuseaddr,
           test_generated_config_records_only_a_chosen_port,
           test_generator_writes_a_port_only_when_asked,
           test_config_json_records_only_a_chosen_port,
           test_ping_at_selector_is_still_recognized,
-          test_ping_at_request_is_refused_on_its_own_selector)
+          test_ping_at_request_is_refused_on_its_own_selector,
+          test_tunables_resolve_env_then_default,
+          test_tunables_refuse_degenerate_values,
+          test_annoy_limit_override_reaches_the_blacklist)

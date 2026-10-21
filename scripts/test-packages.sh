@@ -25,9 +25,9 @@ usage() {
   cat <<'EOF'
 Usage: test-packages.sh [OPTIONS] [pytest args...]
 
-Build the C library, then run the Python test suites for each autonomous-trust
-package. Extra arguments are forwarded to pytest (the flags consumed here are
-stripped before forwarding).
+Regenerate the Protobuf interfaces and build the C library, then run the Python
+test suites for each autonomous-trust package. Extra arguments are forwarded to
+pytest (the flags consumed here are stripped before forwarding).
 
 Options:
   -q, --quick     Skip the two-node integration test.
@@ -58,6 +58,20 @@ if [[ "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV_NAME" ]]; then
     exit 1
 fi
 
+# Regenerate the Protobuf interfaces BEFORE the C build and the suites below.
+# The generated Python package
+# (src/autonomous-trust/autonomous_trust/core/protobuf/) is a build product,
+# gitignored, and imported directly from the source tree by every suite here --
+# so a stale tree silently tests the PREVIOUS .proto, and a fresh checkout has
+# no bindings at all. Regenerating is cheap and idempotent, so it runs
+# unconditionally rather than trying to guess whether the .proto changed.
+echo "========== Regenerating the Protobuf interfaces =========="
+if $verbose; then
+  scripts/build-py.sh proto-only || exit 1
+else
+  scripts/build-py.sh proto-only >/dev/null || exit 1
+fi
+
 echo "========== Building the C library =========="
 if $verbose; then
   scripts/build.sh --c || exit 1
@@ -65,7 +79,7 @@ else
   scripts/build.sh --c >/dev/null || exit 1
 fi
 
-for pkg in autonomous-trust autonomous-trust-services autonomous-trust-inspector autonomous-trust-simulator autonomous-trust-behaviour; do
+for pkg in autonomous-trust autonomous-trust-oracle autonomous-trust-zta autonomous-trust-rendezvous autonomous-trust-first-contact autonomous-trust-dtn autonomous-trust-services autonomous-trust-inspector autonomous-trust-simulator autonomous-trust-behaviour; do
     pkg_dir="$here/src/$pkg"
     if [ -d "$pkg_dir/tests" ]; then
         echo "========== Testing $pkg =========="

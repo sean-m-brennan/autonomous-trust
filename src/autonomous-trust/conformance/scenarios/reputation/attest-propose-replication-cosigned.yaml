@@ -1,0 +1,40 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-propose-replication-cosigned
+byte_pinning: false
+description: |
+    A replication from a tier-3 verifier is co-signed.
+
+    bob holds alice at 0.85, effective tier 3, which meets
+    `AT_ATTEST_REPLICATION_TIER`. alice re-ran another verifier's check on
+    carol's work and attests what she got on `replication`. bob vouches for
+    admissibility only; agreement across verifiers is the app's fold.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+fixtures:
+  reputations:
+    bob:
+      alice: 0.85
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest propose
+    payload:
+      subject: carol
+      score: 0.3
+      channel: replication
+    description: a replication from a verifier bob holds at tier 3.
+
+expected_state:
+  bob:
+    attest_signs_sent: 1

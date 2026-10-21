@@ -72,7 +72,9 @@ Card presence
   With no token flags, presence comes from a PIN-less PKCS#11 probe against an
   autodetected opensc-pkcs11.so. If the Activate tab says "no token detected"
   with a card inserted, the parenthetical reason names the cause; the usual fixes
-  are installing the binding (pip install pykcs11), starting pcscd, or pointing
+  are installing the binding (pip install 'pykcs11>=1.5.19' -- earlier releases
+  no longer build from source, and source is the only Linux path), starting
+  pcscd, or pointing
   AUTONOMOUS_TRUST_PKCS11_MODULE at vendor/CACKey middleware.
 
 Environment:
@@ -94,9 +96,10 @@ case "${1:-}" in
 esac
 
 src="$here/src"
-# Namespace-package roots the operator imports from (core + services + operator);
-# prepended so a working tree runs without an editable install.
-export PYTHONPATH="$src/autonomous-trust:$src/autonomous-trust-services:$src/autonomous-trust-operator${PYTHONPATH:+:$PYTHONPATH}"
+# Namespace-package roots the operator imports from (core + its verification
+# layers + services + operator); prepended so a working tree runs without an
+# editable install.
+export PYTHONPATH="$src/autonomous-trust:$src/autonomous-trust-oracle:$src/autonomous-trust-zta:$src/autonomous-trust-rendezvous:$src/autonomous-trust-first-contact:$src/autonomous-trust-services:$src/autonomous-trust-operator${PYTHONPATH:+:$PYTHONPATH}"
 # Operator core (session/activate/resource_directory/operator_node) is python-only.
 export AUTONOMOUS_TRUST_BACKEND="${AUTONOMOUS_TRUST_BACKEND:-python}"
 

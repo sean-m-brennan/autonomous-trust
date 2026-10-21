@@ -99,15 +99,23 @@ int _set_exception(int err, size_t line, const char *file);
 #ifdef __FRAMAC__
 #define DEFINE_ERROR(num, descr) /* Frama-C: skip constructor registration */
 #else
-#define DEFINE_ERROR(num, descr)                           \
-    void __attribute__((constructor)) register_err_##num() \
-    {                                                      \
-        error_table[error_table_size].errnum = num;        \
-        error_table[error_table_size].errstr = #num;       \
-        error_table[error_table_size].description = descr; \
-        error_table_size++;                                \
+#define DEFINE_ERROR(num, descr)                                  \
+    void __attribute__((constructor)) register_err_##num(void)    \
+    {                                                             \
+        (void)error_table_append((num), #num, (descr));           \
     }
 #endif
+
+/**
+ * @brief Add a custom error at load time (what @ref DEFINE_ERROR expands to).
+ *
+ * The same name under the same number again is accepted as a no-op (an error
+ * both declared for the generator and defined). Refuses (-1, with a line on
+ * stderr) a NULL name, a number another error already holds, and a full table
+ * (ERROR_TABLE_MAX). Not locked: constructors run
+ * before main().
+ */
+int error_table_append(int num, const char *errstr, const char *description);
 
 #ifdef __cplusplus
 } // extern "C"

@@ -20,6 +20,8 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
 
+from .. import rendered_log
+
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.system import CfgIds
 from autonomous_trust.services.data.server import DataProtocol, DataConfig, DataProcess
@@ -173,7 +175,7 @@ class TestDataProcessMessages:
         proc.protocol.run_message_handlers.return_value = False
         proc.process_messages(queues)
         proc.logger.error.assert_called_once()
-        assert 'str' in proc.logger.error.call_args[0][0]
+        assert 'str' in rendered_log(proc.logger.error)
 
 
 class TestDataProcessLoop:
@@ -240,8 +242,13 @@ class TestDataRcvr:
         assert not peer_mock.data_stream.empty()
 
     def test_handle_data_unknown_peer(self):
+        """An unknown peer must be REPORTED, not silently dropped: this process's
+        roster arrives as deltas, and an empty one used to fail without a word."""
         rcvr = MagicMock(spec=DataRcvr)
         rcvr.q_cadence = 0.01
+        rcvr.name = 'data-sink'
+        rcvr._unknown_peer_drops = 0
+        rcvr.logger = MagicMock()      # spec=DataRcvr does not expose it
         rcvr.handle_data = DataRcvr.handle_data.__get__(rcvr)
         rcvr.cohort = MagicMock()
         rcvr.cohort.peers = {}
@@ -251,6 +258,8 @@ class TestDataRcvr:
         msg.obj = '{"test": 1}'
         with patch('autonomous_trust.services.data.client.from_yaml_string', return_value={'test': 1}):
             rcvr.handle_data(None, msg)  # should not raise
+        assert rcvr._unknown_peer_drops == 1
+        assert rcvr.logger.warning.called
 
     def test_process_discovers_peers(self):
         from autonomous_trust.core.identity import Identity
@@ -306,4 +315,36 @@ class TestDataRcvr:
         queues = {rcvr.name: my_q, CfgIds.network: queue.Queue()}
         rcvr.process(queues, MagicMock())
         rcvr.logger.error.assert_called()
-        assert 'str' in rcvr.logger.error.call_args[0][0]
+        assert 'str' in rendered_log(rcvr.logger.error)
+
+
+class TestDataRcvrRosterSync:
+    """The receiver's roster arrives as deltas, so the loop has to drain them:
+    an inbound payload can only be filed against a peer this process knows."""
+
+    def _rcvr(self, rounds=2):
+        rcvr = MagicMock(spec=DataRcvr)
+        rcvr.name = 'data-sink'
+        rcvr.q_cadence = 0.01
+        rcvr.servicers = []
+        rcvr.protocol = MagicMock()
+        rcvr.protocol.peer_capabilities = {}
+        rcvr.protocol.run_message_handlers.return_value = True
+        rcvr.logger = MagicMock()
+        rcvr.keep_running = MagicMock(side_effect=[True] * rounds + [False])
+        rcvr.sync_cohort = MagicMock()
+        rcvr.process = DataRcvr.process.__get__(rcvr)
+        return rcvr
+
+    def test_the_loop_syncs_the_roster_every_pass(self):
+        rcvr = self._rcvr(rounds=3)
+        rcvr.process({rcvr.name: queue.Queue(), CfgIds.network: queue.Queue()},
+                     MagicMock())
+        assert rcvr.sync_cohort.call_count == 3
+
+    def test_the_mixin_is_on_the_receiver(self):
+        """Subscription happens in __init__ (pre-fork, which is the only place it
+        can work) -- so the seam must actually be inherited."""
+        from autonomous_trust.services.cohort_sync import CohortSyncMixin
+        assert issubclass(DataRcvr, CohortSyncMixin)
+        assert 'subscribe_to_cohort' in DataRcvr.__init__.__code__.co_names

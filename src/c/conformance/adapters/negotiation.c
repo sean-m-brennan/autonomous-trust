@@ -30,14 +30,17 @@
  *  cross-language so a future byte-pinned diff is meaningful.
  */
 
+#include "utilities/portable.h"  /* uuid_generate_sha1 / st_mtim on Darwin */
 #include "negotiation.h"
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>  /* mkdtemp: Darwin declares it here, not in stdlib.h */
 #include <string.h>
 #include <time.h>
 
 #include <jansson.h>
+#include <sodium.h>
 #include <uuid/uuid.h>
 
 #include "identity/identity.h"
@@ -48,10 +51,18 @@
 #include "structures/map.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
+#include "reputation/reputation.h"  /* tx_pair_task_uuid */
 
 #include "../negative_runner.h"
 
 #include "../scenario_engine.h"
+#include "../scenario_loader.h"  /* at_byte_pin_json, at_load_testdata_bytes */
+#include "identity/identity_priv.h"  /* public_identity_from_json */
+#ifdef AT_FIRST_CONTACT_ENABLED   /* libat_first_contact is built */
+#include "first_contact/contacts.h"
+#include "first_contact/device.h"
+#endif
+#include "config/configuration.h"
 
 /* ------------------------------------------------------------------------- */
 /* Per-participant impl carries a process_t plus the identity used to        */
@@ -97,13 +108,39 @@ static const char *_resolve_to_id(const generic_msg_t *msg)
     return "unknown";
 }
 
+/* The task scores the requestor sent the reputation process this scenario:
+ * (task uuid, subject). `results_scored` asserts them. Python scores in its
+ * main process, so its adapter reads the results handed to main instead. */
+#define NEG_SCORES_MAX 32
+static struct { uuid_t task; uuid_t subject; } g_scores[NEG_SCORES_MAX];
+static size_t g_n_scores;
+/* The task results the requestor forwarded to its main process (the app's
+ * hop): (task uuid, executor). `results_forwarded` asserts them. Python's
+ * adapter reads the results handed to main without `score_only`. */
+static struct { uuid_t task; uuid_t executor; } g_forwards[NEG_SCORES_MAX];
+static size_t g_n_forwards;
+
 static int _send_hook(const char *key,
                       const message_type_t type,
                       generic_msg_t *msg,
                       bool blocking)
 {
-    (void)key; (void)blocking;
+    (void)blocking;
     if (g_active_ctx == NULL) return 0;
+    if (type == TRANSACTION_SCORE && key != NULL && strcmp(key, "reputation") == 0
+        && g_n_scores < NEG_SCORES_MAX)
+    {
+        uuid_copy(g_scores[g_n_scores].task, msg->info.tx_score.task_uuid);
+        uuid_copy(g_scores[g_n_scores].subject, msg->info.tx_score.peer_uuid);
+        g_n_scores++;
+    }
+    if (type == TASK_RESULT && g_n_forwards < NEG_SCORES_MAX)
+    {
+        uuid_copy(g_forwards[g_n_forwards].task, msg->info.task_result.task_uuid);
+        uuid_copy(g_forwards[g_n_forwards].executor,
+                  msg->info.task_result.requestor_uuid);
+        g_n_forwards++;
+    }
     const char *to_id = _resolve_to_id(msg);
     const char *function = (type == NET_MESSAGE && msg->info.net_msg.function != NULL)
         ? msg->info.net_msg.function : "__internal__";
@@ -172,6 +209,170 @@ static void _free_participant_impl(np_impl_t *impl)
 }
 
 /* Apply scenario fixtures: capabilities map + peer_levels map. */
+/* first_contact: {enabled: true} and verified_contacts: {<holder>: [<pid>..]}.
+ *
+ * Turns the OPTIONAL first-contact feature on for this scenario -- which
+ * brings its §10.3 tier cap into negotiation's gate -- in a scratch root of
+ * its own, so a contacts file written here cannot leak into the next case.
+ * Participants here belong to no group, so every sender is a direct peer:
+ * unverified unless listed. All holders share the one root, and so the one
+ * contacts file, as the Python adapter's scratch root does. Returns true if
+ * it changed the environment (the caller restores it). Mirrors the Python
+ * adapter's _apply_first_contact. */
+static char g_fc_prev_root[1024];
+static bool g_fc_had_root;
+
+static bool _apply_first_contact(sce_run_ctx_t *ctx)
+{
+    json_t *fixtures = json_object_get(ctx->case_data, "fixtures");
+    json_t *fc = json_object_get(fixtures, "first_contact");
+    if (!json_is_true(json_object_get(fc, "enabled")))
+        return false;
+    const char *prev = getenv("AUTONOMOUS_TRUST_ROOT");
+    g_fc_had_root = prev != NULL;
+    snprintf(g_fc_prev_root, sizeof(g_fc_prev_root), "%s", prev ? prev : "");
+    static char root[64];
+    snprintf(root, sizeof(root), "/tmp/at-conformance-neg-fc.XXXXXX");
+    if (mkdtemp(root) == NULL)
+        return false;
+    setenv("AUTONOMOUS_TRUST_ROOT", root, 1);
+    setenv("AT_FIRST_CONTACT", "1", 1);
+
+#ifdef AT_FIRST_CONTACT_ENABLED
+    char dir[CFG_PATH_LEN + 1] = {0};
+    if (get_data_dir(dir, sizeof(dir)) <= 0)
+        return true;
+    contacts_t store;
+    contacts_init(&store);
+    /* verified_contacts and unverified_contacts: {<holder>: [<pid>, ...]}. */
+    const char *keys[2] = { "verified_contacts", "unverified_contacts" };
+    for (int k = 0; k < 2; k++) {
+        json_t *vc = json_object_get(fixtures, keys[k]);
+        if (!json_is_object(vc))
+            continue;
+        bool verified = k == 0;
+        const char *holder;
+        json_t *pids;
+        json_object_foreach(vc, holder, pids) {
+            for (size_t i = 0; json_is_array(pids) && i < json_array_size(pids); i++) {
+                const char *pid = json_string_value(json_array_get(pids, i));
+                sce_participant_t *who = pid != NULL ? sce_find_participant(ctx, pid) : NULL;
+                if (who == NULL || ((np_impl_t *)who->impl)->pub == NULL)
+                    continue;
+                contact_t c;
+                memset(&c, 0, sizeof(c));
+                c.identity = *((np_impl_t *)who->impl)->pub;
+                snprintf(c.petname, sizeof(c.petname), "%s", pid);
+                c.provenance = verified ? AT_PROV_IN_PERSON : AT_PROV_TOKEN;
+                if (verified)
+                    contact_mark_verified(&c, AT_FIRST_CONTACT_VERIFIED_SEED);
+                (void)contacts_add(&store, &c);
+            }
+        }
+    }
+    /* contact_devices: {<first device pid>: [<further device pid>, ...]}
+     * (Phase 4). Certified under the fixed harness operator key (0x33 * 32,
+     * as the Python adapter) and filed by the production at_adopt_operator /
+     * at_link_device, so a refused link shows up as a capped device. */
+    json_t *cd = json_object_get(fixtures, "contact_devices");
+    if (json_is_object(cd)) {
+        unsigned char seed[32], pk[crypto_sign_PUBLICKEYBYTES], sk[crypto_sign_SECRETKEYBYTES];
+        memset(seed, 0x33, sizeof(seed));
+        crypto_sign_seed_keypair(pk, sk, seed);
+        const char *first;
+        json_t *others;
+        json_object_foreach(cd, first, others) {
+            sce_participant_t *who = sce_find_participant(ctx, first);
+            if (who == NULL || ((np_impl_t *)who->impl)->pub == NULL)
+                continue;
+            const public_identity_t *fid = ((np_impl_t *)who->impl)->pub;
+            char fu[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(fid->uuid, fu);
+            contact_t *c = contacts_get(&store, fu);
+            at_dir_signed_t cert;
+            if (c == NULL || at_device_cert_create(sk, fid, (long long)time(NULL), &cert) != 0)
+                continue;
+            (void)at_adopt_operator(c, &cert, &store);
+            at_dir_free(&cert);
+            for (size_t i = 0; json_is_array(others) && i < json_array_size(others); i++) {
+                const char *pid = json_string_value(json_array_get(others, i));
+                sce_participant_t *d = pid != NULL ? sce_find_participant(ctx, pid) : NULL;
+                if (d == NULL || ((np_impl_t *)d->impl)->pub == NULL)
+                    continue;
+                const public_identity_t *did = ((np_impl_t *)d->impl)->pub;
+                if (at_device_cert_create(sk, did, (long long)time(NULL), &cert) != 0)
+                    continue;
+                (void)at_link_device(&store, did, &cert, NULL);
+                at_dir_free(&cert);
+            }
+        }
+    }
+    (void)contacts_save(&store, dir);
+    contacts_free(&store);
+#endif
+    return true;
+}
+
+/* group_members: {<holder>: [<pid>, ...]} puts the listed participants in the
+ * holder's OWN group; child_group_members in a child group the holder
+ * gateways. What the tier cap reads to tell a cohort member from a stranger.
+ * Mirrors the Python adapter's _apply_groups. */
+static void _apply_groups(sce_run_ctx_t *ctx)
+{
+    json_t *fixtures = json_object_get(ctx->case_data, "fixtures");
+    const char *keys[2] = { "group_members", "child_group_members" };
+    for (int k = 0; k < 2; k++) {
+        json_t *spec = json_object_get(fixtures, keys[k]);
+        if (!json_is_object(spec))
+            continue;
+        const char *holder;
+        json_t *pids;
+        json_object_foreach(spec, holder, pids) {
+            sce_participant_t *h = sce_find_participant(ctx, holder);
+            np_impl_t *hi = h != NULL ? (np_impl_t *)h->impl : NULL;
+            if (hi == NULL || hi->proc == NULL)
+                continue;
+            group_t *grp = k == 0 ? &hi->proc->protocol.group
+                                  : calloc(1, sizeof(group_t));
+            if (grp == NULL)
+                continue;
+            uuid_t gid;
+            uuid_generate(gid);
+            group_init(&gid, (char *)"10.0.50.254", grp);
+            for (size_t i = 0; json_is_array(pids) && i < json_array_size(pids); i++) {
+                const char *pid = json_string_value(json_array_get(pids, i));
+                sce_participant_t *who = pid != NULL ? sce_find_participant(ctx, pid) : NULL;
+                np_impl_t *wi = who != NULL ? (np_impl_t *)who->impl : NULL;
+                if (wi == NULL || wi->pub == NULL)
+                    continue;
+                char u[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(wi->pub->uuid, u);
+                group_add_address(grp, u, wi->pub->address);
+            }
+            if (k == 1) {
+                char gs[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(gid, gs);
+                if (hi->proc->protocol.child_groups == NULL
+                    && map_create(&hi->proc->protocol.child_groups) != 0) {
+                    free(grp);
+                    continue;
+                }
+                map_set(hi->proc->protocol.child_groups, (map_key_t)gs,
+                        object_ptr_data(grp, sizeof(group_t)));
+            }
+        }
+    }
+}
+
+static void _restore_first_contact(void)
+{
+    if (g_fc_had_root)
+        setenv("AUTONOMOUS_TRUST_ROOT", g_fc_prev_root, 1);
+    else
+        unsetenv("AUTONOMOUS_TRUST_ROOT");
+    unsetenv("AT_FIRST_CONTACT");
+}
+
 static void _apply_fixtures(sce_run_ctx_t *ctx)
 {
     json_t *fixtures = json_object_get(ctx->case_data, "fixtures");
@@ -278,38 +479,115 @@ static void _apply_fixtures(sce_run_ctx_t *ctx)
 /* Inbound construction                                                       */
 /* ------------------------------------------------------------------------- */
 
+/* Build the inbound payload in the form BOTH runtimes now read: Python's
+ * __type__-tagged Task / TaskStatus / TaskResult, with `requestor` as the flat
+ * DRY canonical PUBLIC identity (doc/architecture/negotiation.md).
+ *
+ * @p py_type picks the form. PY_TYPE_TASK_RESULT carries no `parameters` (a
+ * TaskResult extends TaskInfo, not Task) and carries the answer instead.
+ *
+ * The tags come from neg_proc_priv.h rather than being spelled out here: this
+ * builder mirroring the serializer by hand is precisely how the two shapes
+ * drifted apart while every case passed. */
 static json_t *_build_task_json(json_t *payload, const uuid_t task_uuid,
-                                const uuid_t requestor_uuid,
-                                bool include_full)
+                                const public_identity_t *requestor,
+                                const char *py_type)
 {
     json_t *j = json_object();
     if (j == NULL) return NULL;
 
+    json_object_set_new(j, "__type__", json_string(py_type));
+
     char uuid_buf[UUID_STRING_LEN + 1];
     uuid_unparse_lower(task_uuid, uuid_buf);
-    json_object_set_new(j, "task_uuid", json_string(uuid_buf));
-    if (!include_full) return j;
+    json_object_set_new(j, "uuid",
+                        json_pack("{s:s, s:s}", "__type__", "UUID",
+                                  "__value__", uuid_buf));
 
-    uuid_unparse_lower(requestor_uuid, uuid_buf);
-    json_object_set_new(j, "requestor_uuid", json_string(uuid_buf));
+    json_t *req_j = NULL;
+    if (requestor != NULL && public_identity_to_json(requestor, &req_j) == 0)
+        json_object_set_new(j, "requestor", req_j);
+
+    json_object_set_new(j, "size", json_integer(1));
+
+    /* Freshness sequence for the invitation (task_t.seq; field 12 of
+     * negotiation/task.proto). Defaults to 1 so existing single-invite
+     * scenarios are unchanged. `unstamped: true` sends 0 — the shape a peer
+     * that has not been rebuilt emits, and the shape an attacker produces by
+     * stripping the field; handle_invite must refuse it. A replay is the SAME
+     * seq delivered twice (`repeat: 2`, built once); a genuine flood is
+     * distinct, increasing seqs across steps. Mirrors the Python adapter's
+     * `_build_inbound`. */
+    json_int_t seq = 1;
+    json_t *unstamped_j = json_object_get(payload, "unstamped");
+    if (json_is_true(unstamped_j))
+        seq = 0;
+    else
+    {
+        json_t *seq_j = json_object_get(payload, "seq");
+        if (json_is_integer(seq_j)) seq = json_integer_value(seq_j);
+    }
+    json_object_set_new(j, "seq", json_integer(seq));
+
+    if (strcmp(py_type, PY_TYPE_TASK_RESULT) == 0)
+    {
+        /* Mirrors the Python adapter's
+         * `TaskResult(task=base_task, result=payload.get('result'))`. */
+        json_t *res_j = json_object_get(payload, "result");
+        json_object_set_new(j, "result",
+                            res_j != NULL ? json_incref(res_j) : json_null());
+        json_object_set_new(j, "certificate", json_null());
+        json_object_set_new(j, "proof", json_null());
+        json_object_set_new(j, "requested_capability_name", json_null());
+        json_object_set_new(j, "requested_args", json_array());
+        json_object_set_new(j, "requested_kwargs", json_object());
+        return j;
+    }
+
+    json_t *params = json_object();
+    if (params == NULL) { json_decref(j); return NULL; }
+    json_object_set_new(params, "__type__", json_string(PY_TYPE_TASK_PARAMS));
 
     const char *cap_name = "noop";
     json_t *cap_j = json_object_get(payload, "capability");
     if (json_is_string(cap_j)) cap_name = json_string_value(cap_j);
-    json_object_set_new(j, "capability_name", json_string(cap_name));
+    json_object_set_new(params, "_capability",
+                        json_pack("{s:s, s:s, s:i, s:i}",
+                                  "__type__", PY_TYPE_CAPABILITY,
+                                  "name", cap_name,
+                                  "required_tier", 0,
+                                  "transaction_weight", 1));
 
     bool flexible = true;
     json_t *flex_j = json_object_get(payload, "flexible");
     if (json_is_boolean(flex_j)) flexible = json_boolean_value(flex_j);
-    json_object_set_new(j, "flexible", json_boolean(flexible));
+    json_object_set_new(params, "_flexible", json_boolean(flexible));
 
-    json_object_set_new(j, "timeout", json_integer(0));
-
-    /* when_sec / duration_sec: pin a stable time so handle_invite's
-     * schedule check is deterministic. when=now, duration=60s is plenty
-     * to avoid spurious haggling on a fresh task_stack. */
-    json_object_set_new(j, "when_sec", json_integer((json_int_t)time(NULL)));
-    json_object_set_new(j, "duration_sec", json_integer(60));
+    /* when / duration / timeout: pin a stable time so handle_invite's schedule
+     * check is deterministic. when=now, duration=60s is plenty to avoid
+     * spurious haggling on a fresh task_stack — the values the C scenarios
+     * have always used, kept because they are behavioural fixtures; the wire
+     * SHAPE is pinned by vectors/wire/negotiation-*, not by these. */
+    time_t now_sec = time(NULL);
+    struct tm tm_utc;
+    gmtime_r(&now_sec, &tm_utc);
+    char when_buf[64] = {0};
+    snprintf(when_buf, sizeof(when_buf),
+             "%04d-%02d-%02dT%02d:%02d:%02d+00:00",
+             tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday,
+             tm_utc.tm_hour, tm_utc.tm_min, tm_utc.tm_sec);
+    json_object_set_new(params, "when",
+                        json_pack("{s:s, s:s}", "__type__", "datetime",
+                                  "__value__", when_buf));
+    json_object_set_new(params, "duration",
+                        json_pack("{s:s, s:f}", "__type__", "timedelta",
+                                  "__value__", 60.0));
+    json_object_set_new(params, "timeout",
+                        json_pack("{s:s, s:f}", "__type__", "timedelta",
+                                  "__value__", 0.0));
+    json_object_set_new(params, "args", json_array());
+    json_object_set_new(params, "kwargs", json_object());
+    json_object_set_new(j, "parameters", params);
     return j;
 }
 
@@ -352,46 +630,50 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     bool requestor_is_sender = (strcmp(function, "invitation") == 0
                                 || strcmp(function, "status request") == 0
                                 || strcmp(function, "spawn task") == 0);
-    const uuid_t *requestor_uuid;
+    const public_identity_t *requestor;
     if (requestor_is_sender || recipient_impl == NULL)
-        requestor_uuid = (const uuid_t *)&sender_impl->pub->uuid;
+        requestor = sender_impl->pub;
     else
-        requestor_uuid = (const uuid_t *)&recipient_impl->pub->uuid;
+        requestor = recipient_impl->pub;
 
     /* Build the JSON payload appropriate to each handler. */
     json_t *body = NULL;
     if (strcmp(function, "invitation") == 0
         || strcmp(function, "haggle") == 0
-        || strcmp(function, "spawn task") == 0)
+        || strcmp(function, "spawn task") == 0
+        || strcmp(function, "ack") == 0
+        || strcmp(function, "nack") == 0
+        || strcmp(function, "status request") == 0)
     {
-        body = _build_task_json(payload, task_uuid, *requestor_uuid, true);
-    }
-    else if (strcmp(function, "ack") == 0
-             || strcmp(function, "nack") == 0
-             || strcmp(function, "status request") == 0)
-    {
-        body = _build_task_json(payload, task_uuid, *requestor_uuid, false);
+        /* Every one of these verbs carries a whole serialized Task in
+         * production, on both sides -- a bare uuid was C's own shortcut and
+         * Python's handlers read `message.obj.uuid` off a reconstructed
+         * Task. */
+        body = _build_task_json(payload, task_uuid, requestor, PY_TYPE_TASK);
     }
     else if (strcmp(function, "status response") == 0)
     {
-        body = _build_task_json(payload, task_uuid, *requestor_uuid, false);
+        body = _build_task_json(payload, task_uuid, requestor,
+                                PY_TYPE_TASK_STATUS);
         if (body)
         {
-            /* status enum: harness uses 'pending', 'running', etc.; the
-             * C handle_stat_resp reads the integer so map common
-             * strings. NEG_RUNNING == 1 in neg_status_t per neg_proc.c. */
+            /* The `Enumcfg:` member NAME, which is what Python's decoder
+             * rebuilds the enum from. C used to send its own neg_status_t
+             * integer here, which Python would have read as a plain int.
+             * Mirrors the Python adapter's Status[payload['status']]. */
             const char *st = "running";
             json_t *st_j = json_object_get(payload, "status");
             if (json_is_string(st_j)) st = json_string_value(st_j);
-            int status_int = 0; /* unknown */
-            if (strcmp(st, "running") == 0 || strcmp(st, "pending") == 0)
-                status_int = 1;
-            json_object_set_new(body, "status", json_integer(status_int));
+            json_object_set_new(body, "status",
+                                json_pack("{s:s, s:s}",
+                                          "__type__", PY_ENUM_STATUS,
+                                          "__value__", st));
         }
     }
     else if (strcmp(function, "report results") == 0)
     {
-        body = _build_task_json(payload, task_uuid, *requestor_uuid, false);
+        body = _build_task_json(payload, task_uuid, requestor,
+                                PY_TYPE_TASK_RESULT);
     }
     else if (strcmp(function, "tier_lost") == 0)
     {
@@ -445,8 +727,25 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     out->info.net_msg.function = (char *)function;
     out->info.net_msg.encrypt = false;
     memcpy(&out->info.net_msg.from_whom, sender_impl->pub, sizeof(public_identity_t));
-    if (recipient_impl)
+    /* A `spawn task` step goes from the requestor to itself, but on a start
+     * message `to_whom` is the peer the task is ADDRESSED to (start_task), and
+     * production's main process sends none. Copying the step's recipient made
+     * every spawned task "addressed to ourselves", so no peer was invited;
+     * it went unseen while a result from an uninvited peer still completed a
+     * task (ISSUES §2.8, closed by §2.50). A spawn carries no `to_whom` unless
+     * the step names `target`. */
+    bool spawn = strcmp(function, "spawn task") == 0;
+    if (recipient_impl && !spawn)
         memcpy(&out->info.net_msg.to_whom, recipient_impl->pub, sizeof(public_identity_t));
+    if (spawn && payload != NULL)
+    {
+        /* `target: <pid>` addresses the task. Mirrors the Python adapter. */
+        sce_participant_t *t = sce_find_participant(
+            ctx, json_string_value(json_object_get(payload, "target")));
+        np_impl_t *t_impl = t != NULL ? (np_impl_t *)t->impl : NULL;
+        if (t_impl != NULL && t_impl->pub != NULL)
+            memcpy(&out->info.net_msg.to_whom, t_impl->pub, sizeof(public_identity_t));
+    }
 
     if (body)
     {
@@ -574,6 +873,83 @@ static int _negotiation_check_expected_state(sce_run_ctx_t *ctx)
                              want_present ? "true" : "false");
                     return -1;
                 }
+            } else if (strcmp(key, "results_scored") == 0) {
+                /* {task: <slug>, executors: [<pid>, ...]}: one score per
+                 * named executor, under pair(task, executor), about that
+                 * executor (ISSUES §2.50), and no other score. */
+                const char *slug = json_string_value(json_object_get(val, "task"));
+                json_t *ex = json_object_get(val, "executors");
+                if (slug == NULL || !json_is_array(ex)) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: results_scored expects {task, executors}", pid);
+                    return -1;
+                }
+                uuid_t task_uuid;
+                _uuid5("task:", slug, task_uuid);
+                if (g_n_scores != json_array_size(ex)) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: results_scored for %s: %zu score(s), expected %zu",
+                             pid, slug, g_n_scores, json_array_size(ex));
+                    return -1;
+                }
+                size_t i;
+                json_t *who;
+                json_array_foreach(ex, i, who) {
+                    uuid_t ex_uuid, pair;
+                    _uuid5("neg:", json_string_value(who), ex_uuid);
+                    tx_pair_task_uuid(task_uuid, ex_uuid, pair);
+                    bool found = false;
+                    for (size_t k = 0; k < g_n_scores && !found; k++)
+                        found = uuid_compare(g_scores[k].task, pair) == 0
+                            && uuid_compare(g_scores[k].subject, ex_uuid) == 0;
+                    if (!found) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: results_scored for %s: no score about %s "
+                                 "under its pair task id", pid, slug,
+                                 json_string_value(who));
+                        return -1;
+                    }
+                }
+            } else if (strcmp(key, "results_forwarded") == 0) {
+                /* {task: <slug>, executors: [<pid>, ...]}: the results handed
+                 * on toward the app, in order, by executor (ISSUES §2.8: the
+                 * first reply only). */
+                const char *slug = json_string_value(json_object_get(val, "task"));
+                json_t *ex = json_object_get(val, "executors");
+                if (slug == NULL || !json_is_array(ex)) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: results_forwarded expects {task, executors}", pid);
+                    return -1;
+                }
+                uuid_t task_uuid;
+                _uuid5("task:", slug, task_uuid);
+                size_t n = 0;
+                for (size_t k = 0; k < g_n_forwards; k++)
+                    if (uuid_compare(g_forwards[k].task, task_uuid) == 0)
+                        n++;
+                if (n != json_array_size(ex)) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: results_forwarded for %s: %zu result(s), expected %zu",
+                             pid, slug, n, json_array_size(ex));
+                    return -1;
+                }
+                size_t i, k = 0;
+                json_t *who;
+                json_array_foreach(ex, i, who) {
+                    while (k < g_n_forwards
+                           && uuid_compare(g_forwards[k].task, task_uuid) != 0)
+                        k++;
+                    uuid_t ex_uuid;
+                    _uuid5("neg:", json_string_value(who), ex_uuid);
+                    if (k >= g_n_forwards
+                        || uuid_compare(g_forwards[k].executor, ex_uuid) != 0) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: results_forwarded for %s: entry %zu is not "
+                                 "from %s", pid, slug, i, json_string_value(who));
+                        return -1;
+                    }
+                    k++;
+                }
             } else if (strcmp(key, "flood_count") == 0) {
                 /* {task: <slug>, count: <int>} — derive uuid from slug
                  * (same _uuid5 used elsewhere), read the per-task flood
@@ -617,6 +993,89 @@ static int _negotiation_check_expected_state(sce_run_ctx_t *ctx)
     return 0;
 }
 
+
+/* ------------------------------------------------------------------------- */
+/* Wire vectors: byte-pin the PAYLOAD shape (doc/architecture/negotiation.md)                  */
+/* ------------------------------------------------------------------------- */
+
+/* Round-trip the pinned fixture through this runtime's payload serializer and
+ * require the result to canonicalize back to the fixture.
+ *
+ * The fixture is BOTH the input and the expectation, and the SAME file feeds
+ * the Python adapter. That is the point: envelope-only pinning let C and
+ * Python carry mutually unreadable negotiation payloads through 198 green
+ * cases, because each adapter built its own runtime's shape from the scenario
+ * step and nothing ever compared the two. Parse-then-re-emit against one
+ * shared file cannot pass unless both runtimes agree on every key.
+ *
+ * `requestor` is lifted out of the fixture and handed back to the serializer,
+ * which in production resolves it from the peer table -- a payload-shape
+ * vector has no reason to stand up a cohort to say what an identity
+ * serializes to. */
+static int run_wire_vector(const at_case_t *c, char *err, size_t err_len)
+{
+    json_t *ctor_j = json_object_get(c->data, "constructor");
+    if (!json_is_string(ctor_j)) {
+        snprintf(err, err_len, "wire_vector missing constructor");
+        return -1;
+    }
+    const char *ctor = json_string_value(ctor_j);
+
+    const char *verb;
+    if (strcmp(ctor, "Task") == 0)            verb = NEG_PROTO_ANNOUNCE;
+    else if (strcmp(ctor, "TaskStatus") == 0) verb = NEG_PROTO_STAT_RSP;
+    else if (strcmp(ctor, "TaskResult") == 0) verb = NEG_PROTO_RESULT;
+    else {
+        snprintf(err, err_len, "unsupported constructor: %s", ctor);
+        return 1;  /* skip sentinel */
+    }
+
+    json_t *expected = json_object_get(c->data, "expected");
+    json_t *jwire = expected ? json_object_get(expected, "json_wire") : NULL;
+    if (!json_is_string(jwire)) {
+        snprintf(err, err_len, "%s: expected.json_wire missing", ctor);
+        return -1;
+    }
+
+    char *fixture = NULL;
+    size_t fixture_len = 0;
+    if (at_load_testdata_bytes(json_string_value(jwire), &fixture, &fixture_len) != 0) {
+        snprintf(err, err_len, "%s: cannot load fixture %s", ctor,
+                 json_string_value(jwire));
+        return -1;
+    }
+
+    int rc = -1;
+    json_error_t jerr;
+    json_t *doc = json_loadb(fixture, fixture_len, 0, &jerr);
+    if (doc == NULL) {
+        snprintf(err, err_len, "%s: fixture is not JSON: %s", ctor, jerr.text);
+        goto out;
+    }
+
+    public_identity_t requestor;
+    memset(&requestor, 0, sizeof(requestor));
+    if (public_identity_from_json(json_object_get(doc, "requestor"), &requestor) != 0) {
+        snprintf(err, err_len, "%s: fixture `requestor` is not a canonical "
+                 "public identity", ctor);
+        goto out;
+    }
+
+    char *emitted = NULL;
+    if (negotiation_payload_roundtrip(verb, fixture, &requestor, &emitted) != 0
+        || emitted == NULL) {
+        snprintf(err, err_len, "%s: payload round-trip failed", ctor);
+        goto out;
+    }
+    rc = at_byte_pin_json(c->data, emitted, ctor, err, err_len);
+    free(emitted);
+
+out:
+    if (doc != NULL) json_decref(doc);
+    free(fixture);
+    return rc;
+}
+
 void at_negotiation_run(const at_case_t *c, at_case_result_t *out)
 {
     if (strcmp(c->kind, "negative") == 0)
@@ -624,14 +1083,37 @@ void at_negotiation_run(const at_case_t *c, at_case_result_t *out)
         at_neg_run_wire(c, out);
         return;
     }
+    if (strcmp(c->kind, "wire_vector") == 0)
+    {
+        char wv_err[512] = {0};
+        struct timespec w0, w1;
+        clock_gettime(CLOCK_MONOTONIC, &w0);
+        int wv_rc = run_wire_vector(c, wv_err, sizeof(wv_err));
+        clock_gettime(CLOCK_MONOTONIC, &w1);
+        int wv_ms = (int)((w1.tv_sec - w0.tv_sec) * 1000
+                          + (w1.tv_nsec - w0.tv_nsec) / 1000000);
+        if (wv_rc == 0)      at_case_result_set_pass(out, wv_ms);
+        else if (wv_rc > 0)  at_case_result_set_skip(out, wv_err);
+        else                 at_case_result_set_fail(out, wv_ms, "AssertionError", wv_err);
+        return;
+    }
     if (strcmp(c->kind, "scenario") != 0)
     {
         char detail[160];
         snprintf(detail, sizeof(detail),
-                 "C negotiation adapter only handles kind:scenario|negative (got %s)", c->kind);
+                 "C negotiation adapter only handles kind:scenario|negative|wire_vector "
+                 "(got %s)", c->kind);
         at_case_result_set_skip(out, detail);
         return;
     }
+#ifndef AT_FIRST_CONTACT_ENABLED
+    /* First contact's tier-cap scenarios need its library (AT_FIRST_CONTACT_LIB). */
+    if (json_object_get(json_object_get(c->data, "fixtures"), "first_contact") != NULL) {
+        at_case_result_set_skip(out, "first-contact scenario skipped: C built without "
+                                     "libat_first_contact (AT_FIRST_CONTACT_LIB=OFF)");
+        return;
+    }
+#endif
 
     char err[256] = {0};
     struct timespec t0, t1;
@@ -646,6 +1128,8 @@ void at_negotiation_run(const at_case_t *c, at_case_result_t *out)
     /* Wipe singleton neg_state so observables like task_in_stack:false /
      * has_my_task:false are not polluted by prior scenarios. */
     negotiation_reset_state();
+    g_n_scores = 0;
+    g_n_forwards = 0;
 
     json_t *parts = json_object_get(c->data, "participants");
     if (!json_is_array(parts))
@@ -682,6 +1166,8 @@ void at_negotiation_run(const at_case_t *c, at_case_result_t *out)
     }
 
     _apply_fixtures(&ctx);
+    _apply_groups(&ctx);
+    bool fc_env = _apply_first_contact(&ctx);
 
     g_active_ctx = &ctx;
     messaging_set_test_hook(_send_hook);
@@ -691,6 +1177,8 @@ void at_negotiation_run(const at_case_t *c, at_case_result_t *out)
 
     messaging_set_test_hook(NULL);
     g_active_ctx = NULL;
+    if (fc_env)
+        _restore_first_contact();
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     int duration_ms = (int)((t1.tv_sec - t0.tv_sec) * 1000

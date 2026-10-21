@@ -14,10 +14,13 @@
  *   limitations under the License.
  *******************/
 
+#include <math.h>      /* NAN, for an unparseable probe answer */
 #include <string.h>
 #include <pthread.h>
+#include <unistd.h>   /* close, for the custom run loop */
 
 #include "processes/processes.h"
+#include "processes/extension.h"
 #include "negotiation/negotiation.h"
 #include "structures/map.h"
 #include "structures/data.h"
@@ -27,7 +30,31 @@
 #include "utilities/exception.h"
 #include "network/net_message.h"
 #include "negotiation/neg_proc_priv.h"
-#include "identity/id_proc_priv.h"  /* identity_get_peer_tier */
+#include "identity/id_proc_priv.h"  /* identity_get_peer_tier, identity_self_identity */
+#include "identity/identity_priv.h"  /* public_identity_to_json */
+#include "utilities/freshness.h"
+#include "utilities/util.h"       /* at_strlcpy */
+#include "bootstrap/bootstrap_capabilities.h"  /* known-answer probe verifiers */
+#include "bootstrap/bootstrap_worker.h"        /* probe allocation + window */
+#include "negotiation/neg_oracle.h"            /* §12 verification layers */
+#include "negotiation/neg_ext.h"               /* extensions' tier caps */
+#include "negotiation/neg_certified.h"         /* §12.3 witness wire format */
+#include "config/configuration.h"             /* config_t, for our own identity */
+#include "reputation/tx_channel.h"             /* evidence channels */
+#include "reputation/reputation.h"              /* tx_pair_task_uuid */
+#include "utilities/send_retry.h"   /* at_send: keep a refused frame */
+
+/* Hand a sibling queue one of this process's frames, keeping it if the queue is
+ * full (utilities/send_retry.h, ISSUES §2.14). Every negotiation frame is a
+ * one-shot: nothing re-invites, re-refuses or re-reports, and there is no
+ * deadline sweep, so a frame lost here used to leave its task's tracker
+ * waiting forever. One try, because several callers hold neg_state.lock;
+ * this process's tick (sleep_until) retries what was kept, in order. */
+static int _neg_send(const process_t *proc, const char *queue,
+                     generic_msg_t *out, const char *what)
+{
+    return at_send(proc, queue, out, what, queue, AT_SEND_NOW, NULL, NULL, 0);
+}
 
 DEFINE_ERROR(ENEG_NOPEERS, "No capable peers available");
 
@@ -61,6 +88,24 @@ static char ID_TIER_LOST[] = "tier_lost";
  * analog today. */
 #define NEG_TIMEOUT_EXTENSION_SEC 120L
 #define NEG_DURATION_FRACTION_PCT 10L
+
+/* Status-request rounds the deadline sweep sends, without a live answer, before
+ * it gives the task up. Mirrors Python NegotiationProcess.STATUS_ASKS. */
+#define NEG_STATUS_ASKS 3
+
+/* Worker slots: a due job runs on a thread of its own (_drain_task_stack). At
+ * most max_concurrency are used at once; this is only the array's bound. */
+#define NEG_RUNNING_MAX 16
+
+typedef struct {
+    bool used;                    /* holds a job, running or not yet reported */
+    bool done;                    /* its thread has finished */
+    pthread_t thread;
+    job_t job;
+    const capability_t *cap;
+    int rc;
+    char result[CAP_RESULT_LEN + 1];
+} neg_running_t;
 
 static struct {
     job_queue_t task_stack;
@@ -98,7 +143,26 @@ static struct {
     map_t own_caps_by_proc;
     map_t peer_tiers;
     map_t cap_required_tiers;
+    /* Per-verb replay state: our own monotonic send counter and the
+     * per-(sender, verb) high-water marks, both persisted. Used by
+     * NEG_PROTO_ANNOUNCE only -- the invitation was the one negotiation verb
+     * whose payload carried no freshness token of its own, and it is the verb
+     * that asks a peer to RUN something. The others are bounded by state that
+     * already exists: an ack is deduped per participant, a status response
+     * spends an outstanding request. C twin of Python
+     * NegotiationProcess.freshness; see utilities/freshness.h. */
+    freshness_t freshness;
+    /* The bootstrap corpus's prober state: window bookkeeping, per-peer and
+     * per-capability probe counts, and the continuous-probe rate limit. Python
+     * keeps this in a BootstrapWorker process of its own; here it rides this
+     * process, which is the one that owns the announce path the worker needs.
+     * See _bootstrap_tick. */
+    bootstrap_worker_t bootstrap;
+    /* Jobs running on worker threads, or finished and not yet reported. */
+    neg_running_t running[NEG_RUNNING_MAX];
 } neg_state;
+
+static void _join_running(void);
 
 static void _ensure_init(void)
 {
@@ -115,6 +179,11 @@ static void _ensure_init(void)
         map_init(&neg_state.own_caps_by_proc);
         map_init(&neg_state.peer_tiers);
         map_init(&neg_state.cap_required_tiers);
+        /* Reads AT_BOOTSTRAP_{DURATION_SEC,PAIRS,SEED,DISABLED}; marks all
+         * three capabilities registered, which matches the static capability
+         * table this runtime advertises them from. */
+        bootstrap_worker_init(&neg_state.bootstrap);
+        freshness_init(&neg_state.freshness, "negotiation", NULL);
         neg_state.initialized = true;
     }
 }
@@ -218,11 +287,9 @@ void negotiation_set_own_capabilities(const process_t *proc,
     {
         if (cap_names[i] == NULL) continue;
         size_t len = strlen(cap_names[i]);
-        char *dup = smrt_create(len + 1);
-        if (dup == NULL) continue;
-        memcpy(dup, cap_names[i], len + 1);
-        data_t *str_dat = string_data(dup, len + 1);
-        if (str_dat == NULL) { smrt_deref(dup); continue; }
+        /* string_data copies; no intermediate buffer to leak */
+        data_t *str_dat = string_data((char *)cap_names[i], len + 1);
+        if (str_dat == NULL) continue;
         array_append(arr, str_dat);
     }
     data_t *arr_dat = object_ptr_data(arr, sizeof(array_t));
@@ -288,7 +355,10 @@ void negotiation_clear_test_state(const process_t *proc)
 
 void negotiation_reset_state(void)
 {
+    /* Kept one-shot frames are this process's too (utilities/send_retry.h). */
+    at_send_retry_reset();
     _ensure_init();
+    _join_running();   /* before the lock: a finishing thread takes it */
     pthread_mutex_lock(&neg_state.lock);
     job_queue_clear(&neg_state.task_stack);
     map_free(&neg_state.proposed_tasks);
@@ -307,7 +377,15 @@ void negotiation_reset_state(void)
     map_init(&neg_state.peer_tiers);
     map_free(&neg_state.cap_required_tiers);
     map_init(&neg_state.cap_required_tiers);
+    /* Replay marks too. The harness derives participant uuids
+     * deterministically from their slugs, so "alice" is the same sender in
+     * every scenario; a mark left behind by one would refuse the next
+     * scenario's first invitation as a replay. */
+    freshness_reset(&neg_state.freshness);
     pthread_mutex_unlock(&neg_state.lock);
+    /* And the verification layers' records (observation windows, prediction
+     * and forecast rings), which a scenario must not inherit either. */
+    neg_oracles_reset();
 }
 
 /****************************
@@ -327,55 +405,437 @@ static void _build_reply(const net_msg_t *nmsg, const char *func, generic_msg_t 
 }
 
 /****************************
- * Helper: build a JSON payload containing just task_uuid
+ * Python-tagged negotiation payloads (doc/architecture/negotiation.md)
+ *
+ * Every negotiation verb's payload is Python's `__type__`-tagged
+ * Configuration dump -- what `config_json_decoder` reconstructs a
+ * Task / TaskStatus / TaskResult from. C used to hand-build a flat object
+ * (`task_uuid`, `capability_name`, `when_sec`, ...) mirroring
+ * negotiation/task.proto, a schema Python does not use; the two shapes shared
+ * no key but `seq`, so a C worker could not read a Python requestor's
+ * invitation and a Python requestor could not read a C worker's result.
+ * Negotiation between the runtimes did not work at all. It looked healthy
+ * only because a Python invitation arrived at C with every key missing,
+ * leaving `seq` at 0, and an unstamped invitation is refused by the freshness
+ * gate rather than misexecuted.
+ *
+ * The type tags are shared constants, not language artifacts -- the same
+ * argument that keeps the wire protocol strings byte-identical to Python's
+ * enum values, and that already has C writing Python's `__type__` on the
+ * reputation snapshot (rep_proc.c).
+ *
+ * ONE field is not Python's tagged form: `requestor` carries the flat DRY
+ * canonical PUBLIC identity (@ref public_identity_to_json here,
+ * `public_identity_to_canonical` in Python). Python's tagged Identity dump
+ * serializes `Signature.to_dict()`, which hands back the PRIVATE signing seed
+ * whenever the object is not public-only -- and the requestor is the node's
+ * own private identity -- plus the local-only `petname`. Mirroring it here
+ * would have built that leak into C as well. The canonical form is also what
+ * the two runtimes already exchange for `peer_accepted` and `full_history`,
+ * for exactly the reason that applies here (see its docstring in identity.py).
  ****************************/
 
-static json_t *_task_uuid_json(const char *task_uuid_str)
+/* Python `Status` member NAMES indexed by ::neg_status_t, which is 1-based and
+ * declared in negotiation.h in Python's member order. An `Enumcfg:` value is
+ * `obj.name`, not the enum's value. Python's tenth member, `cancelled`, has no
+ * C counterpart on purpose: it never crosses the wire (handle_tier_lost puts it
+ * on the LOCAL main queue), so an unrecognised name reads as `unknown` rather
+ * than inventing a status this runtime cannot act on. */
+static const char *const _py_status_names[] = {
+    NULL, "running", "sleeping", "zombie", "stopped", "dead",
+    "pending", "unknown", "no_peers", "rejected",
+};
+
+static const char *_py_status_name(neg_status_t s)
 {
-    json_t *j = json_object();
-    if (j)
-        json_object_set_new(j, "task_uuid", json_string(task_uuid_str));
-    return j;
+    size_t i = (size_t)s;
+    if (i == 0 || i >= sizeof(_py_status_names) / sizeof(_py_status_names[0]))
+        return "unknown";
+    return _py_status_names[i];
+}
+
+static neg_status_t _py_status_value(const char *name)
+{
+    if (name == NULL)
+        return NEG_UNKNOWN;
+    for (size_t i = 1; i < sizeof(_py_status_names) / sizeof(_py_status_names[0]); i++)
+        if (strcmp(name, _py_status_names[i]) == 0)
+            return (neg_status_t)i;
+    return NEG_UNKNOWN;
+}
+
+/* Forward declarations: they live further down (with the peer helpers and
+ * the deadline sweep), and code above needs them. */
+static long _extension_secs(const task_t *task);
+static bool _peer_by_uuid(const process_t *proc, const uuid_t peer_uuid,
+                          public_identity_t *out);
+
+/* The `__value__` of a Python-tagged scalar, or the bare string when a payload
+ * carries one unwrapped (hand-written conformance steps do). */
+static const char *_py_tagged_str(const json_t *j)
+{
+    if (j == NULL)
+        return NULL;
+    if (json_is_string(j))
+        return json_string_value(j);
+    if (json_is_object(j))
+    {
+        json_t *v = json_object_get(j, "__value__");
+        if (json_is_string(v))
+            return json_string_value(v);
+    }
+    return NULL;
+}
+
+static json_t *_py_uuid_json(const uuid_t u)
+{
+    char s[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(u, s);
+    return json_pack("{s:s, s:s}", "__type__", "UUID", "__value__", s);
+}
+
+static int _py_uuid_read(const json_t *j, uuid_t out)
+{
+    const char *s = _py_tagged_str(j);
+    if (s == NULL)
+        return -1;
+    return uuid_parse(s, out) == 0 ? 0 : -1;
+}
+
+/* Seconds since the epoch for a datetime_t, honouring its recorded offset.
+ * timegm rather than mktime: the struct is UTC unless it says otherwise, and
+ * mktime would apply the HOST's zone to it.
+ *
+ * NON-STATIC so a test can hold it to that. The rule was written here and
+ * then broken sixty lines into handle_invite, where an accepted job's start
+ * time went through mktime instead — invisible on a UTC host (every docker
+ * cohort) and five hours into the future on a host in EDT, which is why no
+ * netns run has ever executed a single task. A rule stated only in a comment
+ * is one nobody can fail. */
+time_t negotiation_dt_epoch(const datetime_t *dt)
+{
+    struct tm tm_copy;
+    memcpy(&tm_copy, dt, sizeof(struct tm));
+    tm_copy.tm_isdst = 0;
+    time_t t = timegm(&tm_copy);
+    if (t == (time_t)-1)
+        return 0;
+    if (!dt->tm_utc)
+        t -= (time_t)(dt->tm_tz_offset * 3600.0f);
+    return t;
+}
+
+/* Re-express a datetime in UTC. Everything this file puts on the wire goes
+ * through here, so the offset is always the same one. */
+static void _dt_to_utc(const datetime_t *in, datetime_t *out)
+{
+    if (datetime_from_time(negotiation_dt_epoch(in), (long)in->tm_nsec, false, out) != 0)
+        memcpy(out, in, sizeof(datetime_t));
+}
+
+/* Formatted to match Python's `datetime.isoformat('T')` on a UTC-aware
+ * datetime EXACTLY -- `+00:00` rather than `Z`, and the fractional part
+ * omitted when it is zero -- rather than going through datetime_to_isoformat.
+ * Two reasons: that helper's `%z` writes `Z` for a UTC datetime and an
+ * unpadded `+H:M` for a zoned one (dividing by a zero minute-count at offset
+ * 0), and the corpus pins this payload by round-tripping ONE fixture through
+ * both runtimes, so a spelling difference is a failure even though dateutil
+ * would parse either. Microseconds, like Python: a sub-microsecond remainder
+ * is dropped. */
+static json_t *_py_datetime_json(const datetime_t *dt)
+{
+    datetime_t utc;
+    memset(&utc, 0, sizeof(utc));
+    _dt_to_utc(dt, &utc);
+    const struct tm *tm = (const struct tm *)&utc;
+    long usec = (long)(utc.tm_nsec / 1000);
+    char buf[64] = {0};
+    int n;
+    if (usec != 0)
+        n = snprintf(buf, sizeof(buf),
+                     "%04d-%02d-%02dT%02d:%02d:%02d.%06ld+00:00",
+                     tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+                     tm->tm_hour, tm->tm_min, tm->tm_sec, usec);
+    else
+        n = snprintf(buf, sizeof(buf),
+                     "%04d-%02d-%02dT%02d:%02d:%02d+00:00",
+                     tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+                     tm->tm_hour, tm->tm_min, tm->tm_sec);
+    if (n < 0 || (size_t)n >= sizeof(buf))
+        return json_null();
+    return json_pack("{s:s, s:s}", "__type__", "datetime", "__value__", buf);
+}
+
+static int _py_datetime_read(const json_t *j, datetime_t *out)
+{
+    const char *s = _py_tagged_str(j);
+    if (s == NULL || out == NULL)
+        return -1;
+    datetime_t parsed;
+    memset(&parsed, 0, sizeof(parsed));
+    if (datetime_from_isostring(s, &parsed) != 0)
+        return -1;
+    _dt_to_utc(&parsed, out);
+    return 0;
+}
+
+/* Python serializes a timedelta as its total_seconds() float. */
+static json_t *_py_timedelta_json(double seconds)
+{
+    return json_pack("{s:s, s:f}", "__type__", "timedelta",
+                     "__value__", seconds);
+}
+
+static double _py_timedelta_read(const json_t *j, double dflt)
+{
+    const json_t *v = j;
+    if (json_is_object(j))
+        v = json_object_get(j, "__value__");
+    if (json_is_real(v))
+        return json_real_value(v);
+    if (json_is_integer(v))
+        return (double)json_integer_value(v);
+    return dflt;
+}
+
+/* The `requestor` field, resolved from the uuid the task carries: ourselves
+ * when we are the requestor, otherwise the peer table.
+ *
+ * NULL (and so an omitted key) when the identity is not known to us. Python's
+ * `public_identity_from_canonical` returns None for a dict without keys
+ * anyway, and an absent key says "unknown" where a half-filled one would say
+ * "this peer, with no keys". */
+/* Conformance-only: the identity a re-emitted `requestor` field is filled
+ * from when there is no process to resolve it against. Set only by
+ * @ref negotiation_payload_roundtrip, which the corpus's byte-pinned payload
+ * vectors call; NULL on every production path, and the corpus is
+ * single-threaded, so this never races the real serializers. */
+static const public_identity_t *_requestor_override = NULL;
+
+static json_t *_requestor_json(const process_t *proc, const uuid_t requestor_uuid)
+{
+    json_t *obj = NULL;
+    if (_requestor_override != NULL)
+    {
+        if (public_identity_to_json(_requestor_override, &obj) == 0)
+            return obj;
+        return NULL;
+    }
+    if (proc == NULL)
+        return NULL;
+    const identity_t *self = identity_self_identity(proc);
+    /* identity_t embeds public_identity_t at offset 0 (anonymous member). */
+    if (self != NULL && uuid_compare(self->uuid, requestor_uuid) == 0)
+    {
+        if (public_identity_to_json((const public_identity_t *)self, &obj) == 0)
+            return obj;
+        return NULL;
+    }
+    public_identity_t peer;
+    memset(&peer, 0, sizeof(peer));
+    if (_peer_by_uuid(proc, requestor_uuid, &peer)
+        && public_identity_to_json(&peer, &obj) == 0)
+        return obj;
+    return NULL;
+}
+
+/* The fields TaskInfo carries, shared by Task, TaskStatus and TaskResult.
+ * Takes ownership of nothing; fills @p j in place. */
+static void _task_info_into_json(const process_t *proc, const task_t *task,
+                                 json_t *j)
+{
+    json_object_set_new(j, "uuid", _py_uuid_json(task->uuid));
+    json_t *req = _requestor_json(proc, task->requestor_uuid);
+    if (req != NULL)
+        json_object_set_new(j, "requestor", req);
+    /* How many participants the requestor expects. Carried through rather
+     * than assumed to be 1, so the requestor's value survives the round
+     * trip. Neither runtime's completion rule reads it today: both forward
+     * the first result to the app, score every one, and keep the task until
+     * every peer they invited has answered. A task
+     * that arrived without one counts as single-participant, which is what
+     * every C-originated task is. */
+    json_object_set_new(j, "size", json_integer(task->size > 0 ? task->size : 1));
+    /* Freshness sequence. Emitted unconditionally, including as 0, so that an
+     * unstamped invitation is visibly unstamped on the wire rather than
+     * indistinguishable from a field the serializer forgot. Only the invite
+     * senders set it (handle_start_task, handle_haggle's re-announce); the
+     * other verbs carry whatever the task already held and nothing reads it
+     * there. */
+    json_object_set_new(j, "seq", json_integer((json_int_t)task->seq));
 }
 
 /****************************
- * Helper: serialize task_t fields into a JSON object
+ * Helper: serialize task_t as Python's tagged Task
  ****************************/
 
 /* Frama-C: skipped — [serialization] jansson JSON serialization */
-static json_t *_task_to_json(const task_t *task)
+static json_t *_task_to_json(const process_t *proc, const task_t *task)
 {
-    char task_uuid_str[UUID_STRING_LEN + 1] = {0};
-    char req_uuid_str[UUID_STRING_LEN + 1] = {0};
-
-    uuid_unparse_lower(task->uuid, task_uuid_str);
-    uuid_unparse_lower(task->requestor_uuid, req_uuid_str);
-
-    /* duration in total seconds (days*86400 + seconds) */
-    long duration_sec = task->duration.days * 86400L + (long)task->duration.seconds;
-
-    /* when as epoch seconds (mktime on embedded tm) */
-    struct tm tm_copy;
-    memcpy(&tm_copy, &task->when, sizeof(struct tm));
-    time_t when_sec = mktime(&tm_copy);
+    json_t *params = json_object();
+    if (params == NULL)
+        return NULL;
+    json_object_set_new(params, "__type__", json_string(PY_TYPE_TASK_PARAMS));
+    json_object_set_new(params, "_capability",
+                        json_pack("{s:s, s:s, s:i, s:i}",
+                                  "__type__", PY_TYPE_CAPABILITY,
+                                  "name", task->capability.name,
+                                  "required_tier", task->capability.required_tier,
+                                  "transaction_weight", task->capability.transaction_weight));
+    json_object_set_new(params, "_flexible", json_boolean(task->flexible));
+    json_object_set_new(params, "when", _py_datetime_json(&task->when));
+    json_object_set_new(params, "duration",
+                        _py_timedelta_json(task->duration.days * 86400.0
+                                           + task->duration.seconds
+                                           + task->duration.nsecs / 1000000000.0));
+    json_object_set_new(params, "timeout", _py_timedelta_json((double)task->timeout));
+    /* Positional arguments. Always empty: a C task carries only `kwargs_json`
+     * (task.h), and negotiation/task.proto has an `argc` with no argv to fill
+     * it from. Emitted rather than omitted because TaskParameters defaults it
+     * to a tuple and a reader should not have to tell "none" from "absent". */
+    json_object_set_new(params, "args", json_array());
+    /* Keyword arguments as a real JSON object, which is what Python's
+     * TaskParameters.kwargs serializes to. A blob that does not parse as an
+     * object becomes an empty one rather than a quoted string: a responder
+     * reading `kwargs` would find a string where it expected an object and
+     * silently see no arguments, which for a probe means computing the wrong
+     * answer and being scored for it. */
+    json_t *kw = NULL;
+    if (task->kwargs_json[0] != '\0')
+    {
+        json_error_t jerr;
+        kw = json_loads(task->kwargs_json, 0, &jerr);
+        if (kw != NULL && !json_is_object(kw))
+        {
+            json_decref(kw);
+            kw = NULL;
+        }
+    }
+    json_object_set_new(params, "kwargs", kw != NULL ? kw : json_object());
 
     json_t *j = json_object();
-    if (!j)
+    if (j == NULL)
+    {
+        json_decref(params);
         return NULL;
-
-    json_object_set_new(j, "task_uuid",       json_string(task_uuid_str));
-    json_object_set_new(j, "requestor_uuid",  json_string(req_uuid_str));
-    json_object_set_new(j, "capability_name", json_string(task->capability.name));
-    json_object_set_new(j, "flexible",        json_boolean(task->flexible));
-    json_object_set_new(j, "timeout",         json_integer(task->timeout));
-    json_object_set_new(j, "when_sec",        json_integer((json_int_t)when_sec));
-    json_object_set_new(j, "duration_sec",    json_integer((json_int_t)duration_sec));
-
+    }
+    json_object_set_new(j, "__type__", json_string(PY_TYPE_TASK));
+    _task_info_into_json(proc, task, j);
+    json_object_set_new(j, "parameters", params);
     return j;
 }
 
 /****************************
- * Helper: populate a task_t from a JSON object (partial – fills uuid, cap name, flexible, timeout)
+ * Helper: serialize a task + status as Python's tagged TaskStatus
+ ****************************/
+
+/* Frama-C: skipped — [serialization] jansson JSON serialization */
+static json_t *_task_status_to_json(const process_t *proc, const task_t *task,
+                                    neg_status_t status)
+{
+    json_t *j = _task_to_json(proc, task);
+    if (j == NULL)
+        return NULL;
+    /* TaskStatus subclasses Task, so it carries the task fields verbatim and
+     * differs only by the tag and this one key. */
+    json_object_set_new(j, "__type__", json_string(PY_TYPE_TASK_STATUS));
+    json_object_set_new(j, "status",
+                        json_pack("{s:s, s:s}",
+                                  "__type__", PY_ENUM_STATUS,
+                                  "__value__", _py_status_name(status)));
+    return j;
+}
+
+/****************************
+ * Helper: serialize an answer as Python's tagged TaskResult
+ ****************************/
+
+/* Frama-C: skipped — [serialization] jansson JSON serialization */
+static json_t *_task_result_to_json(const process_t *proc, const task_t *task,
+                                    const char *answer, json_t *certificate,
+                                    json_t *prediction)
+{
+    json_t *j = json_object();
+    if (j == NULL)
+    {
+        if (certificate != NULL)
+            json_decref(certificate);
+        if (prediction != NULL)
+            json_decref(prediction);
+        return NULL;
+    }
+    /* TaskResult extends TaskInfo, NOT Task: it carries no `parameters`. The
+     * requestor supplies what it asked for from its own record
+     * (attach_requested_parameters / task_tracker_set_request), which is the
+     * whole point -- reading the challenge back off the reply would verify
+     * nothing. `proof` and the `requested_*` fields are likewise the
+     * requestor's to fill and are omitted here; Python defaults them. */
+    json_object_set_new(j, "__type__", json_string(PY_TYPE_TASK_RESULT));
+    _task_info_into_json(proc, task, j);
+    /* `null` rather than absent when the capability produced nothing -- which
+     * is also what Python emits, and the reason to match it is that the corpus
+     * round-trips ONE pinned fixture through both runtimes (see
+     * negotiation_payload_roundtrip). Either way the requestor's scorer reads
+     * it as an empty return, which is what a failed execution deserves. */
+    if (answer != NULL && answer[0] != '\0')
+        json_object_set_new(j, "result", json_string(answer));
+    else
+        json_object_set_new(j, "result", json_null());
+    json_object_set_new(j, "certificate",
+                        certificate != NULL ? certificate : json_null());
+    /* The prediction set (R+D.md §12.4). Always emitted, and `null` when none
+     * was attached -- which is what this runtime's own executors produce,
+     * since no C capability yet emits prediction sets. Present regardless
+     * because Python always serializes the field and the corpus round-trips
+     * ONE pinned fixture through both runtimes: a key absent on one side is a
+     * diverged shape. Carried through rather than dropped when it IS present,
+     * so a Python peer's set survives a C hop intact. */
+    json_object_set_new(j, "prediction",
+                        prediction != NULL ? prediction : json_null());
+    /* Fields Python's TaskResult always serializes and that this runtime never
+     * fills: `proof` is the ZK-STARK attesting the bytes were not altered
+     * (Python's `generate_proof`, which C has no counterpart for), and the
+     * `requested_*` trio is the REQUESTOR's record of what it asked --
+     * stamped on arrival from the tracker, never read off the reply, because
+     * reading the challenge off the answer would verify nothing. Emitted at
+     * their defaults so both runtimes' TaskResult has one key set. */
+    json_object_set_new(j, "proof", json_null());
+    json_object_set_new(j, "requested_capability_name", json_null());
+    json_object_set_new(j, "requested_args", json_array());
+    json_object_set_new(j, "requested_kwargs", json_object());
+    return j;
+}
+
+/* A TaskResult's `result` rendered as the text this runtime scores against.
+ * Python's capabilities return whatever they return -- an int from `pow`, a
+ * string from `echo` -- so a C requestor has to flatten a JSON scalar rather
+ * than insist on a string. Returns false when there is no result at all. */
+static bool _py_result_text(const json_t *j_result, char *out, size_t cap)
+{
+    if (j_result == NULL || json_is_null(j_result) || out == NULL || cap == 0)
+        return false;
+    if (json_is_string(j_result))
+        return at_strlcpy(out, json_string_value(j_result), cap) < cap;
+    if (json_is_integer(j_result))
+        return (size_t)snprintf(out, cap, "%lld",
+                                (long long)json_integer_value(j_result)) < cap;
+    if (json_is_real(j_result))
+        return (size_t)snprintf(out, cap, "%.17g", json_real_value(j_result)) < cap;
+    if (json_is_true(j_result) || json_is_false(j_result))
+        return at_strlcpy(out, json_is_true(j_result) ? "True" : "False", cap) < cap;
+    /* An object or array: hand it over as compact JSON rather than dropping
+     * it, so a capability that answers with a structure is at least legible
+     * to whatever verifier knows its shape. */
+    char *dumped = json_dumps(j_result, JSON_COMPACT | JSON_SORT_KEYS);
+    if (dumped == NULL)
+        return false;
+    bool ok = at_strlcpy(out, dumped, cap) < cap;
+    free(dumped);
+    return ok;
+}
+
+/****************************
+ * Helper: populate a task_t from Python's tagged Task
  ****************************/
 
 /* Frama-C: skipped — [serialization] jansson JSON deserialization */
@@ -384,50 +844,182 @@ static int _task_from_json(const json_t *j, task_t *task)
     if (!j || !task)
         return -1;
 
-    const char *task_uuid_str = NULL;
-    json_t *j_uuid = json_object_get(j, "task_uuid");
-    if (j_uuid && json_is_string(j_uuid))
+    if (_py_uuid_read(json_object_get(j, "uuid"), task->uuid) != 0)
+        return -1;
+
+    /* The requestor rides as the flat canonical PUBLIC identity; only its uuid
+     * is kept, because the peer table already holds (and has admitted) the
+     * identity itself. A peer we do not know is one we cannot reply to
+     * regardless of what its invitation asserted about itself. */
+    json_t *j_req = json_object_get(j, "requestor");
+    if (json_is_object(j_req))
     {
-        task_uuid_str = json_string_value(j_uuid);
-        if (uuid_parse(task_uuid_str, task->uuid) != 0)
-            return -1;
+        const char *req_uuid = json_string_value(json_object_get(j_req, "uuid"));
+        if (req_uuid != NULL)
+            uuid_parse(req_uuid, task->requestor_uuid);
+    }
+    else if (json_is_string(j_req))
+    {
+        uuid_parse(json_string_value(j_req), task->requestor_uuid);
     }
 
-    json_t *j_req = json_object_get(j, "requestor_uuid");
-    if (j_req && json_is_string(j_req))
-        uuid_parse(json_string_value(j_req), task->requestor_uuid);
+    json_t *j_size = json_object_get(j, "size");
+    task->size = json_is_integer(j_size) ? (int)json_integer_value(j_size) : 1;
+    if (task->size <= 0)
+        task->size = 1;
 
-    json_t *j_cap = json_object_get(j, "capability_name");
-    if (j_cap && json_is_string(j_cap))
-        strncpy(task->capability.name, json_string_value(j_cap), CAP_NAMELEN);
+    /* Absent or non-integer leaves seq at the caller's memset 0 -- unstamped,
+     * which handle_invite refuses. */
+    json_t *j_seq = json_object_get(j, "seq");
+    if (json_is_integer(j_seq))
+        task->seq = (int64_t)json_integer_value(j_seq);
 
-    json_t *j_flex = json_object_get(j, "flexible");
-    if (j_flex && json_is_boolean(j_flex))
+    /* A TaskResult carries no `parameters` (it extends TaskInfo), so their
+     * absence is normal for that verb and leaves the caller's memset zeros. */
+    json_t *params = json_object_get(j, "parameters");
+    if (!json_is_object(params))
+        return 0;
+
+    json_t *j_cap = json_object_get(params, "_capability");
+    const char *cap_name = NULL;
+    if (json_is_object(j_cap))
+    {
+        cap_name = json_string_value(json_object_get(j_cap, "name"));
+        json_t *j_tier = json_object_get(j_cap, "required_tier");
+        if (json_is_integer(j_tier))
+            task->capability.required_tier = (int)json_integer_value(j_tier);
+        json_t *j_weight = json_object_get(j_cap, "transaction_weight");
+        if (json_is_integer(j_weight))
+            task->capability.transaction_weight = (int)json_integer_value(j_weight);
+    }
+    else if (json_is_string(j_cap))
+    {
+        cap_name = json_string_value(j_cap);
+    }
+    if (cap_name != NULL)
+        at_strlcpy(task->capability.name, cap_name, sizeof(task->capability.name));
+
+    json_t *j_flex = json_object_get(params, "_flexible");
+    if (json_is_boolean(j_flex))
         task->flexible = json_boolean_value(j_flex);
 
-    json_t *j_timeout = json_object_get(j, "timeout");
-    if (j_timeout && json_is_integer(j_timeout))
-        task->timeout = (long)json_integer_value(j_timeout);
+    _py_datetime_read(json_object_get(params, "when"), &task->when);
 
-    json_t *j_when = json_object_get(j, "when_sec");
-    if (j_when && json_is_integer(j_when))
-    {
-        time_t when_sec = (time_t)json_integer_value(j_when);
-        struct tm *tm_ptr = gmtime(&when_sec);
-        if (tm_ptr)
-            memcpy(&task->when, tm_ptr, sizeof(struct tm));
-    }
+    double dur = _py_timedelta_read(json_object_get(params, "duration"), 0.0);
+    timedelta_normalize_long(0, (long)dur,
+                             (long)((dur - (double)(long)dur) * 1000000000.0),
+                             &task->duration);
+    task->timeout = (long)_py_timedelta_read(json_object_get(params, "timeout"), 0.0);
 
-    json_t *j_dur = json_object_get(j, "duration_sec");
-    if (j_dur && json_is_integer(j_dur))
+    /* Keyword arguments back into their compact-JSON carrier. Absent leaves
+     * the caller's memset "" -- no arguments. A blob that does not fit is
+     * dropped whole, not truncated: half a JSON object parses as nothing and
+     * would be a worse lie than an honest absence (the executor then produces
+     * no result and the requestor scores an empty return, rather than the
+     * executor answering a corrupted challenge). */
+    task->kwargs_json[0] = '\0';
+    json_t *j_kwargs = json_object_get(params, "kwargs");
+    if (json_is_object(j_kwargs) && json_object_size(j_kwargs) > 0)
     {
-        long dur = (long)json_integer_value(j_dur);
-        task->duration.days    = dur / 86400L;
-        task->duration.seconds = (unsigned int)(dur % 86400L);
-        task->duration.nsecs   = 0;
+        char *dumped = json_dumps(j_kwargs, JSON_COMPACT | JSON_SORT_KEYS);
+        if (dumped != NULL)
+        {
+            if (strlen(dumped) < sizeof(task->kwargs_json))
+                at_strlcpy(task->kwargs_json, dumped,
+                           sizeof(task->kwargs_json));
+            free(dumped);
+        }
     }
 
     return 0;
+}
+
+/****************************
+ * Conformance: byte-pin a negotiation payload's SHAPE (doc/architecture/negotiation.md)
+ ****************************/
+
+/* Parse a negotiation payload and re-emit it. Exported so the corpus can pin
+ * the payload shape itself, which is the gap that let C and Python diverge
+ * unnoticed: only the message ENVELOPE was byte-pinned, and each adapter built
+ * its own runtime's payload from the scenario step, so every case passed with
+ * the two shapes mutually unreadable.
+ *
+ * A round-trip against ONE shared fixture is what makes that impossible: both
+ * runtimes parse the same pinned bytes and must re-emit the same pinned bytes,
+ * so neither can drift without failing. Deliberately not routed through a
+ * handler -- an invitation leaving `_announce_task_locked` carries a fresh
+ * freshness stamp, and a shape vector has no business depending on that.
+ *
+ * @p verb picks the form: NEG_PROTO_RESULT a TaskResult, NEG_PROTO_STAT_RSP a
+ * TaskStatus, anything else a Task. @p requestor fills the re-emitted
+ * `requestor` field, which production reads out of the peer table. Caller
+ * frees @p *out_json. */
+/* Frama-C: skipped — [serialization] jansson JSON round-trip */
+int negotiation_payload_roundtrip(const char *verb, const char *in_json,
+                                  const public_identity_t *requestor,
+                                  char **out_json)
+{
+    if (verb == NULL || in_json == NULL || out_json == NULL)
+        return EINVAL;
+    *out_json = NULL;
+
+    json_error_t jerr;
+    json_t *in = json_loads(in_json, 0, &jerr);
+    if (in == NULL)
+        return EINVAL;
+
+    task_t task;
+    memset(&task, 0, sizeof(task));
+    int err = _task_from_json(in, &task);
+
+    /* An answer and its witness live on the TaskResult, not in task_t, so they
+     * are lifted out here rather than by the task parser. */
+    char result_text[CAP_RESULT_LEN * 4 + 1] = {0};
+    bool have_result = _py_result_text(json_object_get(in, "result"),
+                                       result_text, sizeof(result_text));
+    json_t *j_cert = json_object_get(in, "certificate");
+    json_t *cert_copy = json_is_object(j_cert) ? json_deep_copy(j_cert) : NULL;
+    json_t *j_pred = json_object_get(in, "prediction");
+    json_t *pred_copy = json_is_object(j_pred) ? json_deep_copy(j_pred) : NULL;
+    neg_status_t status = _py_status_value(_py_tagged_str(json_object_get(in, "status")));
+    json_decref(in);
+
+    if (err != 0)
+    {
+        if (cert_copy != NULL)
+            json_decref(cert_copy);
+        if (pred_copy != NULL)
+            json_decref(pred_copy);
+        return EINVAL;
+    }
+
+    _requestor_override = requestor;
+    json_t *out = NULL;
+    if (strcmp(verb, NEG_PROTO_RESULT) == 0)
+    {
+        /* Takes ownership of both copies, including on its own failure. */
+        out = _task_result_to_json(NULL, &task,
+                                   have_result ? result_text : NULL, cert_copy,
+                                   pred_copy);
+    }
+    else
+    {
+        if (cert_copy != NULL)
+            json_decref(cert_copy);
+        if (pred_copy != NULL)
+            json_decref(pred_copy);
+        if (strcmp(verb, NEG_PROTO_STAT_RSP) == 0)
+            out = _task_status_to_json(NULL, &task, status);
+        else
+            out = _task_to_json(NULL, &task);
+    }
+    _requestor_override = NULL;
+
+    if (out == NULL)
+        return ENOMEM;
+    *out_json = json_dumps(out, JSON_COMPACT | JSON_SORT_KEYS);
+    json_decref(out);
+    return (*out_json != NULL) ? 0 : ENOMEM;
 }
 
 /****************************
@@ -490,13 +1082,172 @@ static bool _peer_has_capability(const process_t *proc, const char *peer_uuid_st
  * wired (probes.h is included via processes.c) — just add focused
  * `probes_counter` calls inside each handler when interesting branches
  * fire (haggle-vs-accept, refuse-with-reason, etc.). */
-static bool handle_start_task(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+/* Announce @p task to the peers that can run it, retaining a tracker for the
+ * results. Split out of handle_start_task so the probe dispatcher can start a
+ * task directly rather than posting a message to this very process and waiting
+ * a cadence for it to come back around. Caller holds neg_state.lock.
+ *
+ * @p target_uuid, when non-zero, narrows the fan-out to one peer. */
+static int _announce_task_locked(const process_t *proc, task_t *task,
+                                 const uuid_t target_uuid)
+{
+    /* Store task in proposed_tasks keyed by task UUID string */
+    char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(task->uuid, task_uuid_str);
+
+    task_t *task_copy = (task_t *)malloc(sizeof(task_t));
+    if (task_copy)
+    {
+        memcpy(task_copy, task, sizeof(task_t));
+        data_t *task_dat = object_ptr_data(task_copy, sizeof(task_t));
+        map_set(&neg_state.proposed_tasks, task_uuid_str, task_dat);
+    }
+
+    /* Create a task tracker for result collection. `expected` is corrected to
+     * the number actually invited once the fan-out below has filtered by
+     * capability (and by an addressed target); seeding it from num_peers and
+     * leaving it there means a task whose capability only some peers hold
+     * never reaches its expected count, so handle_results never forwards and
+     * my_tasks grows forever. */
+    task_tracker_t *tracker = NULL;
+    peers_read_lock(proc);
+    int expected = (int)proc->protocol.num_peers;
+    peers_read_unlock(proc);
+    if (task_tracker_create(&tracker, task->uuid, expected) == 0 && tracker)
+    {
+        /* Retain what we asked for, before the announcement goes out. This is
+         * the requestor's own record and the only thing the scorer in
+         * handle_results will trust -- see task_tracker_t and R+D.md §12.7. */
+        task_tracker_set_request(tracker, task->capability.name,
+                                 task->kwargs_json);
+        data_t *trk_dat = object_ptr_data(tracker, sizeof(task_tracker_t));
+        map_set(&neg_state.my_tasks, task_uuid_str, trk_dat);
+    }
+
+    /* One stamp for the whole announcement, not one per peer. The invitation
+     * is a single act fanned out to every capable peer, and each receiver
+     * keeps its OWN high-water mark -- so it is per-receiver monotonicity that
+     * does the work, and numbering the copies separately would only make one
+     * act look like N. A later re-announce (handle_haggle) draws a new, higher
+     * number, which is what distinguishes it from a replay of this one.
+     * Mirrors Python NegotiationProcess.start_task. */
+    task->seq = freshness_stamp(&neg_state.freshness, proc->logger);
+    if (task->seq <= 0)
+    {
+        log_warn(proc->logger,
+                 "Negotiation: no freshness sequence; not announcing task %s\n",
+                 task_uuid_str);
+        return 0;
+    }
+
+    /* Build JSON payload for invitation */
+    json_t *invite_json = _task_to_json(proc, task);
+
+    /* An addressed start narrows the fan-out to one peer. A probe has to be
+     * able to say "this peer": fanned out, an invitation is answered by
+     * whichever peer replies first, so a broadcast cannot express a directed
+     * challenge and a slow peer is never probed at all. Mirrors Python
+     * start_task's `to_whom` handling; a zero target means the ordinary
+     * announce-to-all. A named peer that turns out not to hold the capability
+     * is invited to nothing -- deliberately not widened back to everyone,
+     * which would score the wrong peer. */
+    uuid_t zero_uuid;
+    uuid_clear(zero_uuid);
+    bool addressed = (target_uuid != NULL
+                      && uuid_compare(target_uuid, zero_uuid) != 0);
+
+    /* Send invitation to capable peers */
+    int invited = 0;
+    int sent = 0;   /* of those, the invitations the network queue took */
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++)
+    {
+        char peer_uuid_str[UUID_STRING_LEN + 1] = {0};
+        uuid_unparse_lower(proc->protocol.peers[i].uuid, peer_uuid_str);
+
+        if (addressed && uuid_compare(proc->protocol.peers[i].uuid, target_uuid) != 0)
+            continue;
+
+        /* Filter by capability if peer_capabilities map is available */
+        if (!_peer_has_capability(proc, peer_uuid_str, task->capability.name))
+            continue;
+
+        /* Not a peer the network process has heard from lately: asking it to
+         * work would only time out (doc/architecture/peer-presence.md). It
+         * stays a member; it is just not invited. */
+        if (proc->protocol.peer_absent[i])
+            continue;
+
+        generic_msg_t invite = {0};
+        invite.type = NET_MESSAGE;
+        strncpy(invite.info.net_msg.process, "negotiation", PROC_NAME_LEN);
+        invite.info.net_msg.function = NEG_PROTO_ANNOUNCE;
+        invite.info.net_msg.encrypt = true;
+        memcpy(&invite.info.net_msg.to_whom, &proc->protocol.peers[i],
+               sizeof(public_identity_t));
+        strncpy(invite.info.net_msg.return_to, "negotiation", PROC_NAME_LEN);
+
+        if (invite_json)
+            net_msg_pack_json(&invite.info.net_msg, invite_json);
+
+        if (_neg_send(proc, "network", &invite, "an invitation") == 0)
+            sent++;
+        net_msg_free_obj(&invite.info.net_msg);
+        if (tracker != NULL)
+            task_tracker_add_invited(tracker, proc->protocol.peers[i].uuid);
+        invited++;
+    }
+    peers_read_unlock(proc);
+
+    if (invite_json)
+        json_decref(invite_json);
+
+    /* Correct the tracker to what was actually invited, so completion is
+     * reachable. Seeded from num_peers and left there, a task whose capability
+     * only some peers hold never reaches its expected count: handle_results
+     * never forwards, never scores, and my_tasks grows forever.
+     *
+     * The tracker is kept even when nothing was invited, which is what Python
+     * does (start_task registers it before the participant check and leaves it
+     * on the no-peers path). A stray `report results` from a peer that was
+     * not invited is no longer scored (ISSUES §2.8, closed by §2.50). */
+    if (tracker != NULL)
+    {
+        tracker->expected = invited;
+        /* The invitees are now known, none included: a result from anyone
+         * not invited is not scored (handle_results, ISSUES §2.8/§2.50). */
+        tracker->invited_known = true;
+    }
+
+    if (invited == 0)
+        log_warn(proc->logger, "Negotiation: no capable peers found for task %s\n",
+                 task_uuid_str);
+    return sent;
+}
+
+/****************************
+ * Handler: handle_start_task (spawn task) — NEG_PROTO_START
+ * Deserialize task JSON, then announce it (see _announce_task_locked).
+ ****************************/
+
+/* Frama-C: skipped —
+ * negotiation_run + handlers + helpers: [solver-timeout] memcpy of
+ * public_identity_t + JSON serialization + complex peer-loop msg-build
+ * cascades.
+ */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
+static bool handle_start_task(const process_t *proc, directory_t *queues,
+                              generic_msg_t *msg)
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_info(proc->logger, "Negotiation: start task from %s\n", nmsg->from_whom.nickname);
-
-    pthread_mutex_lock(&neg_state.lock);
+    log_info(proc->logger, "Negotiation: start task from %s\n",
+             nmsg->from_whom.nickname);
 
     /* Deserialize task from JSON payload */
     json_t *j = NULL;
@@ -518,68 +1269,11 @@ static bool handle_start_task(const process_t *proc, directory_t *queues, generi
         uuid_copy(task.requestor_uuid, nmsg->from_whom.uuid);
     }
 
-    /* Store task in proposed_tasks keyed by task UUID string */
-    char task_uuid_str[UUID_STRING_LEN + 1] = {0};
-    uuid_unparse_lower(task.uuid, task_uuid_str);
-
-    task_t *task_copy = (task_t *)malloc(sizeof(task_t));
-    if (task_copy)
-    {
-        memcpy(task_copy, &task, sizeof(task_t));
-        data_t *task_dat = object_ptr_data(task_copy, sizeof(task_t));
-        map_set(&neg_state.proposed_tasks, task_uuid_str, task_dat);
-    }
-
-    /* Create a task tracker for result collection (expect num_peers responses) */
-    task_tracker_t *tracker = NULL;
-    peers_read_lock(proc);
-    int expected = (int)proc->protocol.num_peers;
-    peers_read_unlock(proc);
-    if (task_tracker_create(&tracker, task.uuid, expected) == 0 && tracker)
-    {
-        data_t *trk_dat = object_ptr_data(tracker, sizeof(task_tracker_t));
-        map_set(&neg_state.my_tasks, task_uuid_str, trk_dat);
-    }
-
-    /* Build JSON payload for invitation */
-    json_t *invite_json = _task_to_json(&task);
-
-    /* Send invitation to capable peers */
-    int invited = 0;
-    peers_read_lock(proc);
-    for (size_t i = 0; i < proc->protocol.num_peers; i++)
-    {
-        char peer_uuid_str[UUID_STRING_LEN + 1] = {0};
-        uuid_unparse_lower(proc->protocol.peers[i].uuid, peer_uuid_str);
-
-        /* Filter by capability if peer_capabilities map is available */
-        if (!_peer_has_capability(proc, peer_uuid_str, task.capability.name))
-            continue;
-
-        generic_msg_t invite = {0};
-        invite.type = NET_MESSAGE;
-        strncpy(invite.info.net_msg.process, "negotiation", PROC_NAME_LEN);
-        invite.info.net_msg.function = NEG_PROTO_ANNOUNCE;
-        invite.info.net_msg.encrypt = true;
-        memcpy(&invite.info.net_msg.to_whom, &proc->protocol.peers[i],
-               sizeof(public_identity_t));
-        strncpy(invite.info.net_msg.return_to, "negotiation", PROC_NAME_LEN);
-
-        if (invite_json)
-            net_msg_pack_json(&invite.info.net_msg, invite_json);
-
-        messaging_send("network", NET_MESSAGE, &invite, false);
-        invited++;
-    }
-    peers_read_unlock(proc);
-
-    if (invite_json)
-        json_decref(invite_json);
-
-    if (invited == 0)
-        log_warn(proc->logger, "Negotiation: no capable peers found for task %s\n",
-                 task_uuid_str);
-
+    /* `to_whom` on a start message is the peer the requestor wants, not a
+     * destination for this message -- it is already local. Mirrors Python
+     * start_task reading `message.to_whom`. */
+    pthread_mutex_lock(&neg_state.lock);
+    _announce_task_locked(proc, &task, nmsg->to_whom.uuid);
     pthread_mutex_unlock(&neg_state.lock);
     return true;
 }
@@ -625,6 +1319,42 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
 
     pthread_mutex_lock(&neg_state.lock);
 
+    /* Freshness FIRST, ahead of the flood counter, and silently.
+     *
+     * Ahead, because the counter is the thing a replay would otherwise drive:
+     * six copies of one captured invitation would push the "flood:<uuid>"
+     * count past the threshold and make us refuse -- and a refusal is what the
+     * requestor reads as "this worker is out" (handle_refuse drops the
+     * participant). That turns a replay into a way of evicting a worker from a
+     * task it had already accepted. Past this gate the counter counts what it
+     * was built to count: distinct, freshly stamped invitations for one task.
+     *
+     * Silently, because a replay deserves no reply -- answering would spend a
+     * message on a sender we cannot vouch for and tell an attacker where our
+     * mark sits.
+     *
+     * Unstamped (seq 0: an omitted proto field 12, a missing JSON "seq", or a
+     * payload we could not parse at all) is refused rather than admitted as
+     * legacy. A receiver that accepts unstamped invitations is one an attacker
+     * selects by not stamping. Mirrors Python handle_invite. */
+    char inviter_uuid_str[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(nmsg->from_whom.uuid, inviter_uuid_str);
+    if (!freshness_accept(&neg_state.freshness, inviter_uuid_str,
+                          NEG_PROTO_ANNOUNCE, have_task ? task.seq : 0,
+                          proc->logger))
+    {
+        log_debug(proc->logger,
+                  "Negotiation: invitation for %s from %s refused: seq %lld "
+                  "not above mark %lld (replay or unstamped)\n",
+                  task_uuid_str, inviter_uuid_str,
+                  (long long)(have_task ? task.seq : 0),
+                  (long long)freshness_mark(&neg_state.freshness,
+                                            inviter_uuid_str,
+                                            NEG_PROTO_ANNOUNCE));
+        pthread_mutex_unlock(&neg_state.lock);
+        return true;
+    }
+
     /* Flood detection: count how many times we have seen this task */
     if (have_task)
     {
@@ -657,13 +1387,14 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
 
             generic_msg_t refuse = {0};
             _build_reply(nmsg, NEG_PROTO_REFUSE, &refuse);
-            json_t *rj = _task_uuid_json(task_uuid_str);
+            json_t *rj = _task_to_json(proc, &task);
             if (rj)
             {
                 net_msg_pack_json(&refuse.info.net_msg, rj);
                 json_decref(rj);
             }
-            messaging_send("network", NET_MESSAGE, &refuse, false);
+            _neg_send(proc, "network", &refuse, "a refusal");
+            net_msg_free_obj(&refuse.info.net_msg);
             pthread_mutex_unlock(&neg_state.lock);
             return true;
         }
@@ -691,6 +1422,11 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
     int sender_tier = _peer_tier_override_locked(proc, nmsg->from_whom.uuid);
     if (sender_tier < 0)
         sender_tier = identity_get_peer_tier(nmsg->from_whom.uuid);
+    /* An extension may hold the peer lower (neg_ext.h): first contact keeps an
+     * unverified contact at messaging until verified (§10.3,
+     * doc/architecture/first-contact.md). Applied after the test override too,
+     * so a corpus case can give such a peer a high tier and see it held. */
+    sender_tier = neg_ext_capped_tier(proc, nmsg->from_whom.uuid, sender_tier);
     int required_tier = -1;
     if (have_task && task.capability.name[0] != '\0')
     {
@@ -710,9 +1446,10 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
                  task_uuid_str, sender_tier, required_tier);
         generic_msg_t refuse = {0};
         _build_reply(nmsg, NEG_PROTO_REFUSE, &refuse);
-        json_t *rj = _task_uuid_json(task_uuid_str);
+        json_t *rj = _task_to_json(proc, &task);
         if (rj) { net_msg_pack_json(&refuse.info.net_msg, rj); json_decref(rj); }
-        messaging_send("network", NET_MESSAGE, &refuse, false);
+        _neg_send(proc, "network", &refuse, "a refusal");
+        net_msg_free_obj(&refuse.info.net_msg);
         pthread_mutex_unlock(&neg_state.lock);
         return true;
     }
@@ -744,13 +1481,14 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
 
             generic_msg_t haggle = {0};
             _build_reply(nmsg, NEG_PROTO_RESPONSE, &haggle);
-            json_t *hj = _task_to_json(&task);
+            json_t *hj = _task_to_json(proc, &task);
             if (hj)
             {
                 net_msg_pack_json(&haggle.info.net_msg, hj);
                 json_decref(hj);
             }
-            messaging_send("network", NET_MESSAGE, &haggle, false);
+            _neg_send(proc, "network", &haggle, "a haggle");
+            net_msg_free_obj(&haggle.info.net_msg);
         }
         else
         {
@@ -759,22 +1497,31 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
             memset(&job, 0, sizeof(job));
             memcpy(&job.task, &task, sizeof(task_t));
 
-            struct tm tm_copy;
-            memcpy(&tm_copy, &task.when, sizeof(struct tm));
-            job.start_time = mktime(&tm_copy);
+            /* _dt_epoch, NOT mktime. task.when is UTC (the requester builds
+             * it with gmtime, neg_proc.c:1440) and mktime applies the HOST's
+             * timezone to it — the very mistake _dt_epoch's own comment warns
+             * about. On a UTC host the two agree, which is why this survived:
+             * every docker-backed cohort ran its jobs fine. On a host in, say,
+             * EDT it scheduled every accepted job FOUR HOURS into the future,
+             * so _drain_task_stack never found one due, no task ever completed,
+             * and no task_outcome transaction was ever submitted. Measured: 18
+             * jobs across the 2026-09-17 docker runs, ZERO across every netns
+             * run since. */
+            job.start_time = negotiation_dt_epoch(&task.when);
             job.end_time   = job.start_time + duration_secs;
 
             job_queue_push(&neg_state.task_stack, &job);
 
             generic_msg_t accept = {0};
             _build_reply(nmsg, NEG_PROTO_ACCEPT, &accept);
-            json_t *aj = _task_uuid_json(task_uuid_str);
+            json_t *aj = _task_to_json(proc, &task);
             if (aj)
             {
                 net_msg_pack_json(&accept.info.net_msg, aj);
                 json_decref(aj);
             }
-            messaging_send("network", NET_MESSAGE, &accept, false);
+            _neg_send(proc, "network", &accept, "an acceptance");
+            net_msg_free_obj(&accept.info.net_msg);
         }
     }
     else
@@ -786,13 +1533,14 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
 
         generic_msg_t refuse = {0};
         _build_reply(nmsg, NEG_PROTO_REFUSE, &refuse);
-        json_t *rj = _task_uuid_json(task_uuid_str);
+        json_t *rj = _task_to_json(proc, &task);
         if (rj)
         {
             net_msg_pack_json(&refuse.info.net_msg, rj);
             json_decref(rj);
         }
-        messaging_send("network", NET_MESSAGE, &refuse, false);
+        _neg_send(proc, "network", &refuse, "a refusal");
+        net_msg_free_obj(&refuse.info.net_msg);
     }
 
     pthread_mutex_unlock(&neg_state.lock);
@@ -840,7 +1588,22 @@ static bool handle_haggle(const process_t *proc, directory_t *queues, generic_ms
         log_info(proc->logger,
                  "Negotiation: re-announcing flexible task with adjusted params\n");
 
-        json_t *rj = _task_to_json(&task);
+        /* A fresh stamp: this is a NEW invitation, carrying the schedule we
+         * just conceded, and the peer's mark has already consumed the
+         * sequence of the first one. Reusing it would have the peer refuse
+         * the resolution as a replay -- correctly, since it cannot tell the
+         * two apart otherwise. Mirrors Python handle_haggle. */
+        pthread_mutex_lock(&neg_state.lock);
+        task.seq = freshness_stamp(&neg_state.freshness, proc->logger);
+        pthread_mutex_unlock(&neg_state.lock);
+        if (task.seq <= 0)
+        {
+            log_warn(proc->logger,
+                     "Negotiation: no freshness sequence; not re-announcing\n");
+            return true;
+        }
+
+        json_t *rj = _task_to_json(proc, &task);
         generic_msg_t announce = {0};
         _build_reply(nmsg, NEG_PROTO_ANNOUNCE, &announce);
         if (rj)
@@ -848,7 +1611,8 @@ static bool handle_haggle(const process_t *proc, directory_t *queues, generic_ms
             net_msg_pack_json(&announce.info.net_msg, rj);
             json_decref(rj);
         }
-        messaging_send("network", NET_MESSAGE, &announce, false);
+        _neg_send(proc, "network", &announce, "a re-announcement");
+        net_msg_free_obj(&announce.info.net_msg);
     }
     else
     {
@@ -863,13 +1627,14 @@ static bool handle_haggle(const process_t *proc, directory_t *queues, generic_ms
 
         generic_msg_t refuse = {0};
         _build_reply(nmsg, NEG_PROTO_REFUSE, &refuse);
-        json_t *rj = _task_uuid_json(task_uuid_str);
+        json_t *rj = _task_to_json(proc, &task);
         if (rj)
         {
             net_msg_pack_json(&refuse.info.net_msg, rj);
             json_decref(rj);
         }
-        messaging_send("network", NET_MESSAGE, &refuse, false);
+        _neg_send(proc, "network", &refuse, "a refusal");
+        net_msg_free_obj(&refuse.info.net_msg);
     }
 
     return true;
@@ -973,10 +1738,10 @@ static bool handle_refuse(const process_t *proc, directory_t *queues, generic_ms
 
     if (nmsg->obj && nmsg->len > 0 && net_msg_unpack_json(nmsg, &j) == 0 && j)
     {
-        json_t *j_uuid = json_object_get(j, "task_uuid");
-        if (j_uuid && json_is_string(j_uuid))
+        uuid_t parsed_uuid;
+        if (_py_uuid_read(json_object_get(j, "uuid"), parsed_uuid) == 0)
         {
-            strncpy(task_uuid_str, json_string_value(j_uuid), UUID_STRING_LEN);
+            uuid_unparse_lower(parsed_uuid, task_uuid_str);
             have_task_uuid = true;
         }
         json_decref(j);
@@ -1033,10 +1798,10 @@ static bool handle_accept(const process_t *proc, directory_t *queues, generic_ms
 
     if (nmsg->obj && nmsg->len > 0 && net_msg_unpack_json(nmsg, &j) == 0 && j)
     {
-        json_t *j_uuid = json_object_get(j, "task_uuid");
-        if (j_uuid && json_is_string(j_uuid))
+        uuid_t parsed_uuid;
+        if (_py_uuid_read(json_object_get(j, "uuid"), parsed_uuid) == 0)
         {
-            strncpy(task_uuid_str, json_string_value(j_uuid), UUID_STRING_LEN);
+            uuid_unparse_lower(parsed_uuid, task_uuid_str);
             have_task_uuid = true;
         }
         json_decref(j);
@@ -1050,28 +1815,51 @@ static bool handle_accept(const process_t *proc, directory_t *queues, generic_ms
         strncpy(key, "unknown", UUID_STRING_LEN);
     key[UUID_STRING_LEN] = '\0';
 
-    data_t *count_dat = NULL;
-    int count = 0;
-    if (map_get(&neg_state.confirmed, key, &count_dat) == 0 && count_dat)
-        data_integer(count_dat, &count);
-
-    count++;
-    data_t *new_count = integer_data(count);
-    map_set(&neg_state.confirmed, key, new_count);
-
     /* Per-peer membership entry. Composite key "<task>:<peer>" so
      * handle_stat_resp can answer the Python check
      * `message.from_whom in self.confirmed[task.uuid]`
-     * (negprocess.py:271) without restructuring the count map above. */
+     * (negprocess.py:271) without restructuring the count map below.
+     *
+     * Established BEFORE the count, because it is what makes the count
+     * dedup: one participant, one promise. An `ack` carries nothing that
+     * separates a second delivery from a second promise, so a replayed one
+     * used to increment the tally again and inflate the number of peers
+     * believed to have committed to the task. The pair map was already
+     * set-like (map_set on the same key is idempotent), so it is the
+     * natural place to ask "have we counted this peer yet". Mirrors
+     * Python NegotiationProcess.handle_accept's dedup on self.confirmed. */
+    bool already_confirmed = false;
     if (have_task_uuid)
     {
         char peer_lower[UUID_STRING_LEN + 1];
         uuid_unparse_lower(nmsg->from_whom.uuid, peer_lower);
         char pair_key[UUID_STRING_LEN * 2 + 4];
         snprintf(pair_key, sizeof(pair_key), "%s:%s", task_uuid_str, peer_lower);
-        data_t *marker = integer_data(1);
-        if (marker != NULL)
-            map_set(&neg_state.confirmed_pairs, pair_key, marker);
+        data_t *existing_pair = NULL;
+        if (map_get(&neg_state.confirmed_pairs, pair_key, &existing_pair) == 0
+            && existing_pair != NULL)
+            already_confirmed = true;
+        else
+        {
+            data_t *marker = integer_data(1);
+            if (marker != NULL)
+                map_set(&neg_state.confirmed_pairs, pair_key, marker);
+        }
+    }
+
+    data_t *count_dat = NULL;
+    int count = 0;
+    if (map_get(&neg_state.confirmed, key, &count_dat) == 0 && count_dat)
+        data_integer(count_dat, &count);
+
+    /* No task uuid means no pair key and so no dedup is possible; that
+     * degenerate path keeps its previous behaviour rather than silently
+     * dropping the acceptance. */
+    if (!already_confirmed)
+    {
+        count++;
+        data_t *new_count = integer_data(count);
+        map_set(&neg_state.confirmed, key, new_count);
     }
 
     log_debug(proc->logger,
@@ -1104,20 +1892,22 @@ static bool handle_stat_req(const process_t *proc, directory_t *queues, generic_
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Negotiation: status request from %s\n", nmsg->from_whom.nickname);
 
-    /* Extract task UUID from payload */
+    /* The request payload is a whole serialized Task, not a bare uuid -- the
+     * response is a TaskStatus, which subclasses Task and so has to carry the
+     * task's own fields back. Python's handle_stat_req builds it the same way
+     * (`TaskStatus(message.obj, ...)`, from the task it was sent). */
     json_t *j = NULL;
     char task_uuid_str[UUID_STRING_LEN + 1] = {0};
-    uuid_t task_uuid;
+    task_t task;
+    memset(&task, 0, sizeof(task));
     bool have_task_uuid = false;
 
     if (nmsg->obj && nmsg->len > 0 && net_msg_unpack_json(nmsg, &j) == 0 && j)
     {
-        json_t *j_uuid = json_object_get(j, "task_uuid");
-        if (j_uuid && json_is_string(j_uuid))
+        if (_task_from_json(j, &task) == 0)
         {
-            strncpy(task_uuid_str, json_string_value(j_uuid), UUID_STRING_LEN);
-            if (uuid_parse(task_uuid_str, task_uuid) == 0)
-                have_task_uuid = true;
+            uuid_unparse_lower(task.uuid, task_uuid_str);
+            have_task_uuid = true;
         }
         json_decref(j);
     }
@@ -1127,22 +1917,33 @@ static bool handle_stat_req(const process_t *proc, directory_t *queues, generic_
      * is `pending`, not `running`. Returning RUNNING here causes the
      * requestor's clock-sync detector (handle_stat_resp:269 on the Python
      * side) to miss the discrepancy. Mirrors negprocess.py:238-239. */
+    /* A job holding a worker slot is running (or has just finished, its
+     * result about to go out). Python reports the executing process's state;
+     * this is the C runtime's equivalent. */
     neg_status_t status = NEG_UNKNOWN;
     if (have_task_uuid)
     {
         pthread_mutex_lock(&neg_state.lock);
-        if (job_queue_contains(&neg_state.task_stack, task_uuid))
+        if (job_queue_contains(&neg_state.task_stack, task.uuid))
             status = NEG_PENDING;
+        else
+            for (int i = 0; i < NEG_RUNNING_MAX; i++)
+                if (neg_state.running[i].used
+                    && uuid_compare(neg_state.running[i].job.task.uuid,
+                                    task.uuid) == 0)
+                {
+                    status = NEG_RUNNING;
+                    break;
+                }
         pthread_mutex_unlock(&neg_state.lock);
     }
 
-    /* Build response JSON */
-    json_t *resp_json = json_object();
-    if (resp_json)
-    {
-        json_object_set_new(resp_json, "task_uuid", json_string(task_uuid_str));
-        json_object_set_new(resp_json, "status",    json_integer((json_int_t)status));
-    }
+    /* Build response JSON: Python's tagged TaskStatus (doc/architecture/negotiation.md). The
+     * status rides as the `Enumcfg:` member NAME, which is what
+     * config_json_decoder reconstructs the enum from -- an integer would
+     * deserialize as a plain int and `handle_stat_resp`'s
+     * `isinstance(task, TaskStatus)` would never see a status it understands. */
+    json_t *resp_json = _task_status_to_json(proc, &task, status);
 
     generic_msg_t resp = {0};
     _build_reply(nmsg, NEG_PROTO_STAT_RSP, &resp);
@@ -1152,7 +1953,10 @@ static bool handle_stat_req(const process_t *proc, directory_t *queues, generic_
         json_decref(resp_json);
     }
 
+    /* Bare on purpose: a status reply, and the asker's deadline sweep asks
+     * again. */
     messaging_send("network", NET_MESSAGE, &resp, false);
+    net_msg_free_obj(&resp.info.net_msg);
     return true;
 }
 
@@ -1181,13 +1985,18 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
         char task_uuid_str[UUID_STRING_LEN + 1] = {0};
         neg_status_t status = NEG_UNKNOWN;
 
-        json_t *j_uuid = json_object_get(j, "task_uuid");
-        if (j_uuid && json_is_string(j_uuid))
-            strncpy(task_uuid_str, json_string_value(j_uuid), UUID_STRING_LEN);
+        uuid_t parsed_uuid;
+        if (_py_uuid_read(json_object_get(j, "uuid"), parsed_uuid) == 0)
+            uuid_unparse_lower(parsed_uuid, task_uuid_str);
 
+        /* The `Enumcfg:` member NAME, which is how Python serializes an enum.
+         * An integer is still accepted so a hand-written conformance step can
+         * pin a status without spelling out the tag. */
         json_t *j_status = json_object_get(j, "status");
-        if (j_status && json_is_integer(j_status))
+        if (json_is_integer(j_status))
             status = (neg_status_t)json_integer_value(j_status);
+        else
+            status = _py_status_value(_py_tagged_str(j_status));
 
         json_decref(j);
 
@@ -1243,47 +2052,56 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
                         data_object_ptr(t_dat, (ptr_t *)&live_task);
                 }
 
-                if (tracker && peer_confirmed && live_task) {
+                /* An extension is authorised by an OUTSTANDING status
+                 * request, and the pending entry IS that authorisation:
+                 * draining it here is what stops a replayed (or entirely
+                 * unsolicited) status response from extending the deadline
+                 * again. Mirrors Python's handle_stat_resp. EVERY matching
+                 * slot is drained rather than the first — two slots for one
+                 * task would be two extension tokens. An already-drained
+                 * slot holds "" and cannot match a real uuid, so this is
+                 * naturally idempotent.
+                 *
+                 * The sender is negotiation_status_sweep, which appends the
+                 * task uuid each time it asks. */
+                bool had_pending = false;
+                for (size_t i = 0; i < array_size(&neg_state.status_pending); i++)
+                {
+                    data_t *item = NULL;
+                    if (array_get(&neg_state.status_pending, i, &item) != 0)
+                        continue;
+                    char *stored = NULL;
+                    if (data_string_ptr(item, &stored) == 0 && stored
+                        && strncmp(stored, task_uuid_str, UUID_STRING_LEN) == 0)
+                    {
+                        stored[0] = '\0';
+                        had_pending = true;
+                    }
+                }
+
+                if (tracker && peer_confirmed && live_task && had_pending) {
                     /* Compute the extension. Mirrors Python's
                      * three-way choice at negprocess.py:273-277.
                      * Order matters: explicit timeout wins over
                      * duration-derived; both fall back to the class
                      * default. */
-                    long extend = NEG_TIMEOUT_EXTENSION_SEC;
-                    if (live_task->timeout > 0) {
-                        extend = live_task->timeout;
-                    } else {
-                        long dur_secs = live_task->duration.seconds
-                                      + (long)live_task->duration.days * 86400L;
-                        if (dur_secs > 0)
-                            extend = (dur_secs * NEG_DURATION_FRACTION_PCT) / 100L + 1L;
-                    }
+                    long extend = _extension_secs(live_task);
                     live_task->timeout += extend;
+                    /* The deadline moved, so the sweep's count of unanswered
+                     * rounds starts over from it. */
+                    tracker->status_asks = 0;
+                    tracker->status_asked_at = 0.0;
                     log_debug(proc->logger,
                               "Negotiation: task %s active (status=%d), "
                               "extending timeout by %lds (peer %s)\n",
                               task_uuid_str, (int)status, extend,
                               nmsg->from_whom.nickname);
-
-                    /* Drop the matching task uuid from status_pending —
-                     * Python does `self.status_pending.remove(task)` so
-                     * the periodic poller stops nagging until the next
-                     * cycle. The C status_pending array holds uuid
-                     * strings; zero out the slot like the cleanup loop
-                     * already does below for the response itself. */
-                    for (size_t i = 0; i < array_size(&neg_state.status_pending); i++)
-                    {
-                        data_t *item = NULL;
-                        if (array_get(&neg_state.status_pending, i, &item) != 0)
-                            continue;
-                        char *stored = NULL;
-                        if (data_string_ptr(item, &stored) == 0 && stored
-                            && strncmp(stored, task_uuid_str, UUID_STRING_LEN) == 0)
-                        {
-                            stored[0] = '\0';
-                            break;
-                        }
-                    }
+                } else if (tracker && peer_confirmed && live_task) {
+                    log_debug(proc->logger,
+                              "Negotiation: stat_resp for task %s with no "
+                              "outstanding status request — not extending "
+                              "timeout\n",
+                              task_uuid_str);
                 } else if (tracker && !peer_confirmed) {
                     log_debug(proc->logger,
                               "Negotiation: stat_resp from unconfirmed peer "
@@ -1309,6 +2127,10 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
                                         nmsg->from_whom.uuid);
                 break;
 
+            /* `unknown` only says the worker is not tracking the task, which
+             * is also what it says once it has finished and its result is on
+             * the way: neither extend nor cancel. The deadline sweep gives up
+             * on a worker that has really let the task go. */
             case NEG_UNKNOWN:
             default:
                 log_debug(proc->logger,
@@ -1336,6 +2158,210 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
 
     pthread_mutex_unlock(&neg_state.lock);
     return true;
+}
+
+/****************************
+ * Requestor-side scoring of a returned task result (R+D.md §12.7 / §12.8)
+ ****************************/
+
+/* Pull the probe challenge out of the requestor's OWN retained kwargs. Never
+ * from the responder's reply: see task_tracker_t. @p payload_buf backs the
+ * echo token, because probe_challenge_t holds a non-owning pointer. */
+static void _challenge_from_kwargs(const char *kwargs_json,
+                                   char *payload_buf, size_t payload_len,
+                                   probe_challenge_t *out)
+{
+    out->nonce = 0;
+    out->payload = NULL;
+    out->sent_at = 0.0;
+    payload_buf[0] = '\0';
+    if (kwargs_json == NULL || kwargs_json[0] == '\0')
+        return;
+    json_error_t jerr;
+    json_t *kw = json_loads(kwargs_json, 0, &jerr);
+    if (kw == NULL)
+        return;
+    if (json_is_object(kw))
+    {
+        json_t *j_nonce = json_object_get(kw, "nonce");
+        if (j_nonce && json_is_integer(j_nonce))
+            out->nonce = (long)json_integer_value(j_nonce);
+        json_t *j_payload = json_object_get(kw, "payload");
+        if (j_payload && json_is_string(j_payload))
+        {
+            at_strlcpy(payload_buf, json_string_value(j_payload), payload_len);
+            out->payload = payload_buf;
+        }
+    }
+    json_decref(kw);
+}
+
+/* Monotonic seconds, the clock both the prober's window and the physics
+ * layer's observation window are measured on. CLOCK_MONOTONIC rather than the
+ * wall clock because both are measuring elapsed intervals, and a step
+ * adjustment mid-window would otherwise invent a rate violation out of an NTP
+ * correction. Falls back to time(2) only where the monotonic clock is
+ * unavailable. Mirrors Python's time.monotonic(). */
+static double _now_sec(void)
+{
+    struct timespec ts;
+    return (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        ? (double)ts.tv_sec + (double)ts.tv_nsec / 1e9
+        : (double)time(NULL);
+}
+
+/* Score one returned result and name the evidence channel it came from.
+ * Exported (declared in negotiation.h) so tests and the conformance adapter
+ * pin the same function production uses, rather than a copy of its rules.
+ *
+ * Mirrors the requestor-side branch of Python automate.py's TaskResult
+ * handling, minus the ZKP arm: this runtime attaches no proofs, so it is
+ * always Python's "ZKP unavailable" case -- score on the fact the task came
+ * back with something, and say `task_outcome` so that an absent proof
+ * infrastructure does not read as a failed one.
+ *
+ * A known-answer probe is checked FIRST and subsumes the completion score: for
+ * a capability whose right answer we already hold, "it came back" is not the
+ * question. A tampered or fabricated answer lands on 0.1 here rather than the
+ * 0.3 a dud task gets, and carries the `probe` channel so "failed a challenge
+ * whose answer we knew" stays distinguishable downstream from "scored badly on
+ * a task" when both are the same number.
+ *
+ * Physical consistency (R+D.md §12.2) sits between the two: a claim that is
+ * impossible, or that no consistent story leaves honest, reports `physical`
+ * (0.1); a peer implicated by a conflict that does not name it uniquely
+ * reports `swarm_disagreement` (0.3). That layer only ever refutes -- passing
+ * it earns nothing -- so a claim it has nothing to say about falls through to
+ * the completion arm below, unchanged. */
+double negotiation_score_task_result(const char *cap_name,
+                                    const char *kwargs_json,
+                                    const char *result_str, size_t result_len,
+                                    const char *certificate_json,
+                                    const char *prediction_json,
+                                    const char *subject, double now,
+                                    uint64_t seed,
+                                    const char **channel_out)
+{
+    return negotiation_score_task_result_at(cap_name, kwargs_json, 0.0,
+                                            result_str, result_len,
+                                            certificate_json, prediction_json,
+                                            subject, now, seed, channel_out);
+}
+
+double negotiation_score_task_result_at(const char *cap_name,
+                                        const char *kwargs_json,
+                                        double issued_at,
+                                        const char *result_str, size_t result_len,
+                                        const char *certificate_json,
+                                        const char *prediction_json,
+                                        const char *subject, double now,
+                                        uint64_t seed,
+                                        const char **channel_out)
+{
+    const char *channel_sink = NULL;
+    if (channel_out == NULL)
+        channel_out = &channel_sink;
+    if (cap_name != NULL && cap_name[0] != '\0' && is_probe_capability(cap_name))
+    {
+        char payload_buf[TASK_KWARGS_LEN + 1];
+        probe_challenge_t challenge;
+        _challenge_from_kwargs(kwargs_json, payload_buf,
+                               sizeof(payload_buf), &challenge);
+        challenge.sent_at = issued_at;
+        /* A numeric answer arrives as its decimal text (at.handshake,
+         * at.time-attest). A reply that is not a number at all becomes NaN,
+         * not 0: the verifiers treat non-finite as "unparseable" and score it
+         * 0.1, where 0.0 would be a finite wrong answer -- and for
+         * at.time-attest a finite 0 is "forgivable drift" (0.5), so parsing
+         * prose as zero would grade a nonsense reply more kindly than a late
+         * clock. Python's verifiers reach 0.1 through float() raising on the
+         * same input; this is that behaviour in C. */
+        double result_num = NAN;
+        if (result_str != NULL && result_str[0] != '\0')
+        {
+            char *parse_end = NULL;
+            double parsed = strtod(result_str, &parse_end);
+            /* Whole-string parse only: "42abc" is not 42. */
+            if (parse_end != NULL && *parse_end == '\0')
+                result_num = parsed;
+        }
+        double score = 0.0;
+        if (verify_bootstrap_result(cap_name, result_num, result_str,
+                                    &challenge, 0.0, &score))
+        {
+            *channel_out = TX_CHANNEL_PROBE;
+            return score;
+        }
+    }
+
+    /* The verification layers (R+D.md §12), in their registered order
+     * (negotiation/neg_oracle.h): physics, the coverage audit's settle, the
+     * prequential record, certificates, the coverage audit's verdict. Each is
+     * its own library and speaks only when its declaration names a model; the
+     * first to render a verdict ends scoring. Everything they do not decide
+     * falls through to the completion arm unchanged. */
+    {
+        const neg_score_input_t in = {
+            .cap = cap_name, .kwargs_json = kwargs_json,
+            .result_str = result_str, .result_len = result_len,
+            .certificate_json = certificate_json,
+            .prediction_json = prediction_json,
+            .subject = subject, .now = now, .seed = seed,
+        };
+        double score = 0.0;
+        if (neg_oracles_score(&in, &score, channel_out))
+            return score;
+    }
+
+    *channel_out = TX_CHANNEL_TASK_OUTCOME;
+    return (result_str != NULL && result_len > 0) ? 0.8 : 0.3;
+}
+
+double negotiation_competence_weight(const char *cap_name, const char *subject)
+{
+    return neg_oracle_competence(cap_name, subject);
+}
+
+/* Submit a requestor-side score to the reputation process, which resolves our
+ * own identity as the proposer and starts a Paxos round (rep_proc.c
+ * _handle_local_tx_score). Mirrors automate.py putting a TransactionScore on
+ * the reputation queue. The capability name rides along so the reputation
+ * process can apply the capability's configured transaction_weight instead of
+ * the weight-1 default. */
+static void _submit_tx_score(const process_t *proc, const uuid_t task_uuid,
+                             double score, const char *capability_name,
+                             const char *channel, const uuid_t subject_uuid,
+                             double competence)
+{
+    generic_msg_t msg = {0};
+    msg.type = TRANSACTION_SCORE;
+    msg.size = sizeof(tx_score_msg_t);
+    uuid_copy(msg.info.tx_score.task_uuid, task_uuid);
+    /* peer_uuid is the SUBJECT -- the peer this score is ABOUT, not the
+     * proposer (the reputation process fills our own identity in for that,
+     * since it owns our half of the bilateral transaction). It is what lets a
+     * hard-channel refutation name the peer it accuses (R+D.md §12.8), and it
+     * is IPC-only, so a score that arrives from the wire can never carry one.
+     * Zero when the result is not attributable to a single peer. */
+    if (subject_uuid != NULL)
+        uuid_copy(msg.info.tx_score.peer_uuid, subject_uuid);
+    msg.info.tx_score.score = score;
+    /* The learned EMA weight multiplier (R+D.md §12.5), measured HERE -- this
+     * is the process holding the record of resolved forecasts -- and applied
+     * in the reputation process, which owns the weighted EMA. Local-only on
+     * the same terms as peer_uuid above: the struct never crosses the wire, so
+     * no peer can stamp a multiplier on a score about itself. */
+    msg.info.tx_score.competence = competence;
+    if (capability_name != NULL)
+        at_strlcpy(msg.info.tx_score.capability_name, capability_name,
+                   sizeof(msg.info.tx_score.capability_name));
+    if (channel != NULL)
+        at_strlcpy(msg.info.tx_score.channel, channel,
+                   sizeof(msg.info.tx_score.channel));
+    if (_neg_send(proc, "reputation", &msg, "a task score") != 0)
+        log_warn(proc->logger,
+                 "Negotiation: could not submit score %.2f (via %s)\n",
+                 score, (channel != NULL) ? channel : "-");
 }
 
 /****************************
@@ -1369,22 +2395,68 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
         uuid_t task_uuid;
         bool have_task_uuid = false;
 
-        json_t *j_uuid = json_object_get(j, "task_uuid");
-        if (j_uuid && json_is_string(j_uuid))
+        if (_py_uuid_read(json_object_get(j, "uuid"), task_uuid) == 0)
         {
-            strncpy(task_uuid_str, json_string_value(j_uuid), UUID_STRING_LEN);
-            if (uuid_parse(task_uuid_str, task_uuid) == 0)
-                have_task_uuid = true;
+            uuid_unparse_lower(task_uuid, task_uuid_str);
+            have_task_uuid = true;
         }
 
         /* Extract raw result bytes (base64-encoded string or omitted) */
         const uint8_t *result_data = NULL;
         size_t result_len = 0;
-        json_t *j_result = json_object_get(j, "result_data");
-        if (j_result && json_is_string(j_result))
+        /* The witness that makes the answer checkable (R+D.md §12.3), in its
+         * OWN payload key: a reader that does not know the checker still reads
+         * the answer, and nobody has to sniff bytes to tell a witness from a
+         * result. Absent for every capability that does not certify, which is
+         * most of them. */
+        const char *certificate_json = NULL;
+        json_t *j_cert = json_object_get(j, "certificate");
+        if (json_is_object(j_cert))
         {
-            result_data = (const uint8_t *)json_string_value(j_result);
-            result_len  = strlen((const char *)result_data);
+            static _Thread_local char cert_buf[NEG_CERT_JSON_MAX];
+            char *dumped = json_dumps(j_cert, JSON_COMPACT);
+            if (dumped != NULL)
+            {
+                if (strlen(dumped) < sizeof(cert_buf))
+                {
+                    at_strlcpy(cert_buf, dumped, sizeof(cert_buf));
+                    certificate_json = cert_buf;
+                }
+                free(dumped);
+            }
+        }
+        /* `result` is Python's TaskResult field, and it holds whatever the
+         * capability returned -- an int from `pow`, a string from `echo` --
+         * so it is flattened to the text this runtime scores against rather
+         * than required to be a string. */
+        static _Thread_local char result_buf[CAP_RESULT_LEN * 4 + 1];
+        /* The peer's prediction set and claimed coverage (R+D.md §12.4), in
+         * its OWN payload key for the same reason `certificate` is: `result`
+         * is the answer, the witness makes the answer checkable, and this is
+         * the peer's statement about how often answers of this kind land
+         * inside the set it quotes. Only the last is a claim about the PEER
+         * rather than about this answer. */
+        const char *prediction_json = NULL;
+        json_t *j_pred = json_object_get(j, "prediction");
+        if (json_is_object(j_pred))
+        {
+            static _Thread_local char pred_buf[NEG_PRED_JSON_MAX];
+            char *dumped = json_dumps(j_pred, JSON_COMPACT);
+            if (dumped != NULL)
+            {
+                if (strlen(dumped) < sizeof(pred_buf))
+                {
+                    at_strlcpy(pred_buf, dumped, sizeof(pred_buf));
+                    prediction_json = pred_buf;
+                }
+                free(dumped);
+            }
+        }
+        json_t *j_result = json_object_get(j, "result");
+        if (_py_result_text(j_result, result_buf, sizeof(result_buf)))
+        {
+            result_data = (const uint8_t *)result_buf;
+            result_len  = strlen(result_buf);
         }
 
         if (have_task_uuid)
@@ -1395,7 +2467,19 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
             if (map_get(&neg_state.my_tasks, task_uuid_str, &trk_dat) == 0 && trk_dat)
                 data_object_ptr(trk_dat, (ptr_t *)&tracker);
 
-            if (tracker)
+            if (tracker && !task_tracker_was_invited(tracker, nmsg->from_whom.uuid))
+            {
+                log_warn(proc->logger, "Negotiation: results for task %s from %s, "
+                         "who was not invited; not scored\n", task_uuid_str,
+                         nmsg->from_whom.nickname);
+            }
+            else if (tracker && task_tracker_has_result(tracker, nmsg->from_whom.uuid))
+            {
+                log_debug(proc->logger, "Negotiation: repeated results for task %s "
+                          "from %s; already scored\n", task_uuid_str,
+                          nmsg->from_whom.nickname);
+            }
+            else if (tracker)
             {
                 /* Record the result from this peer */
                 task_tracker_set_result(tracker, nmsg->from_whom.uuid,
@@ -1406,11 +2490,51 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
                           "Negotiation: task %s collected %d/%d results\n",
                           task_uuid_str, collected, tracker->expected);
 
-                /* If all expected results have arrived, forward to main process */
-                if (collected >= tracker->expected)
+                /* Score THIS result, as it arrives, under the pair task id
+                 * (ISSUES §2.50): one transaction per executor, so a task
+                 * fanned out to N peers is N transactions, each pairing our
+                 * half about that executor with that executor's half about
+                 * the task. Under the bare task id the N+1 halves were paired
+                 * by arrival and nodes forked.
+                 *
+                 * Scored here rather than in the main process, where Python
+                 * scores it: the judgment needs what the requestor asked for,
+                 * and this is the process that retained it. The subject is
+                 * the authenticated sender, the same peer the physics layer
+                 * files the observation under and the competence weight
+                 * belongs to. */
+                const char *channel = TX_CHANNEL_TASK_OUTCOME;
+                char subject[UUID_STRING_LEN + 1] = {0};
+                uuid_unparse_lower(nmsg->from_whom.uuid, subject);
+                double score = negotiation_score_task_result_at(
+                    tracker->capability_name, tracker->kwargs_json,
+                    tracker->issued_at,
+                    (const char *)result_data, result_len,
+                    certificate_json, prediction_json, subject,
+                    _now_sec(), at_cert_verifier_seed(), &channel);
+                log_info(proc->logger,
+                         "Negotiation: task %s scored %.2f for %s (cap %s, via %s)\n",
+                         task_uuid_str, score, nmsg->from_whom.nickname,
+                         tracker->capability_name[0] != '\0'
+                             ? tracker->capability_name : "-",
+                         channel);
+                uuid_t pair;
+                tx_pair_task_uuid(task_uuid, nmsg->from_whom.uuid, pair);
+                _submit_tx_score(proc, pair, score, tracker->capability_name,
+                                 channel, nmsg->from_whom.uuid,
+                                 negotiation_competence_weight(
+                                     tracker->capability_name, subject));
+
+                /* The first answer goes to the main process, so the app
+                 * sees one answer per task and one slow or silent invitee
+                 * cannot hold it back; every later one is scored only. The
+                 * tracker lives until every invitee has answered (or the
+                 * task is cancelled). Mirrors Python handle_results, which
+                 * marks the later ones score_only. */
+                if (collected == 1)
                 {
                     log_info(proc->logger,
-                             "Negotiation: task %s complete — forwarding results\n",
+                             "Negotiation: task %s first result — forwarding\n",
                              task_uuid_str);
 
                     /* Build TASK_RESULT message to the main (requestor) process */
@@ -1423,11 +2547,17 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
                     result_msg.info.task_result.result_data = (uint8_t *)result_data;
                     result_msg.info.task_result.result_len  = result_len;
 
-                    messaging_send(AT_MAIN_QUEUE, TASK_RESULT, &result_msg, false);
-
-                    /* Clean up tracker entry */
+                    _neg_send(proc, AT_MAIN_QUEUE, &result_msg, "a task result");
+                }
+                if (collected >= tracker->expected)
+                {
+                    log_info(proc->logger,
+                             "Negotiation: task %s complete\n", task_uuid_str);
+                    /* Clean up tracker entry. The map's value only borrows
+                     * the tracker, which _announce_task_locked calloc'd. */
                     map_remove(&neg_state.my_tasks, task_uuid_str);
                     task_tracker_free(tracker);
+                    free(tracker);
                 }
             }
             else
@@ -1443,6 +2573,475 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
 
     pthread_mutex_unlock(&neg_state.lock);
     return true;
+}
+
+/****************************
+ * Worker side: run accepted jobs and report their results
+ *
+ * Until this existed, `job_queue_pop` had no caller in the whole tree: an
+ * accepted invitation was pushed onto the task stack and sat there. No C node
+ * ever executed a task, so none ever reported a result, and the requestor-side
+ * scoring above had nothing to score. That is what "no C node scores a probe
+ * end to end" meant (R+D.md §12.7).
+ ****************************/
+
+/* Copy the peer record for @p peer_uuid into @p out. Takes the peers read
+ * lock itself, so callers must not already hold it. */
+static bool _peer_by_uuid(const process_t *proc, const uuid_t peer_uuid,
+                          public_identity_t *out)
+{
+    bool found = false;
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++)
+    {
+        if (uuid_compare(proc->protocol.peers[i].uuid, peer_uuid) == 0)
+        {
+            memcpy(out, &proc->protocol.peers[i], sizeof(public_identity_t));
+            found = true;
+            break;
+        }
+    }
+    peers_read_unlock(proc);
+    return found;
+}
+
+/* Report a finished job's answer to the peer that asked for it, as Python's
+ * tagged TaskResult -- the one form both runtimes read (doc/architecture/negotiation.md). */
+static void _report_result(const process_t *proc, const task_t *task,
+                           const char *result)
+{
+    public_identity_t requestor;
+    memset(&requestor, 0, sizeof(requestor));
+    if (!_peer_by_uuid(proc, task->requestor_uuid, &requestor))
+    {
+        char req_str[UUID_STRING_LEN + 1] = {0};
+        uuid_unparse_lower(task->requestor_uuid, req_str);
+        log_warn(proc->logger,
+                 "Negotiation: cannot report results, requestor %s unknown\n",
+                 req_str);
+        return;
+    }
+
+    /* A certifying capability wraps its answer with the witness (R+D.md
+     * §12.3); split them here so the reply carries the two in SEPARATE keys,
+     * exactly as Python's executor unwraps `Certified`. An ordinary capability
+     * is unwrapped and this is a no-op. */
+    char value_buf[CAP_RESULT_LEN + 1] = {0};
+    char cert_buf[CAP_RESULT_LEN + 1] = {0};
+    const char *answer = result;
+    json_t *j_cert = NULL;
+    if (at_cert_split_result(result, value_buf, sizeof(value_buf),
+                             cert_buf, sizeof(cert_buf)))
+    {
+        answer = value_buf;
+        if (cert_buf[0] != '\0')
+        {
+            json_error_t cert_err;
+            j_cert = json_loads(cert_buf, 0, &cert_err);
+        }
+    }
+    /* No prediction: no C capability emits one yet (see the serializer). */
+    json_t *j = _task_result_to_json(proc, task, answer, j_cert, NULL);
+    if (j == NULL)
+    {
+        log_error(proc->logger, "Negotiation: json_object OOM (report)\n");
+        return;
+    }
+
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    strncpy(out.info.net_msg.process, "negotiation", PROC_NAME_LEN);
+    out.info.net_msg.function = NEG_PROTO_RESULT;
+    out.info.net_msg.encrypt = true;
+    memcpy(&out.info.net_msg.to_whom, &requestor, sizeof(public_identity_t));
+    strncpy(out.info.net_msg.return_to, "negotiation", PROC_NAME_LEN);
+    net_msg_pack_json(&out.info.net_msg, j);
+    json_decref(j);
+
+    _neg_send(proc, "network", &out, "a task result");
+    net_msg_free_obj(&out.info.net_msg);
+}
+
+/* Run every job whose start time has arrived, report each answer, and submit
+ * our own (executor) half of the bilateral transaction.
+ *
+ * A job's capability runs on a worker thread of its own, up to
+ * max_concurrency at once, so this loop stays free to answer while it works:
+ * a status request about a running job is answered `running` (handle_stat_req)
+ * instead of waiting behind the job. The thread only fills its slot; the
+ * report, the executor score and every other send happen back on this loop
+ * (_finish_jobs), so nothing that sends runs off it. A job that cannot get a
+ * thread runs inline, as every job used to.
+ *
+ * The 0.9 executor score mirrors automate.py's `_handle_results`: it is our
+ * claim to have done the work, and it is the requestor's own score for the
+ * same task that decides what the work was worth. */
+
+/* Report one finished job: its answer (or none) to the requestor, and our own
+ * half when it produced one. Called on the process loop. */
+static void _complete_job(const process_t *proc, job_t *job,
+                          const capability_t *cap, int rc, const char *result)
+{
+    char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(job->task.uuid, task_uuid_str);
+    if (rc != 0)
+    {
+        /* No result-producing entry point (the fire-and-forget shape) or
+         * the capability failed. Run the void form if there is one, so a
+         * legacy capability still does its work, and report nothing.
+         *
+         * The requestor then scores that as an empty return (0.3), which
+         * is worth being explicit about because it is a judgment and not
+         * an accident: a capability that cannot answer leaves the
+         * requestor with nothing, and the alternative -- staying silent --
+         * leaves it waiting on a tracker that never completes. Reporting
+         * an empty result is the honest half of a bad trade. No capability
+         * in the tree is in this shape today (`data` declares neither
+         * entry point and does its real work as a subscription, not a
+         * task), so this is the path for a future one. */
+        if (cap != NULL && cap->function != NULL)
+            task_run(&job->task);
+        log_debug(proc->logger,
+                  "Negotiation: job %s (%s) produced no result (rc=%d)\n",
+                  task_uuid_str, job->task.capability.name, rc);
+        _report_result(proc, &job->task, NULL);
+        return;
+    }
+
+    log_info(proc->logger, "Negotiation: job %s (%s) done\n",
+             task_uuid_str, job->task.capability.name);
+    _report_result(proc, &job->task, result);
+    /* Executor side, scoring our own completion: no subject, and none
+     * needed -- task_outcome is not slash-eligible. */
+    /* No subject, so no learned weight: competence is a fact about a
+     * peer's forecasting record, and this score is about our own
+     * completion. Neutral == the authored transaction_weight verbatim. */
+    /* Under the PAIR task id (ISSUES §2.50): this executor's half pairs
+     * only with the requester's half about this executor, however many
+     * peers the task fanned out to. */
+    const identity_t *me = identity_self_identity(proc);
+    if (me == NULL)
+    {
+        log_warn(proc->logger, "Negotiation: no identity; not scoring job %s\n",
+                 task_uuid_str);
+        return;
+    }
+    uuid_t pair;
+    tx_pair_task_uuid(job->task.uuid, me->uuid, pair);
+    _submit_tx_score(proc, pair, 0.9, job->task.capability.name,
+                     TX_CHANNEL_TASK_OUTCOME, NULL,
+                     NEG_NEUTRAL_COMPETENCE);
+}
+
+/* A worker thread: run the slot's capability into the slot's buffer, then
+ * mark it done for the loop to report. Touches nothing else. */
+static void *_run_job(void *arg)
+{
+    neg_running_t *slot = arg;
+    char result[CAP_RESULT_LEN + 1] = {0};
+    int rc = capability_execute_result(slot->cap, slot->job.task.kwargs_json,
+                                       result, sizeof(result));
+    pthread_mutex_lock(&neg_state.lock);
+    memcpy(slot->result, result, sizeof(slot->result));
+    slot->rc = rc;
+    slot->done = true;
+    pthread_mutex_unlock(&neg_state.lock);
+    return NULL;
+}
+
+static int _running_limit(void)
+{
+    int limit = neg_state.max_concurrency;
+    if (limit < 1)
+        limit = 1;
+    return limit < NEG_RUNNING_MAX ? limit : NEG_RUNNING_MAX;
+}
+
+/* Report every job whose thread has finished, and free its slot. */
+static void _finish_jobs(const process_t *proc)
+{
+    neg_running_t done[NEG_RUNNING_MAX];
+    size_t n_done = 0;
+    pthread_mutex_lock(&neg_state.lock);
+    for (int i = 0; i < NEG_RUNNING_MAX; i++)
+    {
+        neg_running_t *slot = &neg_state.running[i];
+        if (!slot->used || !slot->done)
+            continue;
+        /* The thread set `done` and released the lock it holds no more, so
+         * the join is immediate. */
+        pthread_join(slot->thread, NULL);
+        done[n_done++] = *slot;
+        memset(slot, 0, sizeof(*slot));
+    }
+    pthread_mutex_unlock(&neg_state.lock);
+    for (size_t i = 0; i < n_done; i++)
+        _complete_job(proc, &done[i].job, done[i].cap, done[i].rc,
+                      done[i].result);
+}
+
+/* Wait for every running job's thread (shutdown, and a test's reset). Their
+ * results are not reported. Caller must not hold neg_state.lock. */
+static void _join_running(void)
+{
+    for (int i = 0; i < NEG_RUNNING_MAX; i++)
+    {
+        neg_running_t *slot = &neg_state.running[i];
+        if (slot->used)
+            pthread_join(slot->thread, NULL);
+        memset(slot, 0, sizeof(*slot));
+    }
+}
+
+static void _drain_task_stack(const process_t *proc)
+{
+    _finish_jobs(proc);
+    time_t now_sec = time(NULL);
+    for (;;)
+    {
+        job_t job;
+        memset(&job, 0, sizeof(job));
+        bool have_job = false;
+        int free_slot = -1;
+
+        pthread_mutex_lock(&neg_state.lock);
+        int in_use = 0;
+        for (int i = 0; i < NEG_RUNNING_MAX; i++)
+        {
+            if (neg_state.running[i].used)
+                in_use++;
+            else if (free_slot < 0)
+                free_slot = i;
+        }
+        job_t peek;
+        memset(&peek, 0, sizeof(peek));
+        /* Peek before popping: a job scheduled for later must stay queued,
+         * and the queue is start-time ordered, so the earliest not being due
+         * means none is. A job with no slot free stays queued (and answers
+         * `pending`) until one frees. */
+        if (in_use < _running_limit() && free_slot >= 0
+            && job_queue_min(&neg_state.task_stack, &peek) == 0
+            && peek.start_time <= now_sec
+            && job_queue_pop(&neg_state.task_stack, &job) == 0)
+            have_job = true;
+        pthread_mutex_unlock(&neg_state.lock);
+
+        if (!have_job)
+            break;
+
+        char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+        uuid_unparse_lower(job.task.uuid, task_uuid_str);
+
+        /* A node with AT_BOOTSTRAP_DISABLED advertises no probe capability, so
+         * it should not answer one either -- an invitation that arrived before
+         * the peer's capability view caught up is dropped rather than
+         * answered. */
+        if (is_probe_capability(job.task.capability.name)
+            && !bootstrap_capabilities_enabled())
+        {
+            log_debug(proc->logger,
+                      "Negotiation: bootstrap disabled; dropping job %s (%s)\n",
+                      task_uuid_str, job.task.capability.name);
+            continue;
+        }
+
+        capability_t *cap = find_capability(job.task.capability.name);
+        if (cap == NULL)
+        {
+            log_warn(proc->logger,
+                     "Negotiation: accepted job %s names unknown capability "
+                     "'%s'; reporting no result\n",
+                     task_uuid_str, job.task.capability.name);
+            _report_result(proc, &job.task, NULL);
+            continue;
+        }
+
+        pthread_mutex_lock(&neg_state.lock);
+        neg_running_t *slot = &neg_state.running[free_slot];
+        memset(slot, 0, sizeof(*slot));
+        slot->job = job;
+        slot->cap = cap;
+        slot->used = true;
+        bool started = pthread_create(&slot->thread, NULL, _run_job, slot) == 0;
+        if (!started)
+            memset(slot, 0, sizeof(*slot));
+        pthread_mutex_unlock(&neg_state.lock);
+        if (started)
+            continue;
+
+        log_warn(proc->logger, "Negotiation: no thread for job %s; running it "
+                 "inline\n", task_uuid_str);
+        char result[CAP_RESULT_LEN + 1] = {0};
+        int rc = capability_execute_result(cap, job.task.kwargs_json,
+                                           result, sizeof(result));
+        _complete_job(proc, &job, cap, rc, result);
+    }
+}
+
+size_t negotiation_run_due_jobs(const process_t *proc)
+{
+    _ensure_init();
+    _drain_task_stack(proc);
+    size_t n = 0;
+    pthread_mutex_lock(&neg_state.lock);
+    for (int i = 0; i < NEG_RUNNING_MAX; i++)
+        if (neg_state.running[i].used)
+            n++;
+    pthread_mutex_unlock(&neg_state.lock);
+    return n;
+}
+
+/****************************
+ * Prober side: the bootstrap corpus, during the window and after it
+ *
+ * Python runs this as its own BootstrapWorker process, which posts a `start`
+ * message onto the negotiation queue. Here it rides the negotiation loop
+ * directly: the sink it needs is the announce path, and this is the process
+ * that owns it. Same probes, same allocation rules, one less process.
+ ****************************/
+
+/* Context for the two emit sinks below. */
+typedef struct {
+    const process_t *proc;
+    size_t peer_count;
+} probe_ctx_t;
+
+/* Build and announce one bootstrap task. @p target_index, when >= 0, addresses
+ * a single peer (a probe); < 0 fans out to every capable peer (a window pair).
+ * Takes neg_state.lock, so the caller must not hold it. */
+static bool _emit_bootstrap_task(const probe_ctx_t *ctx, const char *cap_name,
+                                 long nonce, const char *echo_payload,
+                                 int target_index)
+{
+    const process_t *proc = ctx->proc;
+    const identity_t *self = identity_self_identity(proc);
+
+    task_t task;
+    memset(&task, 0, sizeof(task));
+    uuid_generate(task.uuid);
+    if (self != NULL)
+        uuid_copy(task.requestor_uuid, self->uuid);
+    at_strlcpy(task.capability.name, cap_name, sizeof(task.capability.name));
+    task.flexible = true;
+    /* Now, and briefly: a probe that a peer schedules for later is a probe
+     * whose answer arrives after the question stopped being interesting. */
+    time_t now_sec = time(NULL);
+    struct tm *tm_ptr = gmtime(&now_sec);
+    if (tm_ptr != NULL)
+        memcpy(&task.when, tm_ptr, sizeof(struct tm));
+    task.duration.days = 0;
+    task.duration.seconds = 1;
+    task.timeout = 30;
+
+    /* The challenge. This is the requestor's copy and the only one that will
+     * be trusted when the answer comes back; _announce_task_locked hands it to
+     * the tracker. Keys match Python BootstrapWorker._build_task_args, because
+     * the responder reads them by name.
+     *
+     * Built through jansson rather than printf'd: the payload is a generated
+     * token today, but hand-interpolating a string into JSON is the shape that
+     * breaks the moment one contains a quote or a backslash, and a malformed
+     * challenge is a probe that scores an honest peer 0.1. */
+    json_t *kw = json_object();
+    if (kw != NULL)
+    {
+        if (strcmp(cap_name, "at.handshake") == 0)
+            json_object_set_new(kw, "nonce", json_integer((json_int_t)nonce));
+        else if (echo_payload != NULL && echo_payload[0] != '\0')
+            json_object_set_new(kw, "payload", json_string(echo_payload));
+        if (json_object_size(kw) > 0)
+        {
+            char *dumped = json_dumps(kw, JSON_COMPACT | JSON_SORT_KEYS);
+            if (dumped != NULL)
+            {
+                if (strlen(dumped) < sizeof(task.kwargs_json))
+                    at_strlcpy(task.kwargs_json, dumped,
+                               sizeof(task.kwargs_json));
+                free(dumped);
+            }
+        }
+        json_decref(kw);
+    }
+    /* A challenge that did not fit (or could not be built) would be sent as no
+     * challenge at all, and the responder would answer the default one and be
+     * scored wrong for it. Refuse to issue the probe instead. */
+    if (strcmp(cap_name, "at.time-attest") != 0 && task.kwargs_json[0] == '\0')
+    {
+        log_warn(proc->logger,
+                 "Negotiation: no challenge built for %s; probe not issued\n",
+                 cap_name);
+        return false;
+    }
+
+    uuid_t target;
+    uuid_clear(target);
+    if (target_index >= 0)
+    {
+        if ((size_t)target_index >= ctx->peer_count)
+            return false;
+        peers_read_lock(proc);
+        if ((size_t)target_index < proc->protocol.num_peers)
+            uuid_copy(target, proc->protocol.peers[target_index].uuid);
+        peers_read_unlock(proc);
+        /* The peer set can shrink between the worker's choice and this read;
+         * a probe with no addressee is not issued rather than fanned out. */
+        if (uuid_is_null(target))
+            return false;
+    }
+
+    /* Issued only if an invitation actually left: a probe whose every copy
+     * was refused is not one the worker should count. */
+    pthread_mutex_lock(&neg_state.lock);
+    int sent = _announce_task_locked(proc, &task, target);
+    pthread_mutex_unlock(&neg_state.lock);
+    return sent > 0;
+}
+
+static bool _pair_emit(void *vctx, const char *cap_name, long nonce,
+                       const char *echo_payload)
+{
+    return _emit_bootstrap_task((const probe_ctx_t *)vctx, cap_name, nonce,
+                                echo_payload, -1);
+}
+
+static bool _probe_emit(void *vctx, const char *cap_name, size_t peer_index,
+                        long nonce, const char *echo_payload)
+{
+    return _emit_bootstrap_task((const probe_ctx_t *)vctx, cap_name, nonce,
+                                echo_payload, (int)peer_index);
+}
+
+/* One pass of the bootstrap worker: open the window when peers first appear,
+ * emit pairs while it is open, and issue rate-limited directed probes
+ * thereafter (bootstrap_worker_tick_all). */
+static void _bootstrap_tick(const process_t *proc)
+{
+    if (neg_state.bootstrap.disabled)
+        return;
+    peers_read_lock(proc);
+    size_t peer_count = proc->protocol.num_peers;
+    peers_read_unlock(proc);
+    if (peer_count == 0)
+        return;
+
+    /* Who not to probe this pass: the peers reported absent. Snapshotted, so
+     * the worker reads a stable view; indices match peers[] for this tick
+     * (_emit_bootstrap_task re-checks the index under the lock). */
+    bool absent[DEFAULT_MAX_PEERS] = {false};
+    peers_read_lock(proc);
+    size_t snap = proc->protocol.num_peers < DEFAULT_MAX_PEERS
+                  ? proc->protocol.num_peers : DEFAULT_MAX_PEERS;
+    memcpy(absent, proc->protocol.peer_absent, snap * sizeof(absent[0]));
+    peers_read_unlock(proc);
+    if (peer_count > snap)
+        peer_count = snap;
+
+    probe_ctx_t ctx = { .proc = proc, .peer_count = peer_count };
+    double now_sec = _now_sec();
+    neg_state.bootstrap.skip_peer = absent;
+    bootstrap_worker_tick_all(&neg_state.bootstrap, peer_count, now_sec,
+                              _pair_emit, _probe_emit, &ctx);
+    neg_state.bootstrap.skip_peer = NULL;
 }
 
 /****************************
@@ -1634,10 +3233,11 @@ static bool handle_tier_lost(const process_t *proc, directory_t *queues, generic
                           orig_task->requestor_uuid);
                 cancel_msg.info.task_result.result_data = NULL;
                 cancel_msg.info.task_result.result_len  = 0;
-                messaging_send(AT_MAIN_QUEUE, TASK_RESULT, &cancel_msg, false);
+                _neg_send(proc, AT_MAIN_QUEUE, &cancel_msg, "a task cancellation");
 
                 map_remove(mt, task_uuid_str);
                 task_tracker_free(tracker);
+                free(tracker);
             }
         }
     }
@@ -1651,6 +3251,208 @@ static bool handle_tier_lost(const process_t *proc, directory_t *queues, generic
 
     json_decref(payload);
     return true;
+}
+
+/****************************
+ * Deadline sweep (doc/architecture/negotiation.md)
+ *
+ * A task of ours whose deadline (when + duration + timeout) has passed is
+ * asked about: a status request to every confirmed participant still owing a
+ * result. A live answer extends the deadline (handle_stat_resp). Silence, or
+ * an answer that does not extend, is asked again once an extension's worth of
+ * time has passed, and after NEG_STATUS_ASKS rounds the task is given up:
+ * logged and forgotten, with no result to main and no score -- a lost frame
+ * looks the same as a refusal. Mirrors Python NegotiationProcess.status_sweep.
+ ****************************/
+
+/* How far a live status answer moves the deadline, and so how long the sweep
+ * waits on one: the task's own timeout, else a fraction of its duration, else
+ * the default. Mirrors Python TaskParameters.extension_seconds. */
+static long _extension_secs(const task_t *task)
+{
+    if (task->timeout > 0)
+        return task->timeout;
+    long dur_secs = task->duration.seconds + (long)task->duration.days * 86400L;
+    if (dur_secs > 0)
+        return (dur_secs * NEG_DURATION_FRACTION_PCT) / 100L + 1L;
+    return NEG_TIMEOUT_EXTENSION_SEC;
+}
+
+/* Everything this node keeps about one of its own tasks: the tracker, the
+ * proposed copy, the confirmations and any outstanding status token. Caller
+ * holds neg_state.lock. */
+static void _forget_task_locked(const char *task_uuid_str)
+{
+    data_t *d = NULL;
+    if (map_get(&neg_state.my_tasks, (map_key_t)task_uuid_str, &d) == 0 && d != NULL)
+    {
+        task_tracker_t *tracker = NULL;
+        data_object_ptr(d, (ptr_t *)&tracker);
+        map_remove(&neg_state.my_tasks, (map_key_t)task_uuid_str);
+        if (tracker != NULL)
+        {
+            task_tracker_free(tracker);
+            free(tracker);
+        }
+    }
+    d = NULL;
+    if (map_get(&neg_state.proposed_tasks, (map_key_t)task_uuid_str, &d) == 0 && d != NULL)
+    {
+        task_t *task = NULL;
+        data_object_ptr(d, (ptr_t *)&task);
+        map_remove(&neg_state.proposed_tasks, (map_key_t)task_uuid_str);
+        free(task);
+    }
+    map_remove(&neg_state.confirmed, (map_key_t)task_uuid_str);
+    size_t prefix_len = strlen(task_uuid_str);
+    array_t *keys = map_keys(&neg_state.confirmed_pairs);
+    size_t n = array_size(keys);
+    for (size_t i = 0; i < n; i++)
+    {
+        data_t *kd = NULL;
+        char *k = NULL;
+        if (array_get(keys, (int)i, &kd) != 0 || data_string_ptr(kd, &k) != 0
+            || k == NULL)
+            continue;
+        if (strncmp(k, task_uuid_str, prefix_len) == 0 && k[prefix_len] == ':')
+            map_remove(&neg_state.confirmed_pairs, k);
+    }
+    for (size_t i = 0; i < array_size(&neg_state.status_pending); i++)
+    {
+        data_t *item = NULL;
+        char *stored = NULL;
+        if (array_get(&neg_state.status_pending, (int)i, &item) == 0
+            && data_string_ptr(item, &stored) == 0 && stored != NULL
+            && strncmp(stored, task_uuid_str, UUID_STRING_LEN) == 0)
+            stored[0] = '\0';
+    }
+}
+
+/* Drop the spent status tokens (blanked in place by handle_stat_resp and
+ * _forget_task_locked), so the list holds only outstanding requests. Caller
+ * holds neg_state.lock. */
+static void _compact_status_pending_locked(void)
+{
+    size_t i = 0;
+    while (i < array_size(&neg_state.status_pending))
+    {
+        data_t *item = NULL;
+        char *stored = NULL;
+        if (array_get(&neg_state.status_pending, (int)i, &item) == 0
+            && data_string_ptr(item, &stored) == 0 && stored != NULL
+            && stored[0] == '\0')
+        {
+            array_remove_at(&neg_state.status_pending, (int)i);
+            continue;
+        }
+        i++;
+    }
+}
+
+/* Ask every confirmed participant of @p tracker that still owes a result.
+ * Returns how many requests the network queue took. Caller holds
+ * neg_state.lock. */
+static int _ask_status_locked(const process_t *proc, const char *task_uuid_str,
+                              task_tracker_t *tracker, const task_t *task)
+{
+    json_t *body = _task_to_json(proc, task);
+    if (body == NULL)
+        return 0;
+    int asked = 0;
+    array_t *keys = map_keys(&tracker->invited);
+    size_t n = array_size(keys);
+    for (size_t i = 0; i < n; i++)
+    {
+        data_t *kd = NULL;
+        char *peer_str = NULL;
+        if (array_get(keys, (int)i, &kd) != 0 || data_string_ptr(kd, &peer_str) != 0
+            || peer_str == NULL)
+            continue;
+        char pair_key[UUID_STRING_LEN * 2 + 4];
+        snprintf(pair_key, sizeof(pair_key), "%s:%s", task_uuid_str, peer_str);
+        data_t *m = NULL;
+        if (map_get(&neg_state.confirmed_pairs, pair_key, &m) != 0 || m == NULL)
+            continue;   /* never accepted, or cancelled out */
+        uuid_t peer_uuid;
+        if (uuid_parse(peer_str, peer_uuid) != 0
+            || task_tracker_has_result(tracker, peer_uuid))
+            continue;   /* already answered */
+        public_identity_t peer;
+        if (!_peer_by_uuid(proc, peer_uuid, &peer))
+            continue;
+        generic_msg_t req = {0};
+        req.type = NET_MESSAGE;
+        strncpy(req.info.net_msg.process, "negotiation", PROC_NAME_LEN);
+        req.info.net_msg.function = NEG_PROTO_STAT_REQ;
+        req.info.net_msg.encrypt = true;
+        memcpy(&req.info.net_msg.to_whom, &peer, sizeof(public_identity_t));
+        strncpy(req.info.net_msg.return_to, "negotiation", PROC_NAME_LEN);
+        net_msg_pack_json(&req.info.net_msg, body);
+        if (_neg_send(proc, "network", &req, "a status request") == 0)
+            asked++;
+        net_msg_free_obj(&req.info.net_msg);
+    }
+    json_decref(body);
+    return asked;
+}
+
+size_t negotiation_status_sweep(const process_t *proc, double present)
+{
+    _ensure_init();
+    size_t given_up = 0;
+    pthread_mutex_lock(&neg_state.lock);
+    _compact_status_pending_locked();
+    array_t *keys = map_keys(&neg_state.my_tasks);
+    size_t n = array_size(keys);
+    for (size_t i = 0; i < n; i++)
+    {
+        data_t *kd = NULL;
+        char *task_uuid_str = NULL;
+        if (array_get(keys, (int)i, &kd) != 0
+            || data_string_ptr(kd, &task_uuid_str) != 0 || task_uuid_str == NULL)
+            continue;
+        data_t *d = NULL;
+        task_tracker_t *tracker = NULL;
+        task_t *task = NULL;
+        if (map_get(&neg_state.my_tasks, task_uuid_str, &d) == 0 && d != NULL)
+            data_object_ptr(d, (ptr_t *)&tracker);
+        d = NULL;
+        if (map_get(&neg_state.proposed_tasks, task_uuid_str, &d) == 0 && d != NULL)
+            data_object_ptr(d, (ptr_t *)&task);
+        if (tracker == NULL || task == NULL)
+            continue;
+        double deadline = (double)negotiation_dt_epoch(&task->when)
+            + (double)task->duration.seconds + (double)task->duration.days * 86400.0
+            + (double)task->timeout;
+        if (present <= deadline)
+            continue;
+        if (tracker->status_asks > 0
+            && present < tracker->status_asked_at + (double)_extension_secs(task))
+            continue;   /* still waiting on the last round */
+        int asked = 0;
+        if (tracker->status_asks < NEG_STATUS_ASKS)
+            asked = _ask_status_locked(proc, task_uuid_str, tracker, task);
+        if (asked == 0)
+        {
+            log_warn(proc->logger,
+                     "Negotiation: task %s past its deadline with no live answer "
+                     "after %d status request round(s); giving it up\n",
+                     task_uuid_str, tracker->status_asks);
+            _forget_task_locked(task_uuid_str);
+            given_up++;
+            continue;
+        }
+        tracker->status_asks++;
+        tracker->status_asked_at = present;
+        array_append(&neg_state.status_pending,
+                     string_data(task_uuid_str, strlen(task_uuid_str) + 1));
+        log_debug(proc->logger,
+                  "Negotiation: task %s past its deadline; asked %d participant(s) "
+                  "for status (round %d)\n",
+                  task_uuid_str, asked, tracker->status_asks);
+    }
+    pthread_mutex_unlock(&neg_state.lock);
+    return given_up;
 }
 
 /****************************
@@ -1726,6 +3528,7 @@ int negotiation_register_handlers(process_t *proc)
      * protocol message but registered the same way so the protocol
      * dispatch table routes it. */
     process_register_handler(proc, ID_TIER_LOST,      (handler_ptr_t)handle_tier_lost);
+    at_extensions_register_handlers(proc, "negotiation");
     return 0;
 }
 
@@ -1733,7 +3536,53 @@ int negotiation_run(process_t *proc, directory_t *queues, queue_id_t signal, log
 {
     _ensure_init();
     negotiation_register_handlers(proc);
+    /* A declared verification layer this binary lacks is a check that would
+     * silently not happen; refuse instead (neg_oracle.h). */
+    if (neg_oracles_check_env(logger) != 0)
+        return -1;
     proc->protocol.phase = 1;
-    return process_run(proc, queues, signal, logger);
+
+    /* Custom loop = process_loop plus the two periodic duties this process
+     * gained: running the jobs it accepted, and issuing the bootstrap
+     * corpus's challenges. Both sit at the documented "sub-process specific
+     * post-message activity" hook point, and both run on every pass rather
+     * than only when a message arrived -- process_loop `continue`s past that
+     * hook on an empty queue, which is exactly when a queued job is waiting.
+     * Same shape as data_source_run. */
+    process_ctx_t ctx = {0};
+    int err = process_setup(proc, signal, logger, &ctx);
+    if (err != 0)
+        return err;
+
+    while (keep_running(proc, &ctx.sig_q, logger))
+    {
+        sleep_until(proc, cadence);
+
+        /* Drain, don't sip: one message per cadence tick is slower than a
+         * cohort bootstrap fills this queue, and the surplus is dropped at the
+         * sender (MSG_DONTWAIT / EAGAIN), not buffered. The two hooks below
+         * still run once per tick, exactly as before. See PROC_DRAIN_MAX. */
+        generic_msg_t buf = {0};
+        for (int taken = 0; taken < PROC_DRAIN_MAX; taken++)
+        {
+            messaging_recv_release(&buf);   /* the previous pass's */
+            int rerr = messaging_recv(&buf);
+            if (rerr == -1 || rerr == ENOMSG)
+                break;
+            run_message_handlers(proc, queues, buf.type, &buf);
+        }
+        messaging_recv_release(&buf);
+
+        _drain_task_stack(proc);
+        _bootstrap_tick(proc);
+        negotiation_status_sweep(proc, (double)time(NULL));
+    }
+    _join_running();
+
+    if (ctx.fd1 > 0)
+        close(ctx.fd1);
+    if (ctx.fd2 > 0)
+        close(ctx.fd2);
+    return 0;
 }
 DECLARE_PROCESS(negotiation, neg_proc, negotiation_run);

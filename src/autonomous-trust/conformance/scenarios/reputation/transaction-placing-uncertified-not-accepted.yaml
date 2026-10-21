@@ -1,0 +1,41 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: transaction-placing-uncertified-not-accepted
+byte_pinning: false
+description: |
+    Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+    order"). A half is accepted only when it asks to be certified: a placed
+    entry carries its halves' certificates, and an unsigned acceptance would
+    certify nothing. This one names its group but does not ask, so bob does
+    not accept it.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+
+fixtures: {}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: transaction
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+      task_id: t-1
+      score: 0.8
+      certify: false
+      placing: true
+
+  - id: 2
+    from: bob
+    to: alice
+    function: tx accepted
+    in_response_to: 1
+    expect_none: true
+    payload: {}

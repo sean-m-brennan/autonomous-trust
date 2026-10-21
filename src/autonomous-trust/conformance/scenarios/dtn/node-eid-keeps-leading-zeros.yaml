@@ -1,0 +1,27 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: "1"
+kind: "scenario"
+protocol: "dtn"
+name: "node-eid-keeps-leading-zeros"
+description: |
+  Each byte is two hex digits, leading zeros kept.
+byte_pinning: false
+participants:
+  - id: "host"
+    role: "recipient"
+fixtures:
+  dtn:
+    op: "node_eid"
+    uuid: "000a0b0c-0000-4000-8000-000000000000"
+steps:
+  - id: 1
+    from: "host"
+    to: "host"
+    function: "node_eid"
+    description: "trigger: node_eid"
+expected_state:
+  host:
+    eid: "dtn://at-000a0b0c/"

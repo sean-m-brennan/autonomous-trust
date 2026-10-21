@@ -29,6 +29,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "utilities/socket_helpers.h"  /* at_socket_close */
 #include "net_transport_priv.h"
 #include "utilities/exception.h"
 
@@ -90,12 +91,21 @@ int net_transport_ip_bind_source(int sock, const char *address, int domain,
  * precondition cascade.
  */
 int net_transport_ip_bind(const socket_cfg_t *cfg, const char *address,
-                          int port, bool listen_sock, int *out_fd,
+                          int port, bool listen_sock, bool reuse, int *out_fd,
                           logger_t *logger)
 {
     struct addrinfo hints = {0};
     hints.ai_family = cfg->domain;
     hints.ai_socktype = cfg->type;
+#ifdef _WIN32
+    /* Winsock will not bind a broadcast or multicast group address, which is
+     * what the shared (reuse) sockets bind elsewhere; a socket bound to the
+     * wildcard address on that port receives them instead (the group join
+     * still names the group). UDP only; a TCP listener keeps its address.
+     * Unconfirmed on a Windows host: see ISSUES §2.74. */
+    if (reuse && cfg->type == SOCK_DGRAM)
+        address = NULL;
+#endif
     if (address == NULL)
         hints.ai_flags = AI_PASSIVE;
 
@@ -124,21 +134,69 @@ int net_transport_ip_bind(const socket_cfg_t *cfg, const char *address,
         return -1;
     }
 
-    int one = 1;
-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0)
+    /* Per-socket, deliberately — see the @p reuse contract in the header. Set
+     * on this socket, the option is also what would let a SECOND node bind the
+     * identical addr:port and take delivery of every datagram, so the unicast
+     * recv sockets opt out and get EADDRINUSE instead. */
+    if (reuse && cfg->type == SOCK_STREAM)
     {
-        close(sock);
-        freeaddrinfo(res);
-        SYS_EXCEPTION();
-        log_exception(logger);
-        return -1;
+        /* A TCP listener: SO_REUSEADDR (TIME_WAIT only, never over a live
+         * LISTEN) on POSIX; SO_EXCLUSIVEADDRUSE on Windows, whose SO_REUSEADDR
+         * WOULD let a second listener take the port. */
+        if (at_socket_listener_opts(sock) != 0)
+        {
+            at_socket_close(sock);
+            freeaddrinfo(res);
+            SYS_EXCEPTION();
+            log_exception(logger);
+            return -1;
+        }
+    }
+    else if (reuse)
+    {
+        int one = 1;
+        if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0)
+        {
+            at_socket_close(sock);
+            freeaddrinfo(res);
+            SYS_EXCEPTION();
+            log_exception(logger);
+            return -1;
+        }
+#ifdef __APPLE__
+        /* BSD sockets share a UDP port only with SO_REUSEPORT too (Linux's
+         * SO_REUSEADDR covers it, and there REUSEPORT would load-balance
+         * unicast between the sockets instead). UDP only, by the branch above:
+         * on a TCP listener it would let a second node share the port. */
+        if (setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) != 0)
+        {
+            at_socket_close(sock);
+            freeaddrinfo(res);
+            SYS_EXCEPTION();
+            log_exception(logger);
+            return -1;
+        }
+#endif
     }
 
     if (bind(sock, res->ai_addr, res->ai_addrlen) != 0)
     {
-        close(sock);
+        /* Saved before close()/freeaddrinfo()/log_error, any of which may set
+         * errno on their own; the reported cause has to be the bind's. */
+        int bind_errno = errno;
+        /* Name the likely cause: without SO_REUSEADDR this is how a second
+         * node sharing one base and one address now announces itself, and a
+         * bare "Address already in use" does not say which knob to move. */
+        if (bind_errno == EADDRINUSE)
+            log_error(logger,
+                      "Cannot bind %s:%d -- already held, most likely by "
+                      "another AT node on this address. Give each co-located "
+                      "node a distinct base port (config net_cfg.port, or "
+                      "AT_COMM_PORT).\n",
+                      address ? address : "*", port);
+        at_socket_close(sock);
         freeaddrinfo(res);
-        SYS_EXCEPTION();
+        EXCEPTION(bind_errno);
         log_exception(logger);
         return -1;
     }
@@ -147,7 +205,7 @@ int net_transport_ip_bind(const socket_cfg_t *cfg, const char *address,
     {
         if (listen(sock, 5) != 0)
         {
-            close(sock);
+            at_socket_close(sock);
             freeaddrinfo(res);
             SYS_EXCEPTION();
             log_exception(logger);

@@ -29,8 +29,11 @@ for Phase A and raise NotImplementedError so the runner records them as skip.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -92,6 +95,28 @@ class NetworkAdapter:
                 f'{label}: wire bytes diverge from pinned fixture '
                 f'{expected_path!r}\n  expected: {expected!r}\n  actual:   {actual_canonical!r}'
             )
+
+    def _assert_proto_byte_pin(self, spec: dict[str, Any], actual: bytes,
+                               label: str) -> None:
+        """Compare emitted proto-envelope bytes to the vector's inline hex.
+
+        Compared LITERALLY, unlike the JSON pin's canonical-form comparison:
+        protobuf has no canonical encoding to normalize toward, so "equal after
+        normalization" is not a thing one could check. That strictness is the
+        point -- it is exactly how a runtime whose field order or default-value
+        handling drifted gets caught, which is the risk that made byte-pinning
+        this worth doing.
+        """
+        if not spec.get('byte_pinning'):
+            return
+        expected_hex = (spec.get('expected') or {}).get('proto_wire_hex')
+        if not expected_hex:
+            return
+        actual_hex = actual.hex()
+        if actual_hex != expected_hex:
+            raise AssertionError(
+                f'{label}: proto wire bytes diverge from the pinned hex\n'
+                f'  expected: {expected_hex}\n  actual:   {actual_hex}')
 
     @staticmethod
     def _iter_formats(spec: str) -> list[str]:
@@ -181,6 +206,16 @@ class NetworkAdapter:
         raise AssertionError(f'unsupported wire_vector constructor: {constructor!r}')
 
     def _message_round_trip(self, args: dict[str, Any], spec: dict[str, Any]) -> None:
+        """Round-trip the Message envelope in the format(s) the case asks for.
+
+        `envelope_format` selects the NETWORK envelope encoding
+        (doc/architecture/network-wire-format.md) and is independent of
+        `wire_format`/`serialize_mode`, which govern how a Configuration *payload*
+        serializes. Default json, so every vector
+        written before the proto envelope existed keeps exercising exactly what
+        it did.
+        """
+        from autonomous_trust.core.config import NetWireFormat
         from autonomous_trust.core.network.message import Message
 
         process = args['process']
@@ -189,17 +224,45 @@ class NetworkAdapter:
         encrypt = bool(args.get('encrypt', False))
         trace_id = args.get('trace_id')
         msg = Message(process, function, obj, encrypt=encrypt, trace_id=trace_id)
-        wire = bytes(msg)
-        restored = Message.parse(wire, sender=None, validate=False)
-        assert restored.process == msg.process, 'Message.process drift'
-        assert restored.function == msg.function, 'Message.function drift'
-        # Message.parse re-runs the obj-coercion logic (Configuration auto-deser
-        # only fires for objects with __type__); for the simple string case we
-        # built, restored.obj should be string-equal.
-        assert str(restored.obj) == str(msg.obj), \
-            f'Message.obj drift: {restored.obj!r} != {msg.obj!r}'
-        assert restored.encrypt == msg.encrypt, 'Message.encrypt drift'
-        self._assert_byte_pin(spec, wire, 'Message')
+
+        which = spec.get('envelope_format', 'json')
+        formats = ([NetWireFormat.json, NetWireFormat.proto] if which == 'both'
+                   else [NetWireFormat.proto] if which == 'proto'
+                   else [NetWireFormat.json])
+
+        parsed: dict[str, Any] = {}
+        for fmt in formats:
+            wire = msg.to_wire(fmt)
+            restored = Message.parse(wire, sender=None, validate=False,
+                                     wire_format=fmt)
+            assert restored.process == msg.process, f'Message.process drift ({fmt})'
+            assert restored.function == msg.function, f'Message.function drift ({fmt})'
+            # Message.parse re-runs the obj-coercion logic (Configuration auto-deser
+            # only fires for objects with __type__); for the simple string case we
+            # built, restored.obj should be string-equal.
+            assert str(restored.obj) == str(msg.obj), \
+                f'Message.obj drift ({fmt}): {restored.obj!r} != {msg.obj!r}'
+            assert restored.encrypt == msg.encrypt, f'Message.encrypt drift ({fmt})'
+            assert restored.trace_id == msg.trace_id, f'Message.trace_id drift ({fmt})'
+            if fmt == NetWireFormat.proto:
+                # The marker is not part of the protobuf; a receiver reads it
+                # before deciding which parser the frame is eligible for.
+                assert wire[:1] == bytes([0xAB]), \
+                    f'proto envelope missing its 0xAB marker: got {wire[:1]!r}'
+                self._assert_proto_byte_pin(spec, wire, 'Message')
+            else:
+                self._assert_byte_pin(spec, wire, 'Message')
+            parsed[fmt] = restored
+
+        if which == 'both':
+            # Cross-format equivalence: the two encodings must mean the same
+            # thing, not merely each survive its own round trip.
+            j, p = parsed[NetWireFormat.json], parsed[NetWireFormat.proto]
+            for field in ('process', 'function', 'encrypt', 'trace_id'):
+                jv, pv = getattr(j, field), getattr(p, field)
+                assert jv == pv, f'cross-format {field} drift: json={jv!r} proto={pv!r}'
+            assert str(j.obj) == str(p.obj), \
+                f'cross-format obj drift: json={j.obj!r} proto={p.obj!r}'
 
     @staticmethod
     def _coerce_bytes(value: Any) -> bytes:
@@ -227,6 +290,7 @@ class NetworkAdapter:
             'nacl_box_open':      self._nacl_box_open,
             'nacl_secretbox':     self._nacl_secretbox,
             'nacl_secretbox_open': self._nacl_secretbox_open,
+            'relay_roster_verify': self._relay_roster_verify,
         }.get(primitive)
         if handler is None:
             raise AssertionError(f'unknown crypto primitive: {primitive!r}')
@@ -258,6 +322,39 @@ class NetworkAdapter:
             verified = False
         assert verified == should_verify, \
             f'ed25519_verify: got valid={verified}, expected valid={should_verify}'
+
+    @staticmethod
+    def _relay_roster_verify(inp: dict[str, Any], exp: dict[str, Any]) -> None:
+        """A community relay roster (FIRST_CONTACT_PLAN §4.2 / §4.5) against the
+        pinned issuers: accepted or refused, and when accepted the seq and the
+        relays as ``uuid:fp@host:port``. The file check only; the seq floor is
+        node state."""
+        try:
+            from autonomous_trust.rendezvous._python import relay_rosters
+        except ImportError:
+            # Rosters are rendezvous's (FEATURE_SPLIT_PLAN Phase 7b), as C's
+            # case skips without libat_rendezvous.
+            raise NotImplementedError(
+                'rendezvous case skipped: autonomous-trust-rendezvous is not installed '
+                '(put src/autonomous-trust-rendezvous on the path to run it symmetrically)')
+        should = bool(exp.get('valid', True))
+        try:
+            _issuer, seq, relays, areas = relay_rosters.verify_roster_areas(
+                inp['roster'], [k.lower() for k in inp.get('issuers', [])])
+            valid = True
+        except relay_rosters.InvalidRoster:
+            valid = False
+        assert valid == should, f'relay_roster_verify: got valid={valid}, expected valid={should}'
+        if valid:
+            got = ['%s:%s@%s:%d' % (pin[0], pin[1], ep[0], ep[1]) for ep, pin in relays]
+            assert seq == exp['seq'], f'relay_roster_verify: seq {seq}, expected {exp["seq"]}'
+            assert got == exp['relays'], f'relay_roster_verify: relays {got}, expected {exp["relays"]}'
+            if 'areas' in exp:
+                # The hubs' areas, keyed by the relay's uuid:fp@host:port.
+                got_areas = {'%s:%s@%s:%d' % (pin[0], pin[1], ep[0], ep[1]): areas[ep]
+                             for ep, pin in relays if ep in areas}
+                assert got_areas == exp['areas'], \
+                    f'relay_roster_verify: areas {got_areas}, expected {exp["areas"]}'
 
     @staticmethod
     def _nacl_box(inp: dict[str, Any], exp: dict[str, Any]) -> None:
@@ -349,6 +446,36 @@ class NetworkAdapter:
         if case.name == 'port-resolution':
             self._run_port_resolution(case)
             return
+        if case.name == 'tunables-resolution':
+            self._run_tunables_resolution(case)
+            return
+        if case.name == 'wire-format-mismatch-refused':
+            self._run_wire_format_mismatch_refused(case)
+            return
+        if case.name == 'wire-mode-resolution':
+            self._run_wire_mode_resolution(case)
+            return
+        if case.name == 'group-wire-format-canonical':
+            self._run_group_wire_format_canonical(case)
+            return
+        if case.name == 'cross-group-format-fallback':
+            self._run_cross_group_format_fallback(case)
+            return
+        if case.name == 'gateway-boundary-verbs':
+            self._run_gateway_boundary_verbs(case)
+            return
+        if case.name == 'wire-verb-policy':
+            self._run_wire_verb_policy(case)
+            return
+        if case.name == 'unencrypted-verbs':
+            self._run_unencrypted_verbs(case)
+            return
+        if case.name == 'plaintext-verbs-file':
+            self._run_plaintext_verbs_file(case)
+            return
+        if case.name == 'transport-binds-the-recipient':
+            self._run_transport_binds_the_recipient(case)
+            return
         raise NotImplementedError(
             f'network scenario {case.name!r} not implemented'
         )
@@ -409,6 +536,438 @@ class NetworkAdapter:
                 os.environ.pop('AT_COMM_PORT', None)
             else:
                 os.environ['AT_COMM_PORT'] = saved
+
+    def _run_wire_format_mismatch_refused(self, case: Case) -> None:
+        """The strict envelope-format gate, both directions
+        (doc/architecture/network-wire-format.md).
+
+        Asserts the four combinations of (frame format, expected format) and,
+        for the two mismatches, that the refusal is FORMAT-specific rather than
+        generic malformed-input -- the operator-visible difference between "this
+        peer is broken" and "this cohort is misprovisioned".
+        """
+        from autonomous_trust.core.config import NetWireFormat
+        from autonomous_trust.core.network.message import Message, WireFormatMismatch
+
+        fx = case.data.get('fixtures') or {}
+        msg = Message(fx.get('process', 'identity'), fx.get('function', 'request_access'),
+                      fx.get('obj_json', '{}'), encrypt=False,
+                      trace_id=fx.get('trace_id'))
+        json_wire = msg.to_wire(NetWireFormat.json)
+        proto_wire = msg.to_wire(NetWireFormat.proto)
+
+        def accepted(raw, fmt):
+            """(ok, format_specific_refusal)"""
+            try:
+                Message.parse(raw, sender=None, validate=False, wire_format=fmt)
+                return True, False
+            except WireFormatMismatch:
+                return False, True
+            except Exception:
+                return False, False
+
+        json_as_json_ok, _ = accepted(json_wire, NetWireFormat.json)
+        proto_as_proto_ok, _ = accepted(proto_wire, NetWireFormat.proto)
+        proto_as_json_ok, p_fmt_specific = accepted(proto_wire, NetWireFormat.json)
+        json_as_proto_ok, j_fmt_specific = accepted(json_wire, NetWireFormat.proto)
+
+        state = {
+            'json_as_json_ok': json_as_json_ok,
+            'proto_as_proto_ok': proto_as_proto_ok,
+            'proto_as_json_refused': not proto_as_json_ok,
+            'json_as_proto_refused': not json_as_proto_ok,
+            'refusal_is_format_specific': p_fmt_specific and j_fmt_specific,
+        }
+        _assert_expected_flags(case, 'node', state)
+
+    def _run_wire_mode_resolution(self, case: Case) -> None:
+        """AT_NET_WIRE_MODE resolution: env -> compile-time default.
+
+        Same shape as _run_tunables_resolution, against the named-value
+        resolver. The C adapter runs this identical table against
+        net_wire_mode_resolve, so a knob that accepts a spelling on one side
+        only fails here rather than at a cohort that cannot form.
+        """
+        from autonomous_trust.core._python import system as at_system
+
+        fx = case.data.get('fixtures') or {}
+        knob = fx.get('knob') or {}
+        table = fx.get('resolutions') or []
+        if not table:
+            raise AssertionError('scenario: fixtures.resolutions missing or empty')
+
+        constants_match = True
+        if 'default' in knob and knob['default'] != at_system.default_net_wire_mode:
+            constants_match = False
+        if 'choices' in knob and tuple(knob['choices']) != tuple(at_system.net_wire_modes):
+            constants_match = False
+
+        var = knob.get('env', 'AT_NET_WIRE_MODE')
+        saved = os.environ.get(var)
+        all_match = True
+        try:
+            for row in table:
+                rid = row.get('id', '?')
+                env = row.get('env')
+                if env is None:
+                    os.environ.pop(var, None)
+                else:
+                    os.environ[var] = str(env)
+                got, got_src = at_system.resolve_net_wire_mode()
+                if got != row['expect_value'] or got_src != row['expect_source']:
+                    all_match = False
+                    raise AssertionError(
+                        f'{rid}: {var}={"(unset)" if env is None else env!r} -> '
+                        f'({got!r}, {got_src!r}), want '
+                        f'({row["expect_value"]!r}, {row["expect_source"]!r})')
+        finally:
+            if saved is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = saved
+
+        _assert_expected_flags(case, 'node', {
+            'knob_constants_match': constants_match,
+            'all_resolutions_match': all_match,
+        })
+
+    def _run_group_wire_format_canonical(self, case: Case) -> None:
+        """The group's envelope format crosses the wire with the group (doc/architecture/network-wire-format.md)."""
+        from autonomous_trust.core.config import NetWireFormat
+        from autonomous_trust.core.identity.group import Group
+        from autonomous_trust.core.identity.encrypt import Encryptor
+
+        fx = case.data.get('fixtures') or {}
+        addr_map = dict(fx.get('address_map') or {})
+
+        def make(fmt):
+            return Group(fx.get('group_uuid'), addr_map, '',
+                         Encryptor.generate(), False, _wire_format=fmt)
+
+        proto_canon = make(NetWireFormat.proto).to_canonical()
+        json_canon = make(NetWireFormat.json).to_canonical()
+
+        # Absent field: a group from a peer predating this, or a config written
+        # before it. Must read as json, not error and not proto.
+        absent = dict(proto_canon)
+        absent.pop('wire_format', None)
+        # Unrecognized value: a provisioning typo, which must tighten to the
+        # format every node can read.
+        unknown = dict(proto_canon)
+        unknown['wire_format'] = 'yaml'
+
+        state = {
+            'canonical_key_present': 'wire_format' in proto_canon,
+            'proto_roundtrips':
+                Group.from_canonical(proto_canon).wire_format == NetWireFormat.proto,
+            'json_roundtrips':
+                Group.from_canonical(json_canon).wire_format == NetWireFormat.json,
+            'absent_reads_json':
+                Group.from_canonical(absent).wire_format == NetWireFormat.json,
+            'unknown_reads_json':
+                Group.from_canonical(unknown).wire_format == NetWireFormat.json,
+        }
+        _assert_expected_flags(case, 'node', state)
+
+    def _run_cross_group_format_fallback(self, case: Case) -> None:
+        """A group answers with its own format for its own members and with
+        JSON for anyone it cannot place -- the rule that lets two
+        differently-formatted cohorts complete a merge handshake
+        (doc/architecture/network-wire-format.md).
+        """
+        from autonomous_trust.core.config import NetWireFormat
+        from autonomous_trust.core.identity import Group, Encryptor
+
+        fx = case.data.get('fixtures') or {}
+        proto_member = fx.get('proto_member', '10.0.0.1')
+        json_member = fx.get('json_member', '10.0.1.1')
+        stranger = fx.get('stranger', '10.0.9.9')
+
+        def _group(uuid_str, member, fmt):
+            # The key is irrelevant here -- this asks only about the address
+            # map and the format field -- but Group wants a real Encryptor.
+            return Group(uuid_str, {member: member}, 'cohort',
+                         Encryptor.generate(), False, _wire_format=fmt)
+
+        proto_grp = _group(fx.get('proto_group_uuid'), proto_member,
+                           NetWireFormat.proto)
+        json_grp = _group(fx.get('json_group_uuid'), json_member,
+                          NetWireFormat.json)
+
+        state = {
+            'proto_group_to_own_member_is_proto':
+                proto_grp.wire_format_for_address(proto_member) == NetWireFormat.proto,
+            'json_group_to_own_member_is_json':
+                json_grp.wire_format_for_address(json_member) == NetWireFormat.json,
+            # The merge handshake: neither can place the other's member.
+            'proto_group_to_foreign_member_is_json':
+                proto_grp.wire_format_for_address(json_member) == NetWireFormat.json,
+            'json_group_to_foreign_member_is_json':
+                json_grp.wire_format_for_address(proto_member) == NetWireFormat.json,
+            'proto_group_to_stranger_is_json':
+                proto_grp.wire_format_for_address(stranger) == NetWireFormat.json,
+        }
+        _assert_expected_flags(case, 'node', state)
+
+    def _run_gateway_boundary_verbs(self, case: Case) -> None:
+        """The membership of BOOTSTRAP_VERBS -- the verbs the gateway boundary
+        refuses to carry (doc/architecture/network-wire-format.md).
+
+        Two hand-maintained lists in two languages, so the negative half is
+        what earns this case: a verb added on one side only would otherwise
+        open the boundary on one runtime and close it on the other.
+        """
+        from autonomous_trust.core.identity.protocol import BOOTSTRAP_VERBS
+
+        fx = case.data.get('fixtures') or {}
+        boots = list(fx.get('bootstrap_verbs') or [])
+        others = list(fx.get('not_bootstrap_verbs') or [])
+
+        state = {
+            'all_bootstrap_verbs_recognized':
+                all(v in BOOTSTRAP_VERBS for v in boots),
+            'no_other_verb_is_bootstrap':
+                not any(v in BOOTSTRAP_VERBS for v in others),
+            'bootstrap_verb_count_is_three': len(BOOTSTRAP_VERBS) == 3,
+            # C's classifier takes NULL; Python's set is asked with None/''.
+            'empty_verb_is_not_bootstrap':
+                (None not in BOOTSTRAP_VERBS) and ('' not in BOOTSTRAP_VERBS),
+        }
+        _assert_expected_flags(case, 'node', state)
+
+    def _run_wire_verb_policy(self, case: Case) -> None:
+        """What an inbound frame may carry, by its path (ISSUES §2.17): each
+        fixture case asked of netprocess.wire_verb_admitted. Mirrors C
+        run_wire_verb_policy."""
+        from autonomous_trust.core._python.network.netprocess import \
+            wire_verb_admitted
+        cases = (case.data.get('fixtures') or {}).get('cases') or []
+        mismatched = [c for c in cases
+                      if wire_verb_admitted(c['process'], c['function'],
+                                            c['path'])[0] != bool(c['admitted'])]
+        if mismatched:
+            print('wire-verb-policy mismatches:', mismatched)
+        _assert_expected_flags(case, 'node', {
+            'all_cases_match': bool(cases) and not mismatched})
+
+    def _run_unencrypted_verbs(self, case: Case) -> None:
+        """The plaintext allowlist: which verbs a receiver accepts unencrypted
+        from a known peer, and how that set relates to the bootstrap set.
+
+        The core's verbs are compiled in; first contact's are granted by the
+        scenario's `plaintext_file`, applied through the production loader
+        with that extension enabled. Hand-maintained in two languages, so the
+        negative half is where the value is: a verb added on one side only
+        becomes a downgrade opening on that runtime alone. The `full_history`
+        assertion is the sharpest one -- it is bootstrap yet must never ride in
+        the clear, because it carries the group key.
+        """
+        from autonomous_trust.core import plaintext_verbs
+        from autonomous_trust.core.identity.protocol import (
+            CORE_UNENCRYPTED_VERBS, BOOTSTRAP_VERBS)
+
+        fx = case.data.get('fixtures') or {}
+        plain = list(fx.get('unencrypted_verbs') or [])
+        core = list(fx.get('core_unencrypted_verbs') or [])
+        enc_only = list(fx.get('encrypted_only_verbs') or [])
+        both = list(fx.get('both_bootstrap_and_unencrypted') or [])
+        boot_enc = list(fx.get('bootstrap_but_encrypted') or [])
+        if not plain:
+            raise AssertionError('scenario: fixtures.unencrypted_verbs missing or empty')
+        if fx.get('first_contact') and not _first_contact_present():
+            # First contact declares the verbs its file grants; without its
+            # distribution the file is refused, as it should be.
+            raise NotImplementedError('first-contact scenario skipped: autonomous-trust-first-contact is not installed (put src/autonomous-trust-first-contact on the path to run it symmetrically)')
+
+        with _plaintext_file(fx.get('plaintext_file'),
+                             bool(fx.get('first_contact'))) as cfg_dir:
+            granted = _configure_plaintext(cfg_dir)
+            if granted is None:
+                raise AssertionError('scenario: plaintext_file was refused')
+            active = plaintext_verbs.active()
+            ok = plaintext_verbs.is_unencrypted
+            state = {
+                'all_unencrypted_verbs_recognized': all(ok(v) for v in plain),
+                'no_other_verb_is_unencrypted': not any(ok(v) for v in enc_only),
+                'unencrypted_verb_count_is_fourteen': len(active) == 14,
+                'core_verbs_are_exactly_these_nine':
+                    len(CORE_UNENCRYPTED_VERBS) == 9
+                    and set(core) == set(CORE_UNENCRYPTED_VERBS),
+                'granted_verbs_are_not_core':
+                    bool(granted) and not (granted & CORE_UNENCRYPTED_VERBS),
+                'empty_verb_is_not_unencrypted': not ok(None) and not ok(''),
+                'overlap_verbs_are_both':
+                    bool(both) and all(ok(v) and v in BOOTSTRAP_VERBS for v in both),
+                # Bootstrap, but encrypted: the group key never rides in plaintext.
+                'full_history_is_bootstrap_but_not_unencrypted':
+                    bool(boot_enc) and all(v in BOOTSTRAP_VERBS and not ok(v)
+                                           for v in boot_enc),
+            }
+        _assert_expected_flags(case, 'node', state)
+
+    def _run_plaintext_verbs_file(self, case: Case) -> None:
+        """The rules of unencrypted_verbs.cfg.json (FEATURE_SPLIT_PLAN D8):
+        each row applies one file through the production loader and records
+        whether the start is refused and how many verbs are granted."""
+        from autonomous_trust.core import plaintext_verbs
+        from autonomous_trust.core.identity.protocol import CORE_UNENCRYPTED_VERBS
+
+        rows = (case.data.get('fixtures') or {}).get('rows') or []
+        if not rows:
+            raise AssertionError('scenario: fixtures.rows missing or empty')
+        all_match = refusal_grants_nothing = gku_never = True
+        for row in rows:
+            if row.get('first_contact') and not _first_contact_present():
+                continue    # needs first contact's distribution; the core's rows still run
+            with _plaintext_file(row.get('file'),
+                                 bool(row.get('first_contact'))) as cfg_dir:
+                granted = _configure_plaintext(cfg_dir)
+                refused = granted is None
+                count = len(plaintext_verbs.active() - CORE_UNENCRYPTED_VERBS)
+                if refused and count != 0:
+                    refusal_grants_nothing = False
+                if plaintext_verbs.is_unencrypted('group_key_update'):
+                    gku_never = False
+            if refused != bool(row['expect_refused']) \
+                    or count != int(row['expect_granted']):
+                all_match = False
+                raise AssertionError(
+                    '%s: refused=%s granted=%d, want refused=%s granted=%d'
+                    % (row.get('id', '?'), refused, count, row['expect_refused'],
+                       row['expect_granted']))
+        _assert_expected_flags(case, 'node', {
+            'all_rows_match': all_match,
+            'a_refusal_grants_nothing': refusal_grants_nothing,
+            'group_key_update_never_plaintext': gku_never,
+        })
+
+    def _run_transport_binds_the_recipient(self, case: Case) -> None:
+        """The envelope's `from_*` claim is read ONLY when the transport gave
+        no peer (R+D.md §2.6).
+
+        One signed frame, parsed three ways per format: attributed to its true
+        signer, attributed to a relayer, and unattributed. The relay row is the
+        security property; the override row is what proves the ORDERING rather
+        than merely a disagreement being caught.
+        """
+        from autonomous_trust.core.config import NetWireFormat
+        from autonomous_trust.core.network.message import Message
+
+        fx = case.data.get('fixtures') or {}
+        signer = _make_test_identity('a', addr='10.0.80.1')
+        relayer = _make_test_identity('b', addr='10.0.80.2')
+        signer_pub, relayer_pub = signer.publish(), relayer.publish()
+
+        msg = Message(fx.get('process', 'idproc'),
+                      fx.get('function', 'peer_caps_query'),
+                      fx.get('obj_json', 'payload'),
+                      from_whom=signer, encrypt=False,
+                      trace_id=fx.get('trace_id'))
+
+        state = {}
+        for label, fmt in (('json', NetWireFormat.json),
+                           ('proto', NetWireFormat.proto)):
+            wire = msg.to_wire(fmt)
+
+            # Row 1: honest. Doubles as the control -- without it a parser that
+            # verified nothing would satisfy row 2.
+            true_sender = Message.parse(wire, signer_pub, wire_format=fmt)
+            # Row 2: the SAME bytes, attributed to someone else. The relay.
+            relayed = Message.parse(wire, relayer_pub, wire_format=fmt)
+            # Row 3: no transport peer -- the bootstrap channel.
+            unattributed = Message.parse(wire, None, wire_format=fmt)
+
+            state['%s_verified_for_true_sender' % label] = true_sender.verified
+            state['%s_relay_refused' % label] = not relayed.verified
+            # The ordering: with a peer supplied, the parsed sender IS that
+            # peer, not the envelope's claim.
+            state['%s_transport_peer_overrides_envelope' % label] = (
+                str(getattr(relayed.from_whom, 'uuid', None)) == str(relayer.uuid))
+            state['%s_unattributed_verified' % label] = unattributed.verified
+            state['%s_unattributed_sender_is_envelope_claim' % label] = (
+                str(getattr(unattributed.from_whom, 'uuid', None)) == str(signer.uuid))
+
+        _assert_expected_flags(case, 'signer', state)
+
+    def _run_tunables_resolution(self, case: Case) -> None:
+        """Network-tunable resolution: env -> compile-time default.
+
+        Runs the scenario's table against the production resolvers. The C
+        adapter runs the same table against net_annoy_limit_resolve /
+        net_recv_poll_ms_resolve / net_mystery_max_age_resolve, so a knob that
+        exists on one side only -- which is exactly what this case was written
+        to prevent recurring -- fails here.
+        """
+        from autonomous_trust.core._python import system as at_system
+
+        fixtures = case.data.get('fixtures') or {}
+        knobs = {k['name']: k for k in (fixtures.get('knobs') or [])}
+        table = fixtures.get('resolutions') or []
+        if not knobs:
+            raise AssertionError('scenario: fixtures.knobs missing or empty')
+        if not table:
+            raise AssertionError('scenario: fixtures.resolutions missing or empty')
+
+        # name -> (resolver, default, min, max) as THIS implementation has them.
+        mine = {
+            'annoy_limit': (at_system.resolve_annoy_limit,
+                            at_system.default_annoy_limit,
+                            at_system.annoy_limit_min,
+                            at_system.annoy_limit_max),
+            'recv_poll_ms': (at_system.resolve_recv_poll_ms,
+                             at_system.default_recv_poll_ms,
+                             at_system.recv_poll_ms_min,
+                             at_system.recv_poll_ms_max),
+            'mystery_max_age_s': (at_system.resolve_mystery_max_age_s,
+                                  at_system.default_mystery_max_age_s,
+                                  at_system.mystery_max_age_s_min,
+                                  at_system.mystery_max_age_s_max),
+        }
+
+        # Pinned in the scenario so a drift in either side's constants fails
+        # here instead of agreeing on a value neither side got from the other.
+        for name, spec in knobs.items():
+            if name not in mine:
+                raise AssertionError(f'scenario knob {name!r} has no Python resolver')
+            _, dflt, lo, hi = mine[name]
+            for key, actual in (('default', dflt), ('min', lo), ('max', hi)):
+                if key in spec and spec[key] != actual:
+                    raise AssertionError(
+                        f'{name}.{key}: scenario says {spec[key]}, Python says {actual}')
+
+        env_names = {name: knobs[name]['env'] for name in knobs}
+        saved = {var: os.environ.get(var) for var in env_names.values()}
+        try:
+            for row in table:
+                rid = row.get('id', '?')
+                name = row['knob']
+                if name not in mine:
+                    raise AssertionError(f'{rid}: unknown knob {name!r}')
+                resolver = mine[name][0]
+                var = env_names[name]
+                env = row.get('env')
+                want_value = row['expect_value']
+                want_src = row['expect_source']
+
+                if env is None:
+                    os.environ.pop(var, None)
+                else:
+                    os.environ[var] = str(env)
+
+                got, got_src = resolver()
+                shown = '(unset)' if env is None else repr(env)
+                if got != want_value:
+                    raise AssertionError(
+                        f'{rid}: {var}={shown} -> {name} {got}, want {want_value}')
+                if got_src != want_src:
+                    raise AssertionError(
+                        f'{rid}: {var}={shown} -> source {got_src!r}, want {want_src!r}')
+        finally:
+            for var, val in saved.items():
+                if val is None:
+                    os.environ.pop(var, None)
+                else:
+                    os.environ[var] = val
 
     def _run_peer_encrypted_roundtrip(self, case: Case) -> None:
         """Exercise A.encrypt → B.decrypt → Message.parse end-to-end.
@@ -840,6 +1399,73 @@ def _assert_expected_state(case: Case, participant_id: str, parsed) -> None:
             f'{participant_id}: verified mismatch: '
             f'expected {ver}, got {parsed.verified}'
         )
+
+
+def _first_contact_present() -> bool:
+    """Whether first contact's distribution (FEATURE_SPLIT_PLAN Phase 7) is on
+    the path. Without it, C's twin is a build without libat_first_contact."""
+    import importlib.util
+    return importlib.util.find_spec('autonomous_trust.first_contact') is not None
+
+
+@contextlib.contextmanager
+def _plaintext_file(doc, first_contact: bool):
+    """A scratch configuration directory holding ``doc`` as the node's
+    unencrypted_verbs.cfg.json (a string is written as-is, anything else as
+    JSON; no file at all for None), with AT_FIRST_CONTACT set to
+    ``first_contact``. Restores the flag and resets the grant afterwards."""
+    from autonomous_trust.core import plaintext_verbs
+    saved = os.environ.get('AT_FIRST_CONTACT')
+    os.environ['AT_FIRST_CONTACT'] = '1' if first_contact else '0'
+    plaintext_verbs.reset()
+    try:
+        with tempfile.TemporaryDirectory() as cfg_dir:
+            if doc is not None:
+                with open(os.path.join(cfg_dir, plaintext_verbs.FILENAME), 'w') as fh:
+                    fh.write(doc if isinstance(doc, str) else json.dumps(doc))
+            yield cfg_dir
+    finally:
+        plaintext_verbs.reset()
+        if saved is None:
+            os.environ.pop('AT_FIRST_CONTACT', None)
+        else:
+            os.environ['AT_FIRST_CONTACT'] = saved
+
+
+def _configure_plaintext(cfg_dir):
+    """The verbs the node-start check grants from ``cfg_dir``, or None when it
+    refuses the start."""
+    from autonomous_trust.core import plaintext_verbs
+    from autonomous_trust.core.extensions import configure_plaintext_verbs
+    try:
+        return configure_plaintext_verbs(cfg_dir, logging.getLogger('conformance'))
+    except plaintext_verbs.PlaintextVerbsError:
+        return None
+
+
+def _assert_expected_flags(case: Case, participant_id: str,
+                           actual: dict[str, Any]) -> None:
+    """Compare a dict of BOOLEAN observables against `expected_state`.
+
+    The sibling of `_assert_expected_state`, which compares a parsed Message.
+    Table-driven cases (resolution tables, format gates) observe flags rather
+    than a routed message, and their scenarios declare those flags -- so they
+    should be CHECKED rather than left as documentation the adapter happens to
+    agree with. Every key the scenario declares must be present here: a
+    scenario asserting something the adapter never measured would otherwise
+    pass vacuously, which is the failure mode that makes a corpus reassuring
+    and wrong.
+    """
+    expected = case.data.get('expected_state', {}).get(participant_id, {}) or {}
+    for key, want in expected.items():
+        if key not in actual:
+            raise AssertionError(
+                f'{participant_id}: scenario expects {key!r} but the adapter '
+                f'did not measure it')
+        if bool(actual[key]) != bool(want):
+            raise AssertionError(
+                f'{participant_id}: {key} mismatch: expected {want}, '
+                f'got {actual[key]}')
 
 
 def _assert_expected_state_b(case: Case, parsed) -> None:

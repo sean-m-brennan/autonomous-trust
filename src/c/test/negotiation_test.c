@@ -23,6 +23,7 @@
 
 #include "negotiation/task_priv.h"
 #include "negotiation/negotiation.h"
+#include "negotiation/neg_proc_priv.h"
 
 DEFINE_TEST(test_job_queue_basic)
 {
@@ -76,4 +77,108 @@ DEFINE_TEST(test_task_tracker_basic)
 }
 END_TEST_DEFINITION()
 
-RUN_TESTS(Negotiation, test_job_queue_basic, test_task_tracker_basic)
+/* Freshness sequence survives the protobuf round trip.
+ *
+ * `seq` is field 12 of negotiation/task.proto and the token that makes an
+ * invitation non-replayable (utilities/freshness.h, and
+ * doc/architecture/security-hardening.md "Replay resistance, per verb"). It
+ * rides the same task_t that msg_types.c packs for a TASK_MESSAGE, so a field
+ * lost in pack/unpack would silently turn every invitation unstamped — which
+ * handle_invite refuses, taking the whole verb down rather than failing
+ * visibly here. Hence pinning it at this level. */
+DEFINE_TEST(test_task_proto_roundtrip_carries_seq)
+{
+    task_t out;
+    memset(&out, 0, sizeof(out));
+    uuid_generate(out.uuid);
+    uuid_generate(out.requestor_uuid);
+    strncpy(out.capability.name, "data_fetch", CAP_NAMELEN);
+    out.timeout = 30;
+    out.flexible = true;
+    out.duration.days = 0;
+    out.duration.seconds = 60;
+    out.seq = 7;
+
+    void *data = NULL;
+    size_t data_len = 0;
+    ck_assert_ret_ok(task_to_proto(&out, sizeof(out), &data, &data_len));
+    ck_assert_ptr_nonnull(data);
+
+    task_t in;
+    memset(&in, 0, sizeof(in));
+    ck_assert_int_eq(proto_to_task((uint8_t *)data, data_len, &in), 0);
+    ck_assert_int_eq((int)in.seq, 7);
+    ck_assert_int_eq(uuid_compare(in.uuid, out.uuid), 0);
+    free(data);
+}
+END_TEST_DEFINITION()
+
+/* An unstamped task reads back as seq 0, the never-seen floor that
+ * freshness_accept refuses. This is the flag-day encoding: a peer that has not
+ * been rebuilt omits field 12, an omitted field unpacks as 0, and 0 is a
+ * refusal — so no version check is needed to tell the two apart. */
+DEFINE_TEST(test_task_proto_unstamped_reads_zero)
+{
+    task_t out;
+    memset(&out, 0, sizeof(out));
+    uuid_generate(out.uuid);
+    strncpy(out.capability.name, "data_fetch", CAP_NAMELEN);
+    /* out.seq deliberately left at 0 */
+
+    void *data = NULL;
+    size_t data_len = 0;
+    ck_assert_ret_ok(task_to_proto(&out, sizeof(out), &data, &data_len));
+
+    task_t in;
+    memset(&in, 0, sizeof(in));
+    in.seq = 99;  /* must be overwritten, not merely left alone */
+    ck_assert_int_eq(proto_to_task((uint8_t *)data, data_len, &in), 0);
+    ck_assert_int_eq((int)in.seq, 0);
+    free(data);
+}
+END_TEST_DEFINITION()
+
+/* A task's start time must not depend on the HOST's timezone.
+ *
+ * `task.when` is UTC — the requester builds it with gmtime — and the accepted
+ * job's start_time used to go through mktime, which applies the local zone.
+ * On a UTC host that is a no-op, so every docker-backed cohort ran its jobs
+ * and nobody noticed. On a host in EDT it put every job FIVE HOURS in the
+ * future, `_drain_task_stack` never found one due, no task ever completed,
+ * and no task_outcome reputation transaction was ever submitted: zero jobs
+ * across every netns cohort run ever recorded, against 18 in the docker runs.
+ *
+ * Forces a non-UTC zone on purpose. Run in UTC (most CI), a test that did not
+ * set TZ would pass against the broken conversion too. */
+DEFINE_TEST(test_task_start_epoch_ignores_the_host_timezone)
+{
+    char *saved = getenv("TZ");
+    char keep[64] = {0};
+    if (saved != NULL) snprintf(keep, sizeof(keep), "%s", saved);
+
+    setenv("TZ", "America/New_York", 1);
+    tzset();
+
+    time_t now = time(NULL);
+    datetime_t when;
+    memset(&when, 0, sizeof(when));
+    /* utc=true: exactly what the requester puts on the wire. */
+    ck_assert_int_eq(datetime_from_time(now, 0, false, &when), 0);
+
+    time_t got = negotiation_dt_epoch(&when);
+    if (got != now)
+        _ck_fail("start epoch %ld != %ld (off by %ld s) — the conversion is "
+                 "applying the host timezone to a UTC struct, so every "
+                 "accepted job is scheduled into the future and never runs",
+                 (long)got, (long)now, (long)(got - now));
+    _test_count++;
+
+    if (keep[0] != '\0') setenv("TZ", keep, 1); else unsetenv("TZ");
+    tzset();
+}
+
+
+RUN_TESTS(Negotiation,
+          test_task_start_epoch_ignores_the_host_timezone, test_job_queue_basic, test_task_tracker_basic,
+          test_task_proto_roundtrip_carries_seq,
+          test_task_proto_unstamped_reads_zero)

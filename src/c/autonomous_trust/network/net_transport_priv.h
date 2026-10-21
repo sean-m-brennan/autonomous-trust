@@ -34,6 +34,26 @@
 #define UDP_PACKET_SIZE 65507
 #define TCP_CHUNK_SIZE  2048
 
+/** Array bound on simultaneously-held inbound TCP connections. The runtime
+ *  cap is the AT_NET_MAX_CONNS knob (default 64), clamped to this; the array
+ *  is sized to the knob's maximum so the table is a plain member with no
+ *  allocation on the receive path. */
+#define TCP_MAX_LIVE_CONNS 256
+
+/** One inbound TCP connection held open between frames.
+ *
+ *  Exists because a sender with connection pooling on (Python's AT_NET_POOL,
+ *  on by default) writes many frames down one connection. Closing after the
+ *  first — which this transport did until 2026-08-10 — made the sender's
+ *  second write land on a closed socket, where it is lost silently (see
+ * doc/architecture/network-connection-pooling.md). */
+typedef struct {
+    int fd;                     /**< -1 when the slot is free. */
+    net_channel_t channel;      /**< Listener this arrived on. */
+    char peer[IPV6_ADDR_LEN];   /**< Source address, for attribution. */
+    time_t last_used;           /**< Wall clock of the last frame read. */
+} tcp_conn_t;
+
 /** Socket creation parameters: maps directly to socket(2) arguments. */
 typedef struct {
     int domain;    /**< AF_INET | AF_INET6 */
@@ -59,12 +79,38 @@ struct net_transport_ctx_s {
      *  per-send hot path. Empty when the address could not be derived, in which
      *  case the send paths transmit unbound (the historical behavior). */
     char local_addr[IPV6_ADDR_LEN];
+    /** Inbound connections held open between frames (TCP only; UDP leaves
+     *  this zeroed and never looks at it). Slots are free when @c fd is -1,
+     *  which tcp_open_common sets explicitly — calloc's 0 is a REAL
+     *  descriptor (stdin). */
+    tcp_conn_t live_conns[TCP_MAX_LIVE_CONNS];
+    int max_live_conns;   /**< Resolved AT_NET_MAX_CONNS, ≤ TCP_MAX_LIVE_CONNS. */
+    int conn_idle_ttl;    /**< Resolved AT_NET_CONN_IDLE_TTL, seconds. */
 };
 
 /** Shared bind helper used by both UDP and TCP transports — opens a socket,
- *  sets SO_REUSEADDR, binds to address:port. For TCP, also calls listen(). */
+ *  binds it to address:port, and for TCP also calls listen().
+ *
+ *  @param reuse  Whether to set SO_REUSEADDR before binding. This is a
+ *                PER-SOCKET decision, not a blanket one, because on UDP the
+ *                option is what makes a duplicate bind silent: with it set on
+ *                both sockets the kernel accepts the second bind of an
+ *                identical addr:port and delivers every datagram to the LAST
+ *                binder, so the first node goes deaf with nothing logged.
+ *                Pass:
+ *                  - false for the UNICAST recv sockets (peer, group). Two
+ *                    nodes misconfigured onto one base and one address then
+ *                    fail EADDRINUSE at open instead of one going quietly
+ *                    deaf.
+ *                  - true for the BROADCAST/MULTICAST recv socket, where
+ *                    several listeners on one addr:port is the entire point.
+ *                  - true for TCP listeners, which need it to rebind through
+ *                    TIME_WAIT after a restart. It costs nothing there: on
+ *                    TCP, SO_REUSEADDR does not permit binding over a live
+ *                    LISTEN socket, so a genuine collision is already loud.
+ */
 int net_transport_ip_bind(const socket_cfg_t *cfg, const char *address,
-                          int port, bool listen_sock, int *out_fd,
+                          int port, bool listen_sock, bool reuse, int *out_fd,
                           logger_t *logger);
 
 /** Pin an outbound socket's SOURCE address before it sends or connects.
@@ -77,10 +123,11 @@ int net_transport_ip_bind(const socket_cfg_t *cfg, const char *address,
  *  attribution -- which keys on the datagram's source -- missed every frame.
  *  Mirrors Python's network/udp.py bind_source_address.
  *
- *  Always binds port 0 and NEVER sets SO_REUSEADDR: the recv sockets hold
- *  (local_addr, comm_port) WITH SO_REUSEADDR, and the kernel grants a second
- *  socket that same addr:port only when both set it -- so omitting it here is
- *  precisely what stops autobind from selecting the port this node listens on.
+ *  Always binds port 0 and NEVER sets SO_REUSEADDR: the kernel grants a second
+ *  socket an addr:port already held only when BOTH sockets set the option, so
+ *  omitting it here is what stops autobind from selecting the port this node
+ *  listens on. Since the unicast recv sockets no longer set it either (see
+ *  net_transport_ip_bind's @p reuse), that now holds from both directions.
  *
  *  @param stream  TCP: also sets IP_BIND_ADDRESS_NO_PORT where available, so
  *                 pinning the ADDRESS does not reserve a port ahead of

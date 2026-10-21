@@ -15,6 +15,7 @@
  *******************/
 
 #include "scenario_loader.h"
+#include "jcs.h"           /* jcs_canonicalize, for at_byte_pin_json */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -161,4 +162,68 @@ void at_case_free(at_case_t *c) {
     if (c->_root != NULL) json_decref(c->_root);
     /* zero out so double-free is safe. */
     memset(c, 0, sizeof(*c));
+}
+
+/* Compare implementation-emitted JSON to the pinned `expected.json_wire`
+ * fixture named by @p case_data. Both sides go through jcs_canonicalize first,
+ * so a difference in key order or integer-vs-float lexical form does not
+ * register as a divergence -- only a canonical one does. Returns 0 on match
+ * (and on a case that is not byte-pinned), non-zero with @p err populated
+ * otherwise.
+ *
+ * Lives here rather than in one adapter because more than one protocol pins a
+ * payload now: the negotiation vectors round-trip a shared fixture through
+ * both runtimes (doc/architecture/negotiation.md), which is the check that would have caught
+ * C and Python's negotiation payloads diverging on the day it happened. */
+int at_byte_pin_json(json_t *case_data, const char *emitted_json,
+                     const char *label, char *err, size_t err_len) {
+    json_t *bp = json_object_get(case_data, "byte_pinning");
+    if (!json_is_true(bp)) return 0;
+
+    json_t *expected = json_object_get(case_data, "expected");
+    json_t *jwire = expected ? json_object_get(expected, "json_wire") : NULL;
+    if (!json_is_string(jwire)) {
+        snprintf(err, err_len, "%s: byte_pinning=true but expected.json_wire missing",
+                 label);
+        return -1;
+    }
+
+    char *expected_bytes = NULL;
+    size_t expected_len = 0;
+    if (at_load_testdata_bytes(json_string_value(jwire),
+                               &expected_bytes, &expected_len) != 0) {
+        snprintf(err, err_len, "%s: cannot load fixture %s",
+                 label, json_string_value(jwire));
+        return -1;
+    }
+
+    char *emit_canon = NULL, *exp_canon = NULL;
+    size_t emit_canon_len = 0, exp_canon_len = 0;
+    int rc = -1;
+    if (jcs_canonicalize(emitted_json, strlen(emitted_json),
+                         &emit_canon, &emit_canon_len) != 0) {
+        snprintf(err, err_len, "%s: canonicalize(emitted) failed", label);
+        goto out;
+    }
+    if (jcs_canonicalize(expected_bytes, expected_len,
+                         &exp_canon, &exp_canon_len) != 0) {
+        snprintf(err, err_len, "%s: canonicalize(expected) failed", label);
+        goto out;
+    }
+    if (emit_canon_len != exp_canon_len ||
+        memcmp(emit_canon, exp_canon, emit_canon_len) != 0) {
+        snprintf(err, err_len,
+                 "%s: wire bytes diverge from pinned fixture %s\n"
+                 "  expected: %.*s\n  actual:   %.*s",
+                 label, json_string_value(jwire),
+                 (int)exp_canon_len, exp_canon,
+                 (int)emit_canon_len, emit_canon);
+        goto out;
+    }
+    rc = 0;
+out:
+    free(emit_canon);
+    free(exp_canon);
+    free(expected_bytes);
+    return rc;
 }

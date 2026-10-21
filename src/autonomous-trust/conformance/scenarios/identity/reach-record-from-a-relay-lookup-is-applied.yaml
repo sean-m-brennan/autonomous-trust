@@ -1,0 +1,53 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: reach-record-from-a-relay-lookup-is-applied
+byte_pinning: false
+description: |
+    Bob lost Alice through every relay he knew, looked her up at a relay he is
+    registered with, and his network process hands the answer to identity with NO
+    sender (local IPC). It is applied on the record's own merits: it verifies, and
+    its key is the one Bob holds for Alice.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000000a5"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000000b5"
+      size: 1
+  contacts:
+    alice:
+      rendezvous:
+        - relay://198.51.100.1:27790
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: reach_record
+    payload:
+      seq: 4
+      local: true
+      relays:
+        - relay://203.0.113.7:27790
+
+    description: |
+        The answer to a relay lookup, delivered locally.
+
+expected_state:
+  bob:
+    contacts:
+      alice:
+        reach_seq: 4
+        rendezvous_head: relay://203.0.113.7:27790
+

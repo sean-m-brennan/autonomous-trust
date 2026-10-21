@@ -1,0 +1,61 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: siblings-pair-again-is-a-no-op
+description: Pairing a known sibling again changes nothing.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    mode: add
+    siblings:
+      typename: siblings
+      version: 1
+      operator: af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d
+      devices:
+      - identity:
+          typename: identity
+          uuid: eeeeeeee-0000-4000-8000-000000000007
+          address: ''
+          nickname: other
+          signature:
+            hex_seed: 31debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc
+          encryptor:
+            hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+        cert:
+          body: '{"v":1,"typename":"at-device-cert","operator":"af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d","uuid":"eeeeeeee-0000-4000-8000-000000000007","key":"31debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc","issued_at":1790000000}'
+          sig: e9923667b06b911e9bb9ae2fa324291fde51ae21effbf94bbc09e6d2dc9b52eb52fb3b86703b36e9bbd14358b6317b2be9a816a7e264a32feac9cf861fdff50e
+        added_at: 5.0
+    identity:
+      typename: identity
+      uuid: eeeeeeee-0000-4000-8000-000000000007
+      address: ''
+      nickname: other
+      signature:
+        hex_seed: 31debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc
+      encryptor:
+        hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+    cert:
+      body: '{"v":1,"typename":"at-device-cert","operator":"af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d","uuid":"eeeeeeee-0000-4000-8000-000000000007","key":"31debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc","issued_at":1790000000}'
+      sig: e9923667b06b911e9bb9ae2fa324291fde51ae21effbf94bbc09e6d2dc9b52eb52fb3b86703b36e9bbd14358b6317b2be9a816a7e264a32feac9cf861fdff50e
+    own_cert:
+      body: '{"v":1,"typename":"at-device-cert","operator":"af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d","uuid":"eeeeeeee-0000-4000-8000-000000000006","key":"511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a","issued_at":1790000000}'
+      sig: b5f5e4984de260086e939091ab0bd803c3f5c25cf1657d5a3756e5fc876be449046bbe1f892f95c73dd4964bb85a5939dedccb39c0d06745a77e0ee79b194d0a
+    op: siblings
+steps:
+- id: 1
+  from: host
+  to: host
+  function: siblings
+  description: 'trigger: siblings'
+expected_state:
+  host:
+    sibling_status: ok
+    siblings:
+    - eeeeeeee-0000-4000-8000-000000000007

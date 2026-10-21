@@ -1,0 +1,43 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: place-request-other-head-refused
+byte_pinning: false
+description: |
+    Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+    order"): classic Paxos decides what the chain holds from each index.
+    A placement extends one prefix. alice's request names a head bob's chain does
+    not have, so bob refuses it rather than vote on another chain's history.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures: {}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: place request
+    payload:
+      k: 0
+      ballot: {n: 5, by: alice}
+      head: "abababababababababababababababababababababababababababababababab"
+  - id: 2
+    from: bob
+    to: alice
+    function: place grant
+    in_response_to: 1
+    expect_none: true
+    payload: {}
+
+expected_state:
+  bob:
+    place_promised: null

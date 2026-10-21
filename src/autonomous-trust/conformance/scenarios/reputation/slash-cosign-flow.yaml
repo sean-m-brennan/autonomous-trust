@@ -19,6 +19,13 @@ participants:
   - id: rogue
     role: target
 
+# The slash protocol is opt-in (R+D.md §12.8): nothing arms it automatically,
+# since a poorly scored transaction carries its reason and every peer judges
+# for itself. This scenario drives that protocol, so it arms it -- and every
+# scenario that does NOT set this is a pin that the default is off.
+fixtures:
+  slash_enabled: true
+
 steps:
   - id: 1
     from: alice
@@ -36,8 +43,13 @@ steps:
     function: slash sign
     payload:
       target: rogue
+      floor_score: 0.1
       epoch: 7
-    description: bob's co-signature reaches alice (the detector tallies it).
+    description: |
+        bob's co-signature reaches alice (the detector tallies it). The round
+        is restated in full because the co-signature covers the attestation
+        designation, which includes the floor: a sign step naming a different
+        floor signs different bytes and is refused.
 
   - id: 3
     from: alice

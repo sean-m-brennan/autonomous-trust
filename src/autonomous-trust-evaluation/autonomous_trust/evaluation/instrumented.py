@@ -104,7 +104,7 @@ class InstrumentedAT(AutonomousTrust):
         procs = configs[Process.key]
         if self._log_level <= LogLevel.WARNING:
             self._banner()
-        self.logger.info(self.name + ':  Configuring with metrics collection')
+        self.logger.info('%s:  Configuring with metrics collection', self.name)
 
         if procs is None:
             return
@@ -130,7 +130,7 @@ class InstrumentedAT(AutonomousTrust):
         results = {}
         with self._pool_type(len(procs)) as pool:
             for proc in procs:
-                self.logger.info(self.name + ':  Starting %s ...' % proc.name)
+                self.logger.info('%s:  Starting %s ...', self.name, proc.name)
                 self.process_names.append(proc.name)
                 signals[proc.name] = self.queue_type()
                 results[proc.name] = pool.apply_async(
@@ -140,11 +140,11 @@ class InstrumentedAT(AutonomousTrust):
             if q_out is not None:
                 queues[self.external_feedback] = q_out
             pool.close()
-            self.logger.info(self.name + ':  Ready.')
+            self.logger.info('%s:  Ready.', self.name)
 
             self.autonomous_loop(results, queues, signals)
 
-        self.logger.info(self.name + ':  Shutdown')
+        self.logger.info('%s:  Shutdown', self.name)
 
 
 def main():

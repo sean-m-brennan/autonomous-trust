@@ -1,0 +1,39 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: placed-genesis-not-unanimous-refused
+byte_pinning: false
+description: |
+    Membership recorded in the chain (doc/architecture/reputation.md, "Who is
+    in the group"). There is no roster before the genesis, so the genesis is
+    decided by every member it lists. Two of its three signatures are not
+    enough: bob writes nothing.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  roster: {}          # an unfounded chain: no roster in force
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: placed
+    payload:
+      k: 0
+      value:
+        - {roster: genesis, members: [alice, bob, carol]}
+      signers: [alice, bob]
+
+expected_state:
+  bob:
+    committed_tx_count: 0
+

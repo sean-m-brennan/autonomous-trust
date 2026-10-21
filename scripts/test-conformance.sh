@@ -59,6 +59,16 @@ Environment:
                              keeps the cross-language diff consistent.
   CONFORMANCE_NO_CLEAN=1     Same as --no-clean.
   CONFORMANCE_SKIP_TOX=1     Run pytest directly in the active env, no tox.
+  AT_EXTERNAL_EXTENSIONS     ':'-separated directories of extension libraries
+                             outside this tree (passed to CMake as
+                             -DAT_EXTERNAL_EXTENSIONS). An extension that owns a
+                             conformance protocol registers its C adapter and its
+                             corpus there (at_conformance_adapter).
+  AT_CONFORMANCE_PLUGINS     ':'-separated conformance plug-in directories for the
+                             Python harness (scenarios/ + conformance_plugin.py).
+                             Set both, or the protocol runs on one side only and
+                             the diff reports its cases as one-sided. Agora's
+                             at-social/test-conformance.sh sets both for `social`.
 
 Why the C build dir is wiped by default: on this VM's virtiofs-backed repo mount,
 gcc intermittently writes objects whose ELF is structurally valid but whose symbol
@@ -209,6 +219,16 @@ run_c_harness() {
          "(zta-x509-* scenarios will skip on the C side)." >&2
   fi
 
+  # External extensions (e.g. Agora's libat_social): built inside this project
+  # and, when one registers a conformance adapter, run by the C harness over its
+  # own corpus. The Python side reads AT_CONFORMANCE_PLUGINS from the environment.
+  # Always passed (empty clears a reused cache's value).
+  local _ext_list="${AT_EXTERNAL_EXTENSIONS:-}"
+  local cmake_ext_arg="-DAT_EXTERNAL_EXTENSIONS=${_ext_list//:/;}"
+  if [[ -n "${AT_EXTERNAL_EXTENSIONS:-}" ]]; then
+    echo "AT_EXTERNAL_EXTENSIONS set; building C conformance with ${AT_EXTERNAL_EXTENSIONS}" >&2
+  fi
+
   # AT_CONFORMANCE_BUILD_DIR relocates the build, most usefully OFF the
   # virtiofs repo mount (see the corruption note in --help). The ZTA decision
   # above is independent of WHERE we build, so an override still gets
@@ -278,14 +298,16 @@ run_c_harness() {
   if [[ ! -d "$build_dir" ]]; then
     echo "Initializing C build dir at $build_dir ..." >&2
     mkdir -p "$build_dir"
+    # The OFF-by-default extensions are built so their scenarios run: fleet,
+    # data source, and DTN (its own dtn protocol, on the stub backend).
     # -S/-B rather than `cd $build_dir && cmake ..`: with
     # AT_CONFORMANCE_BUILD_DIR pointing outside the source tree, ".." is not the
     # source dir and cmake would configure whatever happens to be there.
-    cmake -S "$c_dir" -B "$build_dir" $cmake_zta_arg
+    cmake -S "$c_dir" -B "$build_dir" $cmake_zta_arg "$cmake_ext_arg" -DAT_FLEET_LIB=ON -DAT_DATA_SOURCE_LIB=ON -DAT_NET_DTN=ON
   else
     # Reused dir (--no-clean): refresh the cmake config in case CMake files
-    # changed since last run, and to apply/keep -DAT_ZTA.
-    cmake -S "$c_dir" -B "$build_dir" $cmake_zta_arg >/dev/null
+    # changed since last run, and to apply/keep -DAT_ZTA / -DAT_EXTERNAL_EXTENSIONS.
+    cmake -S "$c_dir" -B "$build_dir" $cmake_zta_arg "$cmake_ext_arg" -DAT_FLEET_LIB=ON -DAT_DATA_SOURCE_LIB=ON -DAT_NET_DTN=ON >/dev/null
   fi
 
   echo "Building + running C conformance harness ..."

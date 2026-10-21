@@ -1,0 +1,98 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: remote-refutation-cannot-accuse
+byte_pinning: false
+description: |
+    A hard-channel refutation commits like any other score and accuses
+    nobody -- whoever produced it (R+D.md §12.8, doc/architecture/reputation.md
+    "Only your own evidence counts").
+
+    This scenario was written on 2026-09-01, when a defection-grade score on
+    `physical` / `certificate` / `self_consistency` DID propose a slash and
+    the boundary being pinned was "only if you produced it yourself": the
+    scorer chooses its own tag, so honouring a channel arriving from the wire
+    would let any peer tag a fabricated 0.1 as `physical` and have the
+    receiver accuse a third party on its behalf.
+
+    The accusation path was removed a day later, at the user's direction: a
+    transaction is scored poorly WITH ITS REASON, every peer sees both, and
+    each judges for itself, so no channel levies a verdict from any origin.
+    The scenario is kept, and now pins the stronger property -- an absence.
+    `slashes_proposed: 0` held before because the wire path declined to
+    accuse; it holds now because no evidence channel can accuse at all. If a
+    future slice reintroduces an accusation, this is what fails, and the
+    decision gets made deliberately rather than drifting back in.
+
+    `slash_enabled: true` matters for exactly that reason: the slash protocol
+    is opt-in now, so without arming it the assertion would pass on the gate
+    alone and say nothing about whether an originator exists.
+
+    So alice sends bob the shape a refutation takes: `physical`, score 0.1.
+    bob must treat it as an ordinary proposal -- accept it, commit it, weight
+    it by capability alone -- and originate nothing.
+
+    Why an `expected_state` key rather than the step list: the scenario engine
+    matches the messages a step DECLARES and is permissive about extra ones,
+    on both sides. A stray slash proposal would therefore pass a step-list-only
+    scenario silently -- which is exactly the failure this scenario exists to
+    catch. The tally is cumulative over the whole scenario for the same reason:
+    the assertion is "none, ever," not "none this step."
+
+    What the wire DOES carry is the reason: bob commits the channel with the
+    score, because the response to a poor score is that peers can see why.
+    That half is pinned by `committed-channel-in-the-entry-hash`, which shows
+    both runtimes hashing it into the same window root.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+
+fixtures:
+  slash_enabled: true
+  proposals:
+    alice:
+      - id1: 1000
+        id2: 1
+        task_id: t-1
+        score: 0.1
+        channel: physical
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: transaction
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+      task_id: t-1
+      score: 0.1
+      channel: physical
+    description: |
+        alice proposes a defection-grade score tagged as a physics refutation
+        — the exact shape that, had bob produced it himself, would propose a
+        slash. bob accepts it as an ordinary proposal.
+
+  - id: 2
+    from: bob
+    to: alice
+    function: tx accepted
+    in_response_to: 1
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+    description: |
+        The round commits unchanged. A refuting score is still a score, and it
+        still belongs in the chain; what it must not do is originate an
+        accusation on a claim bob cannot check.
+
+expected_state:
+  bob:
+    slashes_proposed: 0
+  alice:
+    slashes_proposed: 0

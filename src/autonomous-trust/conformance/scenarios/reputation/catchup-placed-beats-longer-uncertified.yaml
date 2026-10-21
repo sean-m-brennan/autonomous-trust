@@ -1,0 +1,48 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: catchup-placed-beats-longer-uncertified
+byte_pinning: false
+description: |
+    Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+    order"): a placed chain carries each placement's certificate on its last
+    entry, with the index the placement began at, so a node catching up checks
+    every placement it is handed, against its own view of the group (a strict
+    majority, here three of four). Then a placement decides, not a length.
+
+    bob's chain holds three entries written the legacy way, outside any
+    placement. alice's is ONE entry long, but certified. Under the legacy rule
+    bob's longer chain would win; under placement the certified entry at the
+    fork wins whatever the lengths. What bob drops goes back to his pool, each
+    half with its commit certificate, to be placed again rather than lost.
+
+participants:
+  - id: alice
+    role: provider
+  - id: bob
+    role: consumer
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  local_chain:
+    bob:
+      - {task: x, p1: 0.2, p2: 0.2, certified_by: [alice, carol, dave]}
+      - {task: y, p1: 0.3, p2: 0.3, certified_by: [alice, carol, dave]}
+      - {task: z, p1: 0.4, p2: 0.4, certified_by: [alice, carol, dave]}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: latest update
+    payload:
+      chain:
+        - {task: a, p1: 0.7, p2: 0.5, batch: 1, placed_by: [alice, bob, carol], certified_by: [alice, carol, dave]}
+
+expected_state:
+  bob:
+    chain_entries: [a]
+    pooled_entries: [x, y, z]

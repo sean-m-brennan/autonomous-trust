@@ -66,7 +66,7 @@ DEFINE_TEST(test_task_proto_roundtrip)
     ck_assert(restored.flexible == true);
     ck_assert_int_eq((int)restored.argc, 2);
 
-    smrt_deref(data);
+    free(data);
 }
 END_TEST_DEFINITION()
 
@@ -95,7 +95,7 @@ DEFINE_TEST(test_task_proto_minimal)
     ck_assert(restored.flexible == false);
     ck_assert_int_eq((int)restored.argc, 0);
 
-    smrt_deref(data);
+    free(data);
 }
 END_TEST_DEFINITION()
 
@@ -108,7 +108,7 @@ DEFINE_TEST(test_paxos_payload_roundtrip)
 {
     ck_assert(sodium_init() >= 0);
 
-    /* Build a Paxos Phase 1a request payload (as handle_request/grant use) */
+    /* Build a Paxos round payload (as the reputation handlers use) */
     json_t *payload = json_object();
     json_object_set_new(payload, "id1", json_real(3.14159));
     json_object_set_new(payload, "id2", json_integer(42));
@@ -152,9 +152,10 @@ DEFINE_TEST(test_paxos_payload_roundtrip)
                      "550e8400-e29b-41d4-a716-446655440000");
 
     json_decref(result);
-    smrt_deref(msg.obj);
-    smrt_deref(wire);
-    smrt_deref(restored.obj);
+    net_msg_free_obj(&msg);
+    free(wire);
+    net_msg_free_obj(&restored);
+    free(restored.function);
 }
 END_TEST_DEFINITION()
 
@@ -184,7 +185,7 @@ DEFINE_TEST(test_reputation_score_payload)
                      "negotiation");
 
     json_decref(result);
-    smrt_deref(msg.obj);
+    net_msg_free_obj(&msg);
 }
 END_TEST_DEFINITION()
 

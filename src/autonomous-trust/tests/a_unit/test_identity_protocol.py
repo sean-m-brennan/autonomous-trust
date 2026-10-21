@@ -47,11 +47,23 @@ class TestIdentityProtocol:
           local-only trigger (attest_trigger), and the local-only
           session round trip it needs
           (operator_state_req, operator_state_resp)
+        - runtime hierarchy roots (hierarchy, hierarchy_req)
+        First contact's verbs left with it (FEATURE_SPLIT_PLAN Phase 7, C6):
+        they are ``FirstContactProtocol``, pinned in that distribution's
+        test_first_contact_plaintext.py.
+        The social verbs (position, profile, connections, DMs, posts,
+        reactions, proximity, business ads and posts, cosign, reports)
+        left with social (FEATURE_SPLIT_PLAN Phase 5): they are
+        ``SocialProtocol`` in Agora's at-social/python, pinned by its
+        test_social_protocol.py.
         Asserting the exact count here pins the wire contract — a
         new verb without intent will fail this and force a deliberate
         update. Update the expected count alongside any new addition
         to ``IdentityProtocol``.
         """
         values = list(IdentityProtocol)
-        assert len(values) == 24
+        assert len(values) == 26
         assert 'announce' in values
+        assert 'hello' not in values
+        assert 'report' not in values
+        assert 'business_ad' not in values

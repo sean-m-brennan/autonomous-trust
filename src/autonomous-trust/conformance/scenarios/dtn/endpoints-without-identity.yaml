@@ -1,0 +1,32 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: "1"
+kind: "scenario"
+protocol: "dtn"
+name: "endpoints-without-identity"
+description: |
+  Without an identity the peer endpoint is on the placeholder node EID.
+byte_pinning: false
+participants:
+  - id: "host"
+    role: "recipient"
+fixtures:
+  dtn:
+    op: "endpoints"
+    node_uuid: null
+    group_uuid: "11223344-5566-7788-99aa-bbccddeeff00"
+steps:
+  - id: 1
+    from: "host"
+    to: "host"
+    function: "endpoints"
+    description: "trigger: endpoints"
+expected_state:
+  host:
+    endpoints:
+      - ["dtn://at-local/peer", "/peer"]
+      - ["dtn://at-group-1122334455667788/bcast", "/bcast"]
+      - ["dtn://at-group-1122334455667788/group", "/group"]
+    group_joined: true

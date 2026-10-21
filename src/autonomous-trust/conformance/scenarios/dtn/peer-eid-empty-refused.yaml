@@ -1,0 +1,28 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: "1"
+kind: "scenario"
+protocol: "dtn"
+name: "peer-eid-empty-refused"
+description: |
+  An empty target has no EID.
+byte_pinning: false
+participants:
+  - id: "host"
+    role: "recipient"
+fixtures:
+  dtn:
+    op: "peer_eid"
+    target: ""
+    peers: []
+steps:
+  - id: 1
+    from: "host"
+    to: "host"
+    function: "peer_eid"
+    description: "trigger: peer_eid"
+expected_state:
+  host:
+    error: true

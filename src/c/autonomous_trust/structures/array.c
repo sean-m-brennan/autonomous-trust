@@ -24,8 +24,23 @@
 
 int array_init(array_t *a)
 {
+    /* The smrt header belongs to the EMBEDDED case, which is what init is
+     * for: a stack local or a struct member (map->keys, id_state.histories)
+     * whose header no allocator ever wrote. array_free ends in
+     * smrt_deref(a), which reads alloc/refs — so leaving them untouched is a
+     * read of uninitialized memory, and a garbage alloc/refs pair would make
+     * that deref call free() on a stack address. alloc=false makes the deref
+     * the intended no-op. array_create, whose struct IS an smrt allocation,
+     * re-asserts the header afterwards. Mirrors map_init. */
+    a->magic = 0;
+    a->alloc = false;
+    a->refs = 0;
     a->size = 0;
-    a->array = smrt_create(sizeof(data_t));
+    /* The element buffer is a plain heap block of data_t pointers, NOT an
+     * smrt allocation: slot 0 sits at offset 0, so an smrt header there is
+     * overwritten by the first element, and a deref of the buffer then reads
+     * a pointer as `refs` and a pointer as `dtor`. */
+    a->array = calloc(1, sizeof(data_t *));
     if (a->array == NULL)
         return EXCEPTION(ENOMEM);
     return 0;
@@ -41,6 +56,19 @@ int array_create(array_t **array_ptr)
         return EXCEPTION(ENOMEM);
     array_t *arr = *array_ptr;
     int err = array_init(arr);
+    /* array_init zeroes the header for the embedded case; this struct is a
+     * real smrt allocation, so restore what smrt_create established or
+     * array_free's closing deref would never free it. */
+    arr->magic = SMRT_MAGIC;
+    arr->alloc = true;
+    arr->refs = 1;
+    if (err != 0)
+    {
+        /* No element buffer: hand back nothing rather than a half-built
+         * array the caller would have to know to release. */
+        smrt_deref(arr);
+        *array_ptr = NULL;
+    }
     return err;
 }
 
@@ -49,10 +77,17 @@ int array_copy(array_t *a, array_t *cpy)
 {
     if (a == NULL)
         return EXCEPTION(EINVAL);
-    cpy->array = smrt_create(a->size * sizeof(data_t));
-    if (cpy->array == NULL)
+    data_t **buf = calloc(a->size > 0 ? a->size : 1, sizeof(data_t *));
+    if (buf == NULL)
         return EXCEPTION(ENOMEM);
-    memcpy(cpy->array, a->array, sizeof(data_t) * a->size);
+    memcpy(buf, a->array, sizeof(data_t *) * a->size);
+    /* The copy owns a reference to each element: array_free derefs every
+     * element of whichever array it is given, so a copy that shared them
+     * unreferenced released them once per array. */
+    for (size_t i = 0; i < a->size; i++)
+        smrt_ref(buf[i]);
+    free(cpy->array);  /* cpy is zeroed or array_init'd: NULL or init's slot */
+    cpy->array = buf;
     cpy->size = a->size;
     return 0;
 }
@@ -86,6 +121,42 @@ int array_filter(array_t *a, bool (*filter)(data_t*))
             return i;
     }
     return -1;
+}
+
+/* Frama-C: skipped — [alloc-pattern] releases the dropped elements */
+size_t array_keep_if(array_t *a, bool (*keep)(data_t *, void *), void *ctx)
+{
+    size_t kept = 0;
+    for (size_t i = 0; i < a->size; i++)
+    {
+        data_t *e = a->array[i];
+        if (keep(e, ctx))
+            a->array[kept++] = e;
+        else
+            smrt_deref(e);
+    }
+    size_t dropped = a->size - kept;
+    for (size_t i = kept; i < a->size; i++)
+        a->array[i] = NULL;
+    a->size = kept;
+    return dropped;
+}
+
+static void _owned_array_dtor(void *ptr)
+{
+    data_t *dat = ptr;
+    if (dat->obj != NULL)
+        array_free((array_t *)dat->obj);
+    dat->obj = NULL;
+}
+
+data_t *owned_array_data(array_t *a)
+{
+    data_t *dat = object_ptr_data(a, sizeof(array_t));
+    if (dat == NULL)
+        return dat;
+    dat->dtor = _owned_array_dtor;
+    return dat;
 }
 
 bool array_contains(array_t *a, data_t *element)
@@ -127,28 +198,53 @@ int array_set(array_t *a, int index, data_t *element)
          * array_init pre-allocates 1 slot, so size==0 && array!=NULL means
          * that slot is still free. Every other case must grow. */
         if (a->size > 0 || a->array == NULL) {
-            size_t new_size = (a->size + 1) * sizeof(data_t);
-            if (smrt_recreate((void **)&a->array, new_size) != 0)
+            data_t **grown = realloc(a->array, (a->size + 1) * sizeof(data_t *));
+            if (grown == NULL)
                 return EXCEPTION(ENOMEM);
+            a->array = grown;
         }
         a->size++;
+        a->array[index] = element;
+        return 0;
     }
+    /* Overwrite: the array ADOPTS the caller's reference and releases the
+     * element it displaces, as map_set does. Guarded against a self-assign,
+     * where the release would free the element being stored. */
+    data_t *displaced = a->array[index];
     a->array[index] = element;
+    if (displaced != element)
+        smrt_deref(displaced);
     return 0;
 }
 
 /* Frama-C: skipped — [alloc-pattern] memmove compaction */
-int array_remove(array_t *a, data_t *element)
+int array_remove_at(array_t *a, int index)
 {
-    int index = array_find(a, element);
     if (index < 0)
-        return EXCEPTION(EARR_NOELT);
-    size_t n = a->size - (index + 1);
+        index = (int)a->size + index;
+    if (index < 0 || (size_t)index >= a->size)
+        return EXCEPTION(EARR_OOB);
+    data_t *removed = a->array[index];
+    size_t n = a->size - ((size_t)index + 1);
     if (n > 0)
         memmove(a->array + index, a->array + index + 1, n * sizeof(data_t *));
     a->size--;
     a->array[a->size] = NULL;
+    /* The array's reference leaves with the element, as map_remove's does.
+     * A caller that still needs it takes its own (smrt_ref) first. */
+    smrt_deref(removed);
     return 0;
+}
+
+int array_remove(array_t *a, data_t *element)
+{
+    /* array_find matches by VALUE (data_equal), so what leaves may be an
+     * equal element rather than @p element itself. A caller that knows the
+     * slot uses array_remove_at. */
+    int index = array_find(a, element);
+    if (index < 0)
+        return EXCEPTION(EARR_NOELT);
+    return array_remove_at(a, index);
 }
 
 /* Frama-C: skipped — [alloc-pattern] iterative element free */
@@ -161,7 +257,7 @@ void array_free(array_t *a)
     */
     for (int i=0; i< a->size; i++)
         smrt_deref(a->array[i]);
-    smrt_deref(a->array);
+    free(a->array);
     a->array = NULL;
     a->size = 0;
     smrt_deref(a);
@@ -247,11 +343,15 @@ int array_from_json(const json_t *obj, void *data_struct)
 {
     array_t *array = data_struct;
     array->size = json_integer_value(json_object_get(obj, "size"));
-    array->array = smrt_create(array->size * sizeof(data_t *));
+    array->array = calloc(array->size > 0 ? array->size : 1, sizeof(data_t *));
+    if (array->array == NULL)
+        return -1;
     json_t *j_arr = json_object_get(obj, "array");
     for (int i=0; i<array->size; i++) {
         json_t *elt = json_array_get(j_arr, i);
         array->array[i] = smrt_create(sizeof(data_t));
+        if (array->array[i] == NULL)
+            return -1;
         data_from_json(elt, array->array[i]);
     }
     return 0;

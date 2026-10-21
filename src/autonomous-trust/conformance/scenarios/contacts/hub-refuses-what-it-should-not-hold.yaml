@@ -1,0 +1,92 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: hub-refuses-what-it-should-not-hold
+description: A hub files only its own areas, only from the holder, never for longer than a day, and only over a lower seq.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: hub
+    areas:
+    - u4pr
+    - gcpv
+    rate: 10
+    now: 1790000000
+    clients:
+      alice:
+        uuid: aaaaaaaa-0000-4000-8000-0000000000a1
+        key: bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5
+      bob:
+        uuid: bbbbbbbb-0000-4000-8000-0000000000b2
+        key: 55154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207
+      eve:
+        uuid: eeeeeeee-0000-4000-8000-0000000000e5
+        key: 4e6008b01b74e49e38d8b11392bfaccc7b5bff86ca2048cbb0f783633a61e2dd
+      carol:
+        uuid: cccccccc-0000-4000-8000-0000000000c3
+        key: d404bc44565aedbb899150e5b0b3b32b9441bf0cb7884c33130da8dbc27dd2cf
+    calls:
+    - as: alice
+      call: publish
+      card:
+        body: '{"v":1,"typename":"at-area-card","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","key":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5","area":"9q8y","bucket":"9q8yy","name":"","seq":1,"expiry":1790003600,"identity":{"typename":"identity","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","address":"","nickname":"alice","signature":{"hex_seed":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5"},"encryptor":{"hex_seed":"7777777777777777777777777777777777777777777777777777777777777777"}}}'
+        sig: 1ed98020e888bd7854a304271303bb0b45f16e61f6066ad9aa35604474a39887900493a44e07f796040d014e1699313049307abb845a745b43e20f49d61e1c01
+    - as: eve
+      call: publish
+      card:
+        body: '{"v":1,"typename":"at-area-card","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","key":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5","area":"u4pr","bucket":"u4pru","name":"","seq":1,"expiry":1790003600,"identity":{"typename":"identity","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","address":"","nickname":"alice","signature":{"hex_seed":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5"},"encryptor":{"hex_seed":"7777777777777777777777777777777777777777777777777777777777777777"}}}'
+        sig: 08bffc1bafb3051928865c3cd71dda4f75adc6daa3686295f855efa586eb72f649b00e4556510b790ab580259466304731faa85163966f910090937dfe6b760c
+    - as: alice
+      call: publish
+      card:
+        body: '{"v":1,"typename":"at-area-card","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","key":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5","area":"u4pr","bucket":"u4pru","name":"","seq":1,"expiry":1790086460,"identity":{"typename":"identity","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","address":"","nickname":"alice","signature":{"hex_seed":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5"},"encryptor":{"hex_seed":"7777777777777777777777777777777777777777777777777777777777777777"}}}'
+        sig: a679ab0e09ee7284b6026b3cd85ba538fe18c9a46bb6daa2cc49711b28c666be259cee2788cca4440bc983325d02d16695bfd1b9d071d68301da97895a350400
+    - as: alice
+      call: publish
+      card:
+        body: '{"v":1,"typename":"at-area-card","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","key":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5","area":"u4pr","bucket":"u4pru","name":"","seq":1,"expiry":1789999999,"identity":{"typename":"identity","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","address":"","nickname":"alice","signature":{"hex_seed":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5"},"encryptor":{"hex_seed":"7777777777777777777777777777777777777777777777777777777777777777"}}}'
+        sig: 5a7b494bdfd74845fddf14c41e1b5dd462393a95c0869d25b40109ef2206fd374b9c953cbdaff0cd8768cf9f9f68eb21ab42ab39a424ed177b9389468a737806
+    - as: alice
+      call: publish
+      card:
+        body: '{"v":1,"typename":"at-area-card","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","key":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5","area":"u4pr","bucket":"u4pru","name":"","seq":2,"expiry":1790003600,"identity":{"typename":"identity","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","address":"","nickname":"alice","signature":{"hex_seed":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5"},"encryptor":{"hex_seed":"7777777777777777777777777777777777777777777777777777777777777777"}}}'
+        sig: abd283da5ed5d20ee0459707d2932adb717908fcad09f15b13883b390e33997a197c5346bab038685b382e65fb0e077d1821346124168a838ebbb476501ab405
+    - as: alice
+      call: publish
+      card:
+        body: '{"v":1,"typename":"at-area-card","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","key":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5","area":"u4pr","bucket":"u4pru","name":"","seq":1,"expiry":1790003600,"identity":{"typename":"identity","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","address":"","nickname":"alice","signature":{"hex_seed":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5"},"encryptor":{"hex_seed":"7777777777777777777777777777777777777777777777777777777777777777"}}}'
+        sig: 08bffc1bafb3051928865c3cd71dda4f75adc6daa3686295f855efa586eb72f649b00e4556510b790ab580259466304731faa85163966f910090937dfe6b760c
+steps:
+- id: 1
+  from: host
+  to: host
+  function: hub
+  description: 'trigger: hub'
+expected_state:
+  host:
+    replies:
+    - op: hub_refused
+      area: 9q8y
+      reason: area
+    - op: hub_refused
+      area: u4pr
+      reason: not_holder
+    - op: hub_refused
+      area: u4pr
+      reason: expiry
+    - op: hub_refused
+      area: u4pr
+      reason: expired
+    - op: hub_published
+      area: u4pr
+      seq: 2
+    - op: hub_refused
+      area: u4pr
+      reason: stale

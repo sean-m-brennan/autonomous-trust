@@ -1,0 +1,58 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: first-contact-unsolicited-ack-ignored
+byte_pinning: false
+description: |
+    An ack admits nobody unless it answers a hello this node sent.
+
+    `first_contact_hello_ack` is a plaintext verb (the initiator is not a known
+    peer when it arrives), and a plaintext frame from an unknown sender is
+    parsed and routed with no verb filter -- that is how bootstrap traffic gets
+    in at all. So nothing upstream of the handler stands between a stranger
+    and it. Before the gate, the handler admitted whoever the envelope named:
+    Alice could send Bob an ack out of nowhere and become Bob's direct peer --
+    reachable, attributable on the encrypted point-to-point channel, and
+    scored by reputation -- without any ticket. Not a group member (the group
+    key never followed), but a peer Bob never agreed to.
+
+    The gate (Python `_take_pending`, C `_fc_take_pending`): an ack is honored
+    only from an inviter this node sent a hello to, before the hello's deadline,
+    with the nonce of the ticket it presented, and signed by the key that
+    ticket carried. Here Bob sent nothing, so there is nothing to answer.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  # Strangers, each alone in a cohort, so "not a peer" is asserted against
+  # the handler rather than against a shared-group fixture.
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000000a7"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000000b7"
+      size: 1
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: first_contact_hello_ack
+    payload:
+      nonce: fc-unsolicited
+    description: |
+        An ack Bob never asked for. It must change nothing on Bob's side.
+
+expected_state:
+  bob:
+    direct_peers:
+      alice: false
+    contacts:
+      alice: false

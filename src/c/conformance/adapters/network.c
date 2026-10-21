@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <sodium.h>
 #include <uuid/uuid.h>
@@ -31,11 +32,17 @@
 #include "identity/identity_priv.h"
 #include "network/network.h"
 #include "network/net_message.h"
+#include "network/net_proc_priv.h"
+#ifdef AT_RENDEZVOUS_ENABLED   /* libat_rendezvous is built */
+#include "rendezvous/net_relay_rosters.h"
+#endif
+#include "processes/plaintext_verbs.h"
 
 #include "../negative_runner.h"
 #include "../jcs.h"
 #include "../scenario_loader.h"
 #include "utilities/b64.h"
+#include "utilities/exception.h"
 
 /* ------------------------------------------------------------------------- */
 /* Hex helpers                                                                */
@@ -122,6 +129,117 @@ cleanup:
     free(expected_sig);
     return rc;
 }
+
+/* A community relay roster against the pinned issuers: accepted or refused, and
+ * when accepted the seq and the relays as uuid:fp@host:port. The file check
+ * only; the seq floor is node state. Mirrors the Python adapter's
+ * _relay_roster_verify. */
+#ifdef AT_RENDEZVOUS_ENABLED
+static int run_relay_roster_verify(json_t *input, json_t *expected,
+                                   char *err, size_t err_len) {
+    const char *text = json_string_value(json_object_get(input, "roster"));
+    json_t *keys = json_object_get(input, "issuers");
+    if (text == NULL || !json_is_array(keys)) {
+        snprintf(err, err_len, "relay_roster_verify: needs roster and issuers");
+        return -1;
+    }
+    net_relay_roster_issuers_t issuers = {0};
+    size_t i;
+    json_t *k;
+    json_array_foreach(keys, i, k) {
+        const char *s = json_string_value(k);
+        if (s == NULL || issuers.n >= AT_RELAY_ROSTER_ISSUERS_MAX)
+            continue;
+        size_t j = 0;
+        for (; s[j] != '\0' && j < AT_RELAY_ROSTER_KEY_HEX; j++)
+            issuers.keys[issuers.n][j] =
+                (char)(s[j] >= 'A' && s[j] <= 'Z' ? s[j] + 32 : s[j]);
+        issuers.keys[issuers.n][j] = '\0';
+        issuers.n++;
+    }
+    net_relay_seed_list_t *l = calloc(1, sizeof(*l));
+    if (l == NULL) {
+        snprintf(err, err_len, "relay_roster_verify: out of memory");
+        return -1;
+    }
+    long long seq = 0;
+    net_relay_roster_areas_t *areas = calloc(1, sizeof(*areas));
+    if (areas == NULL) {
+        free(l);
+        snprintf(err, err_len, "relay_roster_verify: out of memory");
+        return -1;
+    }
+    bool valid = net_relay_roster_verify_areas(text, &issuers, NULL, &seq, l, areas) == 0;
+    bool should = json_is_true(json_object_get(expected, "valid"));
+    int rc = -1;
+    if (valid != should) {
+        snprintf(err, err_len, "relay_roster_verify: got valid=%d, expected valid=%d",
+                 valid ? 1 : 0, should ? 1 : 0);
+        goto done;
+    }
+    if (valid) {
+        json_t *want = json_object_get(expected, "relays");
+        if (seq != (long long)json_integer_value(json_object_get(expected, "seq"))) {
+            snprintf(err, err_len, "relay_roster_verify: seq %lld is not the expected one", seq);
+            goto done;
+        }
+        if (!json_is_array(want) || json_array_size(want) != l->n) {
+            snprintf(err, err_len, "relay_roster_verify: %zu relays, expected %zu",
+                     l->n, json_array_size(want));
+            goto done;
+        }
+        for (size_t r = 0; r < l->n; r++) {
+            char got[AT_RELAY_HOST_LEN + 96];
+            snprintf(got, sizeof(got), "%s:%s@%s:%d", l->pins[r].uuid, l->pins[r].fp,
+                     l->eps[r].host, l->eps[r].port);
+            const char *w = json_string_value(json_array_get(want, r));
+            if (w == NULL || strcmp(got, w) != 0) {
+                snprintf(err, err_len, "relay_roster_verify: relay %zu is %s, expected %s",
+                         r, got, w != NULL ? w : "(none)");
+                goto done;
+            }
+        }
+        /* The hubs' areas, keyed by the relay's uuid:fp@host:port. */
+        json_t *want_areas = json_object_get(expected, "areas");
+        if (want_areas != NULL) {
+            json_t *got_areas = json_object();
+            for (size_t r = 0; r < l->n; r++) {
+                if (areas->n[r] == 0)
+                    continue;
+                char key[AT_RELAY_HOST_LEN + 96];
+                snprintf(key, sizeof(key), "%s:%s@%s:%d", l->pins[r].uuid, l->pins[r].fp,
+                         l->eps[r].host, l->eps[r].port);
+                json_t *list = json_array();
+                for (size_t a = 0; a < areas->n[r]; a++)
+                    json_array_append_new(list, json_string(areas->areas[r][a]));
+                json_object_set_new(got_areas, key, list);
+            }
+            bool same = json_equal(got_areas, want_areas);
+            json_decref(got_areas);
+            if (!same) {
+                snprintf(err, err_len, "relay_roster_verify: areas are not the expected ones");
+                goto done;
+            }
+        }
+    }
+    rc = 0;
+done:
+    free(areas);
+    free(l);
+    return rc;
+}
+#else
+/* Rosters are rendezvous's (FEATURE_SPLIT_PLAN Phase 7b): without its library
+ * the case skips, as the Python adapter's does without the distribution. */
+static int run_relay_roster_verify(json_t *input, json_t *expected,
+                                   char *err, size_t err_len) {
+    (void)input;
+    (void)expected;
+    snprintf(err, err_len, "rendezvous case skipped: C built without "
+                           "libat_rendezvous (AT_RENDEZVOUS_LIB=OFF)");
+    return 1;
+}
+#endif
 
 static int run_ed25519_verify(json_t *input, json_t *expected,
                               char *err, size_t err_len) {
@@ -415,6 +533,9 @@ static int run_crypto_vector(const at_case_t *c,
     if (strcmp(primitive, "nacl_box_open") == 0) {
         return run_box_open(input, expected, err, err_len);
     }
+    if (strcmp(primitive, "relay_roster_verify") == 0) {
+        return run_relay_roster_verify(input, expected, err, err_len);
+    }
     snprintf(err, err_len, "unsupported primitive: %s", primitive);
     return -1;
 }
@@ -429,58 +550,54 @@ static int run_crypto_vector(const at_case_t *c,
  * lexical form, etc. does not register as a divergence — only canonical
  * differences do.  Returns 0 on match (or when the case isn't byte-pinned),
  * non-zero on mismatch (with a populated err buffer). */
-static int assert_byte_pin_json(json_t *case_data, const char *emitted_json,
-                                const char *label, char *err, size_t err_len) {
+/* Compare emitted PROTO-envelope bytes to the vector's inline
+ * `expected.proto_wire_hex`.
+ *
+ * Literal comparison, unlike the JSON pin above: protobuf has no canonical
+ * encoding, so "equal after normalization" is not a thing that can be checked
+ * -- and the strictness is what makes this worth pinning, since a runtime whose
+ * field order or default-value handling drifted would still round-trip its own
+ * bytes happily. Hex is inline in the vector rather than in a fixture file so a
+ * wire-shape change shows up in a reviewable diff. */
+static int assert_byte_pin_proto_hex(json_t *case_data, const uint8_t *wire,
+                                     size_t wire_len, const char *label,
+                                     char *err, size_t err_len) {
     json_t *bp = json_object_get(case_data, "byte_pinning");
     if (!json_is_true(bp)) return 0;
 
     json_t *expected = json_object_get(case_data, "expected");
-    json_t *jwire = expected ? json_object_get(expected, "json_wire") : NULL;
-    if (!json_is_string(jwire)) {
-        snprintf(err, err_len, "%s: byte_pinning=true but expected.json_wire missing",
-                 label);
-        return -1;
-    }
-
-    char *expected_bytes = NULL;
-    size_t expected_len = 0;
-    if (at_load_testdata_bytes(json_string_value(jwire),
-                               &expected_bytes, &expected_len) != 0) {
-        snprintf(err, err_len, "%s: cannot load fixture %s",
-                 label, json_string_value(jwire));
-        return -1;
-    }
-
-    char *emit_canon = NULL, *exp_canon = NULL;
-    size_t emit_canon_len = 0, exp_canon_len = 0;
-    int rc = -1;
-    if (jcs_canonicalize(emitted_json, strlen(emitted_json),
-                         &emit_canon, &emit_canon_len) != 0) {
-        snprintf(err, err_len, "%s: canonicalize(emitted) failed", label);
-        goto out;
-    }
-    if (jcs_canonicalize(expected_bytes, expected_len,
-                         &exp_canon, &exp_canon_len) != 0) {
-        snprintf(err, err_len, "%s: canonicalize(expected) failed", label);
-        goto out;
-    }
-    if (emit_canon_len != exp_canon_len ||
-        memcmp(emit_canon, exp_canon, emit_canon_len) != 0) {
+    json_t *hx = expected ? json_object_get(expected, "proto_wire_hex") : NULL;
+    if (!json_is_string(hx)) {
         snprintf(err, err_len,
-                 "%s: wire bytes diverge from pinned fixture %s\n"
-                 "  expected: %.*s\n  actual:   %.*s",
-                 label, json_string_value(jwire),
-                 (int)exp_canon_len, exp_canon,
-                 (int)emit_canon_len, emit_canon);
-        goto out;
+                 "%s: byte_pinning=true but expected.proto_wire_hex missing", label);
+        return -1;
     }
-    rc = 0;
-out:
-    free(emit_canon);
-    free(exp_canon);
-    free(expected_bytes);
+    const char *want = json_string_value(hx);
+    size_t want_len = strlen(want);
+    if (want_len != wire_len * 2) {
+        snprintf(err, err_len,
+                 "%s: proto wire length %zu bytes, pinned hex is %zu bytes",
+                 label, wire_len, want_len / 2);
+        return -1;
+    }
+    char *got = malloc(wire_len * 2 + 1);
+    if (got == NULL) {
+        snprintf(err, err_len, "%s: oom", label);
+        return -1;
+    }
+    for (size_t i = 0; i < wire_len; i++)
+        snprintf(got + i * 2, 3, "%02x", wire[i]);
+    int rc = 0;
+    if (strcmp(got, want) != 0) {
+        snprintf(err, err_len,
+                 "%s: proto wire bytes diverge from the pinned hex\n"
+                 "  expected: %s\n  actual:   %s", label, want, got);
+        rc = -1;
+    }
+    free(got);
     return rc;
 }
+
 
 /* Build the JSON form the Python adapter emits for an AgreementProof
  * under SerializeMode.PROTO + WireFormat.JSON: protobuf-JSON mapping with
@@ -649,7 +766,7 @@ static int run_wv_agreement_proof(json_t *case_data, json_t *input,
         snprintf(err, err_len, "wv/agreement_proof: json emit failed");
         goto cleanup_restored;
     }
-    int bp_rc = assert_byte_pin_json(case_data, emitted, "wv/agreement_proof",
+    int bp_rc = at_byte_pin_json(case_data, emitted, "wv/agreement_proof",
                                      err, err_len);
     free(emitted);
     if (bp_rc != 0) goto cleanup_restored;
@@ -723,7 +840,7 @@ static int run_wv_signature_byte_pin(json_t *case_data, json_t *input,
         snprintf(err, err_len, "wv/signature: json_dumps failed");
         return -1;
     }
-    int bp_rc = assert_byte_pin_json(case_data, emitted, "wv/signature",
+    int bp_rc = at_byte_pin_json(case_data, emitted, "wv/signature",
                                      err, err_len);
     free(emitted);
     return bp_rc;
@@ -782,12 +899,12 @@ cleanup:
     if (ident != NULL) identity_free(ident);
     /* pub_copy and pb_buf are smrt_ptrs; smrt_deref releases them. */
     if (pub != NULL) smrt_deref(pub);
-    if (pb_buf != NULL) smrt_deref(pb_buf);
+    if (pb_buf != NULL) free(pb_buf);   /* peer_to_proto: plain malloc */
     return rc;
 }
 
 static int run_wv_message_envelope(json_t *case_data, json_t *input,
-                                   json_t *expected,
+                                   json_t *expected, net_wire_format_t fmt,
                                    char *err, size_t err_len) {
     (void)expected;
 
@@ -842,12 +959,22 @@ static int run_wv_message_envelope(json_t *case_data, json_t *input,
         msg.trace_id[tlen] = '\0';
     }
 
-    if (net_message_to_wire(&msg, NULL, &wire, &wire_len) != 0) {
-        snprintf(err, err_len, "wv/message: to_wire failed");
+    if (net_message_to_wire_fmt(&msg, NULL, fmt, &wire, &wire_len) != 0) {
+        snprintf(err, err_len, "wv/message: to_wire failed (%s)",
+                 net_wire_format_name(fmt));
         goto cleanup;
     }
-    if (net_message_from_wire(wire, wire_len, NULL, &restored) != 0) {
-        snprintf(err, err_len, "wv/message: from_wire failed");
+    if (fmt == NET_WIRE_PROTO &&
+        (wire_len < 1 || wire[0] != (uint8_t)NET_WIRE_PROTO_MAGIC)) {
+        /* The marker is not part of the protobuf; a receiver reads it before
+         * deciding which parser the frame is even eligible for. */
+        snprintf(err, err_len, "wv/message: proto envelope missing 0x%02X marker",
+                 NET_WIRE_PROTO_MAGIC);
+        goto cleanup;
+    }
+    if (net_message_from_wire_fmt(wire, wire_len, NULL, fmt, &restored) != 0) {
+        snprintf(err, err_len, "wv/message: from_wire failed (%s)",
+                 net_wire_format_name(fmt));
         goto cleanup;
     }
     if (strcmp(restored.process, msg.process) != 0) {
@@ -866,11 +993,23 @@ static int run_wv_message_envelope(json_t *case_data, json_t *input,
         snprintf(err, err_len, "wv/message: encrypt flag drift");
         goto cleanup;
     }
+    if (msg.trace_id[0] != '\0' &&
+        strcmp(restored.trace_id, msg.trace_id) != 0) {
+        /* A trace that survives one encoding and not the other is worse than no
+         * trace: it silently breaks the correlation chain at that hop. */
+        snprintf(err, err_len, "wv/message: trace_id drift ('%s' != '%s')",
+                 restored.trace_id, msg.trace_id);
+        goto cleanup;
+    }
 
-    /* Byte-pin assertion: the emitted wire is already JSON, so feed it
-     * straight to the shared comparator. */
-    int bp_rc = assert_byte_pin_json(case_data, (const char *)wire,
-                                     "wv/message", err, err_len);
+    /* Byte-pin assertion. JSON goes through the shared JCS comparator;
+     * the proto form is compared LITERALLY against inline hex, because
+     * protobuf has no canonical form to normalize toward -- and that
+     * strictness is the point, since a field-order or default-value
+     * difference between the runtimes is exactly what this pins. */
+    int bp_rc = (fmt == NET_WIRE_PROTO)
+        ? assert_byte_pin_proto_hex(case_data, wire, wire_len, "wv/message", err, err_len)
+        : at_byte_pin_json(case_data, (const char *)wire, "wv/message", err, err_len);
     if (bp_rc != 0) goto cleanup;
 
     rc = 0;
@@ -906,7 +1045,33 @@ static int run_wire_vector(const at_case_t *c,
     } else if (strcmp(ctor, "Signature") == 0) {
         rc = run_wv_signature(c->data, input, expected, err, err_len);
     } else if (strcmp(ctor, "Message") == 0) {
-        rc = run_wv_message_envelope(c->data, input, expected, err, err_len);
+        /* `envelope_format` selects the NETWORK envelope encoding
+         * (doc/architecture/network-wire-format.md), independent of
+         * wire_format/serialize_mode, which govern how a Configuration PAYLOAD
+         * serializes. Default json, so every vector written before the proto envelope
+         * keeps exercising what it did. */
+        const char *ef = json_string_value(json_object_get(c->data, "envelope_format"));
+        if (ef == NULL) ef = "json";
+        if (strcmp(ef, "both") == 0) {
+            /* Cross-format equivalence is asserted by running the SAME input
+             * through both encodings: each round trip checks its result against
+             * the constructed message, so agreeing with the input is agreeing
+             * with each other. */
+            rc = run_wv_message_envelope(c->data, input, expected,
+                                         NET_WIRE_JSON, err, err_len);
+            if (rc == 0)
+                rc = run_wv_message_envelope(c->data, input, expected,
+                                             NET_WIRE_PROTO, err, err_len);
+        } else if (strcmp(ef, "proto") == 0) {
+            rc = run_wv_message_envelope(c->data, input, expected,
+                                         NET_WIRE_PROTO, err, err_len);
+        } else if (strcmp(ef, "json") == 0) {
+            rc = run_wv_message_envelope(c->data, input, expected,
+                                         NET_WIRE_JSON, err, err_len);
+        } else {
+            snprintf(err, err_len, "unknown envelope_format: %s", ef);
+            rc = -1;
+        }
     } else {
         snprintf(err, err_len, "unsupported constructor: %s", ctor);
         rc = 1;  /* skip sentinel */
@@ -2140,6 +2305,959 @@ static int run_port_resolution(const at_case_t *c, char *err, size_t err_len) {
     return rc;
 }
 
+/* Network-tunable resolution (scenario `tunables-resolution`).
+ *
+ * Walks fixtures.knobs to check this implementation's own defaults and bounds,
+ * then fixtures.resolutions, driving each knob's environment variable and
+ * asserting the resolved (value, source). Python's adapter runs the same table
+ * against system.resolve_annoy_limit / resolve_recv_poll_ms /
+ * resolve_mystery_max_age_s, so a knob that exists on one side only -- which is
+ * exactly what this case was written to prevent recurring -- fails here. */
+extern void net_knobs_resolve_reset(void);  /* test seam, not in network.h */
+
+typedef struct {
+    const char *name;
+    int (*resolve)(net_knob_source_t *, logger_t *);
+    int dflt;
+    int min;
+    int max;
+} knob_spec_t;
+
+static const knob_spec_t knob_specs[] = {
+    { "annoy_limit",       net_annoy_limit_resolve,
+      NET_ANNOY_LIMIT, NET_ANNOY_LIMIT_MIN, NET_ANNOY_LIMIT_MAX },
+    { "recv_poll_ms",      net_recv_poll_ms_resolve,
+      NET_RECV_POLL_MS, NET_RECV_POLL_MS_MIN, NET_RECV_POLL_MS_MAX },
+    { "mystery_max_age_s", net_mystery_max_age_resolve,
+      NET_MYSTERY_MAX_AGE_SEC, NET_MYSTERY_MAX_AGE_SEC_MIN,
+      NET_MYSTERY_MAX_AGE_SEC_MAX },
+};
+#define KNOB_SPEC_COUNT (sizeof(knob_specs) / sizeof(knob_specs[0]))
+
+static const knob_spec_t *knob_spec_find(const char *name) {
+    if (name == NULL) return NULL;
+    for (size_t i = 0; i < KNOB_SPEC_COUNT; i++)
+        if (strcmp(knob_specs[i].name, name) == 0)
+            return &knob_specs[i];
+    return NULL;
+}
+
+/* Check one scenario-pinned constant against this implementation's own. */
+static int knob_const_check(json_t *spec, const char *key, const char *name,
+                            int actual, char *err, size_t err_len) {
+    json_t *j = json_object_get(spec, key);
+    if (json_is_integer(j) && (int)json_integer_value(j) != actual) {
+        snprintf(err, err_len, "%s.%s: scenario says %d, C says %d",
+                 name, key, (int)json_integer_value(j), actual);
+        return -1;
+    }
+    return 0;
+}
+
+static int run_tunables_resolution(const at_case_t *c, char *err, size_t err_len) {
+    json_t *fixtures = json_object_get(c->data, "fixtures");
+    json_t *knobs = fixtures != NULL
+        ? json_object_get(fixtures, "knobs") : NULL;
+    json_t *table = fixtures != NULL
+        ? json_object_get(fixtures, "resolutions") : NULL;
+    if (!json_is_array(knobs) || json_array_size(knobs) == 0) {
+        snprintf(err, err_len, "scenario: fixtures.knobs missing or empty");
+        return -1;
+    }
+    if (!json_is_array(table) || json_array_size(table) == 0) {
+        snprintf(err, err_len, "scenario: fixtures.resolutions missing or empty");
+        return -1;
+    }
+
+    /* Defaults and bounds are pinned in the scenario so a drift in either
+     * side's constants fails here rather than agreeing on a value neither side
+     * got from the other. */
+    size_t nk = json_array_size(knobs);
+    for (size_t i = 0; i < nk; i++) {
+        json_t *spec = json_array_get(knobs, i);
+        const char *name = json_string_value(json_object_get(spec, "name"));
+        const knob_spec_t *k = knob_spec_find(name);
+        if (k == NULL) {
+            snprintf(err, err_len, "scenario knob '%s' has no C resolver",
+                     name != NULL ? name : "(null)");
+            return -1;
+        }
+        if (knob_const_check(spec, "default", name, k->dflt, err, err_len) != 0 ||
+            knob_const_check(spec, "min", name, k->min, err, err_len) != 0 ||
+            knob_const_check(spec, "max", name, k->max, err, err_len) != 0)
+            return -1;
+    }
+
+    /* Restore whatever the runner was invoked with, so one case cannot leak an
+     * override into the next. */
+    char saved_buf[KNOB_SPEC_COUNT][64];
+    bool had_saved[KNOB_SPEC_COUNT];
+    const char *env_names[KNOB_SPEC_COUNT];
+    for (size_t i = 0; i < KNOB_SPEC_COUNT; i++) {
+        env_names[i] = NULL;
+        saved_buf[i][0] = '\0';
+        had_saved[i] = false;
+    }
+    /* Env var names come from the scenario, so the two sides also agree on
+     * WHICH variable each knob reads. */
+    for (size_t i = 0; i < nk; i++) {
+        json_t *spec = json_array_get(knobs, i);
+        const char *name = json_string_value(json_object_get(spec, "name"));
+        const char *var = json_string_value(json_object_get(spec, "env"));
+        if (var == NULL) {
+            snprintf(err, err_len, "scenario knob '%s': missing env name",
+                     name != NULL ? name : "(null)");
+            return -1;
+        }
+        for (size_t j = 0; j < KNOB_SPEC_COUNT; j++) {
+            if (strcmp(knob_specs[j].name, name) == 0) {
+                env_names[j] = var;
+                const char *cur = getenv(var);
+                if (cur != NULL) {
+                    had_saved[j] = true;
+                    snprintf(saved_buf[j], sizeof(saved_buf[j]), "%s", cur);
+                }
+                break;
+            }
+        }
+    }
+
+    int rc = 0;
+    size_t n = json_array_size(table);
+    for (size_t i = 0; i < n && rc == 0; i++) {
+        json_t *row = json_array_get(table, i);
+        const char *id = json_string_value(json_object_get(row, "id"));
+        if (id == NULL) id = "?";
+        const char *name = json_string_value(json_object_get(row, "knob"));
+        const knob_spec_t *k = knob_spec_find(name);
+        if (k == NULL) {
+            snprintf(err, err_len, "%s: unknown knob '%s'", id,
+                     name != NULL ? name : "(null)");
+            rc = -1;
+            break;
+        }
+        const char *var = NULL;
+        for (size_t j = 0; j < KNOB_SPEC_COUNT; j++)
+            if (&knob_specs[j] == k) var = env_names[j];
+        if (var == NULL) {
+            snprintf(err, err_len, "%s: knob '%s' not declared in fixtures.knobs",
+                     id, name);
+            rc = -1;
+            break;
+        }
+
+        json_t *j_env = json_object_get(row, "env");
+        const char *env = json_string_value(j_env);   /* NULL when YAML null */
+        int want_value = (int)json_integer_value(json_object_get(row, "expect_value"));
+        const char *want_src =
+            json_string_value(json_object_get(row, "expect_source"));
+        if (want_src == NULL) want_src = "";
+
+        if (env != NULL) setenv(var, env, 1);
+        else unsetenv(var);
+        net_knobs_resolve_reset();  /* the override is read once and cached */
+
+        net_knob_source_t src = KNOB_SRC_DEFAULT;
+        int got = k->resolve(&src, NULL);
+        const char *got_src = net_knob_source_name(src);
+
+        if (got != want_value) {
+            snprintf(err, err_len, "%s: %s=%s -> %s %d, want %d",
+                     id, var, env != NULL ? env : "(unset)", name, got, want_value);
+            rc = -1;
+        } else if (strcmp(got_src, want_src) != 0) {
+            snprintf(err, err_len, "%s: %s=%s -> source '%s', want '%s'",
+                     id, var, env != NULL ? env : "(unset)", got_src, want_src);
+            rc = -1;
+        }
+    }
+
+    for (size_t j = 0; j < KNOB_SPEC_COUNT; j++) {
+        if (env_names[j] == NULL) continue;
+        if (had_saved[j]) setenv(env_names[j], saved_buf[j], 1);
+        else unsetenv(env_names[j]);
+    }
+    net_knobs_resolve_reset();
+    return rc;
+}
+
+
+/* ---- Envelope-format scenarios (doc/architecture/network-wire-format.md)
+ * --------------------------- */
+
+/* Compare a named boolean observable against expected_state.<participant>.
+ * The C twin of the Python adapter's _assert_expected_flags: a scenario that
+ * declares a flag the adapter never measured must FAIL rather than pass
+ * vacuously, which is how a corpus ends up reassuring and wrong. */
+static int expect_flag(const at_case_t *c, const char *participant,
+                       const char *key, bool actual,
+                       char *err, size_t err_len) {
+    json_t *st = json_object_get(c->data, "expected_state");
+    json_t *p  = st != NULL ? json_object_get(st, participant) : NULL;
+    json_t *v  = p != NULL ? json_object_get(p, key) : NULL;
+    if (v == NULL)
+        return 0;  /* the scenario does not assert this one */
+    bool want = json_is_true(v);
+    if (want != actual) {
+        snprintf(err, err_len, "%s: %s mismatch: expected %s, got %s",
+                 participant, key, want ? "true" : "false",
+                 actual ? "true" : "false");
+        return -1;
+    }
+    return 0;
+}
+
+/* The strict format gate, both directions (scenario
+ * `wire-format-mismatch-refused`). */
+static int run_wire_format_mismatch_refused(const at_case_t *c,
+                                           char *err, size_t err_len) {
+    json_t *fx = json_object_get(c->data, "fixtures");
+    const char *process = fx ? json_string_value(json_object_get(fx, "process")) : NULL;
+    const char *function = fx ? json_string_value(json_object_get(fx, "function")) : NULL;
+    const char *obj = fx ? json_string_value(json_object_get(fx, "obj_json")) : NULL;
+    const char *trace = fx ? json_string_value(json_object_get(fx, "trace_id")) : NULL;
+    if (process == NULL) process = "identity";
+    if (function == NULL) function = "request_access";
+    if (obj == NULL) obj = "{}";
+
+    net_wire_msg_t msg = {0};
+    strncpy(msg.process, process, sizeof(msg.process) - 1);
+    msg.function = (char *)function;
+    msg.data     = (uint8_t *)obj;
+    msg.data_len = strlen(obj);
+    msg.to_whom.type = RECIPIENT_BROADCAST;
+    if (trace != NULL) {
+        size_t tlen = strlen(trace);
+        if (tlen > NET_TRACE_ID_LEN) tlen = NET_TRACE_ID_LEN;
+        memcpy(msg.trace_id, trace, tlen);
+        msg.trace_id[tlen] = '\0';
+    }
+
+    uint8_t *jwire = NULL, *pwire = NULL;
+    size_t jlen = 0, plen = 0;
+    int rc = -1;
+    if (net_message_to_wire_fmt(&msg, NULL, NET_WIRE_JSON, &jwire, &jlen) != 0 ||
+        net_message_to_wire_fmt(&msg, NULL, NET_WIRE_PROTO, &pwire, &plen) != 0) {
+        snprintf(err, err_len, "scenario: encode failed");
+        goto out;
+    }
+
+    net_wire_msg_t out_msg;
+    /* Matching format + expectation: accepted. */
+    memset(&out_msg, 0, sizeof(out_msg));
+    bool json_ok = (net_message_from_wire_fmt(jwire, jlen, NULL,
+                                              NET_WIRE_JSON, &out_msg) == 0);
+    net_wire_msg_free(&out_msg);
+    memset(&out_msg, 0, sizeof(out_msg));
+    bool proto_ok = (net_message_from_wire_fmt(pwire, plen, NULL,
+                                               NET_WIRE_PROTO, &out_msg) == 0);
+    net_wire_msg_free(&out_msg);
+
+    /* Mismatched: refused, and refused AS A FORMAT ERROR -- the operator
+     * consequence of "foreign format" differs from "bad message", so the two
+     * must be distinguishable. */
+    memset(&out_msg, 0, sizeof(out_msg));
+    int p_as_j = net_message_from_wire_fmt(pwire, plen, NULL, NET_WIRE_JSON, &out_msg);
+    /* EXCEPTION() always returns -1 and records the code, so the KIND of
+     * refusal is read off the thread-local exception -- which is also how a
+     * production caller distinguishes it. */
+    bool p_fmt_specific = (p_as_j != 0 && _exception.errnum == ENET_WIRE_FORMAT);
+    net_wire_msg_free(&out_msg);
+    memset(&out_msg, 0, sizeof(out_msg));
+    int j_as_p = net_message_from_wire_fmt(jwire, jlen, NULL, NET_WIRE_PROTO, &out_msg);
+    bool j_fmt_specific = (j_as_p != 0 && _exception.errnum == ENET_WIRE_FORMAT);
+    net_wire_msg_free(&out_msg);
+
+    bool fmt_specific = p_fmt_specific && j_fmt_specific;
+
+    if (expect_flag(c, "node", "json_as_json_ok", json_ok, err, err_len) != 0 ||
+        expect_flag(c, "node", "proto_as_proto_ok", proto_ok, err, err_len) != 0 ||
+        expect_flag(c, "node", "proto_as_json_refused", p_as_j != 0, err, err_len) != 0 ||
+        expect_flag(c, "node", "json_as_proto_refused", j_as_p != 0, err, err_len) != 0 ||
+        expect_flag(c, "node", "refusal_is_format_specific", fmt_specific, err, err_len) != 0)
+        goto out;
+    rc = 0;
+out:
+    free(jwire);
+    free(pwire);
+    return rc;
+}
+
+/* The JSON fallback that lets two differently-formatted groups talk
+ * (scenario `cross-group-format-fallback`).
+ *
+ * A group answers with its OWN format for its own members and with JSON for
+ * anyone it cannot place. The second half is what makes a cross-format group
+ * merge work: neither side can place the other, so both fall to JSON and the
+ * group_key_update gets through. See doc/architecture/network-wire-format.md.
+ */
+static int run_cross_group_format_fallback(const at_case_t *c,
+                                           char *err, size_t err_len) {
+    json_t *fx = json_object_get(c->data, "fixtures");
+    const char *pg_uuid = fx ? json_string_value(json_object_get(fx, "proto_group_uuid")) : NULL;
+    const char *jg_uuid = fx ? json_string_value(json_object_get(fx, "json_group_uuid")) : NULL;
+    const char *p_member = fx ? json_string_value(json_object_get(fx, "proto_member")) : NULL;
+    const char *j_member = fx ? json_string_value(json_object_get(fx, "json_member")) : NULL;
+    const char *stranger = fx ? json_string_value(json_object_get(fx, "stranger")) : NULL;
+    if (pg_uuid == NULL) pg_uuid = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+    if (jg_uuid == NULL) jg_uuid = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+    if (p_member == NULL) p_member = "10.0.0.1";
+    if (j_member == NULL) j_member = "10.0.1.1";
+    if (stranger == NULL) stranger = "10.0.9.9";
+
+    uuid_t pgu, jgu;
+    if (uuid_parse(pg_uuid, pgu) != 0 || uuid_parse(jg_uuid, jgu) != 0) {
+        snprintf(err, err_len, "scenario: bad group uuid");
+        return -1;
+    }
+
+    group_t pgrp = {0}, jgrp = {0};
+    if (group_init(&pgu, (char *)p_member, &pgrp) != 0 ||
+        group_init(&jgu, (char *)j_member, &jgrp) != 0) {
+        snprintf(err, err_len, "scenario: group_init failed");
+        return -1;
+    }
+    pgrp.wire_format = NET_WIRE_PROTO;
+    jgrp.wire_format = NET_WIRE_JSON;
+
+    int rc = -1;
+    /* group_init records the group's own address but does not populate the
+     * member map, which is what the lookup walks -- so seed each group with
+     * its one member explicitly. */
+    if (group_add_address(&pgrp, pg_uuid, p_member) != 0 ||
+        group_add_address(&jgrp, jg_uuid, j_member) != 0) {
+        snprintf(err, err_len, "scenario: group_add_address failed");
+        goto out;
+    }
+
+    bool p_own   = (group_wire_format_for_address(&pgrp, p_member) == NET_WIRE_PROTO);
+    bool j_own   = (group_wire_format_for_address(&jgrp, j_member) == NET_WIRE_JSON);
+    bool p_far   = (group_wire_format_for_address(&pgrp, j_member) == NET_WIRE_JSON);
+    bool j_far   = (group_wire_format_for_address(&jgrp, p_member) == NET_WIRE_JSON);
+    bool p_strng = (group_wire_format_for_address(&pgrp, stranger) == NET_WIRE_JSON);
+
+    if (expect_flag(c, "node", "proto_group_to_own_member_is_proto", p_own, err, err_len) != 0 ||
+        expect_flag(c, "node", "json_group_to_own_member_is_json", j_own, err, err_len) != 0 ||
+        expect_flag(c, "node", "proto_group_to_foreign_member_is_json", p_far, err, err_len) != 0 ||
+        expect_flag(c, "node", "json_group_to_foreign_member_is_json", j_far, err, err_len) != 0 ||
+        expect_flag(c, "node", "proto_group_to_stranger_is_json", p_strng, err, err_len) != 0)
+        goto out;
+    rc = 0;
+out:
+    group_free(&pgrp);
+    group_free(&jgrp);
+    return rc;
+}
+
+/* Which verbs the gateway boundary refuses to carry
+ * (scenario `gateway-boundary-verbs`).
+ *
+ * Pins the MEMBERSHIP and the SIZE of the pre-admission set, because it is two
+ * hand-maintained lists in two languages: a verb added on one side only opens
+ * the boundary on one runtime and closes it on the other, silently. The
+ * negative list carries most of the value -- group_key_update and the
+ * partition pair must NOT classify as bootstrap or a gateway could not hold
+ * two cohorts / could not recover from a partition.
+ */
+static int run_gateway_boundary_verbs(const at_case_t *c,
+                                      char *err, size_t err_len) {
+    json_t *fx = json_object_get(c->data, "fixtures");
+    json_t *boots = fx ? json_object_get(fx, "bootstrap_verbs") : NULL;
+    json_t *others = fx ? json_object_get(fx, "not_bootstrap_verbs") : NULL;
+    if (!json_is_array(boots) || json_array_size(boots) == 0) {
+        snprintf(err, err_len, "scenario: fixtures.bootstrap_verbs missing or empty");
+        return -1;
+    }
+
+    bool all_recognized = true;
+    size_t i;
+    json_t *item;
+    json_array_foreach(boots, i, item) {
+        const char *verb = json_string_value(item);
+        if (verb == NULL || !identity_verb_is_bootstrap(verb))
+            all_recognized = false;
+    }
+
+    bool none_other = true;
+    if (json_is_array(others)) {
+        json_array_foreach(others, i, item) {
+            const char *verb = json_string_value(item);
+            if (verb != NULL && identity_verb_is_bootstrap(verb))
+                none_other = false;
+        }
+    }
+
+    bool count_is_three = (identity_bootstrap_verb_count() == 3);
+    /* NULL is the C spelling of Python's None/'' -- safe, and not bootstrap. */
+    bool empty_safe = (!identity_verb_is_bootstrap(NULL) &&
+                       !identity_verb_is_bootstrap(""));
+
+    if (expect_flag(c, "node", "all_bootstrap_verbs_recognized", all_recognized, err, err_len) != 0 ||
+        expect_flag(c, "node", "no_other_verb_is_bootstrap", none_other, err, err_len) != 0 ||
+        expect_flag(c, "node", "bootstrap_verb_count_is_three", count_is_three, err, err_len) != 0 ||
+        expect_flag(c, "node", "empty_verb_is_not_bootstrap", empty_safe, err, err_len) != 0)
+        return -1;
+    return 0;
+}
+
+/* What an inbound frame may carry, by its path (scenario `wire-verb-policy`,
+ * ISSUES §2.17): each fixture case asked of net_wire_verb_admitted. Mirrors
+ * Python _run_wire_verb_policy. */
+static int run_wire_verb_policy(const at_case_t *c, char *err, size_t err_len) {
+    json_t *cases = json_object_get(json_object_get(c->data, "fixtures"), "cases");
+    if (!json_is_array(cases) || json_array_size(cases) == 0) {
+        snprintf(err, err_len, "scenario: fixtures.cases missing or empty");
+        return -1;
+    }
+    static const struct { const char *name; net_route_path_t path; } paths[] = {
+        { "peer", NET_PATH_PEER },
+        { "stranger-plaintext", NET_PATH_STRANGER },
+        { "relayed-stranger", NET_PATH_RELAY_STRANGER },
+        { "broadcast", NET_PATH_BROADCAST },
+        { "group", NET_PATH_GROUP },
+    };
+    bool all = true;
+    size_t i;
+    json_t *one;
+    json_array_foreach(cases, i, one) {
+        const char *proc = json_string_value(json_object_get(one, "process"));
+        const char *fn = json_string_value(json_object_get(one, "function"));
+        const char *pname = json_string_value(json_object_get(one, "path"));
+        bool want = json_is_true(json_object_get(one, "admitted"));
+        int found = -1;
+        for (size_t k = 0; pname != NULL && k < sizeof(paths) / sizeof(paths[0]); k++)
+            if (strcmp(pname, paths[k].name) == 0)
+                found = (int)k;
+        if (found < 0) {
+            snprintf(err, err_len, "scenario: unknown path '%s'", pname ? pname : "");
+            return -1;
+        }
+        if (net_wire_verb_admitted(proc, fn, paths[found].path, NULL) != want) {
+            fprintf(stderr, "wire-verb-policy mismatch: %s.%s on %s\n",
+                    proc ? proc : "?", fn ? fn : "?", pname);
+            all = false;
+        }
+    }
+    return expect_flag(c, "node", "all_cases_match", all, err, err_len) != 0 ? -1 : 0;
+}
+
+/* The plaintext allowlist (scenario `unencrypted-verbs`).
+ *
+ * Pins the membership AND the size of the set a receiver accepts unencrypted
+ * from a known peer. Two hand-maintained lists in two languages, and the
+ * failure is asymmetric: too small drops protocol traffic, too large is a
+ * DOWNGRADE opening an attacker selects by simply not encrypting.
+ *
+ * The sharpest assertion is the relationship to the bootstrap set: the two
+ * overlap on request_access / access_granted (both run before a key exists),
+ * but full_history is bootstrap and must NEVER be accepted in the clear
+ * because it hands over the group key. Neither set is a subset of the other.
+ */
+/* A scratch configuration directory holding @p doc as the node's
+ * unencrypted_verbs.cfg.json (a JSON string is written as its text, anything
+ * else as JSON; no file for NULL / null), with AT_FIRST_CONTACT set to
+ * @p first_contact; then apply it through the production loader. Returns the
+ * loader's rc (0 granted, -1 refused). The grant stays in force for the
+ * caller to inspect; plaintext_verbs_reset() undoes it. */
+static int _configure_plaintext(const json_t *doc, bool first_contact)
+{
+    char dir[] = "/tmp/at_conf_plaintext_XXXXXX";
+    if (mkdtemp(dir) == NULL)
+        return -2;
+    char path[sizeof(dir) + sizeof(PLAINTEXT_VERBS_FILENAME) + 1];
+    snprintf(path, sizeof(path), "%s/%s", dir, PLAINTEXT_VERBS_FILENAME);
+    bool wrote = false;
+    if (doc != NULL && !json_is_null(doc)) {
+        FILE *f = fopen(path, "w");
+        if (f == NULL) {
+            rmdir(dir);
+            return -2;
+        }
+        if (json_is_string(doc)) {
+            fputs(json_string_value(doc), f);
+        } else {
+            char *text = json_dumps(doc, JSON_COMPACT);
+            fputs(text != NULL ? text : "", f);
+            free(text);
+        }
+        fclose(f);
+        wrote = true;
+    }
+    const char *saved = getenv("AT_FIRST_CONTACT");
+    char saved_copy[16] = "";
+    bool had = saved != NULL;
+    if (had)
+        snprintf(saved_copy, sizeof(saved_copy), "%s", saved);
+    setenv("AT_FIRST_CONTACT", first_contact ? "1" : "0", 1);
+    plaintext_verbs_reset();
+    int rc = plaintext_verbs_configure(dir, NULL);
+    if (had)
+        setenv("AT_FIRST_CONTACT", saved_copy, 1);
+    else
+        unsetenv("AT_FIRST_CONTACT");
+    if (wrote)
+        unlink(path);
+    rmdir(dir);
+    return rc;
+}
+
+static int run_unencrypted_verbs(const at_case_t *c, char *err, size_t err_len) {
+    json_t *fx = json_object_get(c->data, "fixtures");
+    json_t *plain = fx ? json_object_get(fx, "unencrypted_verbs") : NULL;
+    json_t *core = fx ? json_object_get(fx, "core_unencrypted_verbs") : NULL;
+    json_t *enc_only = fx ? json_object_get(fx, "encrypted_only_verbs") : NULL;
+    json_t *both = fx ? json_object_get(fx, "both_bootstrap_and_unencrypted") : NULL;
+    json_t *boot_enc = fx ? json_object_get(fx, "bootstrap_but_encrypted") : NULL;
+    if (!json_is_array(plain) || json_array_size(plain) == 0) {
+        snprintf(err, err_len, "scenario: fixtures.unencrypted_verbs missing or empty");
+        return -1;
+    }
+#ifndef AT_FIRST_CONTACT_ENABLED
+    /* First contact declares the verbs its file grants; without its library
+     * (AT_FIRST_CONTACT_LIB) the file is refused, as it should be. */
+    if (json_is_true(json_object_get(fx, "first_contact"))) {
+        snprintf(err, err_len, "first-contact scenario skipped: C built without "
+                               "libat_first_contact (AT_FIRST_CONTACT_LIB=OFF)");
+        return 1;
+    }
+#endif
+    if (_configure_plaintext(fx ? json_object_get(fx, "plaintext_file") : NULL,
+                             fx != NULL && json_is_true(json_object_get(fx, "first_contact")))
+        != 0) {
+        plaintext_verbs_reset();
+        snprintf(err, err_len, "scenario: plaintext_file was refused");
+        return -1;
+    }
+
+    size_t i;
+    json_t *item;
+
+    bool all_recognized = true;
+    json_array_foreach(plain, i, item) {
+        const char *verb = json_string_value(item);
+        if (verb == NULL || !identity_verb_is_unencrypted(verb))
+            all_recognized = false;
+    }
+
+    bool none_other = true;
+    if (json_is_array(enc_only)) {
+        json_array_foreach(enc_only, i, item) {
+            const char *verb = json_string_value(item);
+            if (verb != NULL && identity_verb_is_unencrypted(verb))
+                none_other = false;
+        }
+    }
+
+    bool count_is_fourteen = (identity_unencrypted_verb_count() == 14);
+    /* The core's nine: exactly the fixture's list, in either direction. */
+    bool core_nine = json_is_array(core)
+                     && identity_core_unencrypted_verb_count() == 9
+                     && json_array_size(core) == 9;
+    if (core_nine) {
+        json_array_foreach(core, i, item) {
+            const char *verb = json_string_value(item);
+            if (verb == NULL || !identity_verb_is_core_unencrypted(verb))
+                core_nine = false;
+        }
+    }
+    /* What the file granted is never a core verb. */
+    bool granted_not_core = plaintext_verbs_granted_count() > 0;
+    json_t *pfile = fx ? json_object_get(fx, "plaintext_file") : NULL;
+    json_t *gverbs = json_is_object(pfile) ? json_object_get(pfile, "verbs") : NULL;
+    if (json_is_array(gverbs)) {
+        json_array_foreach(gverbs, i, item) {
+            const char *verb = json_string_value(item);
+            if (verb == NULL || identity_verb_is_core_unencrypted(verb)
+                || !plaintext_verb_granted(verb))
+                granted_not_core = false;
+        }
+    }
+    bool empty_safe = (!identity_verb_is_unencrypted(NULL) &&
+                       !identity_verb_is_unencrypted(""));
+
+    /* Overlap: run before a key exists, so bootstrap AND plaintext. */
+    bool overlap_ok = json_is_array(both) && json_array_size(both) > 0;
+    if (overlap_ok) {
+        json_array_foreach(both, i, item) {
+            const char *verb = json_string_value(item);
+            if (verb == NULL || !identity_verb_is_unencrypted(verb) ||
+                !identity_verb_is_bootstrap(verb))
+                overlap_ok = false;
+        }
+    }
+
+    /* Bootstrap but encrypted: the group key never rides in the clear. */
+    bool boot_enc_ok = json_is_array(boot_enc) && json_array_size(boot_enc) > 0;
+    if (boot_enc_ok) {
+        json_array_foreach(boot_enc, i, item) {
+            const char *verb = json_string_value(item);
+            if (verb == NULL || !identity_verb_is_bootstrap(verb) ||
+                identity_verb_is_unencrypted(verb))
+                boot_enc_ok = false;
+        }
+    }
+    plaintext_verbs_reset();
+
+    if (expect_flag(c, "node", "all_unencrypted_verbs_recognized", all_recognized, err, err_len) != 0 ||
+        expect_flag(c, "node", "no_other_verb_is_unencrypted", none_other, err, err_len) != 0 ||
+        expect_flag(c, "node", "unencrypted_verb_count_is_fourteen", count_is_fourteen, err, err_len) != 0 ||
+        expect_flag(c, "node", "core_verbs_are_exactly_these_nine", core_nine, err, err_len) != 0 ||
+        expect_flag(c, "node", "granted_verbs_are_not_core", granted_not_core, err, err_len) != 0 ||
+        expect_flag(c, "node", "empty_verb_is_not_unencrypted", empty_safe, err, err_len) != 0 ||
+        expect_flag(c, "node", "overlap_verbs_are_both", overlap_ok, err, err_len) != 0 ||
+        expect_flag(c, "node", "full_history_is_bootstrap_but_not_unencrypted", boot_enc_ok, err, err_len) != 0)
+        return -1;
+    return 0;
+}
+
+/* The rules of unencrypted_verbs.cfg.json (scenario `plaintext-verbs-file`,
+ * FEATURE_SPLIT_PLAN D8): each row applies one file through the production
+ * loader and records whether the start is refused and how many verbs are
+ * granted. Mirrors Python _run_plaintext_verbs_file. */
+static int run_plaintext_verbs_file(const at_case_t *c, char *err, size_t err_len) {
+    json_t *fx = json_object_get(c->data, "fixtures");
+    json_t *rows = fx ? json_object_get(fx, "rows") : NULL;
+    if (!json_is_array(rows) || json_array_size(rows) == 0) {
+        snprintf(err, err_len, "scenario: fixtures.rows missing or empty");
+        return -1;
+    }
+    bool all_match = true, refusal_grants_nothing = true, gku_never = true;
+    size_t i;
+    json_t *row;
+    json_array_foreach(rows, i, row) {
+#ifndef AT_FIRST_CONTACT_ENABLED
+        /* A row with first contact on needs its library (AT_FIRST_CONTACT_LIB);
+         * the core's rows still run. */
+        if (json_is_true(json_object_get(row, "first_contact")))
+            continue;
+#endif
+        int rc = _configure_plaintext(json_object_get(row, "file"),
+                                      json_is_true(json_object_get(row, "first_contact")));
+        if (rc == -2) {
+            snprintf(err, err_len, "adapter: cannot write a scratch config dir");
+            return -1;
+        }
+        bool refused = rc != 0;
+        long long count = (long long)plaintext_verbs_granted_count();
+        if (refused && count != 0)
+            refusal_grants_nothing = false;
+        if (identity_verb_is_unencrypted("group_key_update"))
+            gku_never = false;
+        plaintext_verbs_reset();
+        bool want_refused = json_is_true(json_object_get(row, "expect_refused"));
+        long long want_count = json_integer_value(json_object_get(row, "expect_granted"));
+        if (refused != want_refused || count != want_count) {
+            all_match = false;
+            const char *id = json_string_value(json_object_get(row, "id"));
+            snprintf(err, err_len, "%s: refused=%s granted=%lld, want refused=%s "
+                     "granted=%lld", id != NULL ? id : "?",
+                     refused ? "true" : "false", count,
+                     want_refused ? "true" : "false", want_count);
+            return -1;
+        }
+    }
+    if (expect_flag(c, "node", "all_rows_match", all_match, err, err_len) != 0 ||
+        expect_flag(c, "node", "a_refusal_grants_nothing", refusal_grants_nothing,
+                    err, err_len) != 0 ||
+        expect_flag(c, "node", "group_key_update_never_plaintext", gku_never,
+                    err, err_len) != 0)
+        return -1;
+    return 0;
+}
+
+/* The envelope's from_* claim is read ONLY when the transport gave no peer
+ * (scenario `transport-binds-the-recipient`, R+D.md 2.6).
+ *
+ * One signed frame, parsed three ways per format: attributed to its true
+ * signer, attributed to a RELAYER (the cross-recipient attack), and
+ * unattributed. Row 2 is the security property; row 3 proves the ORDERING --
+ * with a peer supplied the parsed sender IS that peer, so the envelope's claim
+ * was ignored rather than merely contradicted.
+ *
+ * Both formats on purpose: C duplicates this branch in net_message_from_wire
+ * and net_message_from_wire_proto, so a divergence between our own two parsers
+ * is exactly what a single-format case would miss.
+ */
+static int run_transport_binds_the_recipient(const at_case_t *c,
+                                             char *err, size_t err_len) {
+    json_t *fx = json_object_get(c->data, "fixtures");
+    const char *process = fx ? json_string_value(json_object_get(fx, "process")) : NULL;
+    const char *function = fx ? json_string_value(json_object_get(fx, "function")) : NULL;
+    const char *obj = fx ? json_string_value(json_object_get(fx, "obj_json")) : NULL;
+    const char *trace = fx ? json_string_value(json_object_get(fx, "trace_id")) : NULL;
+    if (process == NULL) process = "idproc";
+    if (function == NULL) function = "peer_caps_query";
+    if (obj == NULL) obj = "payload";
+
+    int rc = -1;
+    identity_t *signer = NULL, *relayer = NULL;
+    public_identity_t *signer_pub = NULL, *relayer_pub = NULL;
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+
+    if (_make_deterministic_identity("a", "10.0.80.1", &signer) != 0 ||
+        _make_deterministic_identity("b", "10.0.80.2", &relayer) != 0) {
+        snprintf(err, err_len, "scenario: identity setup failed");
+        goto out;
+    }
+    if (identity_publish(signer, &signer_pub) != 0 ||
+        identity_publish(relayer, &relayer_pub) != 0) {
+        snprintf(err, err_len, "scenario: identity_publish failed");
+        goto out;
+    }
+
+    net_wire_msg_t msg = {0};
+    at_strlcpy(msg.process, process, sizeof(msg.process));
+    msg.function = (char *)function;
+    msg.data     = (uint8_t *)obj;
+    msg.data_len = strlen(obj);
+    msg.to_whom.type = RECIPIENT_BROADCAST;
+    /* The envelope carries the SIGNER's identity; that claim is what the
+     * transport peer must override below. */
+    memcpy(&msg.from_whom, signer_pub, sizeof(public_identity_t));
+    if (trace != NULL) {
+        size_t tlen = strlen(trace);
+        if (tlen > NET_TRACE_ID_LEN) tlen = NET_TRACE_ID_LEN;
+        memcpy(msg.trace_id, trace, tlen);
+        msg.trace_id[tlen] = '\0';
+    }
+
+    const struct { const char *label; net_wire_format_t fmt; } formats[] = {
+        { "json",  NET_WIRE_JSON  },
+        { "proto", NET_WIRE_PROTO },
+    };
+
+    for (size_t i = 0; i < 2; i++) {
+        free(wire);
+        wire = NULL;
+        if (net_message_to_wire_fmt(&msg, signer, formats[i].fmt,
+                                    &wire, &wire_len) != 0) {
+            snprintf(err, err_len, "scenario: encode failed (%s)", formats[i].label);
+            goto out;
+        }
+
+        net_wire_msg_t out_msg;
+        char flag[96];
+
+        /* Row 1: honest attribution. Also the control -- a parser that never
+         * verifies would satisfy row 2 on its own. */
+        memset(&out_msg, 0, sizeof(out_msg));
+        bool ok_true = (net_message_from_wire_fmt(wire, wire_len, signer_pub,
+                                                  formats[i].fmt, &out_msg) == 0)
+                       && out_msg.verified;
+        net_wire_msg_free(&out_msg);
+
+        /* Row 2: the SAME bytes attributed to the relayer. The relay attack. */
+        memset(&out_msg, 0, sizeof(out_msg));
+        bool parsed_relay = (net_message_from_wire_fmt(wire, wire_len, relayer_pub,
+                                                       formats[i].fmt, &out_msg) == 0);
+        bool relay_refused = !parsed_relay || !out_msg.verified;
+        /* Row 3: the ordering -- the parsed sender must BE the transport peer. */
+        bool overrides = parsed_relay &&
+            (memcmp(out_msg.from_whom.uuid, relayer_pub->uuid, sizeof(uuid_t)) == 0);
+        net_wire_msg_free(&out_msg);
+
+        /* The unattributed channel: the envelope is the only identity there is. */
+        memset(&out_msg, 0, sizeof(out_msg));
+        bool parsed_unattr = (net_message_from_wire_fmt(wire, wire_len, NULL,
+                                                        formats[i].fmt, &out_msg) == 0);
+        bool unattr_verified = parsed_unattr && out_msg.verified;
+        bool unattr_is_claim = parsed_unattr &&
+            (memcmp(out_msg.from_whom.uuid, signer_pub->uuid, sizeof(uuid_t)) == 0);
+        net_wire_msg_free(&out_msg);
+
+        snprintf(flag, sizeof(flag), "%s_verified_for_true_sender", formats[i].label);
+        if (expect_flag(c, "signer", flag, ok_true, err, err_len) != 0) goto out;
+        snprintf(flag, sizeof(flag), "%s_relay_refused", formats[i].label);
+        if (expect_flag(c, "signer", flag, relay_refused, err, err_len) != 0) goto out;
+        snprintf(flag, sizeof(flag), "%s_transport_peer_overrides_envelope", formats[i].label);
+        if (expect_flag(c, "signer", flag, overrides, err, err_len) != 0) goto out;
+        snprintf(flag, sizeof(flag), "%s_unattributed_verified", formats[i].label);
+        if (expect_flag(c, "signer", flag, unattr_verified, err, err_len) != 0) goto out;
+        snprintf(flag, sizeof(flag), "%s_unattributed_sender_is_envelope_claim", formats[i].label);
+        if (expect_flag(c, "signer", flag, unattr_is_claim, err, err_len) != 0) goto out;
+    }
+    rc = 0;
+out:
+    free(wire);
+    if (signer_pub != NULL) smrt_deref(signer_pub);
+    if (relayer_pub != NULL) smrt_deref(relayer_pub);
+    if (signer != NULL) smrt_deref(signer);
+    if (relayer != NULL) smrt_deref(relayer);
+    return rc;
+}
+
+/* AT_NET_WIRE_MODE resolution (scenario `wire-mode-resolution`). Same shape as
+ * run_tunables_resolution, against the named-value resolver. */
+static int run_wire_mode_resolution(const at_case_t *c, char *err, size_t err_len) {
+    json_t *fx = json_object_get(c->data, "fixtures");
+    json_t *knob = fx != NULL ? json_object_get(fx, "knob") : NULL;
+    json_t *table = fx != NULL ? json_object_get(fx, "resolutions") : NULL;
+    if (!json_is_array(table) || json_array_size(table) == 0) {
+        snprintf(err, err_len, "scenario: fixtures.resolutions missing or empty");
+        return -1;
+    }
+
+    /* The default and the accepted spellings are pinned in the scenario so a
+     * drift in either side's constants fails here rather than the two sides
+     * agreeing on a value neither got from the other. */
+    bool constants_match = true;
+    const char *want_dflt = knob ? json_string_value(json_object_get(knob, "default")) : NULL;
+    if (want_dflt != NULL &&
+        strcmp(want_dflt, net_wire_format_name(NET_WIRE_MODE_DEFAULT)) != 0)
+        constants_match = false;
+    json_t *choices = knob ? json_object_get(knob, "choices") : NULL;
+    if (json_is_array(choices)) {
+        if (json_array_size(choices) != 2) {
+            constants_match = false;
+        } else {
+            const char *c0 = json_string_value(json_array_get(choices, 0));
+            const char *c1 = json_string_value(json_array_get(choices, 1));
+            if (c0 == NULL || c1 == NULL ||
+                strcmp(c0, "json") != 0 || strcmp(c1, "proto") != 0)
+                constants_match = false;
+        }
+    }
+
+    const char *var = knob ? json_string_value(json_object_get(knob, "env")) : NULL;
+    if (var == NULL) var = "AT_NET_WIRE_MODE";
+    char saved[64];
+    bool had_saved = false;
+    const char *cur = getenv(var);
+    if (cur != NULL) {
+        had_saved = true;
+        snprintf(saved, sizeof(saved), "%s", cur);
+    }
+
+    int rc = 0;
+    bool all_match = true;
+    size_t n = json_array_size(table);
+    for (size_t i = 0; i < n && rc == 0; i++) {
+        json_t *row = json_array_get(table, i);
+        const char *id = json_string_value(json_object_get(row, "id"));
+        if (id == NULL) id = "?";
+        const char *env = json_string_value(json_object_get(row, "env"));
+        const char *want_value =
+            json_string_value(json_object_get(row, "expect_value"));
+        const char *want_src =
+            json_string_value(json_object_get(row, "expect_source"));
+        if (want_value == NULL || want_src == NULL) {
+            snprintf(err, err_len, "%s: row missing expect_value/expect_source", id);
+            rc = -1;
+            break;
+        }
+
+        if (env != NULL) setenv(var, env, 1);
+        else unsetenv(var);
+        net_knobs_resolve_reset();  /* the override is read once and cached */
+
+        net_knob_source_t src = KNOB_SRC_DEFAULT;
+        const char *got = net_wire_format_name(net_wire_mode_resolve(&src, NULL));
+        const char *got_src = net_knob_source_name(src);
+        if (strcmp(got, want_value) != 0 || strcmp(got_src, want_src) != 0) {
+            all_match = false;
+            snprintf(err, err_len, "%s: %s=%s -> ('%s','%s'), want ('%s','%s')",
+                     id, var, env != NULL ? env : "(unset)", got, got_src,
+                     want_value, want_src);
+            rc = -1;
+        }
+    }
+
+    if (had_saved) setenv(var, saved, 1);
+    else unsetenv(var);
+    net_knobs_resolve_reset();
+
+    if (rc == 0) {
+        if (expect_flag(c, "node", "knob_constants_match", constants_match,
+                        err, err_len) != 0 ||
+            expect_flag(c, "node", "all_resolutions_match", all_match,
+                        err, err_len) != 0)
+            rc = -1;
+    }
+    return rc;
+}
+
+/* The group's envelope format crosses the wire with the group (scenario
+ * `group-wire-format-canonical`). */
+static int run_group_wire_format_canonical(const at_case_t *c,
+                                          char *err, size_t err_len) {
+    json_t *fx = json_object_get(c->data, "fixtures");
+    const char *guuid = fx ? json_string_value(json_object_get(fx, "group_uuid")) : NULL;
+    const char *addr = fx ? json_string_value(json_object_get(fx, "address")) : NULL;
+    if (guuid == NULL) guuid = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+    if (addr == NULL) addr = "10.0.0.1";
+
+    uuid_t gu;
+    if (uuid_parse(guuid, gu) != 0) {
+        snprintf(err, err_len, "scenario: bad group_uuid");
+        return -1;
+    }
+
+    group_t grp = {0};
+    if (group_init(&gu, (char *)addr, &grp) != 0) {
+        snprintf(err, err_len, "scenario: group_init failed");
+        return -1;
+    }
+    grp.wire_format = NET_WIRE_PROTO;
+
+    int rc = -1;
+    json_t *canon = NULL;
+    if (group_to_json(&grp, &canon) != 0 || canon == NULL) {
+        snprintf(err, err_len, "scenario: group_to_json failed");
+        goto out;
+    }
+    bool key_present = json_is_string(json_object_get(canon, "wire_format"));
+
+    group_t back = {0};
+    bool proto_rt = (group_from_json(canon, &back) == 0) &&
+                    back.wire_format == NET_WIRE_PROTO;
+    map_free(&back.address_map);
+
+    /* json round trip */
+    grp.wire_format = NET_WIRE_JSON;
+    json_t *canon_json = NULL;
+    bool json_rt = false;
+    if (group_to_json(&grp, &canon_json) == 0 && canon_json != NULL) {
+        group_t b2 = {0};
+        json_rt = (group_from_json(canon_json, &b2) == 0) &&
+                  b2.wire_format == NET_WIRE_JSON;
+        map_free(&b2.address_map);
+        json_decref(canon_json);
+    }
+
+    /* Absent field: a group from a peer predating this, or a config written
+     * before it. Must read as json -- not error, not proto. */
+    json_t *absent = json_deep_copy(canon);
+    json_object_del(absent, "wire_format");
+    group_t b3 = {0};
+    bool absent_json = (group_from_json(absent, &b3) == 0) &&
+                       b3.wire_format == NET_WIRE_JSON;
+    map_free(&b3.address_map);
+    json_decref(absent);
+
+    /* Unrecognized value: a provisioning typo must tighten to the format every
+     * node can read rather than fail the load. */
+    json_t *unknown = json_deep_copy(canon);
+    json_object_set_new(unknown, "wire_format", json_string("yaml"));
+    group_t b4 = {0};
+    bool unknown_json = (group_from_json(unknown, &b4) == 0) &&
+                        b4.wire_format == NET_WIRE_JSON;
+    map_free(&b4.address_map);
+    json_decref(unknown);
+
+    if (expect_flag(c, "node", "canonical_key_present", key_present, err, err_len) != 0 ||
+        expect_flag(c, "node", "proto_roundtrips", proto_rt, err, err_len) != 0 ||
+        expect_flag(c, "node", "json_roundtrips", json_rt, err, err_len) != 0 ||
+        expect_flag(c, "node", "absent_reads_json", absent_json, err, err_len) != 0 ||
+        expect_flag(c, "node", "unknown_reads_json", unknown_json, err, err_len) != 0)
+        goto out;
+    rc = 0;
+out:
+    if (canon != NULL) json_decref(canon);
+    map_free(&grp.address_map);
+    return rc;
+}
+
 static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
     /* Network scenarios are protocol-specific; each adds a branch here
      * matching by case name. */
@@ -2172,6 +3290,36 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
     }
     if (strcmp(c->name, "port-resolution") == 0) {
         return run_port_resolution(c, err, err_len);
+    }
+    if (strcmp(c->name, "tunables-resolution") == 0) {
+        return run_tunables_resolution(c, err, err_len);
+    }
+    if (strcmp(c->name, "wire-format-mismatch-refused") == 0) {
+        return run_wire_format_mismatch_refused(c, err, err_len);
+    }
+    if (strcmp(c->name, "wire-mode-resolution") == 0) {
+        return run_wire_mode_resolution(c, err, err_len);
+    }
+    if (strcmp(c->name, "group-wire-format-canonical") == 0) {
+        return run_group_wire_format_canonical(c, err, err_len);
+    }
+    if (strcmp(c->name, "cross-group-format-fallback") == 0) {
+        return run_cross_group_format_fallback(c, err, err_len);
+    }
+    if (strcmp(c->name, "gateway-boundary-verbs") == 0) {
+        return run_gateway_boundary_verbs(c, err, err_len);
+    }
+    if (strcmp(c->name, "wire-verb-policy") == 0) {
+        return run_wire_verb_policy(c, err, err_len);
+    }
+    if (strcmp(c->name, "unencrypted-verbs") == 0) {
+        return run_unencrypted_verbs(c, err, err_len);
+    }
+    if (strcmp(c->name, "plaintext-verbs-file") == 0) {
+        return run_plaintext_verbs_file(c, err, err_len);
+    }
+    if (strcmp(c->name, "transport-binds-the-recipient") == 0) {
+        return run_transport_binds_the_recipient(c, err, err_len);
     }
     snprintf(err, err_len, "unknown network scenario: %s", c->name);
     return 1; /* skip */
