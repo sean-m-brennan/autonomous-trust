@@ -114,9 +114,12 @@ def preprocess(target_filepath: str, output_file: str, directory: str, rel_path:
                    if d not in exclude_dirs
                    and not os.path.exists(os.path.join(root, d, 'CMakeCache.txt'))]
         for filename in files:
+            # Compare with '/' separators: the #include paths in ignore_list
+            # use '/', but native Windows Python walks with '\\'.
+            filepath = os.path.join(root, filename).replace(os.sep, '/')
             ignore = False
             for path in ignore_list:
-                if path in os.path.join(root, filename):
+                if path in filepath:
                     ignore = True
             if (filename.endswith('.c') or filename.endswith('.h')) and not ignore:
                 with open(os.path.join(root, filename), 'r', encoding='utf-8') as f:
@@ -133,6 +136,7 @@ def preprocess(target_filepath: str, output_file: str, directory: str, rel_path:
                             index = contents.find(delimiter, index + 1)
                         incl_path = os.path.relpath(os.path.join(root, filename),
                                                     os.path.join(os.path.abspath(directory), rel_path))
+                        incl_path = incl_path.replace(os.sep, '/')
                         if incl_path.endswith('.c'):
                             incl_path = incl_path[:-2] + '_priv.h'
                             if not os.path.basename(incl_path) in files:

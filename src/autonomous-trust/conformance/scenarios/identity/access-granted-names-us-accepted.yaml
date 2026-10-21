@@ -1,0 +1,33 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: access-granted-names-us-accepted
+byte_pinning: false
+description: |
+    The grant is [package_hash, capabilities, seq, grantee]: the fourth slot
+    names the one node it is for (RD_2.6 plan §2.4, the user's call
+    2026-10-21). A grant naming the newcomer is taken, so its freshness mark
+    for bg moves to the grant's sequence. The twin of
+    access-granted-misaddressed-refused. (The mark, not the peer count, is
+    the observable: the two adapters seed a newcomer's peer list
+    differently.)
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: access_granted
+    payload:
+      seq: 1
+
+expected_state:
+  newcomer:
+    freshness_mark:
+      bg:
+        access_granted: 1

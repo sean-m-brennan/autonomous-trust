@@ -68,12 +68,17 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
         # core/freshness.py and doc/architecture/security-hardening.md,
         # "Replay resistance, per verb".
         self.freshness = Freshness(self.name, self.logger)
+        # Our own identity, to sign what a receiver must verify: a nack is
+        # honored only when signed (handle_refuse). C's network layer signs
+        # every frame with its own key; ours signs only given from_whom.
+        self.identity = self.configs.get(CfgIds.identity)
         self.max_concurrency = max_cores
         self.protocol = NegotiationProtocol(self.name, self.logger, configurations)
         self.protocol.register_handler(NegotiationProtocol.start, self.start_task)
         self.protocol.register_handler(NegotiationProtocol.announce, self.handle_invite)
         self.protocol.register_handler(NegotiationProtocol.response, self.handle_haggle)
         self.protocol.register_handler(NegotiationProtocol.acceptance, self.handle_accept)
+        self.protocol.register_handler(NegotiationProtocol.refusal, self.handle_refuse)
         self.protocol.register_handler(NegotiationProtocol.status_req, self.handle_stat_req)
         self.protocol.register_handler(NegotiationProtocol.status_resp, self.handle_stat_resp)
         self.protocol.register_handler(NegotiationProtocol.result, self.handle_results)
@@ -263,14 +268,16 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                     'Negotiation: flood detected for task %s (count=%d), refusing', task.uuid, self.flood_counts[task.uuid])
                 try:
                     msg = Message(self.name, NegotiationProtocol.refusal,
-                                  task.to_json_string(), message.from_whom)
+                                  task.to_json_string(), message.from_whom,
+                                  from_whom=self.identity)
                     queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                 except Full:
                     self.logger.error('handle_invite: Network queue full (flood-refuse)')
                 return True
             try:
                 if task.capability not in self.capabilities:
-                    msg = Message(self.name, NegotiationProtocol.refusal, task.to_json_string(), message.from_whom)
+                    msg = Message(self.name, NegotiationProtocol.refusal, task.to_json_string(),
+                                  message.from_whom, from_whom=self.identity)
                     queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                     self.logger.debug('Remote task refused: not capable')
                 else:
@@ -302,7 +309,8 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                     required_tier = getattr(local_cap, 'required_tier', 0)
                     if sender_tier < required_tier:
                         msg = Message(self.name, NegotiationProtocol.refusal,
-                                      task.to_json_string(), message.from_whom)
+                                      task.to_json_string(), message.from_whom,
+                                      from_whom=self.identity)
                         queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                         self.logger.debug(
                             'Remote task refused: sender tier %d < required %d',
@@ -332,9 +340,13 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
 
     def _cancel_participant(self, queues, message):
         task = message.obj
-        result = self.my_tasks[task.uuid].results
-        if result[message.from_whom.uuid] is None:
-            del result[message.from_whom.uuid]
+        tracker = self.my_tasks.get(task.uuid)
+        if tracker is None:
+            return              # not a task of ours, as C's lookup decides
+        result = tracker.results
+        uid = message.from_whom.uuid
+        if uid in result and result[uid] is None:
+            del result[uid]
         # Drop the confirmation too, mirroring the C twin's removal of its
         # per-(task, peer) marker: a peer we have cancelled out of a task must
         # not still read as confirmed in handle_stat_resp, or it can go on
@@ -399,7 +411,15 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
         return False
 
     def handle_refuse(self, queues, message):
+        """A participant declined our task: drop it, as C does. Only a signed
+        nack counts, or anyone could cancel a participant by naming the task
+        (RD_2.6 plan §2.8, the user's call 2026-10-21)."""
         if message.function == NegotiationProtocol.refusal:
+            if not getattr(message, 'verified', False):
+                self.logger.warning(
+                    'Ignoring unverified nack from %s',
+                    getattr(message.from_whom, 'nickname', message.from_whom))
+                return True
             try:
                 self._cancel_participant(queues, message)
                 self.logger.debug('My task refused')

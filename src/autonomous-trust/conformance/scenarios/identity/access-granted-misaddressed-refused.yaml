@@ -1,0 +1,34 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: access-granted-misaddressed-refused
+byte_pinning: false
+description: |
+    A grant names its grantee (RD_2.6 plan §2.4). bg's grant to other, signed
+    and fresh, is captured and delivered to newcomer. It names someone else,
+    so newcomer refuses it before its freshness mark for bg moves. Before, the
+    grant named nobody and was valid at any node whose mark for bg was low,
+    which is exactly a fresh one.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: other
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: access_granted
+    payload:
+      seq: 1
+      grantee: other
+
+expected_state:
+  newcomer:
+    freshness_mark:
+      bg:
+        access_granted: 0

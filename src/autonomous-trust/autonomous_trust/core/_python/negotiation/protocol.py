@@ -30,7 +30,6 @@ class NegotiationProtocol(Protocol):
     start = 'spawn task'
     announce = 'invitation'
     response = 'haggle'
-    task = 'task info'
     acceptance = 'ack'
     refusal = 'nack'
     status_req = 'status request'
