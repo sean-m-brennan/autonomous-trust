@@ -2153,9 +2153,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # than wrapped so the first two slots stay exactly where the C twin
         # reads them. This verb is PLAINTEXT and adds the granter to the
         # receiver's peer set on arrival, so unstamped it could be harvested
-        # off the wire and replayed at any node in phase >= 2.
+        # off the wire and replayed at any node in phase >= 2. The fourth names
+        # the grantee, so a captured grant is refused at any other node
+        # (RD_2.6 plan §2.4, the user's call 2026-10-21).
         msg_str = to_json_string((self.package_hash, self.capabilities.to_list(),
-                                  self.freshness.stamp()))
+                                  self.freshness.stamp(), str(blob.identity.uuid)))
         message = Message(self.name, IdentityProtocol.accept, msg_str, to_whom=blob.identity,
                           from_whom=self.identity, encrypt=False)
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
@@ -2593,19 +2595,26 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         """
         if self.identity is None or self.package_hash is None:
             return
-        try:
-            payload = to_json_string((self.identity.publish(),
-                                      self.package_hash,
-                                      self.capabilities.to_list()))
-        except Exception as err:
-            self.logger.error(
-                '_announce_self_to_bundled_peers: payload build failed: %s', err)
-            return
         sent = 0
         for peer in peer_idents:
+            # The canonical grant, as C's _announce_self_to_bundled_peers sends
+            # it: identity in the envelope, a fresh stamp per recipient (a mark
+            # is per sender and verb), and the recipient named. The old payload
+            # led with our published identity and carried no stamp, so every
+            # receiver refused it as unstamped.
+            try:
+                payload = to_json_string((self.package_hash,
+                                          self.capabilities.to_list(),
+                                          self.freshness.stamp(),
+                                          str(peer.uuid)))
+            except Exception as err:
+                self.logger.error(
+                    '_announce_self_to_bundled_peers: payload build failed: %s', err)
+                return
             try:
                 message = Message(self.name, IdentityProtocol.accept,
-                                  payload, to_whom=peer, encrypt=False)
+                                  payload, to_whom=peer, from_whom=self.identity,
+                                  encrypt=False)
                 queues[CfgIds.network].put(
                     message, block=True, timeout=self.q_cadence)
                 _probes.counter('peer.set', 'self_announce', 'sent')
@@ -2797,6 +2806,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 pkh, caps, seq = payload[0], payload[1], None
             else:
                 pkh, caps, seq = '', [], None  # C granter sends an empty payload
+            # The grant must name us, checked before the freshness mark moves
+            # so a misaddressed one cannot advance it (RD_2.6 plan §2.4).
+            grantee = payload[3] if payload and len(payload) >= 4 else None
+            if str(grantee).lower() != str(self.identity.uuid).lower():
+                _probes.counter('peer.set', 'access_granted_misaddressed')
+                self.logger.warning(
+                    'access_granted from %s refused: it does not name us as '
+                    'its grantee', str(ident.uuid)[:8])
+                return True
             # Freshness per granter. Unstamped is refused rather than accepted
             # as legacy: this verb is plaintext, so anyone on the wire can
             # harvest one, and it writes the granter into our peer set
@@ -3370,8 +3388,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 return True  # asker already has us
             out = to_json_string({'from_identity': self.identity.publish(),
                                   'from_address': self.identity.address})
+            # Signed: the receiver adds the identity it carries to its peer
+            # set, so it must be the signer's own (RD_2.6 plan §2.5).
             reply = Message(self.name, IdentityProtocol.id_response, out,
-                            to_whom=Network.broadcast, encrypt=False)
+                            to_whom=Network.broadcast, from_whom=self.identity,
+                            encrypt=False)
             queues[CfgIds.network].put(reply, block=True, timeout=self.q_cadence)
             _probes.counter('peer.set', 'identity_response_sent')
         except Full:
@@ -3386,7 +3407,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         """Receive a group member's published identity (reply to our
         id_query) and add it to self.peers. Gated to peers whose advertised
         address is actually in our group's address map, so a stray
-        broadcaster can't inject itself into our peer set."""
+        broadcaster can't inject itself into our peer set, and to a response
+        its own subject signed: unsigned, unverified, or signed by anyone but
+        the identity it carries is refused (RD_2.6 plan §2.5, the user's call
+        2026-10-21). Mirrors C handle_identity_response."""
         if message.function != IdentityProtocol.id_response:
             return False
         try:
@@ -3397,6 +3421,16 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             ident = self._as_identity(payload.get('from_identity'))
             if ident is None or getattr(ident, 'uuid', None) is None:
                 _probes.counter('peer.set', 'identity_response_no_identity')
+                return True
+            signer = message.from_whom
+            if not getattr(message, 'verified', False) \
+                    or str(getattr(signer, 'uuid', '')) != str(ident.uuid) \
+                    or getattr(getattr(signer, 'signature', None), 'public', None) \
+                    != getattr(getattr(ident, 'signature', None), 'public', None):
+                _probes.counter('peer.set', 'identity_response_unverified')
+                self.logger.warning(
+                    'Refusing identity response for %s: not signed by that '
+                    'identity', str(ident.uuid)[:8])
                 return True
             addr = (getattr(ident, 'address', None)
                     or payload.get('from_address'))

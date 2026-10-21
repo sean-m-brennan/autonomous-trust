@@ -46,6 +46,8 @@
 #include "network/network.h"
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
+#include "network/net_message.h"
+#include "utilities/message.h"
 
 /* ---- Mock transport (mirrors the pattern in net_proc_relay_test) ---- */
 
@@ -255,7 +257,111 @@ DEFINE_TEST(test_multiple_defers_distinct_uuids_each_match_own_peer)
 }
 END_TEST_DEFINITION()
 
+/* ---- Known-peer plaintext is verified against the STORED key ---- */
+
+static int  g_routed;
+static bool g_routed_verified;
+
+static int _route_hook(const char *key, const message_type_t type,
+                       generic_msg_t *msg, bool blocking)
+{
+    (void)key; (void)blocking;
+    if (type == NET_MESSAGE) {
+        g_routed++;
+        g_routed_verified = msg->info.net_msg.verified;
+    }
+    return 0;
+}
+
+/* A plaintext access_granted from a known peer's uuid, arriving in a PEER
+ * envelope (src = peer, dst = ME), signed by the stored peer itself (@p genuine)
+ * or by an impostor holding the same uuid under fresh keys. Returns whether it
+ * was delivered verified: it must be iff the signature checks against the key
+ * we HOLD for that peer. */
+static bool _plaintext_from_known_peer_verified(bool genuine)
+{
+    uuid_t P, ME;
+    uuid_fill(P, 0x40);
+    uuid_fill(ME, 0x20);
+    identity_t *stored = NULL, *impostor = NULL;
+    ck_assert_ret_ok(identity_create(&P, "10.1.0.5", "peer", "peer", &stored));
+    ck_assert_ret_ok(identity_create(&P, "10.1.0.5", "peer", "peer", &impostor));
+    const identity_t *signer = genuine ? stored : impostor;
+    public_identity_t *stored_pub = NULL, *signer_pub = NULL;
+    ck_assert_ret_ok(identity_publish(stored, &stored_pub));
+    ck_assert_ret_ok(identity_publish(signer, &signer_pub));
+
+    process_t proc;
+    init_proc_empty_peers(&proc);
+    memcpy(&proc.protocol.peers[0], stored_pub, sizeof(public_identity_t));
+    proc.protocol.num_peers = 1;
+    identity_t myself = {0};
+    memcpy(myself.uuid, ME, 16);
+    mock_ctx_t mctx = { .is_gateway_flag = false };
+    network_config_t net_cfg = { .port = 27787 };
+    gateway_test_enable(&proc, &net_cfg);
+    bool stop = false;
+    logger_t logger = {0};
+    net_thread_ctx_t tctx = {
+        .transport = &mock_transport, .ctx = (net_transport_ctx_t *)&mctx,
+        .proc = &proc, .logger = &logger, .net_cfg = &net_cfg,
+        .myself = &myself, .stop = &stop,
+    };
+
+    net_wire_msg_t msg = {0};
+    snprintf(msg.process, sizeof(msg.process), "%s", "identity");
+    msg.function = (char *)"access_granted";
+    msg.data = (uint8_t *)"[]";
+    msg.data_len = 2;
+    msg.encrypt = false;
+    memcpy(&msg.from_whom, signer_pub, sizeof(public_identity_t));
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    ck_assert_ret_ok(net_message_to_wire_fmt(&msg, signer, NET_WIRE_JSON,
+                                             &wire, &wire_len));
+    net_envelope_t env = { .version = NET_ENV_VERSION, .type = NET_ENV_TYPE_PEER };
+    memcpy(env.src_uuid, P, 16);
+    memcpy(env.dst_uuid, ME, 16);
+    uint8_t frame[4096];
+    size_t frame_len = 0;
+    ck_assert_ret_ok(net_envelope_pack(&env, wire, wire_len, frame, sizeof(frame),
+                                       &frame_len));
+
+    g_routed = 0;
+    g_routed_verified = false;
+    messaging_set_test_hook(_route_hook);
+    handle_inbound_peer(&tctx, frame, frame_len, "10.1.0.5");
+    messaging_set_test_hook(NULL);
+    ck_assert_int_eq(g_routed, 1);
+
+    free(wire);
+    smrt_deref(signer_pub);
+    smrt_deref(stored_pub);
+    identity_free(stored);
+    identity_free(impostor);
+    pthread_rwlock_destroy(&proc.protocol.peers_rwlock);
+    return g_routed_verified;
+}
+
+/* The control: signed by the key we hold, it verifies. */
+DEFINE_TEST(test_known_peer_plaintext_signed_by_its_key_verifies)
+{
+    ck_assert(_plaintext_from_known_peer_verified(true));
+}
+END_TEST_DEFINITION()
+
+/* RD_2.6 plan §2.7: a plaintext frame from a known peer is checked against the
+ * key we hold for it, not the key the envelope names. Before, C parsed it with
+ * no peer, so a frame signed by ANY key verified under the known uuid. */
+DEFINE_TEST(test_known_peer_plaintext_under_another_key_is_unverified)
+{
+    ck_assert(!_plaintext_from_known_peer_verified(false));
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(Net_Proc_Defer,
           test_envelope_defer_keys_by_src_uuid_not_gateway_addr,
           test_out_of_range_index_returns_false,
-          test_multiple_defers_distinct_uuids_each_match_own_peer)
+          test_multiple_defers_distinct_uuids_each_match_own_peer,
+          test_known_peer_plaintext_signed_by_its_key_verifies,
+          test_known_peer_plaintext_under_another_key_is_unverified)

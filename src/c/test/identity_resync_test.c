@@ -208,14 +208,18 @@ static void _dispatch_query(process_t *proc, const char *group_uuid,
     run_message_handlers(proc, NULL, NET_MESSAGE, &msg);
 }
 
-/* Craft + dispatch a peer_identity_response carrying @p member's identity. */
-static void _dispatch_response(process_t *proc, identity_t *member)
+/* Craft + dispatch a peer_identity_response carrying @p member's identity, as
+ * the network layer hands it on: from @p signer, verified iff @p verified. */
+static void _dispatch_response_as(process_t *proc, identity_t *member,
+                                  identity_t *signer, bool verified)
 {
     public_identity_t *pub = NULL;
     ck_assert_ret_ok(identity_publish(member, &pub));
     json_t *ident_json = NULL;
     ck_assert_ret_ok(public_identity_to_json(pub, &ident_json));
     smrt_deref(pub);
+    public_identity_t *signer_pub = NULL;
+    ck_assert_ret_ok(identity_publish(signer, &signer_pub));
 
     json_t *payload = json_object();
     json_object_set_new(payload, "from_identity", ident_json);
@@ -225,10 +229,19 @@ static void _dispatch_response(process_t *proc, identity_t *member)
     msg.type = NET_MESSAGE;
     strncpy(msg.info.net_msg.process, "identity", PROC_NAME_LEN);
     msg.info.net_msg.function = ID_RESPONSE_FN;
+    msg.info.net_msg.verified = verified;
+    memcpy(&msg.info.net_msg.from_whom, signer_pub, sizeof(public_identity_t));
+    smrt_deref(signer_pub);
     ck_assert_ret_ok(net_msg_pack_json(&msg.info.net_msg, payload));
     json_decref(payload);
 
     run_message_handlers(proc, NULL, NET_MESSAGE, &msg);
+}
+
+/* ...signed by its own subject, as a genuine response is. */
+static void _dispatch_response(process_t *proc, identity_t *member)
+{
+    _dispatch_response_as(proc, member, member, true);
 }
 
 static bool _peers_contain(const process_t *proc, const uuid_t uuid)
@@ -418,6 +431,35 @@ DEFINE_TEST(test_response_backfills_member)
 }
 END_TEST_DEFINITION()
 
+/* RD_2.6 plan §2.5: a response must be signed by the identity it carries. */
+DEFINE_TEST(test_unverified_response_refused)
+{
+    _begin();
+    identity_t *me = _mk_identity("coord", "10.0.0.1");
+    identity_t *m1 = _mk_identity("alice", "10.0.0.2");
+    process_t *proc = _mk_process(me);
+    _add_group_member_addr(proc, m1);
+    _dispatch_response_as(proc, m1, m1, false);
+    ck_assert_int_eq(proc->protocol.num_peers, 0);
+    _end();
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_response_signed_by_another_refused)
+{
+    _begin();
+    identity_t *me = _mk_identity("coord", "10.0.0.1");
+    identity_t *m1 = _mk_identity("alice", "10.0.0.2");
+    identity_t *m2 = _mk_identity("bob", "10.0.0.3");
+    process_t *proc = _mk_process(me);
+    _add_group_member_addr(proc, m1);
+    _add_group_member_addr(proc, m2);
+    _dispatch_response_as(proc, m1, m2, true);
+    ck_assert_int_eq(proc->protocol.num_peers, 0);
+    _end();
+}
+END_TEST_DEFINITION()
+
 DEFINE_TEST(test_response_rejects_non_member)
 {
     _begin();
@@ -592,6 +634,8 @@ RUN_TESTS(IdentityResync,
           test_responder_silent_when_asker_has_us,
           test_responder_silent_for_other_group,
           test_response_backfills_member,
+          test_unverified_response_refused,
+          test_response_signed_by_another_refused,
           test_response_rejects_non_member,
           test_confirm_does_not_add_self,
           test_confirm_adds_real_peer,

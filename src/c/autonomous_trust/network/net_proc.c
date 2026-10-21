@@ -1699,22 +1699,24 @@ static bool boundary_refuse(logger_t *logger, const char *kind,
  * decrypt is NOT accepted -- corrupt ciphertext, a stale group key or a forged
  * frame all fall through to the caller's existing log + annoy path.
  *
- * Parses with a NULL peer, i.e. without signature verification, mirroring
- * Python's validate=False on the same path. Only the ADDRESS is stamped onto
- * from_whom, exactly as the unknown-sender branch below does: public_identity_t
- * carries heap members (operator_key_binding, zta_credential) that
- * net_wire_msg_free does not release, so copying a whole peer struct over
- * from_whom would leak them and alias the peer's own pointers.
+ * Parses with the known @p peer, so the transport wins and the signature is
+ * checked against the key we hold for that peer, as Python's
+ * _accept_unencrypted does. It used to parse with NULL, which read the key off
+ * the envelope: a plaintext frame from a known address verified under any key
+ * the frame named (RD_2.6 plan §2.7, the user's call 2026-10-21). The parser
+ * copies the peer into from_whom exactly as the encrypted known-peer branch
+ * does.
  *
  * Frama-C: skipped — [serialization] net_message_from_wire + at_logging.
  */
 static bool try_unencrypted_from_known_peer(net_thread_ctx_t *ctx,
                                            const uint8_t *buf, size_t len,
                                            const char *from_addr,
+                                           const public_identity_t *peer,
                                            net_wire_format_t fmt)
 {
     net_wire_msg_t wmsg;
-    if (net_message_from_wire_fmt(buf, len, NULL, fmt, &wmsg) != 0)
+    if (net_message_from_wire_fmt(buf, len, peer, fmt, &wmsg) != 0)
         return false;
     if (!wmsg.verified && wmsg.function != NULL
         && strcmp(wmsg.function, "group_key_update") == 0)
@@ -1729,8 +1731,6 @@ static bool try_unencrypted_from_known_peer(net_thread_ctx_t *ctx,
         net_wire_msg_free(&wmsg);
         return false;
     }
-    snprintf(wmsg.from_whom.address, sizeof(wmsg.from_whom.address),
-             "%s", from_addr);
     route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger,
                      NET_PATH_PLAIN_KNOWN);
     net_wire_msg_free(&wmsg);
@@ -1844,7 +1844,7 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
             free(plain);
             net_wire_msg_free(&wmsg);
         } else if (try_unencrypted_from_known_peer(
-                       ctx, inner_buf, inner_len, from_addr,
+                       ctx, inner_buf, inner_len, from_addr, peer,
                        wire_format_for_address(&ctx->proc->protocol.group,
                                                peer->address))) {
             /* A verb this protocol sends in plaintext by design. Delivered, and
