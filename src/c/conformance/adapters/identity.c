@@ -49,6 +49,7 @@
 #include "processes/extension.h"
 #include "utilities/util.h"
 #include "identity/group.h"           /* group_init / group_add_address */
+#include "identity/package_hash.h"    /* at_package_hash */
 #include "config/configuration.h"     /* config_t (proc->configs["identity"]) */
 #include "structures/data.h"          /* object_ptr_data */
 #ifdef AT_ZTA_ENABLED
@@ -1342,7 +1343,6 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                           const char *function,
                           json_t *payload,
                           generic_msg_t *out) {
-    (void)to_id;
     sce_participant_t *sender = sce_find_participant(ctx, from_id);
     if (sender == NULL) {
         snprintf(ctx->err, sizeof(ctx->err), "build_inbound: unknown from %s", from_id);
@@ -1359,6 +1359,11 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     out->info.net_msg.function = (char *)function;
     out->info.net_msg.encrypt = false;
     memcpy(&out->info.net_msg.from_whom, sender_impl->pub, sizeof(public_identity_t));
+    /* The Python adapter builds every inbound message signed by its sender,
+     * so it arrives verified; mirror that, as the reputation adapter does.
+     * Handlers that refuse an unverified frame (id_response, RD_2.6 plan §2.5)
+     * would otherwise see every scenario message as forged. */
+    out->info.net_msg.verified = true;
 
     /* A feature's own functions (ic_ext_t.inbound). */
     if (g_ic_ext != NULL && g_ic_ext->inbound != NULL) {
@@ -1366,6 +1371,31 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                                        function, payload, out);
         if (ext_rc != 1)
             return ext_rc;
+    }
+
+    /* access_granted -- the canonical grant [package_hash, capabilities, seq,
+     * grantee]: identity in the envelope, the grantee named (RD_2.6 plan
+     * §2.4). `grantee` names another participant (a misaddressed grant); the
+     * recipient by default. Mirrors the Python adapter. */
+    if (strcmp(function, "access_granted") == 0) {
+        const char *gpid = json_string_value(json_object_get(payload, "grantee"));
+        sce_participant_t *gp = sce_find_participant(ctx, gpid != NULL ? gpid : to_id);
+        json_t *jseq = json_object_get(payload, "seq");
+        json_t *body = json_array();
+        json_array_append_new(body, json_string(at_package_hash()));
+        json_array_append_new(body, json_array());
+        json_array_append_new(body, json_integer(json_is_integer(jseq)
+                                                 ? json_integer_value(jseq) : 1));
+        if (gp != NULL) {
+            char gu[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(((ic_impl_t *)gp->impl)->pub->uuid, gu);
+            json_array_append_new(body, json_string(gu));
+        } else {
+            json_array_append_new(body, json_null());
+        }
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+        return 0;
     }
 
     /* trigger_cohort_join — the only pseudo-function that carries a payload: it names
@@ -2243,9 +2273,8 @@ static int _build_inbound(sce_run_ctx_t *ctx,
 
     /* peer_identity_response — the sender's published identity + address.
      * handle_identity_response gates on from_address being a known group
-     * address, then adds the identity to peers[]. No signature: the
-     * handler does not verify one (the address-in-group gate is the
-     * trust anchor). */
+     * address and on the response being signed by the identity it carries,
+     * then adds the identity to peers[]. */
     if (strcmp(function, "peer_identity_response") == 0) {
         json_t *from_id_json = NULL;
         public_identity_to_json(sender_impl->pub, &from_id_json);
@@ -2256,6 +2285,16 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                             json_string(sender_impl->pub->address));
         net_msg_pack_json(&out->info.net_msg, body);
         json_decref(body);
+        /* `unsigned: true` arrives unverified; `signed_by: <pid>` carries
+         * another participant's signature over the sender's identity (RD_2.6
+         * plan §2.5). Mirrors the Python adapter. */
+        sce_participant_t *by = sce_find_participant(
+            ctx, json_string_value(json_object_get(payload, "signed_by")));
+        if (by != NULL)
+            memcpy(&out->info.net_msg.from_whom, ((ic_impl_t *)by->impl)->pub,
+                   sizeof(public_identity_t));
+        if (json_is_true(json_object_get(payload, "unsigned")))
+            out->info.net_msg.verified = false;
         return 0;
     }
 
@@ -3364,6 +3403,32 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                                  "%s: freshness_refusals[%s]=%lld, expected %lld",
                                  pid, verb, (long long)got, (long long)want);
                         return -1;
+                    }
+                }
+            } else if (strcmp(key, "freshness_mark") == 0) {
+                /* {sender: {verb: N}} -- the high-water mark held for a
+                 * sender's verb: what an ACCEPTED stamped message moves, and
+                 * a refused one must not. id_state is process-global, so the
+                 * cases asserting it have one receiving participant. Mirrors
+                 * the Python adapter. */
+                const char *spid = NULL;
+                json_t *verbs = NULL;
+                json_object_foreach(val, spid, verbs) {
+                    sce_participant_t *sp = sce_find_participant(ctx, spid);
+                    if (sp == NULL) continue;
+                    char su[UUID_STRING_LEN + 1];
+                    uuid_unparse_lower(((ic_impl_t *)sp->impl)->pub->uuid, su);
+                    const char *verb = NULL;
+                    json_t *want_val = NULL;
+                    json_object_foreach(verbs, verb, want_val) {
+                        int64_t want = (int64_t)json_integer_value(want_val);
+                        int64_t got = identity_freshness_mark(su, verb);
+                        if (got != want) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: freshness_mark[%s][%s]=%lld, expected %lld",
+                                     pid, spid, verb, (long long)got, (long long)want);
+                            return -1;
+                        }
                     }
                 }
             } else if (strcmp(key, "caps_query_emitted") == 0) {

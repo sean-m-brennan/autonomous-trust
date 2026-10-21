@@ -529,9 +529,13 @@ negotiation. The tests are `test_late_joiner_caps_resync.py` (Python) and
 where a peer holds a group address map but is missing the `Identity` objects for
 some co-members. When the known-peer count is below the group address count it
 broadcasts a `peer_identity_query`. `handle_identity_query` responds with the
-published identity if the sender is a group member, and
+published identity if the sender is a group member, signed, and
 `handle_identity_response` backfills the peer table for addresses already in the
-group. Pinned by `conformance/scenarios/identity/identity-resync-backfill.yaml`
+group. It takes only a response signed by the identity it carries: unsigned,
+unverified, or signed by another member is refused, since otherwise anyone who
+could claim a group address could add an identity to the table (RD_2.6 plan
+§2.5, 2026-10-21; `identity-response-unsigned-refused`,
+`identity-response-signed-by-another-refused`). Pinned by `conformance/scenarios/identity/identity-resync-backfill.yaml`
 (Python in `idprocess.py`, C mirror in `src/c/.../id_proc.c`).
 
 These sweeps are also surfaced from the perspective of the node in [Node

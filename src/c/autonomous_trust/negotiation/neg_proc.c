@@ -1727,6 +1727,15 @@ static bool handle_refuse(const process_t *proc, directory_t *queues, generic_ms
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* Only a signed nack counts, or anyone could cancel a participant by
+     * naming the task (RD_2.6 plan §2.8, the user's call 2026-10-21). Mirrors
+     * Python handle_refuse. */
+    if (!nmsg->verified)
+    {
+        log_warn(proc->logger, "Negotiation: ignoring unverified nack from %s\n",
+                 nmsg->from_whom.nickname);
+        return true;
+    }
     log_info(proc->logger, "Negotiation: refused by %s\n", nmsg->from_whom.nickname);
 
     pthread_mutex_lock(&neg_state.lock);

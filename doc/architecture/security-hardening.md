@@ -286,6 +286,10 @@ Although the simulator does not run in production, correctness in its radio mode
 | Python core / C library | Persisted per-(target, slasher) slash epoch marks | A superseded slash replayed into sticky exclusion, undoing a rehabilitation |
 | Python core / C library | Status request consumed as a one-shot token | Unbounded remote extension of a task deadline |
 | Python core / C library | Monotonic payload sequence + per-(sender, verb) high-water marks | Replayed partition probes/responses, peer confirmations, hierarchy claims, access grants, and capability responses |
+| Python core / C library | `access_granted` names its grantee, checked before the freshness mark | A captured grant replayed at another fresh node |
+| Python core / C library | `id_response` signed, and signed by the identity it carries | An identity injected into a peer table by anyone claiming a group address |
+| Python core / C library | A nack counts only when its signature verifies | Any node cancelling a participant by naming the task |
+| C library | Known-address plaintext verified against the stored peer key | A frame from a known address verifying under a key of the sender's choosing |
 | Protobuf schema / both runtimes | `Task.seq`, checked ahead of the flood counter | A replayed task invitation re-executing work, or being replayed to trip the flood refusal and evict an honest worker |
 | Inspector | Debug mode parameterization | Information disclosure in production |
 | Inspector | WebSocket origin validation | Cross-origin data exfiltration |

@@ -31,7 +31,7 @@ move it.
 | `invitation` | `announce` | requester to capable peers | Invite peers to execute a task |
 | `haggle` | `response` | peer to requester | Counter-propose modified parameters |
 | `ack` | `acceptance` | peer to requester | Peer accepts the task |
-| `nack` | `refusal` | peer to requester | Peer refuses the task |
+| `nack` | `refusal` | peer to requester | Peer refuses the task; the requester drops it, if the nack is signed |
 | `status request` | `status_req` | requester to peer | Check a long-running task |
 | `status response` | `status_resp` | peer to requester | Report execution status |
 | `report results` | `result` | peer to requester | Deliver task results |

@@ -799,6 +799,15 @@ size_t identity_advertise_local_capabilities(const process_t *proc)
     return k;
 }
 
+int64_t identity_freshness_mark(const char *sender, const char *verb)
+{
+    if (!id_state.initialized) return 0;
+    pthread_mutex_lock(&id_state.lock);
+    int64_t n = freshness_mark(&id_state.freshness, sender, verb);
+    pthread_mutex_unlock(&id_state.lock);
+    return n;
+}
+
 int64_t identity_freshness_refusals(const char *verb)
 {
     if (!id_state.initialized) return 0;
@@ -1673,7 +1682,10 @@ static int _send_caps_query(const process_t *proc, const public_identity_t *peer
  * first two are left empty rather than removed so the receiver's indices are
  * the same for both runtimes. Returns NULL on failure (caller must not send).
  */
-static json_t *_accept_body(const process_t *proc)
+/* [package_hash, capabilities, seq, grantee]: the grantee's uuid names the one
+ * node this grant is for, so a captured grant is refused anywhere else (RD_2.6
+ * plan §2.4, the user's call 2026-10-21). */
+static json_t *_accept_body(const process_t *proc, const public_identity_t *grantee)
 {
     pthread_mutex_lock(&id_state.lock);
     int64_t seq = freshness_stamp(&id_state.freshness, proc->logger);
@@ -1686,6 +1698,9 @@ static json_t *_accept_body(const process_t *proc)
     json_array_append_new(body, json_string(at_package_hash()));
     json_array_append_new(body, json_array());
     json_array_append_new(body, json_integer((json_int_t)seq));
+    char gu[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(grantee->uuid, gu);
+    json_array_append_new(body, json_string(gu));
     return body;
 }
 
@@ -1944,7 +1959,7 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
     accept.info.net_msg.function = ID_ACCEPT;
     accept.info.net_msg.encrypt = false;
     memcpy(&accept.info.net_msg.to_whom, new_peer, sizeof(public_identity_t));
-    json_t *accept_body = _accept_body(proc);
+    json_t *accept_body = _accept_body(proc, new_peer);
     if (accept_body == NULL) {
         log_error(proc->logger,
                   "Identity: no freshness sequence; not sending access_granted\n");
@@ -2447,8 +2462,9 @@ static bool handle_acceptance(const process_t *proc, directory_t *queues, generi
              nmsg->from_whom.nickname);
 
     /* Freshness per granter, before anything is written. The body is
-     * [package_hash, capabilities, seq]; this runtime leaves the capabilities
-     * empty (see _accept_body) but the sequence is required. Unstamped is
+     * [package_hash, capabilities, seq, grantee]; this runtime leaves the
+     * capabilities empty (see _accept_body) but the sequence is required, and
+     * a grant that does not name us is refused before the mark moves. Unstamped is
      * refused, not accepted as legacy: this verb is PLAINTEXT, so anyone on
      * the wire can harvest one, and it appends the granter to our peer set
      * below (doc/architecture/reputation.md, "Quorum attestation"). */
@@ -2456,6 +2472,8 @@ static bool handle_acceptance(const process_t *proc, directory_t *queues, generi
         json_t *accept_payload = NULL;
         int64_t accept_seq = 0;
         char tagged[160] = {0};
+        bool for_us = false;
+        const identity_t *me = identity_self_identity(proc);
         if (net_msg_unpack_json(nmsg, &accept_payload) == 0
             && accept_payload != NULL && json_is_array(accept_payload)
             && json_array_size(accept_payload) >= 3)
@@ -2465,9 +2483,21 @@ static bool handle_acceptance(const process_t *proc, directory_t *queues, generi
                 accept_seq = (int64_t)json_integer_value(j);
             at_package_hash_of_json(json_array_get(accept_payload, 0), tagged,
                                     sizeof(tagged));
+            const char *g = json_string_value(json_array_get(accept_payload, 3));
+            uuid_t gu;
+            for_us = g != NULL && me != NULL && uuid_parse(g, gu) == 0
+                && uuid_compare(gu, me->uuid) == 0;
         }
         if (accept_payload != NULL)
             json_decref(accept_payload);
+        if (!for_us)
+        {
+            probes_counter("peer.set", "access_granted_misaddressed", "1");
+            log_warn(proc->logger, "Identity: access_granted from %s refused: "
+                     "it does not name us as its grantee\n",
+                     nmsg->from_whom.nickname);
+            return true;
+        }
         /* The granter is held to the same allowlist as a requester: an
          * accept adds it to our peer set as surely as a vote adds a newbie. */
         char why[96] = {0};
@@ -2601,7 +2631,7 @@ static int _announce_self_to_bundled_peers(const process_t *proc,
         /* A fresh stamp per recipient: separate messages, and a receiver's
          * mark is per (sender, verb), so reusing one sequence across the
          * fanout would have every recipient after the first refuse it. */
-        json_t *accept_body = _accept_body(proc);
+        json_t *accept_body = _accept_body(proc, &peers[i]);
         if (accept_body == NULL) {
             probes_counter("peer.set", "self_announce", "no_sequence");
             continue;
@@ -6200,13 +6230,16 @@ static bool handle_identity_query(const process_t *proc, directory_t *queues, ge
         smrt_deref(self_pub);
         return true;
     }
+    generic_msg_t reply = {0};
+    /* Signed: the receiver adds the identity it carries to its peer set, so
+     * it must be the signer's own (RD_2.6 plan §2.5). */
+    memcpy(&reply.info.net_msg.from_whom, self_pub, sizeof(public_identity_t));
     smrt_deref(self_pub);
     json_t *out = json_object();
     if (out == NULL) { json_decref(from_id_json); return true; }
     json_object_set_new(out, "from_identity", from_id_json);
     json_object_set_new(out, "from_address", json_string(self->address));
 
-    generic_msg_t reply = {0};
     reply.type = NET_MESSAGE;
     strncpy(reply.info.net_msg.process, "identity", PROC_NAME_LEN);
     reply.info.net_msg.function = ID_IDENTITY_RESPONSE;
@@ -6256,6 +6289,18 @@ static bool handle_identity_response(const process_t *proc, directory_t *queues,
     public_identity_t parsed = {0};
     if (public_identity_from_json(ident_json, &parsed) != 0) {
         probes_counter("peer.set", "identity_response_no_identity", "1");
+        json_decref(payload);
+        return true;
+    }
+    /* Only a response its own subject signed: unsigned, unverified, or signed
+     * by anyone but the identity it carries is refused (RD_2.6 plan §2.5, the
+     * user's call 2026-10-21). Mirrors Python handle_identity_response. */
+    if (!nmsg->verified || uuid_compare(nmsg->from_whom.uuid, parsed.uuid) != 0
+        || memcmp(nmsg->from_whom.signature.public, parsed.signature.public,
+                  crypto_sign_PUBLICKEYBYTES) != 0) {
+        probes_counter("peer.set", "identity_response_unverified", "1");
+        log_warn(proc->logger, "Identity: refusing identity response for %s: "
+                 "not signed by that identity\n", parsed.nickname);
         json_decref(payload);
         return true;
     }

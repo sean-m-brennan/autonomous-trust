@@ -241,17 +241,24 @@ static public_identity_t *g_peer;
 static char g_task_str[UUID_STRING_LEN + 1];
 static double g_t0;
 
-static void _dispatch(char *function, const public_identity_t *from, json_t *j)
+static void _dispatch_as(char *function, const public_identity_t *from, json_t *j,
+                         bool verified)
 {
     generic_msg_t in;
     memset(&in, 0, sizeof(in));
     in.type = NET_MESSAGE;
     strncpy(in.info.net_msg.process, "negotiation", PROC_NAME_LEN);
     in.info.net_msg.function = function;
+    in.info.net_msg.verified = verified;
     memcpy(&in.info.net_msg.from_whom, from, sizeof(public_identity_t));
     ck_assert_ret_ok(net_msg_pack_json(&in.info.net_msg, j));
     run_message_handlers(g_proc, NULL, NET_MESSAGE, &in);
     net_msg_free_obj(&in.info.net_msg);
+}
+
+static void _dispatch(char *function, const public_identity_t *from, json_t *j)
+{
+    _dispatch_as(function, from, j, false);
 }
 
 static json_t *_uuid_json(void)
@@ -350,6 +357,36 @@ DEFINE_TEST(test_a_silent_participant_is_asked_then_given_up)
     ck_assert_uint_eq(g_stat_reqs, 3);
     ck_assert(!_still_tracked());
     ck_assert_uint_eq(negotiation_status_sweep(g_proc, g_t0 + 30.0), 0);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* RD_2.6 plan §2.8: a nack is honored only when signed, or anyone could
+ * cancel a participant by naming the task. An unverified one leaves the
+ * confirmed participant in place, so the deadline sweep still asks it. */
+DEFINE_TEST(test_an_unverified_nack_is_ignored)
+{
+    _begin_requestor(true);
+    json_t *n = json_object();
+    json_object_set_new(n, "uuid", _uuid_json());
+    _dispatch_as(NEG_PROTO_REFUSE, g_peer, n, false);
+    json_decref(n);
+    ck_assert_uint_eq(negotiation_status_sweep(g_proc, g_t0 + 10.0), 0);
+    ck_assert_uint_eq(g_stat_reqs, 1);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* ...and a signed one drops it: nobody is left to ask. */
+DEFINE_TEST(test_a_signed_nack_drops_the_participant)
+{
+    _begin_requestor(true);
+    json_t *n = json_object();
+    json_object_set_new(n, "uuid", _uuid_json());
+    _dispatch_as(NEG_PROTO_REFUSE, g_peer, n, true);
+    json_decref(n);
+    (void)negotiation_status_sweep(g_proc, g_t0 + 10.0);
+    ck_assert_uint_eq(g_stat_reqs, 0);
     _end();
 }
 END_TEST_DEFINITION()
@@ -567,6 +604,8 @@ DEFINE_TEST(test_an_absent_peer_is_not_invited)
 END_TEST_DEFINITION()
 
 RUN_TESTS(NegSendKeep,
+          test_an_unverified_nack_is_ignored,
+          test_a_signed_nack_drops_the_participant,
           test_a_refusal_survives_a_full_queue,
           test_an_acceptance_survives_a_full_queue,
           test_a_silent_participant_is_asked_then_given_up,

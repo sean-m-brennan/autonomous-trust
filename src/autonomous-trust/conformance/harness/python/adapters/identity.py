@@ -580,6 +580,19 @@ class _Participant:
                             f'{self.id}: freshness_refusals[{verb!r}]={actual}, '
                             f'expected {want}'
                         )
+            elif key == 'freshness_mark':
+                # {sender: {verb: N}} -- the high-water mark this participant
+                # holds for a sender's verb: what an ACCEPTED stamped message
+                # moves, and a refused one must not. Mirrors the C adapter's
+                # identity_freshness_mark.
+                for spid, verbs in expected.items():
+                    sender_uuid = str((self.pid_to_uuid or {})[spid])
+                    for verb, want in verbs.items():
+                        actual = self.process.freshness.mark(sender_uuid, verb)
+                        if actual != int(want):
+                            raise AssertionError(
+                                f'{self.id}: freshness_mark[{spid}][{verb!r}]='
+                                f'{actual}, expected {want}')
             elif key == 'caps_query_emitted':
                 # Number of directed `peer_caps_query` messages this participant
                 # emitted -- driven by the periodic caps-resync sweep (triggered
@@ -2180,9 +2193,17 @@ class IdentityAdapter:
                     else sender_identity.encryptor,
                     _public_only=False).publish()
         elif function == IdentityProtocol.accept:
+            # The canonical grant, (package_hash, capabilities, seq, grantee):
+            # identity in the envelope, the grantee named (RD_2.6 plan §2.4).
+            # `grantee` names another participant (a misaddressed grant);
+            # the recipient by default. Mirrors the C adapter.
             caps_list = payload.get('capabilities', [])
-            obj = to_json_string((sender_identity.publish(),
-                                  self._package_hash, caps_list))
+            grantee_pid = payload.get('grantee') or to_id
+            grantee = (participants[grantee_pid].impl.identity.uuid
+                       if grantee_pid in participants else None)
+            obj = to_json_string((self._package_hash, caps_list,
+                                  int(payload.get('seq', 1)),
+                                  None if grantee is None else str(grantee)))
         elif function == IdentityProtocol.confirm:
             target_pid = payload.get('peer') or payload.get('candidate')
             target = participants[target_pid].impl.identity
@@ -2540,6 +2561,16 @@ class IdentityAdapter:
                       from_whom=sender_identity,
                       to_whom=Network.broadcast if to_id == 'broadcast' else None,
                       encrypt=(function != IdentityProtocol.announce))
+        if function == IdentityProtocol.id_response and isinstance(payload, dict):
+            # `unsigned: true` arrives unverified; `signed_by: <pid>` carries
+            # another participant's signature over the sender's identity
+            # (RD_2.6 plan §2.5). Mirrors the C adapter.
+            if payload.get('signed_by') in participants:
+                msg = Message(CfgIds.identity, function, obj,
+                              from_whom=participants[payload['signed_by']].impl.identity,
+                              to_whom=msg.to_whom, encrypt=msg.encrypt)
+            if payload.get('unsigned'):
+                msg.verified = False
         if function == FirstContactProtocol.reach_record and payload.get('local'):
             # As the network process hands on a relay lookup's answer: no
             # sender on the envelope.
