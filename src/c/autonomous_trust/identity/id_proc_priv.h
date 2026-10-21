@@ -275,6 +275,9 @@ int identity_partition_canonical_response(const char *group_uuid,
  *  one participant to do the refusing. Same compromise as
  *  @ref identity_get_peer_caps_count. */
 int64_t identity_freshness_refusals(const char *verb);
+/* The freshness high-water mark this node holds for (@p sender uuid, @p verb):
+ * 0 until a stamped message from it is accepted. */
+int64_t identity_freshness_mark(const char *sender, const char *verb);
 
 /** @name Identity services for a feature built beside the identity process
  *

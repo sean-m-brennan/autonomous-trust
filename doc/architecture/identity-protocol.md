@@ -72,7 +72,7 @@ The protocol messages, for reference:
 | Message | Constant | Payload |
 |---------|----------|---------|
 | `request_access` | `announce` | `(identity, package_hash, capabilities_list)` |
-| `access_granted` | `accept` | `(identity, package_hash, capabilities_list)` |
+| `access_granted` | `accept` | `(package_hash, capabilities_list, seq, grantee)`, the granter in the envelope |
 | `full_history` | `history` | `(list[LinkedStep], Group)` |
 | `history_diff` | `diff` | `list[LinkedStep]` |
 | `propose_peer` | `propose` | `IdentityObj` |
@@ -199,6 +199,14 @@ convenience into a global namespace, which is exactly what we refuse.
 
 Four checks carry the security of the protocol, and each closes a specific
 attack.
+
+*A grant names its grantee.* `access_granted` travels in plaintext and adds
+the granter to the receiver's peer set, so it carries the grantee's uuid as its
+fourth slot, beside the freshness sequence, and a node refuses a grant that
+does not name it before its freshness mark moves. Without the slot a captured
+grant was valid at any node whose mark for that granter was low, which is
+exactly a fresh one (RD_2.6 plan §2.4, 2026-10-21). There is no lenient mode:
+a granter that sends three slots is refused.
 
 *Package hash verification* rejects nodes running software the group has not
 accepted. Each node sends a hash of what it runs, tagged by runtime: a C node

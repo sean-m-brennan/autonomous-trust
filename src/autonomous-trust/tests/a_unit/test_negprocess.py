@@ -416,10 +416,31 @@ class TestHandleRefuseDeeper:
         np.my_tasks[task.uuid].results[peer.uuid] = None
         msg = Message(CfgIds.negotiation, NegotiationProtocol.refusal,
                       task, from_whom=peer)
+        msg.verified = True     # as the network layer marks a signed nack
         main_q = queue.Queue()
         result = np.handle_refuse({CfgIds.main: main_q}, msg)
         assert result is True
         assert peer.uuid not in np.my_tasks[task.uuid].results
+
+    def test_unverified_refuse_is_ignored(self):
+        """Only a signed nack counts, or anyone could cancel a participant by
+        naming the task (RD_2.6 plan §2.8)."""
+        np = _make_neg_process()
+        peer = _make_mock_peer()
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
+        task = Task(tp, peer, size=2)
+        np.my_tasks[task.uuid] = TaskTracker(task)
+        np.my_tasks[task.uuid].results[peer.uuid] = None
+        msg = Message(CfgIds.negotiation, NegotiationProtocol.refusal,
+                      task, from_whom=peer)
+        msg.verified = False
+        result = np.handle_refuse({CfgIds.main: queue.Queue()}, msg)
+        assert result is True
+        assert peer.uuid in np.my_tasks[task.uuid].results
+
+    def test_refuse_is_registered(self):
+        np = _make_neg_process()
+        assert NegotiationProtocol.refusal in np.protocol.handlers
 
 
 class TestHandleStatReqDeeper:
@@ -574,6 +595,7 @@ class TestHandleRefuseDeeper2:
         np.my_tasks[task.uuid].results[peer.uuid] = None
         msg = Message(CfgIds.negotiation, NegotiationProtocol.refusal,
                       task, from_whom=peer)
+        msg.verified = True
         main_q = queue.Queue()
         result = np.handle_refuse({CfgIds.main: main_q}, msg)
         assert result is True
@@ -848,6 +870,7 @@ class TestHandleRefuseFullException:
         np.my_tasks[task.uuid].results[peer.uuid] = None
         msg = Message(CfgIds.negotiation, NegotiationProtocol.refusal,
                       task, from_whom=peer)
+        msg.verified = True
         full_q = MagicMock()
         full_q.put = MagicMock(side_effect=queue.Full)
         result = np.handle_refuse({CfgIds.main: full_q}, msg)
