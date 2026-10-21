@@ -147,7 +147,13 @@ set(useful_warnings
     -Winit-self
 )
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
-    list(APPEND useful_warnings -Wuse-after-free -Wfree-nonheap-object -Wno-cast-function-type)
+    list(APPEND useful_warnings -Wfree-nonheap-object -Wno-cast-function-type)
+    # GCC 12+; ubuntu:22.04 (the AppImage container) ships GCC 11.
+    include(CheckCCompilerFlag)
+    check_c_compiler_flag(-Wuse-after-free AT_HAVE_WUAF)
+    if(AT_HAVE_WUAF)
+        list(APPEND useful_warnings -Wuse-after-free)
+    endif()
 endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
     list(APPEND useful_warnings -Wno-microsoft-anon-tag -Wno-deprecated-non-prototype -Wno-unused-but-set-variable -Wno-unknown-pragmas -Wno-cast-align)
