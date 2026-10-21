@@ -125,7 +125,7 @@ static const unit_row_t UNIT_TABLE[] = {
 static const size_t UNIT_TABLE_LEN = sizeof(UNIT_TABLE) / sizeof(UNIT_TABLE[0]);
 
 static void _fail(char *err, size_t errlen, const char *fmt, ...)
-    __attribute__((format(printf, 3, 4)));
+    __attribute__((format(AT_PRINTF_FORMAT, 3, 4)));
 
 static void _fail(char *err, size_t errlen, const char *fmt, ...)
 {

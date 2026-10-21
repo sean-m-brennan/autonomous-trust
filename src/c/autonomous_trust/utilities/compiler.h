@@ -122,6 +122,15 @@
 
 #endif // __GNUC__
 
+/* The archetype for __attribute__((format(AT_PRINTF_FORMAT, m, n))). MinGW's
+ * gcc reads plain `printf` as the old MSVCRT dialect, which has no %zu; AT
+ * builds against UCRT, whose printf family is C99, so check it as such. */
+#if defined __MINGW32__
+#define AT_PRINTF_FORMAT gnu_printf
+#else
+#define AT_PRINTF_FORMAT printf
+#endif
+
 
 /** @} */ /* end of internal_utilities */
 

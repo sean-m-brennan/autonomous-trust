@@ -44,9 +44,10 @@
 
 #include "adapters/certificate.h"
 #include "certificates/certificates.h"
+#include "utilities/compiler.h"   /* AT_PRINTF_FORMAT */
 
 static bool _fail(at_case_result_t *out, const char *fmt, ...)
-    __attribute__((format(printf, 2, 3)));
+    __attribute__((format(AT_PRINTF_FORMAT, 2, 3)));
 
 static bool _fail(at_case_result_t *out, const char *fmt, ...)
 {
