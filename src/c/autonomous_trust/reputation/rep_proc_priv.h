@@ -97,6 +97,9 @@ size_t _recheck_parked_cosigns(const process_t *proc, double present);
 
 /** Test seam: how many checkpoint proposals are parked for a later co-sign. */
 size_t reputation_parked_cosign_count(void);
+/* The equivocation records chain @p key ("" = primary) holds (R+D.md §14.1),
+ * as a new JSON array. */
+json_t *reputation_fork_records(const char *key);
 
 /** Toggle synchronous-dispatch mode for the conformance harness, as the
  *  Python adapter sets synchronous_dispatch. Production must leave this
