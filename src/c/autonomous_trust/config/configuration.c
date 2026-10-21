@@ -202,10 +202,16 @@ int all_config_files(char dir[], array_t *paths)
             if (dot && (!strcmp(dot, ".cfg.jsn") || !strcmp(dot, ".cfg.json")
                         || !strcmp(dot, ".cfg.pb")))
             {
+                /* d_name can outrun CFG_PATH_LEN (MinGW's is MAX_PATH, 260).
+                 * A truncated name would name some other file, and strncpy
+                 * would leave it unterminated, so skip it instead. */
+                size_t len = strlen(de->d_name);
+                if (len > CFG_PATH_LEN)
+                    continue;
                 char *path = malloc(CFG_PATH_LEN + 1);
                 if (path == NULL)
                     return SYS_EXCEPTION();
-                strncpy(path, de->d_name, CFG_PATH_LEN);
+                memcpy(path, de->d_name, len + 1);   /* includes NUL */
                 data_t *str_dat = string_data(path, strlen(path));
                 int err = array_append(paths, str_dat);
                 if (err != 0)

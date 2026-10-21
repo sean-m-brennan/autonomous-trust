@@ -60,7 +60,7 @@ bool at_cert_checker_known(const char *kind)
 }
 
 static void _err(char *buf, size_t len, const char *fmt, ...)
-    __attribute__((format(printf, 3, 4)));
+    __attribute__((format(AT_PRINTF_FORMAT, 3, 4)));
 
 static void _err(char *buf, size_t len, const char *fmt, ...)
 {
