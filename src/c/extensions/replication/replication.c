@@ -15,6 +15,7 @@
  *******************/
 
 #include "replication/replication.h"
+#include "utilities/compiler.h"   /* AT_PRINTF_FORMAT */
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -24,7 +25,7 @@
 #include <jansson.h>
 
 static void _fail(char *err, size_t err_len, const char *fmt, ...)
-    __attribute__((format(printf, 3, 4)));
+    __attribute__((format(AT_PRINTF_FORMAT, 3, 4)));
 
 static void _fail(char *err, size_t err_len, const char *fmt, ...)
 {

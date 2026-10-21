@@ -50,7 +50,7 @@ static void _vec_free(vec_t *v) { free(v->v); v->v = NULL; v->n = 0; }
 static void _mat_free(mat_t *m) { free(m->v); m->v = NULL; m->rows = m->cols = 0; }
 
 static void _say(char *buf, size_t len, const char *fmt, ...)
-    __attribute__((format(printf, 3, 4)));
+    __attribute__((format(AT_PRINTF_FORMAT, 3, 4)));
 
 static void _say(char *buf, size_t len, const char *fmt, ...)
 {
