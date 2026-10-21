@@ -554,13 +554,28 @@ placement is saved: `place` and `place accepted` carry it, then `placed`.
 **Catch-up.** Reconcile follows four rules:
 1. Nothing below this node's own placed end is rewritten. A certified entry
    there that differs from ours is equivocation: two certificates for one
-   index. It is logged as an error and refused.
+   index. It is logged as an error, refused, and recorded (below).
 2. Past the placed end, a certified segment wins whatever the lengths. The
    finalized-checkpoint guard still applies.
 3. An uncertified entry is cut off once the segment reaches placed territory.
    A segment carrying a placement certificate that does not verify is refused
    whole.
 4. A certified placement may carry a node that is far behind across a gap.
+
+**Equivocation is recorded.** Two quorums of one roster cannot sign two
+values at one index unless the members in both signed twice. A node meets
+this in two places: in catch-up (rule 1), and in a `placed` for an index it
+already holds whose certificate verifies after its own entry before it, which
+used to be dropped unread. Either way it keeps its own entry and writes a
+record into the chain's evidence document, under `forks`: the fork index,
+where it was seen and from whom, both certificates (start index, predecessor
+hash, value digest, signatures, and who among the signers verifies against the
+roster in force), and the members who signed both. A rival without a verifying
+certificate proves nothing and is not recorded, and neither is the same value
+twice. The same fork is recorded once, and a chain keeps the last 32. The
+records survive a restart, are never sent, and are never scored or used to
+slash anyone: the proof is this node's own (R+D.md §14.1, the user's calls of
+2026-10-21). A node that never saw one writes the document it always did.
 
 Every placement certificate in a segment is judged against the roster in
 force for its instance: the latest roster entry below it, the node's own or
@@ -608,6 +623,8 @@ sequenceDiagram
 | A certified attestation goes to the pool | [`attest-final-placing-pooled.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/attest-final-placing-pooled.yaml) |
 | A certified segment beats a longer uncertified one | [`catchup-placed-beats-longer-uncertified.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-placed-beats-longer-uncertified.yaml) |
 | The placed end is never rewritten; equivocation is refused | [`catchup-placed-end-not-rewritten.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-placed-end-not-rewritten.yaml), [`catchup-placed-equivocation-kept.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-placed-equivocation-kept.yaml) |
+| An equivocation is kept, with both certificates and who signed both | [`catchup-placed-equivocation-kept.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-placed-equivocation-kept.yaml), [`placed-equivocation-recorded.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/placed-equivocation-recorded.yaml) |
+| A rival without a verifying certificate is not recorded | [`placed-equivocation-uncertified-not-recorded.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/placed-equivocation-uncertified-not-recorded.yaml) |
 | A certified placement crosses a gap | [`catchup-placed-crosses-gap.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-placed-crosses-gap.yaml) |
 
 What conformance cannot reach is covered by unit tests. Its C harness starts
