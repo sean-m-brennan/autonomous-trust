@@ -17,6 +17,7 @@ Technical architecture documentation for the AutonomousTrust cooperative computi
 - [Reputation consensus](reputation.md): Paxos-based reputation scoring
 - [Gateway reputation tree](gateway-reputation-tree.md): Multi-group membership and recursive subtree reputation
 - [Reputation vs. blockchain analysis](reputation-vs-blockchain-analysis.md): Hash-linking, Merkle checkpoints, and slashing
+- [Byzantine references](byzantine-references.md): The verified reading list for the Byzantine sections of `R+D.md`, with a locator for each claim it supports and the claims it does not
 - [Trust tiers](trust-tiers.md): Tiered capabilities, weighted transactions, bootstrap corpus, tier-gated access
 - [Physical consistency](physical-consistency.md): Refuting a peer's claim on dimensions, bounds, kinematics and conservation, before any reputation math runs
 - [Certificate-carrying interfaces](certificate-interfaces.md): Answers that arrive with a witness: duals, DRAT refutations, potentials and cuts, checked exactly

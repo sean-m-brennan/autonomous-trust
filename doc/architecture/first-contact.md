@@ -215,6 +215,14 @@ recorded contact through to it rather than refusing it as a sybil of itself
 ([Becoming a peer](identity-protocol.md#amnesia)). Joining the cohort is the
 cohort's decision, and an invitation is not a vote.
 
+Nor does a contact count while it waits. Every quorum is sized from the
+members in the group's address map, never from `Peers`, so a contact adds
+nothing to a denominator and its signature is no vote: not in a Paxos round,
+a checkpoint, an attestation, or C's admission count (R+D.md §13.5 D2;
+[Who is in the group](reputation.md#who-is-in-the-group)). Before, every
+contact a leaf node added made its cohort's quorums one vote harder to meet,
+and enough of them could stop a small cohort from reaching any quorum at all.
+
 A contact admitted this way is still **unverified**, since the handshake proves
 reachability and possession of the ticket rather than that the human on the
 other end is who Bob thinks. Only the out-of-band safety-number comparison flips
@@ -288,7 +296,11 @@ without a restart.
 We write it **only where the node has no reputation for that peer at all**. It
 can never overwrite an earned score, a warm-started one, or a slashed one, since
 a contact cannot be verified back into good standing, or safety-number
-confirmation would become an attack on reputation rather than a convenience.
+confirmation would become an attack on reputation rather than a convenience. The
+seed stays in this node's own reputation table. It is never part of a half, a
+checkpoint or a roster, so one member's out-of-band check never becomes the
+cohort's shared score (R+D.md §13.5 D4). It is visible only as this node's own
+view, in its answer to a reputation request.
 Both halves of the record are checked, verified *and* a seed above zero, because
 the store is plain JSON in the user's data dir and honoring a hand-written
 `trust_seed` on an unverified record would turn one editable float into a
@@ -849,6 +861,8 @@ asymmetry.
 | An ack nobody asked for admits nobody | [`first-contact-unsolicited-ack-ignored.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-unsolicited-ack-ignored.yaml) |
 | An ack for a different ticket admits nobody | [`first-contact-ack-wrong-nonce-ignored.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-ack-wrong-nonce-ignored.yaml) |
 | Removing a contact drops the direct peer | [`first-contact-remove-drops-the-direct-peer.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-remove-drops-the-direct-peer.yaml) |
+| A contact does not raise the admission bar | [`direct-peer-not-in-admission-denominator.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/direct-peer-not-in-admission-denominator.yaml) |
+| A contact sizes no reputation quorum, and its signature does not count | [`direct-peer-not-in-checkpoint-quorum.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/direct-peer-not-in-checkpoint-quorum.yaml), [`direct-peer-not-in-paxos-quorum.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/direct-peer-not-in-paxos-quorum.yaml), [`direct-peer-cosignature-not-counted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/direct-peer-cosignature-not-counted.yaml) |
 | An unverified contact is held at tier 1 | [`invite-unverified-contact-held-at-communication.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-unverified-contact-held-at-communication.yaml) |
 | A verified contact uses what it earned | [`invite-verified-contact-uses-earned-tier.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-verified-contact-uses-earned-tier.yaml) |
 | A child-group member with no contact record uses what it earned | [`invite-child-group-member-uses-earned-tier.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-child-group-member-uses-earned-tier.yaml) |

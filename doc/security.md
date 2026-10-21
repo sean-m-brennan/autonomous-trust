@@ -93,6 +93,17 @@ still bias trust within that quorum. Identity cost, reputation weighting,
 hardware attestation, and quorum thresholds raise the price of that majority;
 they do not make it impossible.
 
+AT does not try to find Sybils in the transaction graph, and that is a
+decision rather than a gap. The social-graph Sybil defenses are all community
+detection under different names (Viswanath, Post, Gummadi & Mislove, SIGCOMM
+2010), so they work only when honest nodes form one well-connected region and
+the Sybils hang off it by few attack edges. An AT cohort is small and grouped
+by mission, which is the community structure those methods misread, and a
+well-behaved Sybil earns its attack edges by doing tasks. A detector of that
+kind would add false exclusions without bounding the identity count, so the
+bound is left to admission and quorum thresholds (R+D.md §13.5; sources in
+[Byzantine references](architecture/byzantine-references.md)).
+
 Corruption of the system of knowing. The trust record is itself an attack
 surface. Bad-mouthing, whitewashing, and on-off behavior all target the
 reputation history rather than the data path. Hash-linking, Merkle checkpoints,

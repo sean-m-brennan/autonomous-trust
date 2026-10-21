@@ -714,6 +714,19 @@ from the live roster. Merges are out of scope: absorbed members arrive as adds,
 one per instance. A gateway's child chain has its own roster, of that child
 group's members.
 
+**A contact is not a member.** The live view is the peers in the address map
+of this node's group, or of a child group it gateways (Python
+`_roster_peers`, C `processes_peer_is_member`). A first-contact direct peer is
+in the peer list and in no group, so it never sizes a quorum, its signature
+never counts, and it never enters a logged roster or the attested-record
+roster file (R+D.md §13.5 D2). Before, a leaf counted every contact in every
+denominator, so each contact made its cohort's quorums one vote harder to
+meet. A gateway already left them out, because it sizes each child from that
+group's map. The same rule sizes C's admission vote (`_admission_roster`).
+A node that holds no group with a member map yet counts every peer, as
+before. A contact's trust seed stays local: it is written into this node's own
+reputation table and is never part of a half, a checkpoint or a roster.
+
 | Behavior | Scenario |
 |---|---|
 | A placement is judged by the roster logged before it | [`placed-judged-by-logged-roster.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/placed-judged-by-logged-roster.yaml) |
@@ -724,6 +737,7 @@ group's members.
 | A genesis within the acceptor's view is accepted; one naming a stranger is not | [`place-genesis-subset-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-genesis-subset-accepted.yaml), [`place-genesis-stranger-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-genesis-stranger-refused.yaml) |
 | A genesis needs every member it lists | [`placed-genesis-unanimous-written.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/placed-genesis-unanimous-written.yaml), [`placed-genesis-not-unanimous-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/placed-genesis-not-unanimous-refused.yaml) |
 | Nothing but a genesis before the roster | [`place-before-genesis-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-before-genesis-refused.yaml), [`placed-before-genesis-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/placed-before-genesis-refused.yaml) |
+| A contact does not size a quorum, and its signature does not count | [`direct-peer-not-in-checkpoint-quorum.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/direct-peer-not-in-checkpoint-quorum.yaml), [`direct-peer-not-in-paxos-quorum.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/direct-peer-not-in-paxos-quorum.yaml), [`direct-peer-cosignature-not-counted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/direct-peer-cosignature-not-counted.yaml) |
 | A newcomer anchors on the roster its group signed, and on no other | [`catchup-roster-anchor-newcomer-adopts.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-roster-anchor-newcomer-adopts.yaml), [`catchup-roster-anchor-insider-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-roster-anchor-insider-refused.yaml), [`catchup-roster-anchor-view-mismatch-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-roster-anchor-view-mismatch-refused.yaml) |
 
 The cohort's race, founders joining one at a time, a member joining mid
