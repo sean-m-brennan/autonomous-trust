@@ -127,7 +127,8 @@ static process_t *_mk_process(identity_t *self)
     return proc;
 }
 
-static void _add_peer(process_t *proc, identity_t *peer)
+/* A peer in peers[] only: a first-contact direct peer, which is in no group. */
+static void _add_contact(process_t *proc, identity_t *peer)
 {
     public_identity_t *pub = NULL;
     ck_assert_ret_ok(identity_publish(peer, &pub));
@@ -136,6 +137,15 @@ static void _add_peer(process_t *proc, identity_t *peer)
            sizeof(public_identity_t));
     proc->protocol.num_peers++;
     smrt_deref(pub);
+}
+
+/* A member: in peers[] and in the group's address map, as an admitted peer is. */
+static void _add_peer(process_t *proc, identity_t *peer)
+{
+    _add_contact(proc, peer);
+    char peer_uuid[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer->uuid, peer_uuid);
+    group_add_address(&proc->protocol.group, peer_uuid, peer->address);
 }
 
 static public_identity_t *_publish(identity_t *ident)
@@ -341,6 +351,43 @@ DEFINE_TEST(test_sweep_is_a_no_op_with_nothing_pending)
 }
 END_TEST_DEFINITION()
 
+/* R+D.md §13.5 D2: the bar is a majority of the MEMBERS. Contacts are in
+ * peers[] and in no group, and never vote, so counting them raised the bar by
+ * one per contact. Two members and three contacts: two of three admit, where
+ * the old count asked for four of six. */
+DEFINE_TEST(test_contacts_do_not_raise_the_admission_bar)
+{
+    _begin();
+    identity_t *me = _mk_identity("ada", "10.0.0.1");
+    identity_t *m1 = _mk_identity("amy", "10.0.0.2");
+    identity_t *m2 = _mk_identity("bob", "10.0.0.4");
+    identity_t *c1 = _mk_identity("cat", "10.0.1.1");
+    identity_t *c2 = _mk_identity("cy", "10.0.1.2");
+    identity_t *c3 = _mk_identity("cyd", "10.0.1.3");
+    identity_t *joiner = _mk_identity("dan", "10.0.0.6");
+    process_t *proc = _mk_process(me);
+    directory_t *queues = _mk_queues();
+    _add_peer(proc, m1);
+    _add_peer(proc, m2);
+    _add_contact(proc, c1);
+    _add_contact(proc, c2);
+    _add_contact(proc, c3);
+
+    public_identity_t *pub = _publish(joiner);
+    identity_arm_pending_vote(pub, 1, -1.0);   /* our vote alone: one of three */
+    identity_periodic_vote_collection(proc, queues);
+    ck_assert_int_eq(g_confirm_count, 0);
+
+    identity_arm_pending_vote(pub, 2, -1.0);   /* two of three: a majority */
+    identity_periodic_vote_collection(proc, queues);
+    ck_assert(_was_admitted(joiner->uuid));
+
+    smrt_deref(pub);
+    array_free(queues);
+    _end();
+}
+END_TEST_DEFINITION()
+
 /* Several joiners arriving at once are all decided, not just the first. */
 DEFINE_TEST(test_every_expired_admission_is_decided)
 {
@@ -378,4 +425,5 @@ RUN_TESTS(VoteCollection,
           test_admission_waits_while_the_grace_period_runs,
           test_expired_grace_period_still_needs_the_majority,
           test_sweep_is_a_no_op_with_nothing_pending,
-          test_every_expired_admission_is_decided)
+          test_every_expired_admission_is_decided,
+          test_contacts_do_not_raise_the_admission_bar)

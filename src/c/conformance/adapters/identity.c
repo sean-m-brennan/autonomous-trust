@@ -1016,6 +1016,41 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
         }
     }
 
+    /* direct_peers: { "<participant>": ["<participant>", ...], ... } -- each
+     * listed peer is a first-contact direct peer of the key participant: in
+     * its peers[] and NOT in its group, which holds the participant itself
+     * (R+D.md §13.5 D2). Mirrors the Python adapter, whose shared group
+     * leaves every listed peer out. */
+    json_t *direct = json_object_get(fixtures, "direct_peers");
+    if (json_is_object(direct)) {
+        const char *dp_pid;
+        json_t *dp_list;
+        json_object_foreach(direct, dp_pid, dp_list) {
+            sce_participant_t *part = sce_find_participant(ctx, dp_pid);
+            if (part == NULL || !json_is_array(dp_list)) continue;
+            ic_impl_t *impl = (ic_impl_t *)part->impl;
+            if (impl == NULL || impl->proc == NULL || impl->pub == NULL) continue;
+            process_t *p = impl->proc;
+            if (p->protocol.group.address_map.items == NULL)
+                map_init(&p->protocol.group.address_map);
+            char su[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(impl->pub->uuid, su);
+            group_add_address(&p->protocol.group, su, impl->pub->address);
+            size_t di;
+            json_t *dv;
+            json_array_foreach(dp_list, di, dv) {
+                sce_participant_t *cp = json_is_string(dv)
+                    ? sce_find_participant(ctx, json_string_value(dv)) : NULL;
+                ic_impl_t *ci = cp != NULL ? (ic_impl_t *)cp->impl : NULL;
+                if (ci == NULL || ci->pub == NULL
+                    || p->protocol.num_peers >= DEFAULT_MAX_PEERS) continue;
+                memcpy(&p->protocol.peers[p->protocol.num_peers], ci->pub,
+                       sizeof(public_identity_t));
+                p->protocol.num_peers++;
+            }
+        }
+    }
+
     /* capless_peers: { "<participant>": <N>, ... } -- inject N synthetic
      * cap-less peers (present in proc->protocol.peers[] but absent from the
      * peer_caps_map) so the periodic caps-resync sweep has more than the

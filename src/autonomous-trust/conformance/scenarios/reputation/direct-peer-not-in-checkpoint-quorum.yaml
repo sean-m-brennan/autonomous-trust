@@ -1,0 +1,43 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: direct-peer-not-in-checkpoint-quorum
+byte_pinning: false
+description: |
+    A first-contact direct peer is in a node's peer list and in no group, so
+    it never sizes a quorum (R+D.md §13.5 D2). Before, it raised every leaf
+    denominator by one: each contact a node added made its cohort's quorums
+    harder to meet.
+
+    bob's members are alice and carol; eve is his direct peer. Checkpoint
+    finality is a majority of the whole group, bob included: two of three.
+    Counting eve, it was three of four, and two signatures were refused.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: member
+  - id: carol
+    role: member
+  - id: eve
+    role: member
+
+fixtures:
+  direct_peers: [eve]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: checkpoint final
+    payload:
+      root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+      epoch: 7
+      first_index: 0
+      count: 3
+      cosigners: [alice, bob]
+
+expected_state:
+  bob:
+    checkpoint_root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"

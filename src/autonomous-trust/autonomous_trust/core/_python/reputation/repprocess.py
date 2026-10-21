@@ -870,29 +870,47 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
     def _members_of_group(self, group):
         """Peers (from self.peers.all) whose address is in this group's
         address map. Used to size per-group Paxos quorum on a gateway
-        whose self.peers.all spans several groups."""
+        whose self.peers.all spans several groups. No group means this
+        node's own: ``_roster_peers``."""
         if group is None:
-            return list(self.peers.all)
+            return self._roster_peers()
         try:
             addrs = set(group.addresses)
         except Exception:
-            return list(self.peers.all)
+            return self._roster_peers()
         return [p for p in self.peers.all
                 if getattr(p, 'address', None) in addrs]
+
+    def _roster_peers(self):
+        """The peers that count in consensus: those in the address map of
+        this node's group or of a child group it gateways. A first-contact
+        direct peer is a peer but a member of neither, so it never sizes a
+        quorum, signs into one, or enters a logged roster (R+D.md §13.5 D2).
+        Before this node holds a group with a member map, every peer counts,
+        as before. Mirrors C processes_peer_is_member."""
+        keys = set()
+        for grp in [self.group] + list(self.child_groups.values()):
+            members = getattr(grp, '_address_map', None) \
+                if grp is not None else None
+            if isinstance(members, dict):
+                keys |= {str(k).lower() for k in members}
+        if not keys:
+            return list(self.peers.all)
+        return [p for p in self.peers.all if str(p.uuid).lower() in keys]
 
     def _quorum_for_group(self, group_uuid):
         """floor(roster/2), the bar slashing and the co-signature quorum test
         (`_quorum_met`) clear with `>`. Paxos rounds use _round_quorum.
 
         Back-compat: a non-gateway node (no child_groups) always uses the
-        historical len(self.peers.all)//2, so leaf quorum math is
-        unchanged. Only a gateway — whose self.peers.all conflates the
-        members of every group it belongs to — sizes per-group."""
+        historical roster // 2 over its own members (_roster_peers). Only a
+        gateway — whose self.peers.all conflates the members of every group
+        it belongs to — sizes per-group."""
         if not self.child_groups:
-            return len(self.peers.all) // 2
+            return len(self._roster_peers()) // 2
         grp = self._group_by_uuid(group_uuid)
         if grp is None:
-            return len(self.peers.all) // 2
+            return len(self._roster_peers()) // 2
         return len(self._members_of_group(grp)) // 2
 
     def _round_quorum(self, group_uuid):
@@ -978,7 +996,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         were heard within REACH_WINDOW_TIMEOUTS commit timeouts of
         ``present``. Mirrors C _members_reachable_locked."""
         since = present - self.REACH_WINDOW_TIMEOUTS * self.COMMIT_TIMEOUT
-        members = list(self.peers.all)
+        members = self._roster_peers()
         reached = 1 + sum(1 for p in members
                           if self.heard.get(str(p.uuid), float('-inf')) >= since)
         return reached, len(members) + 1
@@ -1559,11 +1577,12 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         """Resolve a co-signer uuid to the Identity holding its public key:
         self first (a proposer counts its own signature), then the peer
         roster. None when the claimed voter is unknown to us -- an unknown
-        voter's signature cannot be verified, so it cannot count."""
+        voter's signature cannot be verified, so it cannot count. A direct
+        peer is not on the roster (_roster_peers)."""
         key = str(voter_uuid)
         if key == str(self.identity.uuid):
             return self.identity
-        for peer in self.peers.all:
+        for peer in self._roster_peers():
             if str(peer.uuid) == key:
                 return peer
         return None
@@ -2165,7 +2184,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
     def _is_member(self, uuid) -> bool:
         key = str(uuid)
         return key == str(self.identity.uuid) or any(
-            str(p.uuid) == key for p in self.peers.all)
+            str(p.uuid) == key for p in self._roster_peers())
 
     #: Conflicted co-signers (ISSUES §2.54): ``{"teams": [[uuid, ...], ...]}``,
     #: written by an application (Stele, from a verified team roster). Two
@@ -2258,7 +2277,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             if mates and len(voters) < 2:
                 return False
             return len(voters) > others // 2
-        members = len(self.peers.all) + 1
+        members = len(self._roster_peers()) + 1
         mates = len(self._conflicted_members(subject))
         others = members - (1 if self._is_member(subject) else 0)
         others = max(others - mates, 0)
@@ -2595,9 +2614,9 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         """The roster a checkpoint's quorum is sized from, this node NOT
         included: the peers, or a gateway's members of that child group."""
         if not self.child_groups:
-            return len(self.peers.all)
+            return len(self._roster_peers())
         grp = self._group_by_uuid(group_uuid)
-        return (len(self.peers.all) if grp is None
+        return (len(self._roster_peers()) if grp is None
                 else len(self._members_of_group(grp)))
 
     def _checkpoint_quorum_met(self, designation, sigs, group_uuid=None) -> bool:
@@ -2752,7 +2771,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             for m in members.values():
                 if isinstance(m, dict):
                     m['member'] = False
-            current = [self.identity] + list(self.peers.all)
+            current = [self.identity] + self._roster_peers()
             for ident in current:
                 uid = str(ident.uuid)
                 key = ident.signature.public.encode(
@@ -2853,7 +2872,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 in_force = hist.roster_at(tx.index)
                 group_size = (len(in_force.roster_members)
                               if in_force is not None and in_force.roster_members
-                              else len(self.peers.all) + 1)
+                              else len(self._roster_peers()) + 1)
                 rec = attested_record(doc, tx.task_id, signers,
                                       group_size, ckpt_group_size,
                                       self._is_member(tx.subject_id))
@@ -3923,8 +3942,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                     self._reconcile_into(queues, '', chain, 'the majority chain')
                 else:
                     self.logger.error('Closest %d peers unable to agree on history', self.num_updates)
-                    self._request_update(queues, len(self.peers.all),
-                                         quorum=len(self.peers.all))
+                    roster = len(self._roster_peers())
+                    self._request_update(queues, roster, quorum=roster)
             return True
         return False
 
@@ -4021,7 +4040,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         identity = getattr(self, 'identity', None)
         if identity is None:
             return 0
-        roster = {str(p.uuid): p for p in self.peers.all}
+        roster = {str(p.uuid): p for p in self._roster_peers()}
         for gone in [k for k in self.handoff if k not in roster]:
             del self.handoff[gone]
         due = []
