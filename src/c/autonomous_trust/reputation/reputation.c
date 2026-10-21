@@ -2452,6 +2452,59 @@ int tx_history_reconcile_placed(tx_history_t *hist, const json_t *arr,
                       true, out);
 }
 
+const transaction_t *tx_history_committed_at(const tx_history_t *hist, int index)
+{
+    return hist == NULL ? NULL : _committed_at(hist, index);
+}
+
+int tx_history_own_place_batch(const tx_history_t *hist, int f,
+                               tx_place_batch_t *out, json_t **sigs_out)
+{
+    if (hist == NULL || out == NULL || sigs_out == NULL)
+        return -1;
+    *sigs_out = NULL;
+    memset(out, 0, sizeof(*out));
+    for (int at = f; at < f + PLACE_BATCH_MAX; at++)
+    {
+        const transaction_t *last = _committed_at(hist, at);
+        if (last == NULL)
+            return -1;
+        char task[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(last->task_uuid, task);
+        data_t *d = NULL, *fd = NULL;
+        char *text = NULL;
+        int from = -1;
+        if (map_get((map_t *)&hist->place_certs, (map_key_t)task, &d) != 0
+            || d == NULL || data_string_ptr(d, &text) != 0 || text == NULL
+            || map_get((map_t *)&hist->place_from, (map_key_t)task, &fd) != 0
+            || fd == NULL || data_integer(fd, &from) != 0)
+            continue;
+        if (from > f || at - from >= PLACE_BATCH_MAX)
+            return -1;
+        int m = 0;
+        for (int i = from; i <= at; i++)
+        {
+            const transaction_t *e = _committed_at(hist, i);
+            if (e == NULL)
+                return -1;
+            out->entries[m++] = *e;
+        }
+        json_t *sigs = json_loads(text, 0, NULL);
+        if (!json_is_object(sigs))
+        {
+            json_decref(sigs);
+            return -1;
+        }
+        out->k = from;
+        out->n = m;
+        out->whole = true;
+        out->sigs = sigs;
+        *sigs_out = sigs;
+        return 0;
+    }
+    return -1;
+}
+
 int tx_history_place_batches(const tx_history_t *hist, const json_t *arr,
                              tx_place_batch_t **out, int *n_out)
 {

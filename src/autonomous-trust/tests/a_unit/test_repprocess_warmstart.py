@@ -860,3 +860,54 @@ class TestEvidencePersistence:
                           epoch=1, first_index=0, count=1)
         rp._store_checkpoint(ckpt, {})  # must not raise
         assert rp._checkpoint is ckpt
+
+
+class TestEquivocationRecords:
+    """R+D.md §14.1: the records are this node's own evidence, so they ride in
+    its evidence document, survive a restart, and are absent when there are
+    none (the document is then what it always was)."""
+
+    def _record(self, index=3):
+        cert = {'k': index, 'prev': 'ab' * 32, 'digest': 'cd' * 32,
+                'sigs': {}, 'signers': []}
+        return {'index': index, 'source': 'placed', 'from': None, 'at': 1,
+                'ours': dict(cert), 'theirs': dict(cert, digest='ef' * 32),
+                'both': []}
+
+    def test_no_records_no_key(self, cfg_root):
+        rp = _make_rep_process(identity=_identity('me'))
+        rp._persist_history('')
+        assert 'forks' not in json.loads(_evidence_file(cfg_root).read_text())
+
+    def test_records_survive_a_restart(self, cfg_root):
+        me = _identity('me')
+        rp = _make_rep_process(identity=me)
+        rp._forks = {'': [self._record()]}
+        rp._persist_history('')
+        doc = json.loads(_evidence_file(cfg_root).read_text())
+        assert [r['index'] for r in doc['forks']] == [3]
+        restarted = _make_rep_process(identity=me)
+        assert restarted._fork_records('') == doc['forks']
+
+    def test_malformed_records_are_dropped_on_load(self, cfg_root):
+        me = _identity('me')
+        rp = _make_rep_process(identity=me)
+        rp._load_fork_records('', {'forks': [self._record(), {'index': 'x'}, 7]})
+        assert [r['index'] for r in rp._fork_records('')] == [3]
+
+    def test_the_same_fork_is_recorded_once(self, cfg_root):
+        rp = _make_rep_process(identity=_identity('me'))
+        r = self._record()
+        for _ in range(2):
+            rp._note_equivocation('', 3, 'placed', None, r['ours'], r['theirs'])
+        assert len(rp._fork_records('')) == 1
+
+    def test_records_are_bounded(self, cfg_root):
+        from autonomous_trust.core._python.reputation.placement import FORKS_MAX
+        rp = _make_rep_process(identity=_identity('me'))
+        for i in range(FORKS_MAX + 5):
+            r = self._record(i)
+            rp._note_equivocation('', i, 'placed', None, r['ours'], r['theirs'])
+        held = rp._fork_records('')
+        assert len(held) == FORKS_MAX
+        assert held[0]['index'] == 5

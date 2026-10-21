@@ -10,7 +10,8 @@ description: |
     it at that index exactly as given.
 
     The same placement arrives twice. The second is behind bob's chain by then,
-    so the chain holds each entry once.
+    so the chain holds each entry once, and the same value twice is no
+    equivocation.
 
 participants:
   - id: alice
@@ -40,3 +41,4 @@ steps:
 expected_state:
   bob:
     chain_tasks: [t-2, t-1]
+    equivocations: {count: 0}

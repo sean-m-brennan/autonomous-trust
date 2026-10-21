@@ -1,0 +1,42 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: placed-equivocation-uncertified-not-recorded
+byte_pinning: false
+description: |
+    A rival value for an index bob already holds, signed by alice alone. One
+    of four is no quorum, so it proves nothing about anyone and bob records
+    nothing (R+D.md §14.1). The twin of placed-equivocation-recorded.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  local_chain:
+    bob:
+      - {task: a, p1: 0.7, p2: 0.5, batch: 1}
+      - {task: b, p1: 0.9, p2: 0.3, batch: 1, placed_by: [alice, bob, carol]}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: placed
+    payload:
+      k: 0
+      value:
+        - {task_id: t-3, p1: alice, p1_score: 0.4, p2: dave, p2_score: 0.4}
+      signers: [alice]
+
+expected_state:
+  bob:
+    chain_entries: [a, b]
+    equivocations: {count: 0}
+    evidence_doc: {forks: 0}

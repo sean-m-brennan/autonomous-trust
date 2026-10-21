@@ -52,6 +52,9 @@ PLACEMENT_FILE = 'reputation-placement'
 POOL_FILE = 'reputation-pool'
 #: Decided placements held ahead of the chain, per chain.
 PLACED_AHEAD_MAX = 16
+#: Equivocation records kept per chain in its evidence document, oldest
+#: dropped first (R+D.md §14.1).
+FORKS_MAX = 32
 
 
 def _hex(value) -> str:
@@ -505,14 +508,15 @@ class PlacementMixin:
     # --- learner --------------------------------------------------------
 
     def _placement_certified(self, chain, k, entries, sigs, group,
-                             roster=...) -> bool:
+                             roster=..., prev=None) -> bool:
         """Does `sigs` certify this value at k, after OUR head? A strict
         majority of the roster in force for k (doc/architecture/reputation.md,
         "Who is in the group"), verified with the keys it records, must have
         signed its :func:`place_designation`; a genesis, every member it
         lists. Before a roster there is nothing else to learn."""
         digest = place_value_digest(entries, k)
-        desig = place_designation(k, chain.head_hash, digest)
+        desig = place_designation(k, chain.head_hash if prev is None else prev,
+                                  digest)
         if roster is ...:
             roster = chain.roster_at(k)
         genesis = self._genesis_of(entries)
@@ -524,6 +528,107 @@ class PlacementMixin:
             return len(self._verified_cosigners(desig, sigs, roster)) >= \
                 len(roster.roster_members or ()) // 2 + 1
         return False            # nothing but a genesis before the roster
+
+    # --- equivocation (R+D.md §14.1) ----------------------------------------
+    #
+    # Two certificates for different values at one index mean two quorums of
+    # the roster signed both, and the members in both signed twice. We keep
+    # ours either way. The record holds both certificates, so this node can
+    # prove it later; it is never sent and never scored (the user's calls,
+    # 2026-10-21, D3 B and D4 B).
+
+    def _fork_records(self, key) -> list:
+        return list(getattr(self, '_forks', {}).get(key, ()))
+
+    def _load_fork_records(self, key, doc):
+        """Take back the records an evidence document holds for chain `key`."""
+        raw = doc.get('forks') if isinstance(doc, dict) else None
+        if not isinstance(raw, list):
+            return
+        keep = [dict(r) for r in raw if isinstance(r, dict)
+                and isinstance(r.get('index'), int)
+                and isinstance(r.get('ours'), dict)
+                and isinstance(r.get('theirs'), dict)]
+        if not hasattr(self, '_forks'):
+            self._forks = {}
+        self._forks[key] = keep[-FORKS_MAX:]
+
+    def _fork_cert(self, chain, k, entries, sigs, prev) -> dict:
+        """One side of an equivocation: the placement at `k` after the entry
+        whose hash is `prev`, its value digest, its signatures, and who among
+        them verifies against the roster in force for `k` (our live view
+        while the chain holds none)."""
+        digest = place_value_digest(entries, k)
+        desig = place_designation(k, prev or b'', digest)
+        roster = chain.roster_at(k)
+        return {'k': int(k), 'prev': _hex(prev), 'digest': _hex(digest),
+                'sigs': {str(u).lower(): _hex(v) for u, v in sigs.items()},
+                'signers': sorted(self._verified_cosigners(desig, sigs, roster))}
+
+    def _own_fork_cert(self, chain, f):
+        """Our own certificate for the placement holding index `f`, or None
+        when it is not resident in full."""
+        for k, entries, sigs in chain.placement_batches(list(chain._chain)):
+            if entries and k <= f < k + len(entries):
+                return self._fork_cert(chain, k, entries, sigs,
+                                       entries[0].prev_hash)
+        return None
+
+    def _note_equivocation(self, key, f, source, sender, ours, theirs):
+        """Keep one equivocation record for chain `key` and persist it."""
+        if ours is None or theirs is None or ours['digest'] == theirs['digest']:
+            return
+        if not hasattr(self, '_forks'):
+            self._forks = {}
+        held = self._forks.setdefault(key, [])
+        if any(r.get('index') == f and r['ours'].get('digest') == ours['digest']
+               and r['theirs'].get('digest') == theirs['digest'] for r in held):
+            return
+        both = sorted(set(ours['signers']) & set(theirs['signers']))
+        held.append({'index': int(f), 'source': source,
+                     'from': None if sender is None else str(sender).lower(),
+                     'at': int(time.time()), 'ours': ours, 'theirs': theirs,
+                     'both': both})
+        del held[:-FORKS_MAX]
+        self.logger.error(
+            'equivocation recorded on chain %s at index %d (%s): %d member(s) '
+            'signed both values', key or 'primary', f, source, len(both))
+        self._persist_history(key)
+
+    def _record_catchup_equivocation(self, key, chain, seg, f, sender):
+        """Catch-up returned EQUIVOCATION at `f`: record our certificate and
+        the segment's."""
+        theirs = None
+        for k, entries, sigs in chain.placement_batches(seg):
+            if entries and k <= f < k + len(entries):
+                theirs = self._fork_cert(chain, k, entries, sigs,
+                                         entries[0].prev_hash)
+                break
+        self._note_equivocation(key, f, 'catchup', sender,
+                                self._own_fork_cert(chain, f), theirs)
+
+    def _check_placed_equivocation(self, key, chain, k, entries, sigs, sender):
+        """A `placed` for an index we already hold. The same value is a late
+        duplicate. A different value whose certificate verifies after our own
+        entry at k-1 is an equivocation, recorded at the first index where the
+        two differ."""
+        held = {t.index: t for t in chain._chain if t.index is not None}
+        ours = [held.get(i) for i in range(k, k + len(entries))]
+        if any(t is None for t in ours):
+            return
+        if place_value_digest(ours, k) == place_value_digest(entries, k):
+            return
+        before = held.get(k - 1)
+        prev = b'' if k == 0 else (None if before is None else before.entry_hash())
+        if prev is None or not self._placement_certified(
+                chain, k, entries, sigs, None, prev=prev):
+            return
+        f = next((k + i for i in range(len(entries))
+                  if place_value_digest([ours[i]], k + i)
+                  != place_value_digest([entries[i]], k + i)), k)
+        self._note_equivocation(key, f, 'placed', sender,
+                                self._own_fork_cert(chain, f),
+                                self._fork_cert(chain, k, entries, sigs, prev))
 
     def _apply_placement(self, chain, key, k, entries, sigs, group) -> bool:
         if not self._placement_certified(chain, k, entries, sigs, group):
@@ -580,6 +685,9 @@ class PlacementMixin:
             return True
         k = payload['k']
         if k < chain.next_index:
+            self._check_placed_equivocation(
+                key, chain, k, entries, sigs,
+                getattr(message.from_whom, 'uuid', None))
             return True
         st = self._place_state(key)
         if k > chain.next_index:

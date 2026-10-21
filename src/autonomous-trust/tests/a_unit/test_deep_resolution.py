@@ -628,8 +628,13 @@ class TestEndToEnd:
         # the deep group -- so the holder's signature must verify against the
         # identity the ANSWER carries, and be trusted because... it cannot be.
         # Give the requestor the holder as a known peer to stand in for the
-        # anchor check, which has its own test above.
+        # anchor check, which has its own test above. It must be a MEMBER of
+        # the requestor's group: a peer in no group is a first-contact direct
+        # peer, whose signature is never trusted (R+D.md §13.5 D2).
         req.peers.all = [gateway, holder]
+        req.protocol.group._address_map = {
+            str(requestor.uuid): requestor.address,
+            str(holder.uuid): holder.address}
 
         qa, qb, qc = _queues(), _queues(), _queues()
         qid = req.resolve_reputation(qa, peer)

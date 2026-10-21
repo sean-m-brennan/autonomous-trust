@@ -2101,13 +2101,16 @@ def _hex_str(value) -> str:
     return str(value)
 
 
-def evidence_to_dict(chain, signed_checkpoint=None, attest_certs=None) -> dict:
+def evidence_to_dict(chain, signed_checkpoint=None, attest_certs=None,
+                     forks=None) -> dict:
     """The persisted-evidence document for ``chain`` (an iterable of committed
     ``Transaction``) and the finalized ``SignedCheckpoint`` covering it.
 
     Only entries with an assigned ``index`` are written: an index is what a
     committed, bilateral entry has, and an un-indexed one is not evidence of
-    anything yet.
+    anything yet. ``forks`` are this node's equivocation records (R+D.md
+    §14.1), written only when there are any, so a node that never saw one
+    writes the document it always did.
     """
     entries = []
     for tx in chain:
@@ -2190,6 +2193,8 @@ def evidence_to_dict(chain, signed_checkpoint=None, attest_certs=None) -> dict:
             'sigs': {str(k): _hex_str(v)
                      for k, v in (signed_checkpoint.sigs or {}).items()},
         }
+    if forks:
+        doc['forks'] = [dict(f) for f in forks]
     return doc
 
 

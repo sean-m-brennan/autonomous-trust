@@ -919,6 +919,16 @@ typedef struct {
 int  tx_history_place_batches(const tx_history_t *hist, const json_t *arr,
                               tx_place_batch_t **out, int *n_out);
 
+/** The committed entry at absolute @p index, or NULL when it is not resident. */
+const transaction_t *tx_history_committed_at(const tx_history_t *hist, int index);
+
+/** Our own placement holding index @p f, completed from resident entries,
+ *  with its certificate: *@p sigs_out is a new reference (decref it), also
+ *  borrowed by out->sigs. Returns -1 when the placement is not resident in
+ *  full. Mirrors the batch Python _own_fork_cert picks. */
+int  tx_history_own_place_batch(const tx_history_t *hist, int f,
+                                tx_place_batch_t *out, json_t **sigs_out);
+
 /** Merkle root over our committed entries at indices [first, first + count),
  *  the value a checkpoint over that window attests. Returns -1 unless every
  *  index in the range is resident, in order. Mirrors Python's

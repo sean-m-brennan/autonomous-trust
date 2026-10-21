@@ -14,7 +14,8 @@ description: |
     DIFFERENT certified placement at index 0, and a second after it. Two
     quorums cannot sign two values at one index unless someone signed both:
     that is equivocation, never settled by a rule. bob keeps his chain and
-    reports it.
+    records it: both certificates, and alice and carol, who signed both
+    values (R+D.md §14.1).
 
 participants:
   - id: alice
@@ -40,9 +41,11 @@ steps:
     payload:
       chain:
         - {task: c, p1: 0.6, p2: 0.4, batch: 1, certified_by: [alice, carol, dave]}
-        - {task: d, p1: 0.8, p2: 0.8, batch: 1, placed_by: [alice, bob, carol], certified_by: [alice, carol, dave]}
-        - {task: e, p1: 0.5, p2: 0.5, batch: 2, placed_by: [alice, bob, carol], certified_by: [alice, carol, dave]}
+        - {task: d, p1: 0.8, p2: 0.8, batch: 1, placed_by: [alice, carol, dave], certified_by: [alice, carol, dave]}
+        - {task: e, p1: 0.5, p2: 0.5, batch: 2, placed_by: [alice, carol, dave], certified_by: [alice, carol, dave]}
 
 expected_state:
   bob:
     chain_entries: [a, b]
+    equivocations: {count: 1, index: 0, both: [alice, carol]}
+    evidence_doc: {forks: 1}

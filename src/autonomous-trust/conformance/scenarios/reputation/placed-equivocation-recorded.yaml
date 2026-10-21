@@ -1,0 +1,49 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: placed-equivocation-recorded
+byte_pinning: false
+description: |
+    A `placed` for an index bob already holds, with a different value and a
+    certificate that verifies after bob's own head there. Two quorums of four
+    signed two values at index 0, so the members in both signed twice. bob
+    keeps his chain and records the equivocation: both certificates, and
+    alice and carol, who signed both (R+D.md §14.1). The record is local: it
+    is never sent and never scored.
+
+    Before, a `placed` behind the chain was dropped unread. bob's own
+    placement is seated by `local_chain`: the C adapter resets state per
+    dispatch, so it cannot carry one from an earlier step.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  local_chain:
+    bob:
+      - {task: a, p1: 0.7, p2: 0.5, batch: 1}
+      - {task: b, p1: 0.9, p2: 0.3, batch: 1, placed_by: [alice, bob, carol]}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: placed
+    payload:
+      k: 0
+      value:
+        - {task_id: t-3, p1: alice, p1_score: 0.4, p2: dave, p2_score: 0.4}
+      signers: [alice, carol, dave]
+
+expected_state:
+  bob:
+    chain_entries: [a, b]
+    equivocations: {count: 1, index: 0, both: [alice, carol]}
+    evidence_doc: {forks: 1}

@@ -3000,7 +3000,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                     sigs=dict(self._checkpoint_sigs_final.get(chain_key, {})))
             hist = self._chain_for_key(chain_key)
             doc = evidence_to_dict(hist, signed,
-                                   getattr(hist, 'attest_certs', None))
+                                   getattr(hist, 'attest_certs', None),
+                                   self._fork_records(chain_key))
             with atomic_write(self._evidence_path(chain_key)) as f:
                 json.dump(doc, f, indent=2)
         except (OSError, IOError, ValueError, TypeError) as e:
@@ -3165,6 +3166,9 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         except ValueError as e:
             self.logger.warning('Reputation evidence is not valid JSON: %s', e)
             return
+        # The equivocation records are this node's own, whatever becomes of
+        # the chain beside them, so they come back first.
+        self._load_fork_records(chain_key, doc)
         try:
             chain, signed = evidence_from_dict(doc)
         except (ValueError, KeyError, TypeError) as e:
@@ -3789,6 +3793,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 'chain from %s holds a certified placement at index %d '
                 'that differs from ours: two quorums signed two values '
                 'there; keeping ours', who, res.fork)
+            sender = getattr(getattr(message, 'from_whom', None), 'uuid', None)
+            self._record_catchup_equivocation(key, hist, seg, res.fork, sender)
         for tx in res.added + res.dropped:
             for peer in (tx.p1_id, tx.p2_id):
                 if peer is not None:
