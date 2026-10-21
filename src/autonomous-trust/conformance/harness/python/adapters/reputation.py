@@ -710,12 +710,16 @@ class ReputationAdapter:
             identities[pid] = identity
 
         # Group seeded by first participant; every existing participant in
-        # the group's address map.
+        # the group's address map, except the `direct_peers`: a first-contact
+        # direct peer is in every peer list and in no group (R+D.md §13.5 D2).
+        # The first participant must not be one. Mirrors the C adapter.
+        direct = {str(d) for d in fixtures.get('direct_peers') or ()}
         seed_pid = spec_participants[0]['id']
         group = Group(identities[seed_pid].uuid, {identities[seed_pid].uuid: identities[seed_pid].address},
                       'rep-grp', Encryptor.generate(), False)
         for spec in spec_participants[1:]:
-            group.add_address(identities[spec['id']].uuid, identities[spec['id']].address)
+            if spec['id'] not in direct:
+                group.add_address(identities[spec['id']].uuid, identities[spec['id']].address)
         # Every group places its order (doc/architecture/reputation.md,
         # "Agreeing on an order"). Placement state lives in a directory per
         # participant, fresh per case: every participant shares this process
@@ -728,7 +732,8 @@ class ReputationAdapter:
         if 'roster' in fixtures:
             preset_roster = fixtures.get('roster') or {}
         else:
-            everyone = [p['id'] for p in spec_participants]
+            everyone = [p['id'] for p in spec_participants
+                        if p['id'] not in direct]
             preset_roster = {p['id']: everyone for p in spec_participants}
         self._fixture_roster = preset_roster
 

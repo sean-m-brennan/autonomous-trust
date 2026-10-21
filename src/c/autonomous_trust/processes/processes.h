@@ -379,6 +379,17 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
 bool processes_remove_peer(process_t *proc, const unsigned char *uuid);
 
 /**
+ * @brief Whether @p peer counts in consensus: it is in the address map of this
+ * node's group or of a child group it gateways.
+ *
+ * A first-contact direct peer is in peers[] but in no group, so it never sizes
+ * a quorum or an admission, signs into one, or enters a logged roster (R+D.md
+ * §13.5 D2). While no group holds a member map, every peer counts. Caller
+ * holds the peers read lock.
+ */
+bool processes_peer_is_member(const process_t *proc, const public_identity_t *peer);
+
+/**
  * @brief Context for split process setup/loop lifecycle
  */
 typedef struct

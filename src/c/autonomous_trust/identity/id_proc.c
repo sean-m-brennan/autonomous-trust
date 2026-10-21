@@ -199,6 +199,19 @@ DEFINE_ERROR(EID_NOQ, "Required process queue missing");
  * arithmetic §2.22 corrected for checkpoint finality). Odd-sized groups are
  * unchanged; a lone node still admits on its own vote. */
 #define ADMISSION_QUORUM(num_peers) MAJORITY((num_peers) + 1)
+
+/* The roster an admission is sized against, this node NOT included: the peers
+ * that are members (processes_peer_is_member). A first-contact direct peer is
+ * in peers[] but never votes, so counting it raised the bar by one per contact
+ * (R+D.md §13.5 D2). Caller holds the peers read lock. */
+static size_t _admission_roster(const process_t *proc)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < proc->protocol.num_peers; i++)
+        if (processes_peer_is_member(proc, &proc->protocol.peers[i]))
+            count++;
+    return count;
+}
 /* How long we wait for other members' votes on a peer we just proposed before
  * deciding on the votes in hand. Mirrors Python IdentityProcess.vote_timeout
  * (idprocess.py:154). Short by design: it is a grace period for votes already
@@ -2276,7 +2289,7 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
      * test path always proposes regardless of peer count. */
     peers_read_lock(proc);
     bool bootstrap = (proc->protocol.num_peers == 0);
-    size_t snapshot_num_peers = proc->protocol.num_peers;
+    size_t snapshot_num_peers = _admission_roster(proc);
     peers_read_unlock(proc);
     if (bootstrap && !id_state.synchronous_dispatch)
     {
@@ -3667,7 +3680,8 @@ void identity_reset_state(void)
 }
 
 /* Accept the proposed peer @p uuid_key if @p count (our own vote included)
- * is a majority of the whole group, @p num_peers plus this node. Shared by the two things that can decide an admission: an
+ * is a majority of the whole group, @p num_peers (_admission_roster) plus this
+ * node. Shared by the two things that can decide an admission: an
  * inbound vote (handle_count_vote) and the expiry of our own grace period
  * (identity_periodic_vote_collection). Returns whether the peer was accepted.
  *
@@ -3766,7 +3780,7 @@ void identity_periodic_vote_collection(process_t *proc, directory_t *queues)
     pthread_mutex_unlock(&id_state.lock);
 
     peers_read_lock(proc);
-    size_t num_peers = proc->protocol.num_peers;
+    size_t num_peers = _admission_roster(proc);
     peers_read_unlock(proc);
 
     for (size_t i = 0; i < n_due; i++)
@@ -3839,7 +3853,7 @@ static bool handle_count_vote(process_t *proc, directory_t *queues, generic_msg_
     int count = vote_collection_increment(uuid_key);
 
     peers_read_lock(proc);
-    size_t num_peers = proc->protocol.num_peers;
+    size_t num_peers = _admission_roster(proc);
     peers_read_unlock(proc);
 
     log_debug(proc->logger, "Identity: vote count for %s: %d (need %d)\n",
