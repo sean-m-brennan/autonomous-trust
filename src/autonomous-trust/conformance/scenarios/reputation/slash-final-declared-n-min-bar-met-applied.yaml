@@ -1,0 +1,48 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: slash-final-declared-n-min-bar-met-applied
+byte_pinning: false
+description: |
+    The positive control for slash-final-declared-n-min-raises-the-bar: four
+    verified signatures meet the bar a five-member roster declaring N_min 4 sets,
+    and bob floors rogue to 0.1.
+
+participants:
+  - id: alice
+    role: detector
+  - id: bob
+    role: member
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+  - id: rogue
+    role: target
+
+fixtures:
+  slash_enabled: true
+  roster: {}          # the roster in force is the one bob's chain logs
+  local_chain:
+    bob:
+      - {roster: genesis, members: [alice, bob, carol, dave, rogue]}
+      - {roster: restate, n_min: 4}
+  reputations:
+    bob:
+      rogue: 0.6
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: slash final
+    payload:
+      target: rogue
+      floor_score: 0.1
+      epoch: 3
+      cosigners: [alice, bob, carol, dave]
+
+expected_state:
+  bob:
+    reputation_of:
+      rogue: 0.1

@@ -1,0 +1,12 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/include
+
+Name: autonomous_trust
+Description: Autonomous Trust C library
+URL: https://github.com/sean-m-brennan/autonomous-trust
+Version: @AT_PC_VERSION@
+Requires: libsodium jansson uuid libprotobuf-c
+Libs: -L${libdir} -lautonomous_trust
+Libs.private: -lprotobuf -lstdc++ -lpthread -lm
+Cflags: -fms-extensions -I${includedir} -I${includedir}/autonomous_trust -I${includedir}/autonomous_trust/core/protobuf

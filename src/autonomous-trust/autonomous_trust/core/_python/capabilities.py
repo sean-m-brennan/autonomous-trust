@@ -73,7 +73,8 @@ class Capability(Configuration):
 
     def __init__(self, name, function=None, arg_names=None, keywords=None,
                  required_tier: int = 0, transaction_weight: int = 1,
-                 description: str = '', kind: str = '', arg_schema=None):
+                 description: str = '', kind: str = '', arg_schema=None,
+                 replay=None):
         super().__init__(capabilities_pb2.Capability)
         self.name = name
         self.function = function  # this will be None for remote handling
@@ -96,10 +97,19 @@ class Capability(Configuration):
         self.description = description
         self.kind = kind
         self.arg_schema = arg_schema
+        # A step contract (negotiation/replay.py `Replayable`) for a
+        # capability written to be replayed (RD_12.6 plan, D2): executed step
+        # by step, with the states kept so a replica's disagreement can be
+        # settled. Runtime-only, like `function`.
+        self.replay = replay
 
     def execute(self, task, pid_q):
         pid_q.put_nowait(multiprocessing.current_process().pid)
         try:
+            if self.replay is not None:
+                from .negotiation.replay import run_trace
+                return run_trace(self.replay, task.parameters.args,
+                                 task.parameters.kwargs)
             return self.function(*task.parameters.args, **task.parameters.kwargs)
         except Exception as e:
             raise RuntimeError('Capability %r execution failed for task %s: %s' % (self.name, task.uuid, e)) from e
@@ -128,6 +138,7 @@ class Capability(Configuration):
     def sync_from_message(self):
         self.name = self.message.name
         self.function = None
+        self.replay = None
         self.arg_names = None
         self.keywords = None
         # Descriptor metadata is runtime-only / not on the wire (see __init__).
@@ -163,12 +174,13 @@ class Capabilities(Mapping):
 
     def register_ability(self, name, function, arg_names=None, keywords=None,
                          required_tier: int = 0, transaction_weight: int = 1,
-                         description: str = '', kind: str = '', arg_schema=None):
+                         description: str = '', kind: str = '', arg_schema=None,
+                         replay=None):
         self._listing[name] = Capability(name, function, arg_names, keywords,
                                          required_tier=required_tier,
                                          transaction_weight=transaction_weight,
                                          description=description, kind=kind,
-                                         arg_schema=arg_schema)
+                                         arg_schema=arg_schema, replay=replay)
 
 
 class PeerCapabilities(Mapping, Configuration):

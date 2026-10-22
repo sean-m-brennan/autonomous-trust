@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import time
 import traceback
 from queue import Empty, Full
 from datetime import timedelta
@@ -21,14 +22,17 @@ from uuid import UUID
 
 from ..bootstrap_capabilities import BOOTSTRAP_CAPABILITY_NAMES
 from ..capabilities import Capability
-from ..config import from_json_string
+from ..config import from_json_string, to_json_string
 from ..freshness import Freshness
 from ..identity.protocol import IdentityProtocol
 from ..network import Message
 from ..processes import Process, ProcMeta
-from ..extensions import capped_tier, load_extensions, run_post_fork
+from ..extensions import (capped_tier, load_extensions, negotiation_on_result,
+                          negotiation_periodic, run_post_fork)
 from .protocol import NegotiationProtocol
-from .negotiation import Job, JobQueue, Task, TaskStatus, TaskTracker, TaskCounter, TaskResult, Status
+from .negotiation import (Job, JobQueue, Task, TaskParameters, TaskStatus,
+                          TaskTracker, TaskCounter, TaskResult, Status)
+from .replay import trace_chain
 from ..system import CfgIds, max_concurrency, now, proc_idle_floor
 from .. import _probes
 
@@ -82,6 +86,11 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(NegotiationProtocol.status_req, self.handle_stat_req)
         self.protocol.register_handler(NegotiationProtocol.status_resp, self.handle_stat_resp)
         self.protocol.register_handler(NegotiationProtocol.result, self.handle_results)
+        # The executor's half of live replication (RD_12.6 plan §3.7).
+        self.protocol.register_handler(NegotiationProtocol.replay_challenge,
+                                       self.handle_replay_request)
+        self.protocol.register_handler(NegotiationProtocol.replay_reveal,
+                                       self.handle_replay_request)
         # Trust-tier demotion → cancel in-flight tasks the peer is no
         # longer authorised for. Local IPC from ReputationProcess; see
         # doc/architecture/trust-tiers.md §7.2.
@@ -526,6 +535,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
 
     def forward_result(self, queues, message):
         if isinstance(message, TaskResult):
+            self._retain_trace(message)
             try:
                 msg = Message(self.name, NegotiationProtocol.result, message.to_json_string(), message.requestor)
                 queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
@@ -534,6 +544,110 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                 self.logger.error('forward_result: Network queue full')
             return True
         return False
+
+    # --- live replication (RD_12.6_LIVE_REPLICATION_PLAN.md §3.7) ---------
+
+    #: How long an executor keeps a trace to answer a verifier: twice the
+    #: requestor's hold on its halves. Mirrors C NEG_TRACE_RETAIN_SEC.
+    TRACE_RETAIN_SEC = 60.0
+    #: How many traces are kept at once; the oldest goes first.
+    TRACE_RETAIN_MAX = 16
+
+    def _retain_trace(self, result) -> None:
+        """Keep a replayable capability's states, by task uuid, to answer the
+        requestor's questions about them."""
+        states = getattr(result, 'trace_states', None)
+        requestor = getattr(getattr(result, 'requestor', None), 'uuid', None)
+        if not states or requestor is None:
+            return
+        traces = self.__dict__.setdefault('_traces', {})
+        self._expire_traces()
+        while len(traces) >= self.TRACE_RETAIN_MAX:
+            del traces[min(traces, key=lambda k: traces[k][2])]
+        traces[str(result.uuid)] = (list(states), str(requestor),
+                                    time.monotonic() + self.TRACE_RETAIN_SEC)
+
+    def _expire_traces(self) -> None:
+        traces = self.__dict__.get('_traces')
+        if traces:
+            clock = time.monotonic()
+            for key in [k for k, v in traces.items() if v[2] <= clock]:
+                del traces[key]
+
+    def handle_replay_request(self, queues, message):
+        """Answer a verifier about a trace we committed to: a chain digest
+        (`replay challenge`) or the reveal at the divergent step (`replay
+        reveal`). Only the task's requestor is answered, and only while the
+        trace is kept."""
+        if message.function not in (NegotiationProtocol.replay_challenge,
+                                     NegotiationProtocol.replay_reveal):
+            return False
+        if not message.verified:
+            return True
+        payload = message.obj
+        if isinstance(payload, (str, bytes)):
+            try:
+                payload = from_json_string(payload)
+            except ValueError:
+                return True
+        if not isinstance(payload, dict):
+            return True
+        task, rnd, index = payload.get('task'), payload.get('round'), payload.get('index')
+        if not isinstance(task, str) or isinstance(index, bool) \
+                or not isinstance(index, int) or isinstance(rnd, bool) \
+                or not isinstance(rnd, int):
+            return True
+        self._expire_traces()
+        kept = self.__dict__.get('_traces', {}).get(task)
+        sender = getattr(message.from_whom, 'uuid', None)
+        if kept is None or sender is None or str(sender) != kept[1]:
+            self.logger.debug('replay request for %s from %s not answered',
+                              task[:8], str(sender)[:8])
+            return True
+        states = kept[0]
+        answer = {'task': task, 'round': rnd, 'index': index}
+        if message.function == NegotiationProtocol.replay_challenge:
+            if not 0 <= index < len(states):
+                return True
+            answer['digest'] = trace_chain(states[:index + 1])[-1]
+        else:
+            if not 0 <= index <= len(states):
+                return True
+            chain = trace_chain(states[:index]) if index else []
+            answer['reveal'] = {
+                'prev': chain[index - 2] if index >= 2 else None,
+                'pre': states[index - 1] if index >= 1 else None,
+                'state': states[index] if index < len(states) else None}
+        try:
+            queues[CfgIds.network].put(Message(
+                self.name, NegotiationProtocol.replay_response,
+                to_json_string(answer), message.from_whom,
+                from_whom=self.identity), block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('handle_replay_request: network queue full')
+        return True
+
+    def release_result(self, queues, task, score=None) -> None:
+        """Release a result whose score live replication held: scored with
+        ``score`` (``(score, channel)``, the verdict) or, with None, by the
+        ordinary arms. Never forwarded to the application again."""
+        task.score_hold = False
+        task.score_only = True
+        task.replication_score = score
+        try:
+            queues[CfgIds.main].put(task, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('release_result: main queue full')
+
+    def start_directed(self, queues, capability_name, args, kwargs, peer):
+        """Ask ``peer`` alone to run ``capability_name`` (a replica,
+        RD_12.6 plan D4). Returns the task, or None when it could not be
+        started."""
+        task = Task(TaskParameters(Capability(capability_name), args=list(args or ()),
+                                   kwargs=dict(kwargs or {})), self.identity)
+        self.start_task(queues, Message(self.name, NegotiationProtocol.start,
+                                        task, peer))
+        return task if task.uuid in self.my_tasks else None
 
     def handle_results(self, queues, message):
         """Every invitee's result is scored, as it arrives, under its own pair
@@ -593,8 +707,14 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                             'task %s; result forwarded unstamped', task.uuid)
                     # Local-only: never serialized, read by automate.py.
                     task.score_only = len(scored) > 1
-                    queues[CfgIds.main].put(task, block=True, timeout=self.q_cadence)
-                    self.logger.debug('Task results forwarded')
+                    # Live replication may hold this result's score, or take
+                    # a replica's result entirely (RD_12.6 plan §3.7).
+                    held = negotiation_on_result(self, queues, task, tracker)
+                    if held == 'hold':
+                        task.score_hold = True
+                    if held != 'consume':
+                        queues[CfgIds.main].put(task, block=True, timeout=self.q_cadence)
+                        self.logger.debug('Task results forwarded')
                     if len(scored) >= max(1, len(invited)):
                         del self.my_tasks[task.uuid]  # every invitee answered
                 except Full:
@@ -838,6 +958,8 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                         self.logger.error('process: Main queue full')
 
                 self.status_sweep(queues, now())
+                self._expire_traces()
+                negotiation_periodic(self, queues)
             except Exception as err:
                 self.logger.error(err)
                 self.logger.error(traceback.format_exc())

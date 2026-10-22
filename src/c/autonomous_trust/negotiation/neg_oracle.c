@@ -142,6 +142,7 @@ static const struct { const char *env; const char *oracle; } declarations[] = {
     { "AT_CALIBRATION",  "calibration" },
     { "AT_PREQUENTIAL",  "prequential" },
     { "AT_CERTIFICATES", "certificates" },
+    { "AT_REPLICATION",  "replication" },
 };
 
 int neg_oracles_check_env(logger_t *logger)

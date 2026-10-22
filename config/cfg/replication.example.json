@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "note": "Only a capability with a `replay` object is replicated by a running node (RD_12.6 plan §0.1, D12). default_prob applies to a replayable capability that gives no replicate_prob of its own; a capability without `replay` is never replicated live, whatever its probability. replicate_prob without `replay` is still read by the conformance layer.",
   "default_prob": 0.05,
   "capabilities": {
     "demo.command-issue": {
@@ -13,6 +14,13 @@
     "demo.query": {
       "replicate_prob": 0.0,
       "note": "a read-only query verifiable by other means; never worth a second executor. 0.0 is a real setting, not the absence of one"
+    },
+    "demo.integrate": {
+      "replay": {
+        "max_steps": 64,
+        "max_state_bytes": 4096
+      },
+      "note": "a step-structured computation its executor commits to as a hash-chained trace of at most max_steps states (each at most max_state_bytes). No replicate_prob, so default_prob applies; a disagreement goes to the bisection game, settled by re-executing one step"
     }
   }
 }

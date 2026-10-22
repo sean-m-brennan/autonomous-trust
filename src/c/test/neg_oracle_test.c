@@ -71,6 +71,7 @@ DEFINE_TEST(test_empty_registry_is_neutral)
     unsetenv("AT_CALIBRATION");
     unsetenv("AT_PREQUENTIAL");
     unsetenv("AT_CERTIFICATES");
+    unsetenv("AT_REPLICATION");
     neg_score_input_t in = { .cap = "decide" };
     double score = -1.0;
     const char *channel = NULL;
@@ -96,6 +97,11 @@ DEFINE_TEST(test_declared_layer_missing_is_refused)
     setenv("AT_CALIBRATION", "", 1);   /* empty is undeclared */
     ck_assert_int_eq(neg_oracles_check_env(NULL), 0);
     unsetenv("AT_CALIBRATION");
+    /* $AT_REPLICATION is a declaration like the others (RD_12.6 plan,
+     * Phase 1). This test binary does not link libat_replication. */
+    setenv("AT_REPLICATION", "/nonexistent/replication.json", 1);
+    ck_assert_int_eq(neg_oracles_check_env(NULL), -1);
+    unsetenv("AT_REPLICATION");
 }
 END_TEST_DEFINITION()
 

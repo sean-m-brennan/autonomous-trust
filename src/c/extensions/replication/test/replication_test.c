@@ -24,7 +24,10 @@
 #define DEBUG_TESTS 1
 #include "test_setup.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "replication/adjudication.h"
 #include "replication/bisection.h"
@@ -81,6 +84,73 @@ DEFINE_TEST(test_model_resolves_and_rejects)
     ck_assert(at_replication_model_parse("", &m, err, sizeof(err)));
     ck_assert_double_eq_tol(at_replication_prob_for(&m, "cmd"), 0.05, 1e-15);
 }
+
+/* $AT_REPLICATION names the declaration; unset or empty is the empty model,
+ * and a bad file is refused. Mirrors test_replication.py
+ * test_the_environment_names_the_declaration. */
+DEFINE_TEST(test_the_environment_names_the_declaration)
+{
+    at_replication_model_t m;
+    char err[256] = {0};
+    unsetenv(AT_REPLICATION_ENV);
+    ck_assert(at_replication_model_load_env(&m, err, sizeof(err)));
+    ck_assert_uint_eq(m.num_caps, 0);
+    setenv(AT_REPLICATION_ENV, "", 1);
+    ck_assert(at_replication_model_load_env(&m, err, sizeof(err)));
+    char path[] = "/tmp/at-repl-env-XXXXXX";
+    int fd = mkstemp(path);
+    ck_assert(fd >= 0);
+    FILE *fp = fdopen(fd, "w");
+    fputs("{\"version\":1,\"capabilities\":{\"cmd\":{\"replicate_prob\":0.5}}}", fp);
+    fclose(fp);
+    setenv(AT_REPLICATION_ENV, path, 1);
+    ck_assert(at_replication_model_load_env(&m, err, sizeof(err)));
+    ck_assert_double_eq_tol(at_replication_prob_for(&m, "cmd"), 0.5, 1e-15);
+    fp = fopen(path, "w");
+    fputs("{\"version\":2}", fp);
+    fclose(fp);
+    ck_assert(!at_replication_model_load_env(&m, err, sizeof(err)));
+    setenv(AT_REPLICATION_ENV, "/nonexistent/replication.json", 1);
+    ck_assert(!at_replication_model_load_env(&m, err, sizeof(err)));
+    unsetenv(AT_REPLICATION_ENV);
+    unlink(path);
+}
+END_TEST_DEFINITION()
+
+/* The live game's session refuses what the wire could send it wrong; the
+ * game itself is pinned by scenarios/replication/challenge-session.yaml.
+ * Mirrors test_replication.py TestChallengeSession. */
+DEFINE_TEST(test_the_session_refuses_a_bad_answer)
+{
+    const char *sa[4] = {"s0", "s1", "s2", "s3"};
+    const char *sb[4] = {"s0", "s1", "X2", "X3"};
+    char ca[4][AT_REPL_HASH_HEX_LEN + 1], cb[4][AT_REPL_HASH_HEX_LEN + 1];
+    for (size_t i = 0; i < 4; i++)
+    {
+        ck_assert(at_replication_commit_root(sa, i + 1, ca[i]));
+        ck_assert(at_replication_commit_root(sb, i + 1, cb[i]));
+    }
+    static at_repl_session_t s;
+    ck_assert(at_repl_session_init(&s, 4, ca[3], 4, cb[3]));
+    int at = -1;
+    bool owe[2];
+    ck_assert(at_repl_session_pending(&s, &at, owe));
+    ck_assert_int_eq(at, 1);
+    ck_assert(owe[0] && owe[1]);
+    ck_assert(!at_repl_session_answer(&s, 2, ca[2], cb[2]));   /* not asked */
+    ck_assert(!at_repl_session_answer(&s, 1, ca[1], NULL));    /* b owes one */
+    ck_assert(!at_repl_session_answer(&s, 1, ca[1], "short")); /* not a digest */
+    ck_assert(at_repl_session_answer(&s, 1, ca[1], cb[1]));
+    ck_assert(at_repl_session_answer(&s, 2, ca[2], cb[2]));
+    ck_assert(!at_repl_session_pending(&s, &at, owe));
+    ck_assert_int_eq(at_repl_session_divergence(&s), 2);
+
+    ck_assert(at_repl_session_init(&s, 4, ca[3], 4, ca[3]));    /* no dispute */
+    ck_assert(!at_repl_session_pending(&s, &at, owe));
+    ck_assert_int_eq(at_repl_session_divergence(&s), -1);
+    ck_assert(!at_repl_session_init(&s, AT_REPL_MAX_STEPS + 1, ca[3], 4, cb[3]));
+}
+END_TEST_DEFINITION()
 
 static void _num(at_repl_result_t *r, const char *peer, double v)
 {
@@ -181,6 +251,8 @@ RUN_TESTS(Replication,
           test_sampling_draw_is_the_shared_stream,
           test_sampling_endpoints_are_strict,
           test_model_resolves_and_rejects,
+          test_the_environment_names_the_declaration,
+          test_the_session_refuses_a_bad_answer,
           test_adjudicate_needs_a_strict_majority,
           test_verify_maps_only_the_scored_verdicts,
           test_bisection_localizes_and_adjudicates)

@@ -41,8 +41,8 @@ from ..system import CfgIds, now
 from .protocol import ReputationProtocol
 from .reputation import (PLACE_BATCH_MAX, ROSTER_OPS, AttestedScore,
                          Transaction, TransactionHistory, place_designation,
-                         place_value_digest,
-                         roster_digest, roster_members_norm, roster_task_id)
+                         place_value_digest, roster_digest,
+                         roster_members_norm, roster_n_min_norm, roster_task_id)
 
 #: Persisted acceptor state, one file per chain (doc/architecture/reputation.md).
 PLACEMENT_FILE = 'reputation-placement'
@@ -88,6 +88,8 @@ def entry_to_dict(tx: Transaction) -> dict:
                        'uuid': None if tx.roster_uuid is None else str(tx.roster_uuid),
                        'digest': str(tx.roster_digest),
                        'members': [list(m) for m in tx.roster_members or []]}
+        if tx.roster_n_min:
+            d['roster']['n_min'] = int(tx.roster_n_min)
         return d
     if tx.attested:
         d.update({'attested': True, 'p1': str(tx.p1_id),
@@ -149,7 +151,8 @@ def entry_from_dict(d) -> Transaction:
         who = r.get('uuid')
         return Transaction(task, roster_op=r['op'],
                            roster_uuid=None if who is None else UUID(str(who)),
-                           roster_digest=digest, roster_members=members)
+                           roster_digest=digest, roster_members=members,
+                           roster_n_min=roster_n_min_norm(r.get('n_min')))
     if d.get('attested') is True:
         return Transaction(task, p1_id=UUID(str(d['p1'])), p1_score=_score('p1_score'),
                            p1_channel=d.get('p1_channel') or None, attested=True,
@@ -420,13 +423,18 @@ class PlacementMixin:
                          message.from_whom)
         return True
 
-    def _place_value_ok(self, entries, chain, group) -> 'str | None':
+    def _place_value_ok(self, entries, chain, group,
+                        config_check=True) -> 'str | None':
         """Why this value cannot be placed on `chain` now, or None when it
         can. Checked against this node's own prefix and its own view of the
         group, before accepting, so a decided value is valid by construction
-        and its write never needs checking."""
+        and its write never needs checking. A proposer carrying a value
+        another member accepted passes `config_check=False`: whether a
+        declared N_min matches each acceptor's configuration is for the
+        acceptors to say (RD_13.2 plan §0.4, call 9)."""
         if any(tx.is_roster for tx in entries):
-            return self._roster_value_ok(entries, chain, self._chain_key(group))
+            return self._roster_value_ok(entries, chain, self._chain_key(group),
+                                         config_check)
         if not self._founded(chain):
             return 'nothing is placed before the genesis'
         tasks = [str(tx.task_id).lower() for tx in entries]
@@ -498,10 +506,13 @@ class PlacementMixin:
         except Exception:
             self.logger.error('handle_place: cannot sign; not accepting')
             return True
-        self._place_send(queues, ReputationProtocol.place_accepted,
-                         {'group': payload.get('group') or '', 'k': k,
-                          'ballot': ballot_obj(ballot),
-                          'digest': _hex(digest), 'sig': sig},
+        accepted = {'group': payload.get('group') or '', 'k': k,
+                    'ballot': ballot_obj(ballot),
+                    'digest': _hex(digest), 'sig': sig}
+        mine = roster_n_min_norm(getattr(self, 'N_MIN', None))
+        if mine is not None:
+            accepted['n_min'] = mine      # our report (see "the declared N_min")
+        self._place_send(queues, ReputationProtocol.place_accepted, accepted,
                          message.from_whom)
         return True
 
@@ -816,25 +827,68 @@ class PlacementMixin:
                                roster_op='genesis', roster_digest=d,
                                roster_members=live)
         have = dict(map(tuple, roster.roster_members or ()))
+        n_min = roster.roster_n_min
         missing = sorted(u for u, _k in live if u not in have)
         if missing:
             who = missing[0]
             members = list(map(list, roster.roster_members)) + [[who, dict(live)[who]]]
             d = roster_digest(members)
-            return Transaction(roster_task_id(roster.task_id, 'add', who, d),
+            return Transaction(roster_task_id(roster.task_id, 'add', who, d, n_min),
                                roster_op='add', roster_uuid=UUID(who),
-                               roster_digest=d, roster_members=members)
-        if roster.index is not None and \
-                chain.next_index - roster.index >= chain.max_chain_len // 2:
-            d = roster.roster_digest
-            return Transaction(roster_task_id(roster.task_id, 'restate', None, d),
-                               roster_op='restate', roster_digest=d,
-                               roster_members=roster.roster_members)
-        return None
+                               roster_digest=d, roster_members=members,
+                               roster_n_min=n_min)
+        target = self._n_min_majority(key, roster)
+        if target is not ... and target != n_min:
+            # A strict majority of the roster reports another N_min: restate
+            # the roster declaring it, whatever our own configuration.
+            n_min = target
+        elif roster.index is None or \
+                chain.next_index - roster.index < chain.max_chain_len // 2:
+            return None
+        d = roster.roster_digest
+        return Transaction(roster_task_id(roster.task_id, 'restate', None, d, n_min),
+                           roster_op='restate', roster_digest=d,
+                           roster_members=roster.roster_members,
+                           roster_n_min=n_min)
 
-    def _roster_value_ok(self, entries, chain, key) -> 'str | None':
+    # --- the declared N_min (RD_13.2 plan §0.4) ---------------------------
+    #
+    # A roster entry may declare the group's N_min, and with it the F the
+    # certificate rounds are sized for. A genesis declares none. Each member
+    # reports its configured value in every place_accepted, and the member
+    # leading a placement restates the roster with value X once a strict
+    # majority of the roster in force has reported X, whatever it is
+    # configured for itself: a leader proposing its own value could have it
+    # accepted by itself alone, and every later proposer at that index would
+    # then have to carry a value most acceptors refuse. An acceptor takes a
+    # value only if it is the one in force or the one it is configured for.
+
+    def _n_min_reports(self, key) -> dict:
+        return self.__dict__.setdefault('_place_n_min_seen', {}).setdefault(key, {})
+
+    def _n_min_majority(self, key, roster):
+        """The N_min a strict majority of `roster`'s members reports (this
+        node's configuration standing for its own report), or ... when no
+        value has one."""
+        me = str(self.identity.uuid).lower()
+        seen = dict(self._n_min_reports(key))
+        seen[me] = roster_n_min_norm(getattr(self, 'N_MIN', None))
+        listed = [u for u, _k in roster.roster_members or ()]
+        counts = {}
+        for u in listed:
+            if u in seen:
+                counts[seen[u]] = counts.get(seen[u], 0) + 1
+        for value, n in counts.items():
+            if n >= len(listed) // 2 + 1:
+                return value
+        return ...
+
+    def _roster_value_ok(self, entries, chain, key,
+                         config_check=True) -> 'str | None':
         """Why a value holding a roster entry cannot be accepted on `chain`
-        now, or None when it can (the acceptor's rules for roster entries)."""
+        now, or None when it can (the acceptor's rules for roster entries).
+        A declared N_min must be the one in force (none before the genesis)
+        or, with `config_check`, the one this node is configured for."""
         if len(entries) != 1:
             return 'a roster entry is placed alone'
         tx = entries[0]
@@ -844,6 +898,12 @@ class PlacementMixin:
             return 'roster members do not match their digest'
         me = str(self.identity.uuid).lower()
         roster = chain.latest_roster()
+        in_force = None if roster is None else roster.roster_n_min
+        mine = roster_n_min_norm(getattr(self, 'N_MIN', None))
+        n_min = tx.roster_n_min
+        if n_min != in_force and config_check and n_min != mine:
+            return 'a declared n_min of %s, ours is %s and %s is in force' % (
+                n_min, mine, in_force)
         if tx.roster_op == 'genesis':
             if roster is not None or chain.next_index != 0:
                 return 'genesis on a chain that has one'
@@ -851,7 +911,7 @@ class PlacementMixin:
                 return 'a genesis that leaves us out'
             if any(live.get(u) != k for u, k in members.items()):
                 return 'a genesis naming a member we do not see'
-            want = roster_task_id(None, 'genesis', None, tx.roster_digest)
+            want = roster_task_id(None, 'genesis', None, tx.roster_digest, n_min)
         elif roster is None:
             return 'a roster change with no roster in force'
         elif tx.roster_op == 'add':
@@ -863,14 +923,18 @@ class PlacementMixin:
                 return 'an add that changes more than one member'
             if live.get(who) != members.get(who):
                 return 'an add of a member we do not see'
-            want = roster_task_id(roster.task_id, 'add', who, tx.roster_digest)
+            if n_min != in_force:
+                return 'an add that changes the declared n_min'
+            want = roster_task_id(roster.task_id, 'add', who, tx.roster_digest, n_min)
         else:
             if tx.roster_digest != roster.roster_digest:
                 return 'a restatement that changes the roster'
-            if roster.index is None or \
-                    chain.next_index - roster.index < chain.max_chain_len // 2:
+            if n_min == in_force and (roster.index is None or
+                                      chain.next_index - roster.index
+                                      < chain.max_chain_len // 2):
                 return 'a restatement too early'
-            want = roster_task_id(roster.task_id, 'restate', None, tx.roster_digest)
+            want = roster_task_id(roster.task_id, 'restate', None,
+                                  tx.roster_digest, n_min)
         if str(tx.task_id) != str(want):
             return 'a roster entry with the wrong task id'
         return None
@@ -1062,7 +1126,8 @@ class PlacementMixin:
             raw = max(reported, key=lambda g: g[0])[1]
             entries = value_from_list(raw)
             if entries is None or self._place_value_ok(
-                    entries, chain, group if key else None) is not None:
+                    entries, chain, group if key else None,
+                    config_check=False) is not None:
                 self.logger.warning('Placement %d: the value to carry is not '
                                     'valid here; dropping the round', rnd['k'])
                 self._place_vars()['_place_rounds'].pop(key, None)
@@ -1128,6 +1193,14 @@ class PlacementMixin:
         payload, key, chain, group = got
         rnd = self._place_round_for(payload, key)
         voter = self._place_voter(message, key, payload['k'])
+        if voter is not None:
+            # The member's N_min report, from any acceptance it sends: a round
+            # closes on its majority, and the reports of the rest would go
+            # stale. A hint only; each acceptor holds its own configuration.
+            try:
+                self._n_min_reports(key)[voter] = roster_n_min_norm(payload.get('n_min'))
+            except ValueError:
+                self._n_min_reports(key).pop(voter, None)
         if rnd is None or voter is None or rnd['value'] is None:
             return True
         if str(payload.get('digest') or '') != _hex(rnd['digest']):

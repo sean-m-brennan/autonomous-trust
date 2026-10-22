@@ -16,18 +16,29 @@
 
 #include "replication/bisection.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include <sodium.h>
 
-/* blake2b(in) -> 64 lowercase hex chars + NUL, the same primitive as the
- * reputation Merkle's merkle_hash_hex (crypto_generichash 32-byte digest,
- * sodium_bin2hex), i.e. Python MerkleTree.get_hash. */
-static void _hash_hex(const unsigned char *in, size_t len,
-                      char out[AT_REPL_HASH_HEX_LEN + 1])
+/* blake2b, 64 lowercase hex chars + NUL: the same primitive as the
+ * reputation Merkle's merkle_hash_hex, i.e. Python MerkleTree.get_hash.
+ * H(prev || state): the previous digest as its 64 hex bytes (none for h_0)
+ * and the state's bytes, streamed, so a state of any length hashes as the
+ * Python twin's does. It used to be copied into a 576-byte buffer, which
+ * silently truncated any state over 512 bytes. */
+static void _digest(const char *prev, const char *state,
+                    char out[AT_REPL_HASH_HEX_LEN + 1])
 {
+    crypto_generichash_state st;
     unsigned char digest[32];
-    crypto_generichash(digest, sizeof(digest), in, len, NULL, 0);
+    crypto_generichash_init(&st, NULL, 0, sizeof(digest));
+    if (prev != NULL)
+        crypto_generichash_update(&st, (const unsigned char *)prev,
+                                  AT_REPL_HASH_HEX_LEN);
+    if (state != NULL)
+        crypto_generichash_update(&st, (const unsigned char *)state, strlen(state));
+    crypto_generichash_final(&st, digest, sizeof(digest));
     sodium_bin2hex(out, AT_REPL_HASH_HEX_LEN + 1, digest, sizeof(digest));
 }
 
@@ -37,19 +48,8 @@ static void _hash_hex(const unsigned char *in, size_t len,
 static void _hash_chain(const char *const *states, size_t n,
                         char (*chain)[AT_REPL_HASH_HEX_LEN + 1])
 {
-    unsigned char buf[AT_REPL_HASH_HEX_LEN + 512];
     for (size_t i = 0; i < n; i++)
-    {
-        const char *s = states[i] ? states[i] : "";
-        size_t slen = strlen(s);
-        size_t prev_len = (i == 0) ? 0 : AT_REPL_HASH_HEX_LEN;
-        if (prev_len + slen > sizeof(buf))
-            slen = sizeof(buf) - prev_len;   /* defensive; tokens are short */
-        if (i != 0)
-            memcpy(buf, chain[i - 1], prev_len);
-        memcpy(buf + prev_len, s, slen);
-        _hash_hex(buf, prev_len + slen, chain[i]);
-    }
+        _digest(i == 0 ? NULL : chain[i - 1], states[i] ? states[i] : "", chain[i]);
 }
 
 bool at_replication_commit_root(const char *const *states, size_t n,
@@ -142,5 +142,154 @@ bool at_replication_bisect_adjudicate(
     if (verdict_b)
         *verdict_b = _streq_nullable(b_k, ref_k) ? AT_REPL_CORROBORATED
                                                  : AT_REPL_OUTVOTED;
+    return true;
+}
+
+/* ---- The live game -------------------------------------------------------- */
+
+bool at_repl_session_init(at_repl_session_t *s, int len_a, const char *root_a,
+                          int len_b, const char *root_b)
+{
+    if (s == NULL || len_a < 0 || len_b < 0 || len_a > AT_REPL_MAX_STEPS
+        || len_b > AT_REPL_MAX_STEPS)
+        return false;
+    memset(s, 0, sizeof(*s));
+    s->lens[0] = len_a;
+    s->lens[1] = len_b;
+    const char *roots[2] = { root_a, root_b };
+    for (int side = 0; side < 2; side++)
+        if (s->lens[side] > 0 && roots[side] != NULL)
+        {
+            int at = s->lens[side] - 1;
+            snprintf(s->digests[side][at], AT_REPL_HASH_HEX_LEN + 1, "%s", roots[side]);
+            s->have[side][at] = true;
+        }
+    int n = len_a < len_b ? len_a : len_b;
+    if (len_a == len_b && _streq_nullable(root_a, root_b))
+        s->disputed = false;               /* no dispute to resolve */
+    else
+    {
+        s->disputed = true;
+        s->lo = 0;
+        /* Equal lengths differ at the roots; otherwise the shorter has no
+         * state at n, so the chains differ there. */
+        s->hi = n == 0 ? 0 : (len_a == len_b ? n - 1 : n);
+    }
+    return true;
+}
+
+bool at_repl_session_pending(const at_repl_session_t *s, int *index, bool owe[2])
+{
+    if (s == NULL || !s->disputed)
+        return false;
+    bool searching = s->lo < s->hi;
+    int at = searching ? (s->lo + s->hi) / 2 : s->lo;
+    bool any = false;
+    for (int side = 0; side < 2; side++)
+    {
+        owe[side] = !s->have[side][at] && (searching || at < s->lens[side]);
+        any = any || owe[side];
+    }
+    if (!searching && !any)
+        return false;
+    *index = at;
+    return true;
+}
+
+bool at_repl_session_answer(at_repl_session_t *s, int index,
+                            const char *digest_a, const char *digest_b)
+{
+    int at = 0;
+    bool owe[2];
+    if (!at_repl_session_pending(s, &at, owe) || at != index)
+        return false;
+    const char *given[2] = { digest_a, digest_b };
+    for (int side = 0; side < 2; side++)
+        if (owe[side] && (given[side] == NULL
+                          || strlen(given[side]) != AT_REPL_HASH_HEX_LEN))
+            return false;
+    for (int side = 0; side < 2; side++)
+        if (owe[side])
+        {
+            snprintf(s->digests[side][at], AT_REPL_HASH_HEX_LEN + 1, "%s", given[side]);
+            s->have[side][at] = true;
+        }
+    if (s->lo == s->hi)
+        return true;                       /* the final fetch at k */
+    if (strcmp(s->digests[0][at], s->digests[1][at]) != 0)
+        s->hi = at;
+    else
+        s->lo = at + 1;
+    return true;
+}
+
+int at_repl_session_divergence(const at_repl_session_t *s)
+{
+    int at = 0;
+    bool owe[2];
+    if (s == NULL || !s->disputed || at_repl_session_pending(s, &at, owe))
+        return -1;
+    return s->lo;
+}
+
+static const char *_agreed_prev(const at_repl_session_t *s, int k)
+{
+    return k > 0 ? s->digests[0][k - 1] : NULL;
+}
+
+bool at_repl_reveal_consistent(const at_repl_session_t *s, int side,
+                               const at_repl_reveal_t *r, size_t max_state_bytes)
+{
+    int k = at_repl_session_divergence(s);
+    if (k < 0 || side < 0 || side > 1 || r == NULL)
+        return false;
+    if ((r->pre != NULL && strlen(r->pre) > max_state_bytes)
+        || (r->state != NULL && strlen(r->state) > max_state_bytes))
+        return false;
+    char h[AT_REPL_HASH_HEX_LEN + 1];
+    if (k > 0)
+    {
+        if (r->pre == NULL || (r->prev == NULL) != (k == 1))
+            return false;
+        if (r->prev != NULL && strlen(r->prev) != AT_REPL_HASH_HEX_LEN)
+            return false;
+        _digest(r->prev, r->pre, h);
+        if (strcmp(h, _agreed_prev(s, k)) != 0)
+            return false;
+    }
+    else if (r->pre != NULL)
+        return false;
+    if (!s->have[side][k])
+        return r->state == NULL;          /* its trace ends before k */
+    if (r->state == NULL)
+        return false;
+    _digest(_agreed_prev(s, k), r->state, h);
+    return strcmp(h, s->digests[side][k]) == 0;
+}
+
+bool at_repl_settle(const at_repl_session_t *s, const at_repl_reveal_t reveals[2],
+                    at_repl_truth_fn truth, void *ctx, size_t max_state_bytes,
+                    at_repl_verdict_t out[2])
+{
+    int k = at_repl_session_divergence(s);
+    if (k < 0 || reveals == NULL || truth == NULL || out == NULL)
+        return false;
+    bool ok[2];
+    for (int side = 0; side < 2; side++)
+        ok[side] = at_repl_reveal_consistent(s, side, &reveals[side], max_state_bytes);
+    const char *pre = NULL;
+    if (k > 0)
+    {
+        if (!ok[0] && !ok[1])
+        {
+            out[0] = out[1] = AT_REPL_OUTVOTED;
+            return true;
+        }
+        pre = reveals[ok[0] ? 0 : 1].pre;
+    }
+    const char *true_k = truth(pre, ctx);
+    for (int side = 0; side < 2; side++)
+        out[side] = ok[side] && _streq_nullable(reveals[side].state, true_k)
+            ? AT_REPL_CORROBORATED : AT_REPL_OUTVOTED;
     return true;
 }

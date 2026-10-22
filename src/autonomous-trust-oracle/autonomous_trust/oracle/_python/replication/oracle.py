@@ -20,4 +20,6 @@ what lets a node say it has the layer. The Python twin of
 """
 from autonomous_trust.core import oracles
 
-oracles.declare('replication')
+from . import live  # noqa: E402
+
+oracles.declare('replication', live.reset)

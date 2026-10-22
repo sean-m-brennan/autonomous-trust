@@ -1,0 +1,44 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: place-roster-add-changing-n-min-refused
+byte_pinning: false
+description: |
+    An add carries the N_min in force and never changes it (RD_13.2 plan §0.4):
+    a change is a restatement of its own. bob is configured for N_min 4, but this
+    add of dave declares 4 where none is in force, so bob refuses it.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  roster:
+    bob: [alice, bob, carol]
+  n_min:
+    bob: 4
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: place
+    payload:
+      k: 0
+      ballot: {n: 5, by: alice}
+      head: ""
+      value:
+        - {roster: add, member: dave, n_min: 4}
+  - id: 2
+    from: bob
+    to: alice
+    function: place accepted
+    in_response_to: 1
+    expect_none: true
+    payload: {}

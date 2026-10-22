@@ -309,6 +309,193 @@ static int _run_bisect(json_t *event, int index, char *err, size_t err_len)
     return _check_vs(event, index, peers, verdicts, 2, err, err_len);
 }
 
+/* ---- The live declaration and game (RD_12.6 plan, Phases 1 and 2) ------ */
+
+/* A declaration parsed on its own: `refused: true` pins a refusal. */
+static int _run_declare(json_t *event, int index, char *err, size_t err_len)
+{
+    char *text = json_dumps(json_object_get(event, "declare"), JSON_COMPACT);
+    at_replication_model_t m;
+    char perr[256] = {0};
+    bool refused = text == NULL || !at_replication_model_parse(text, &m, perr, sizeof(perr));
+    free(text);
+    bool want = json_is_true(json_object_get(event, "refused"));
+    if (refused != want)
+    {
+        snprintf(err, err_len, "event %d: refused=%s, expected %s (%s)", index,
+                 refused ? "True" : "False", want ? "True" : "False", perr);
+        return -1;
+    }
+    return 0;
+}
+
+static int _run_live_prob(const at_replication_model_t *model, json_t *event,
+                          int index, char *err, size_t err_len)
+{
+    const char *cap = json_string_value(json_object_get(event, "capability"));
+    double want = json_number_value(json_object_get(event, "live_prob"));
+    double got = at_replication_live_prob_for(model, cap);
+    if (fabs(got - want) > AT_REPL_TOL)
+    {
+        snprintf(err, err_len, "event %d: live_prob_for('%s')=%.17g, expected %.17g",
+                 index, cap ? cap : "(null)", got, want);
+        return -1;
+    }
+    return 0;
+}
+
+static int _run_replay(const at_replication_model_t *model, json_t *event,
+                       int index, char *err, size_t err_len)
+{
+    const char *cap = json_string_value(json_object_get(event, "capability"));
+    json_t *want = json_object_get(event, "replay");
+    int steps = 0, bytes = 0;
+    bool has = at_replication_replay_for(model, cap, &steps, &bytes);
+    bool ok = json_is_null(want)
+        ? !has
+        : has && json_integer_value(json_object_get(want, "max_steps")) == steps
+              && json_integer_value(json_object_get(want, "max_state_bytes")) == bytes;
+    if (!ok)
+    {
+        snprintf(err, err_len, "event %d: replay_for('%s')=%s{%d, %d}", index,
+                 cap ? cap : "(null)", has ? "" : "none ", steps, bytes);
+        return -1;
+    }
+    return 0;
+}
+
+/* Re-execution in the corpus: the reference's state at k, NULL past its end. */
+typedef struct { const char *const *ref; size_t nref; int k; } _truth_ctx_t;
+
+static const char *_truth(const char *pre, void *ctx)
+{
+    (void)pre;
+    const _truth_ctx_t *t = ctx;
+    return (size_t)t->k < t->nref ? t->ref[t->k] : NULL;
+}
+
+/* Play the live game: each executor answers from its own chain, except at the
+ * indices `lies` names; each reveals its own states at k, overridden by
+ * `reveal`. Mirrors the Python adapter's _challenge. */
+static int _run_challenge(json_t *event, int index, char *err, size_t err_len)
+{
+    json_t *spec = json_object_get(event, "challenge");
+    json_t *traces = json_object_get(spec, "traces");
+    if (!json_is_object(traces) || json_object_size(traces) != 2)
+    {
+        snprintf(err, err_len, "event %d: challenge needs exactly two traces", index);
+        return -1;
+    }
+    const char *peers[2] = {NULL, NULL};
+    json_t *tj[2] = {NULL, NULL};
+    const char *key;
+    json_t *val;
+    json_object_foreach(traces, key, val)
+    {
+        int i = peers[0] == NULL ? 0 : 1;
+        peers[i] = key;
+        tj[i] = val;
+    }
+    static const char *st[2][AT_REPL_MAX_STEPS];
+    static char chain[2][AT_REPL_MAX_STEPS][AT_REPL_HASH_HEX_LEN + 1];
+    size_t n[2];
+    for (int i = 0; i < 2; i++)
+    {
+        n[i] = _string_array(tj[i], st[i], AT_REPL_MAX_STEPS);
+        for (size_t j = 0; j < n[i]; j++)
+            if (!at_replication_commit_root(st[i], j + 1, chain[i][j]))
+            {
+                snprintf(err, err_len, "event %d: cannot hash a trace", index);
+                return -1;
+            }
+    }
+    static at_repl_session_t session;
+    if (!at_repl_session_init(&session, (int)n[0], n[0] ? chain[0][n[0] - 1] : NULL,
+                              (int)n[1], n[1] ? chain[1][n[1] - 1] : NULL))
+    {
+        snprintf(err, err_len, "event %d: session refused its commitments", index);
+        return -1;
+    }
+    json_t *lies = json_object_get(spec, "lies");
+    int asked[AT_REPL_MAX_STEPS + 1];
+    size_t n_asked = 0;
+    int at = 0;
+    bool owe[2];
+    while (at_repl_session_pending(&session, &at, owe))
+    {
+        const char *given[2] = {NULL, NULL};
+        for (int i = 0; i < 2; i++)
+            if (owe[i])
+            {
+                char ik[16];
+                snprintf(ik, sizeof(ik), "%d", at);
+                const char *lie = json_string_value(
+                    json_object_get(json_object_get(lies, peers[i]), ik));
+                given[i] = lie != NULL ? lie : chain[i][at];
+            }
+        if (!at_repl_session_answer(&session, at, given[0], given[1]))
+        {
+            snprintf(err, err_len, "event %d: answer at %d refused", index, at);
+            return -1;
+        }
+        asked[n_asked++] = at;
+    }
+    int k = at_repl_session_divergence(&session);
+    json_t *want_asked = json_object_get(event, "asked");
+    if (json_is_array(want_asked))
+    {
+        bool same = json_array_size(want_asked) == n_asked;
+        for (size_t j = 0; same && j < n_asked; j++)
+            same = json_integer_value(json_array_get(want_asked, j)) == asked[j];
+        if (!same)
+        {
+            snprintf(err, err_len, "event %d: asked %zu indices, not the pinned %zu "
+                     "(or in another order)", index, n_asked, json_array_size(want_asked));
+            return -1;
+        }
+    }
+    json_t *want_k = json_object_get(event, "divergence_index");
+    if (want_k != NULL
+        && (json_is_null(want_k) ? k >= 0 : k != (int)json_integer_value(want_k)))
+    {
+        snprintf(err, err_len, "event %d: divergence_index=%d", index, k);
+        return -1;
+    }
+    at_repl_verdict_t verdicts[2] = {AT_REPL_CORROBORATED, AT_REPL_CORROBORATED};
+    if (k >= 0)
+    {
+        at_repl_reveal_t reveals[2];
+        json_t *over = json_object_get(spec, "reveal");
+        for (int i = 0; i < 2; i++)
+        {
+            reveals[i].prev = k >= 2 ? chain[i][k - 2] : NULL;
+            reveals[i].pre = k >= 1 && (size_t)k <= n[i] ? st[i][k - 1] : NULL;
+            reveals[i].state = (size_t)k < n[i] ? st[i][k] : NULL;
+            json_t *o = json_object_get(over, peers[i]);
+            json_t *f;
+            if ((f = json_object_get(o, "prev")) != NULL)
+                reveals[i].prev = json_string_value(f);
+            if ((f = json_object_get(o, "pre")) != NULL)
+                reveals[i].pre = json_string_value(f);
+            if ((f = json_object_get(o, "state")) != NULL)
+                reveals[i].state = json_string_value(f);
+        }
+        static const char *ref[AT_REPL_MAX_STEPS];
+        size_t nref = _string_array(json_object_get(spec, "reference"), ref,
+                                    AT_REPL_MAX_STEPS);
+        _truth_ctx_t ctx = { ref, nref, k };
+        json_t *mb = json_object_get(spec, "max_state_bytes");
+        size_t max_bytes = json_is_integer(mb) ? (size_t)json_integer_value(mb)
+                                               : AT_REPL_DEFAULT_MAX_STATE_BYTES;
+        if (!at_repl_settle(&session, reveals, _truth, &ctx, max_bytes, verdicts))
+        {
+            snprintf(err, err_len, "event %d: settle failed", index);
+            return -1;
+        }
+    }
+    return _check_vs(event, index, peers, verdicts, 2, err, err_len);
+}
+
 void at_replication_conformance_run(const at_case_t *c, at_case_result_t *out)
 {
     if (strcmp(c->kind, "scenario") != 0)
@@ -431,6 +618,27 @@ void at_replication_conformance_run(const at_case_t *c, at_case_result_t *out)
         else if (json_is_object(json_object_get(event, "bisect")))
         {
             if (_run_bisect(event, index, err, sizeof(err)) != 0)
+                goto done;
+        }
+        else if (json_is_object(json_object_get(event, "challenge")))
+        {
+            if (_run_challenge(event, index, err, sizeof(err)) != 0)
+                goto done;
+        }
+        else if (json_object_get(event, "declare") != NULL)
+        {
+            if (_run_declare(event, index, err, sizeof(err)) != 0)
+                goto done;
+        }
+        else if (json_is_number(json_object_get(event, "live_prob"))
+                 && json_is_string(cap_field))
+        {
+            if (_run_live_prob(&model, event, index, err, sizeof(err)) != 0)
+                goto done;
+        }
+        else if (json_object_get(event, "replay") != NULL && json_is_string(cap_field))
+        {
+            if (_run_replay(&model, event, index, err, sizeof(err)) != 0)
                 goto done;
         }
         else if (json_is_number(prob_field) && json_is_string(cap_field))

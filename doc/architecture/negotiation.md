@@ -243,6 +243,14 @@ The status on a `status response` rides as the enum's member *name* rather than
 its value, because the name is what rebuilds an enum on the other side. An
 integer would arrive as an integer.
 
+`report results` also carries the executor's commitment to a replayable
+capability's trace, `trace_root` and `trace_len` (null for any other
+capability). Three plain-JSON verbs serve live replication
+([Replication](replication.md)): `replay challenge` and `replay reveal`, from a
+requestor to an executor about the trace of one of its tasks
+(`{task, round, index}`), and `replay response`, the answer (`digest`, or
+`reveal: {prev, pre, state}`). An executor answers only the task's requestor.
+
 ### The requestor is the exception
 
 One field is not the tagged form. The `requestor` is the flat canonical *public*
@@ -302,6 +310,7 @@ both runtimes must reproduce.
 | Demotion cancels running work | [`tier-loss-cancels-running-task.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/tier-loss-cancels-running-task.yaml) |
 | Invitation replay refused, worker keeps the task | [`invite-replay-survives.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-replay-survives.yaml) |
 | Unstamped invitation refused | [`invite-unstamped-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-unstamped-refused.yaml) |
+| An executor answers its requestor, and only it, about its trace | [`replay-challenge-answered-by-the-executor.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/replay-challenge-answered-by-the-executor.yaml) |
 
 The v1 binary floor, refusing whenever the peer level was zero, is still pinned
 alongside the per-capability tier comparison that replaced it.

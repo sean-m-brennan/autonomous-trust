@@ -90,6 +90,13 @@ void negotiation_clear_test_state(const process_t *proc);
  *  polluted by prior scenarios run in alphabetical order. */
 void negotiation_reset_state(void);
 
+/** Keep the trace @p states (copied) for @p task, shown only to @p requestor,
+ *  as an executor of a replayable capability does (RD_12.6 plan 3.7).
+ *  Conformance/test hook. @return 0, or -1 on a bad argument or no memory. */
+int negotiation_retain_trace_for_test(const unsigned char *task,
+                                      const unsigned char *requestor,
+                                      const char *const *states, int n);
+
 /** Read the current size of the shared task_stack for
  *  `task_in_stack` expected_state assertions. Returns -1 if neg_state
  *  is uninitialized. Mirrors the Python adapter's check on

@@ -30,8 +30,9 @@ doc/architecture/replication.md for the design and the C twin at
 ``src/c/extensions/replication/``.
 """
 
-from .model import (DEFAULT_PROB, EMPTY_MODEL,  # noqa: F401
-                    REPLICATION_ENV, ReplicationDeclarationError,
+from .model import (DEFAULT_MAX_STATE_BYTES, DEFAULT_PROB,  # noqa: F401
+                    EMPTY_MODEL, MAX_STEPS, REPLICATION_ENV,
+                    ReplaySpec, ReplicationDeclarationError,
                     ReplicationModel, load_replication, load_replication_env,
                     parse_replication)
 from .sampling import (clamp_prob, should_replicate,  # noqa: F401
@@ -39,8 +40,9 @@ from .sampling import (clamp_prob, should_replicate,  # noqa: F401
 from .adjudication import (CORROBORATED, CORROBORATED_SCORE,  # noqa: F401
                           DISPUTE, OUTVOTED, OUTVOTED_SCORE, SINGLE,
                           adjudicate, verify)
-from .bisection import (bisect_adjudicate, commit_root,  # noqa: F401
-                       first_divergence, hash_chain)
+from .bisection import (ChallengeSession, bisect_adjudicate,  # noqa: F401
+                        commit_root, first_divergence, hash_chain,
+                        reveal_consistent, settle)
 
 # Declares this layer to the core's oracle registry (..oracles).
 from . import oracle  # noqa: F401,E402

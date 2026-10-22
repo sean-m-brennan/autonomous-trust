@@ -146,3 +146,160 @@ def bisect_adjudicate(peer_a: str, states_a: list[Any],
         peer_a: CORROBORATED if a_k == ref_k else OUTVOTED,
         peer_b: CORROBORATED if b_k == ref_k else OUTVOTED,
     }
+
+
+# --- the live game (RD_12.6_LIVE_REPLICATION_PLAN.md §3.5) --------------------
+#
+# bisect_adjudicate above holds both traces whole. A live verifier holds only
+# what each executor committed to, (trace_len, trace_root), and asks for
+# digests one index at a time. The session keeps an interval (lo, hi) with
+# the two chains differing at hi and agreeing at lo - 1 (or lo = 0), and ends
+# when lo == hi = k, the first divergent step. Soundness does not rest on the
+# executors answering honestly: a lie about a midpoint only moves k, and at k
+# each executor must reveal states that hash to its own claimed digests.
+
+def _digest(prev: Optional[str], state: Any) -> str:
+    """``H(prev || state)``, ``prev`` as its hex text (none for h_0)."""
+    head = prev.encode('ascii') if prev else b''
+    return MerkleTree.get_hash(head + _state_bytes(state)).decode('ascii')
+
+
+class ChallengeSession:
+    """The verifier's side of the bisection game over two commitments.
+
+    Executor ``'a'`` committed ``(len_a, root_a)`` and ``'b'`` ``(len_b,
+    root_b)``; a root is ``None`` for an empty trace. :meth:`pending` names
+    the index to ask about and which executors still owe a digest there (a
+    committed root is never asked for again), :meth:`answer` records the
+    replies, and once :attr:`done`, :attr:`divergence` is the first step where
+    the chains part. Mirrors C ``at_repl_session_t``."""
+
+    def __init__(self, len_a: int, root_a: Optional[str],
+                 len_b: int, root_b: Optional[str]) -> None:
+        self.lens = {'a': int(len_a), 'b': int(len_b)}
+        self.digests: dict[str, dict[int, str]] = {'a': {}, 'b': {}}
+        self.asked: list[int] = []
+        for side, n, root in (('a', len_a, root_a), ('b', len_b, root_b)):
+            if n > 0 and root is not None:
+                self.digests[side][n - 1] = root
+        n = min(len_a, len_b)
+        if len_a == len_b and root_a == root_b:
+            self.lo = self.hi = None           # no dispute to resolve
+        elif n == 0:
+            self.lo = self.hi = 0
+        elif len_a == len_b:
+            self.lo, self.hi = 0, n - 1
+        else:
+            # The shorter has no state at n, so the chains differ there.
+            self.lo, self.hi = 0, n
+
+    @property
+    def disputed(self) -> bool:
+        return self.lo is not None
+
+    @property
+    def done(self) -> bool:
+        return self.pending() is None
+
+    @property
+    def divergence(self) -> Optional[int]:
+        return self.lo if self.disputed and self.done else None
+
+    def pending(self) -> Optional[tuple[int, tuple[str, ...]]]:
+        """``(index, sides that owe a digest there)``, or None when done.
+        Once the search has narrowed to k, a side whose trace reaches k but
+        whose digest there is not yet known (the longer of two traces of
+        different lengths) is asked for it before the session is done."""
+        if self.lo is None:
+            return None
+        at = (self.lo + self.hi) // 2 if self.lo < self.hi else self.lo
+        owe = tuple(s for s in ('a', 'b')
+                    if at not in self.digests[s]
+                    and (self.lo < self.hi or at < self.lens[s]))
+        if self.lo == self.hi and not owe:
+            return None
+        return at, owe
+
+    def answer(self, index: int, digest_a: Optional[str] = None,
+               digest_b: Optional[str] = None) -> None:
+        """Record the digests owed at ``index`` and narrow the interval.
+        Raises ValueError for an index not asked or a digest still owed."""
+        want = self.pending()
+        if want is None or want[0] != index:
+            raise ValueError('index %r was not asked' % (index,))
+        for side, digest in (('a', digest_a), ('b', digest_b)):
+            if side in want[1]:
+                if not isinstance(digest, str) or len(digest) != 64:
+                    raise ValueError('a digest is owed by %s' % side)
+                self.digests[side][index] = digest
+        self.asked.append(index)
+        if self.lo == self.hi:
+            return                              # the final fetch at k
+        if self.digests['a'][index] != self.digests['b'][index]:
+            self.hi = index
+        else:
+            self.lo = index + 1
+
+    def agreed_prev(self) -> Optional[str]:
+        """``h_{k-1}``, which both chains share, or None at ``k == 0``."""
+        k = self.divergence
+        return None if not k else self.digests['a'][k - 1]
+
+    def claimed(self, side: str) -> Optional[str]:
+        """``side``'s digest at ``k``, or None when its trace ends before k."""
+        return self.digests[side].get(self.divergence)
+
+
+def reveal_consistent(session: ChallengeSession, side: str,
+                      reveal: dict[str, Any], max_state_bytes: int) -> bool:
+    """Do ``side``'s revealed states hash to its own claimed digests?
+
+    ``reveal`` holds ``prev`` (``h_{k-2}``, absent for k < 2), ``pre``
+    (``s_{k-1}``, absent at k = 0) and ``state`` (``s_k``, absent when the
+    side's trace ends before k). An executor whose reveal contradicts its own
+    commitment, or whose state is over ``max_state_bytes``, is inconsistent.
+    Mirrors C ``at_repl_reveal_consistent``."""
+    k = session.divergence
+    pre, state, prev = reveal.get('pre'), reveal.get('state'), reveal.get('prev')
+    for s in (pre, state):
+        if s is not None and len(_state_bytes(s)) > max_state_bytes:
+            return False
+    if k > 0:
+        if pre is None or (prev is None) != (k == 1):
+            return False
+        if prev is not None and len(prev) != 64:
+            return False
+        if _digest(prev, pre) != session.agreed_prev():
+            return False
+    elif pre is not None:
+        return False
+    claimed = session.claimed(side)
+    if claimed is None:
+        return state is None
+    return state is not None and _digest(session.agreed_prev(), state) == claimed
+
+
+def settle(session: ChallengeSession, reveals: dict[str, dict[str, Any]],
+           truth, max_state_bytes: int) -> dict[str, str]:
+    """The verdict on each executor once the session is done.
+
+    ``truth(pre_state)`` re-executes the divergent step from the verified
+    pre-state (``None`` at k = 0, where it returns the agreed ``s_0``) and
+    returns the true ``s_k``, or None when the computation ends at ``k - 1``.
+    An executor whose reveal is inconsistent is ``outvoted``; a consistent one
+    is ``corroborated`` iff its ``s_k`` is the true one. With no consistent
+    pre-state at k > 0 there is nothing to re-execute from, and both are
+    ``outvoted``: each contradicted its own commitment. Mirrors C
+    ``at_repl_settle``."""
+    k = session.divergence
+    ok = {s: reveal_consistent(session, s, reveals.get(s) or {}, max_state_bytes)
+          for s in ('a', 'b')}
+    pre = None
+    if k > 0:
+        good = [s for s in ('a', 'b') if ok[s]]
+        if not good:
+            return {'a': OUTVOTED, 'b': OUTVOTED}
+        pre = reveals[good[0]].get('pre')
+    true_k = truth(pre)
+    return {s: CORROBORATED if ok[s] and (reveals[s] or {}).get('state') == true_k
+            else OUTVOTED for s in ('a', 'b')}

@@ -15,6 +15,8 @@
  *******************/
 
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -657,6 +659,15 @@ static struct {
      * commit_designation (the slash_sigs shape). Mirrors Python
      * commit_sigs_pending. */
     map_t commit_sigs;
+    /* The N_min each member reported in its place_accepted (RD_13.2 plan
+     * section 0.4): {chain key: {voter uuid: n_min}}, 0 for none. A leader
+     * restates the roster with the value a strict majority reports. Mirrors
+     * Python _place_n_min_seen. */
+    json_t *place_n_min_seen;
+    /* Rounds already warned about falling short of a declared bar, as
+     * {"where:round": true}; cleared when it grows past 1024. Mirrors Python
+     * _bar_warned. */
+    json_t *bar_warned;
     int64_t slash_epoch;
     /* "target:slasher" -> integer_data(epoch): the highest slash epoch this
      * node has ever APPLIED for that pair. Never removed, unlike `slashed`
@@ -884,6 +895,8 @@ static void _ensure_init(void)
         map_init(&rep_state.attest_pending);
         map_init(&rep_state.attest_sigs);
         map_init(&rep_state.commit_sigs);
+        rep_state.place_n_min_seen = json_object();
+        rep_state.bar_warned = json_object();
         map_init(&rep_state.round_granters);
         map_init(&rep_state.round_acceptors);
         rep_state.slash_epoch = 0;
@@ -1102,21 +1115,6 @@ static size_t _members_of_group(const process_t *proc, const char *group_uuid)
     return count;
 }
 
-/* members / 2, the bar slashing and the co-signature quorum test clear with
- * `>`; Paxos rounds use _round_quorum_for_group. A non-gateway (no child
- * groups) uses its members (_member_count) / 2. Mirrors Python
- * _quorum_for_group. */
-static size_t _quorum_for_group(const process_t *proc, const char *group_uuid)
-{
-    if (proc == NULL)
-        return 0;
-    if (proc->protocol.child_groups == NULL
-        || map_size(proc->protocol.child_groups) == 0
-        || group_uuid == NULL || group_uuid[0] == '\0')
-        return _member_count(proc) / 2;
-    return _members_of_group(proc, group_uuid) / 2;
-}
-
 /* CHECKPOINT finality threshold for `group_uuid`: more than this many
  * co-signers, the proposer's own included, finalize a window. A MAJORITY OF
  * THE WHOLE GROUP, THIS NODE INCLUDED: floor(members / 2) where members is the
@@ -1129,7 +1127,8 @@ static size_t _quorum_for_group(const process_t *proc, const char *group_uuid)
  * refused to rewrite inside its finality at the heal (tx_history_reconcile),
  * and the chains could never converge (Agora Phase 4 DDIL, 2026-09-25). Odd
  * sizes are unchanged. Paxos rounds now take the same majority
- * (_round_quorum_for_group); slashing keeps num_peers / 2. Mirrors Python's
+ * (_round_quorum_for_group), and so does slashing (_quorum_met). Mirrors
+ * Python's
  * _checkpoint_quorum. */
 /* The roster a checkpoint's quorum is sized from, this node NOT included: the
  * peers, or a gateway's members of that child group. Caller holds the peers
@@ -1145,11 +1144,15 @@ static size_t _ckpt_roster_for_group(const process_t *proc, const char *group_uu
         : _members_of_group(proc, group_uuid);
 }
 
-static size_t _ckpt_quorum_for_group(const process_t *proc, const char *group_uuid)
+/* @p f raises it (RD_13.2 plan section 0.4): more than (M + F) / 2 signers,
+ * M the whole group. The caller reads F (_f_in_force) BEFORE taking the peers
+ * lock, since the roster lives under rep_state.lock, which is taken first. */
+static size_t _ckpt_quorum_for_group(const process_t *proc, const char *group_uuid,
+                                     int f)
 {
     if (proc == NULL)
         return 0;
-    return (_ckpt_roster_for_group(proc, group_uuid) + 1) / 2;
+    return (_ckpt_roster_for_group(proc, group_uuid) + 1 + (size_t)(f > 0 ? f : 0)) / 2;
 }
 
 /* Other members a Paxos round needs, grants and acceptances alike. With the
@@ -5124,30 +5127,67 @@ static size_t _verified_cosigners_in(const process_t *proc, const json_t *roster
     return count;
 }
 
-/* Receiver-side quorum test: more than floor(N/2) distinct voters must have
- * signed the exact bytes we re-derive. Sized against OUR OWN roster
- * (proc->protocol.num_peers, the mirror of Python's len(peers.all)), so the
- * finalizer cannot also choose the bar it has to clear. */
-static bool _quorum_met_for(const process_t *proc, json_t *sigs,
-                            const uint8_t *desig, size_t dlen,
-                            const char *group_uuid)
+/* The N_min the roster in force for @p group_uuid's chain declares (RD_13.2
+ * plan section 0.4), 0 for none or before a genesis. Takes rep_state.lock, so
+ * the caller holds neither it nor the peers lock. */
+static int _n_min_in_force(const process_t *proc, const char *group_uuid)
 {
     if (proc == NULL)
-        return false;
-    peers_read_lock(proc);
-    /* Sized against the group whose chain the round covers: a child-group
-     * checkpoint must clear THAT group's majority, not the conflated roster a
-     * gateway sees across every group it belongs to. A leaf node (no child
-     * groups) gets num_peers/2 exactly as before. */
-    size_t quorum = _quorum_for_group(proc, group_uuid);
-    peers_read_unlock(proc);
-    return _verified_cosigners(proc, sigs, desig, dlen) > quorum;
+        return 0;
+    char key[UUID_STRING_LEN + 1];
+    _chain_key(proc, group_uuid, key, sizeof(key));
+    transaction_t r;
+    pthread_mutex_lock(&rep_state.lock);
+    tx_history_t *chain = _chain_for_key_locked(key);
+    int n = tx_history_roster_at(chain, chain->next_index, &r) == 0
+        ? r.roster_n_min : 0;
+    pthread_mutex_unlock(&rep_state.lock);
+    return n;
 }
 
-static bool _quorum_met(const process_t *proc, json_t *sigs,
-                        const uint8_t *desig, size_t dlen)
+/* Does @p have reach the Byzantine bar over @p members (RD_13.2 plan section
+ * 0.4)? The bar is (members + F) / 2 + @p extra signatures, F from @p n_min:
+ * @p extra is 1 where the count includes the round's own author, 0 where the
+ * author is the remaining vote. At F = 0 that is the strict majority every
+ * site already used. Short of a declared bar, warn once per round (keyed by
+ * the designation) with the bar and the declaration. Caller holds no lock.
+ * Mirrors Python _bar_met. */
+static bool _bar_met(const process_t *proc, const char *where,
+                     const uint8_t *round, size_t round_len, size_t have,
+                     size_t members, size_t extra, int n_min)
 {
-    return _quorum_met_for(proc, sigs, desig, dlen, NULL);
+    int f = tx_byzantine_f(n_min);
+    size_t need = (members + (size_t)f) / 2 + extra;
+    if (have >= need)
+        return true;
+    if (f > 0 && proc != NULL)
+    {
+        unsigned char h[16];
+        crypto_generichash(h, sizeof(h), round, round_len, NULL, 0);
+        char mark[64];
+        int n = snprintf(mark, sizeof(mark), "%s:", where);
+        for (size_t i = 0; n > 0 && (size_t)n + 2 < sizeof(mark) && i < sizeof(h); i++)
+            n += snprintf(mark + n, sizeof(mark) - (size_t)n, "%02x", h[i]);
+        bool fresh = false;
+        pthread_mutex_lock(&rep_state.lock);
+        if (rep_state.bar_warned != NULL
+            && json_object_get(rep_state.bar_warned, mark) == NULL)
+        {
+            if (json_object_size(rep_state.bar_warned) > 1024)
+                json_object_clear(rep_state.bar_warned);
+            json_object_set_new(rep_state.bar_warned, mark, json_true());
+            fresh = true;
+        }
+        pthread_mutex_unlock(&rep_state.lock);
+        if (fresh)
+            log_warn(proc->logger,
+                     "Reputation: %s: %zu of the %zu signature(s) needed; the group "
+                     "declares N_min %d (F %d) over %zu member(s)%s\n", where, have,
+                     need, n_min, f, members,
+                     members >= (size_t)n_min ? ""
+                     : ", fewer than N_min, so the bar may be out of reach");
+    }
+    return false;
 }
 
 /* _quorum_met_for with the CHECKPOINT threshold (_ckpt_quorum_for_group). */
@@ -5158,9 +5198,53 @@ static bool _ckpt_quorum_met_for(const process_t *proc, json_t *sigs,
     if (proc == NULL)
         return false;
     peers_read_lock(proc);
-    size_t quorum = _ckpt_quorum_for_group(proc, group_uuid);
+    size_t members = _ckpt_roster_for_group(proc, group_uuid) + 1;
     peers_read_unlock(proc);
-    return _verified_cosigners(proc, sigs, desig, dlen) > quorum;
+    return _bar_met(proc, "checkpoint", desig, dlen,
+                    _verified_cosigners(proc, sigs, desig, dlen), members, 1,
+                    _n_min_in_force(proc, group_uuid));
+}
+
+/* The slash quorum, at the slasher's tally and at every receiver: a strict
+ * majority of the whole group, the slasher's own signature counted, over the
+ * signatures of `desig` that verify. Sized from OUR view, so the finalizer
+ * cannot also choose the bar it has to clear: the logged roster in force,
+ * verified with the keys it records, as commit, placement and attestation are;
+ * before a genesis, the live view (the checkpoint majority).
+ *
+ * It used to be more than num_peers / 2, the roster without this node, which
+ * let two members of four finalize a slash, and the slasher sized it from the
+ * roster a gateway conflates across its groups (RD_13.2 plan section 0.4,
+ * 2026-10-22). Caller holds neither rep_state.lock nor the peers lock.
+ * Mirrors Python _quorum_met. */
+static bool _quorum_met_for(const process_t *proc, json_t *sigs,
+                            const uint8_t *desig, size_t dlen,
+                            const char *group_uuid)
+{
+    if (proc == NULL || !json_is_object(sigs))
+        return false;
+    json_t *roster = _roster_for_group(proc, group_uuid);
+    if (roster == NULL)
+        return _ckpt_quorum_met_for(proc, sigs, desig, dlen, group_uuid);
+    size_t count = 0;
+    const char *voter = NULL;
+    json_t *val = NULL;
+    json_object_foreach(sigs, voter, val)
+    {
+        if (_verify_cosignature_in(proc, roster, voter, desig, dlen,
+                                   json_string_value(val)))
+            count++;
+    }
+    size_t members = json_array_size(roster);
+    json_decref(roster);
+    return _bar_met(proc, "slash", desig, dlen, count, members, 1,
+                    _n_min_in_force(proc, group_uuid));
+}
+
+static bool _quorum_met(const process_t *proc, json_t *sigs,
+                        const uint8_t *desig, size_t dlen)
+{
+    return _quorum_met_for(proc, sigs, desig, dlen, NULL);
 }
 
 /* Record one verified co-signature for a round. The map is keyed
@@ -5374,16 +5458,18 @@ static bool _commit_cert_ok(const process_t *proc, const uuid_t scorer,
                                    json_string_value(val)))
             count++;
     }
-    size_t quorum;
     if (roster != NULL)
-        quorum = json_array_size(roster) / 2;   /* the scorer the remaining vote */
-    else
     {
-        peers_read_lock(proc);
-        quorum = _round_quorum_for_group(proc, group_uuid);
-        peers_read_unlock(proc);
+        /* A majority of the logged roster, the scorer the remaining vote,
+         * raised by the F it declares. */
+        size_t members = json_array_size(roster);
+        json_decref(roster);
+        return _bar_met(proc, "commit", desig, dlen, count, members, 0,
+                        _n_min_in_force(proc, group_uuid));
     }
-    json_decref(roster);
+    peers_read_lock(proc);
+    size_t quorum = _round_quorum_for_group(proc, group_uuid);
+    peers_read_unlock(proc);
     return count >= quorum;
 }
 
@@ -5808,7 +5894,8 @@ static bool _attest_quorum_met(const process_t *proc, const rep_attest_t *a,
         others = others > mates ? others - mates : 0;
         if (mates > 0 && count < 2)
             return false;
-        return count > others / 2;
+        return _bar_met(proc, "attestation", desig, dlen, count, others, 1,
+                        _n_min_in_force(proc, a->group[0] != '\0' ? a->group : NULL));
     }
     peers_read_lock(proc);
     members = _member_count(proc) + 1;
@@ -6713,10 +6800,7 @@ static bool handle_slash_sign(const process_t *proc, directory_t *queues, generi
     size_t count = 0;
     json_t *sigs = _cosigs_json_locked(&rep_state.slash_sigs, key, &count);
     pthread_mutex_unlock(&rep_state.lock);
-    peers_read_lock(proc);
-    size_t quorum = _member_count(proc) / 2;
-    peers_read_unlock(proc);
-    bool finalize = count > quorum;
+    bool finalize = _quorum_met(proc, sigs, desig, dlen);
 
     /* payload and pending stay alive until the end: the strings read from
      * them above (the round's identity) are pointers INTO them. Freed here,
@@ -7312,8 +7396,9 @@ static bool handle_checkpoint_sign(const process_t *proc, directory_t *queues, g
     size_t count = 0;
     json_t *sigs = _cosigs_json_locked(&rep_state.checkpoint_sigs, key, &count);
     pthread_mutex_unlock(&rep_state.lock);
+    int f = tx_byzantine_f(_n_min_in_force(proc, NULL));
     peers_read_lock(proc);
-    size_t quorum = _ckpt_quorum_for_group(proc, NULL);
+    size_t quorum = _ckpt_quorum_for_group(proc, NULL, f);
     peers_read_unlock(proc);
     bool finalize = count > quorum;
 
@@ -9035,8 +9120,9 @@ static void _store_checkpoint(const process_t *proc, const char *proposer,
     size_t quorum = 0;
     if (proc != NULL)
     {
+        int f = tx_byzantine_f(_n_min_in_force(proc, primary ? NULL : chain_key));
         peers_read_lock(proc);
-        quorum = _ckpt_quorum_for_group(proc, primary ? NULL : chain_key);
+        quorum = _ckpt_quorum_for_group(proc, primary ? NULL : chain_key, f);
         peers_read_unlock(proc);
     }
     bool write = false;
@@ -10770,9 +10856,17 @@ static bool _place_entry_from_json(const json_t *d, transaction_t *tx,
             || strcmp(want, dig) != 0
             || (who != NULL && uuid_parse(who, tx->roster_uuid) != 0))
             return false;
+        /* The declared N_min: absent or null is none; anything but a
+         * non-negative integer is malformed. */
+        json_t *nm = json_object_get(r, "n_min");
+        if (nm != NULL && !json_is_null(nm)
+            && (!json_is_integer(nm) || json_integer_value(nm) < 0
+                || json_integer_value(nm) > INT_MAX))
+            return false;
         tx->roster = true;
         at_strlcpy(tx->roster_op, op, sizeof(tx->roster_op));
         at_strlcpy(tx->roster_digest, dig, sizeof(tx->roster_digest));
+        tx->roster_n_min = json_is_integer(nm) ? (int)json_integer_value(nm) : 0;
         return true;
     }
     const char *task = json_string_value(json_object_get(d, "task"));
@@ -11129,10 +11223,11 @@ static json_t *_live_roster(const process_t *proc, const char *key)
     return norm;
 }
 
-/* A roster entry on the placement wire (borrowing @p members). */
+/* A roster entry on the placement wire (borrowing @p members), declaring
+ * @p n_min when it is > 0. */
 static json_t *_roster_entry_json(const uuid_t task, const char *op,
                                   const char *who, const char *digest,
-                                  json_t *members)
+                                  json_t *members, int n_min)
 {
     char t[UUID_STRING_LEN + 1];
     uuid_unparse_lower(task, t);
@@ -11141,6 +11236,8 @@ static json_t *_roster_entry_json(const uuid_t task, const char *op,
     json_object_set_new(r, "uuid", who != NULL ? json_string(who) : json_null());
     json_object_set_new(r, "digest", json_string(digest));
     json_object_set(r, "members", members);
+    if (n_min > 0)
+        json_object_set_new(r, "n_min", json_integer(n_min));
     json_t *e = json_object();
     json_object_set_new(e, "task", json_string(t));
     json_object_set_new(e, "roster", r);
@@ -11162,6 +11259,100 @@ static json_t *_roster_now(const char *key, transaction_t *r, bool *have,
     json_t *cur = mt != NULL ? json_loads(mt, 0, NULL) : NULL;
     pthread_mutex_unlock(&rep_state.lock);
     return cur;
+}
+
+/* ---- The declared N_min (RD_13.2 plan section 0.4) -----------------------
+ *
+ * A roster entry may declare the group's N_min, and with it the F the
+ * certificate rounds are sized for. A genesis declares none. Each member
+ * reports its configured value in every place_accepted, and the member
+ * leading a placement restates the roster with value X once a strict majority
+ * of the roster in force has reported X, whatever it is configured for
+ * itself: a leader proposing its own value could have it accepted by itself
+ * alone, and every later proposer at that index would then have to carry a
+ * value most acceptors refuse. An acceptor takes a value only if it is the one
+ * in force or the one it is configured for. Mirrors Python placement.py,
+ * "the declared N_min". */
+
+/* AT_REP_N_MIN: 0 when unset or empty, the value, or -1 when it is not a
+ * non-negative integer (fatal at reputation_run). Mirrors Python _env_n_min. */
+static int _env_n_min(void)
+{
+    const char *raw = getenv("AT_REP_N_MIN");
+    if (raw == NULL)
+        return 0;
+    while (isspace((unsigned char)*raw))
+        raw++;
+    if (*raw == '\0')
+        return 0;
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(raw, &end, 10);
+    while (end != NULL && isspace((unsigned char)*end))
+        end++;
+    if (errno != 0 || end == raw || end == NULL || *end != '\0' || v < 0
+        || v > INT_MAX)
+        return -1;
+    return (int)v;
+}
+
+/* The N_min this node is configured for, 0 for none. */
+static int _n_min_config(void)
+{
+    int n = _env_n_min();
+    return n > 0 ? n : 0;
+}
+
+/* Is there an N_min a strict majority of @p roster's members reports (this
+ * node's configuration standing for its own report)? Writes it to @p out.
+ * Caller does not hold rep_state.lock. Mirrors Python _n_min_majority. */
+static bool _n_min_majority(const process_t *proc, const char *key,
+                            const json_t *roster, int *out)
+{
+    char me[UUID_STRING_LEN + 1] = {0};
+    uuid_t self_u;
+    if (_resolve_self_uuid(proc, self_u))
+        uuid_unparse_lower(self_u, me);
+    size_t listed = json_array_size(roster);
+    if (listed == 0)
+        return false;
+    int *vals = calloc(listed, sizeof(int));
+    if (vals == NULL)
+        return false;
+    size_t n = 0, i;
+    json_t *m;
+    pthread_mutex_lock(&rep_state.lock);
+    json_t *seen = json_object_get(rep_state.place_n_min_seen, key);
+    json_array_foreach((json_t *)roster, i, m)
+    {
+        const char *u = json_string_value(json_array_get(m, 0));
+        if (u == NULL)
+            continue;
+        if (strcmp(u, me) == 0)
+            vals[n++] = _n_min_config();
+        else
+        {
+            json_t *v = json_object_get(seen, u);
+            if (json_is_integer(v))
+                vals[n++] = (int)json_integer_value(v);
+        }
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    bool found = false;
+    for (size_t a = 0; a < n && !found; a++)
+    {
+        size_t count = 0;
+        for (size_t b = 0; b < n; b++)
+            if (vals[b] == vals[a])
+                count++;
+        if (count >= listed / 2 + 1)
+        {
+            *out = vals[a];
+            found = true;
+        }
+    }
+    free(vals);
+    return found;
 }
 
 /* The roster entry this node would place next on chain @p key (wire form, a
@@ -11186,7 +11377,7 @@ static json_t *_roster_item(const process_t *proc, const char *key)
             && roster_digest(live, d, NULL) == 0)
         {
             tx_roster_task_uuid(NULL, "genesis", NULL, d, t);
-            out = _roster_entry_json(t, "genesis", NULL, d, live);
+            out = _roster_entry_json(t, "genesis", NULL, d, live, 0);
         }
     }
     else if (cur != NULL)
@@ -11211,16 +11402,27 @@ static json_t *_roster_item(const process_t *proc, const char *key)
             uuid_t wu;
             if (roster_digest(members, d, &norm) == 0 && uuid_parse(who, wu) == 0)
             {
-                tx_roster_task_uuid(r.task_uuid, "add", wu, d, t);
-                out = _roster_entry_json(t, "add", who, d, norm);
+                tx_roster_task_uuid_n(r.task_uuid, "add", wu, d, r.roster_n_min, t);
+                out = _roster_entry_json(t, "add", who, d, norm, r.roster_n_min);
             }
             json_decref(norm);
             json_decref(members);
         }
-        else if (r.index >= 0 && next - r.index >= MAX_CHAIN_LEN / 2)
+        else
         {
-            tx_roster_task_uuid(r.task_uuid, "restate", NULL, r.roster_digest, t);
-            out = _roster_entry_json(t, "restate", NULL, r.roster_digest, cur);
+            /* A strict majority of the roster reports another N_min: restate
+             * the roster declaring it, whatever our own configuration. */
+            int target = 0;
+            bool change = _n_min_majority(proc, key, cur, &target)
+                && target != r.roster_n_min;
+            if (change || (r.index >= 0 && next - r.index >= MAX_CHAIN_LEN / 2))
+            {
+                int n_min = change ? target : r.roster_n_min;
+                tx_roster_task_uuid_n(r.task_uuid, "restate", NULL, r.roster_digest,
+                                      n_min, t);
+                out = _roster_entry_json(t, "restate", NULL, r.roster_digest, cur,
+                                         n_min);
+            }
         }
     }
     json_decref(cur);
@@ -11260,9 +11462,11 @@ static json_t *_value_genesis(const json_t *value)
 }
 
 /* Why a value holding a roster entry cannot be accepted on chain @p key now,
- * or NULL when it can. Mirrors Python _roster_value_ok. */
+ * or NULL when it can. A declared N_min must be the one in force (none
+ * before the genesis) or, with @p config_check, the one this node is
+ * configured for. Mirrors Python _roster_value_ok. */
 static const char *_roster_value_why(const process_t *proc, const char *key,
-                                     const json_t *value)
+                                     const json_t *value, bool config_check)
 {
     if (json_array_size(value) != 1)
         return "a roster entry is placed alone";
@@ -11283,6 +11487,15 @@ static const char *_roster_value_why(const process_t *proc, const char *key,
         json_decref(members);
         return "roster members do not match their digest";
     }
+    json_t *nm = json_object_get(ro, "n_min");
+    if (nm != NULL && !json_is_null(nm)
+        && (!json_is_integer(nm) || json_integer_value(nm) < 0
+            || json_integer_value(nm) > INT_MAX))
+    {
+        json_decref(members);
+        return "a malformed n_min";
+    }
+    int n_min = json_is_integer(nm) ? (int)json_integer_value(nm) : 0;
     json_t *live = _live_roster(proc, key);
     transaction_t r;
     bool have = false;
@@ -11295,9 +11508,14 @@ static const char *_roster_value_why(const process_t *proc, const char *key,
     const char *why = NULL;
     size_t i;
     json_t *m;
+    int in_force = have ? r.roster_n_min : 0;
+    if (n_min != in_force && config_check && n_min != _n_min_config())
+        why = "a declared n_min that is neither ours nor the one in force";
     if (strcmp(op, "genesis") == 0)
     {
-        if (have || next != 0)
+        if (why != NULL)
+            ;
+        else if (have || next != 0)
             why = "genesis on a chain that has one";
         else if (_roster_key_of(members, me) == NULL)
             why = "a genesis that leaves us out";
@@ -11309,14 +11527,18 @@ static const char *_roster_value_why(const process_t *proc, const char *key,
                 if (lk == NULL || strcmp(lk, json_string_value(json_array_get(m, 1))) != 0)
                     why = "a genesis naming a member we do not see";
             }
-        tx_roster_task_uuid(NULL, "genesis", NULL, dig, want);
+        tx_roster_task_uuid_n(NULL, "genesis", NULL, dig, n_min, want);
     }
     else if (!have || cur == NULL)
         why = "a roster change with no roster in force";
     else if (strcmp(op, "add") == 0)
     {
-        if (who == NULL || uuid_parse(who, wu) != 0 || _roster_key_of(cur, who) != NULL)
+        if (why != NULL)
+            ;
+        else if (who == NULL || uuid_parse(who, wu) != 0 || _roster_key_of(cur, who) != NULL)
             why = "an add of nobody new";
+        else if (n_min != in_force)
+            why = "an add that changes the declared n_min";
         else if (json_array_size(members) != json_array_size(cur) + 1)
             why = "an add that changes more than one member";
         else
@@ -11334,15 +11556,17 @@ static const char *_roster_value_why(const process_t *proc, const char *key,
                 why = "an add of a member we do not see";
         }
         if (who != NULL && uuid_parse(who, wu) == 0)
-            tx_roster_task_uuid(r.task_uuid, "add", wu, dig, want);
+            tx_roster_task_uuid_n(r.task_uuid, "add", wu, dig, n_min, want);
     }
     else
     {
-        if (strcmp(dig, r.roster_digest) != 0)
+        if (why != NULL)
+            ;
+        else if (strcmp(dig, r.roster_digest) != 0)
             why = "a restatement that changes the roster";
-        else if (r.index < 0 || next - r.index < MAX_CHAIN_LEN / 2)
+        else if (n_min == in_force && (r.index < 0 || next - r.index < MAX_CHAIN_LEN / 2))
             why = "a restatement too early";
-        tx_roster_task_uuid(r.task_uuid, "restate", NULL, dig, want);
+        tx_roster_task_uuid_n(r.task_uuid, "restate", NULL, dig, n_min, want);
     }
     if (why == NULL && uuid_compare(want, tu) != 0)
         why = "a roster entry with the wrong task id";
@@ -11359,13 +11583,14 @@ static const char *_roster_value_why(const process_t *proc, const char *key,
  * before accepting, so a decided value is valid by construction. Mirrors
  * Python PlacementMixin._place_value_ok. */
 static const char *_place_value_why(const process_t *proc, const char *key,
-                                    const json_t *value, const char *group)
+                                    const json_t *value, const char *group,
+                                    bool config_check)
 {
     size_t vi;
     json_t *ve;
     json_array_foreach((json_t *)value, vi, ve)
         if (json_object_get(ve, "roster") != NULL)
-            return _roster_value_why(proc, key, value);
+            return _roster_value_why(proc, key, value, config_check);
     pthread_mutex_lock(&rep_state.lock);
     bool founded = _founded_locked(key);
     pthread_mutex_unlock(&rep_state.lock);
@@ -11699,7 +11924,8 @@ static bool handle_place(const process_t *proc, directory_t *queues,
         return true;
     }
     json_t *value = json_object_get(payload, "value");
-    const char *why = _place_value_why(proc, key, value, key[0] != '\0' ? group : NULL);
+    const char *why = _place_value_why(proc, key, value, key[0] != '\0' ? group : NULL,
+                                       true);
     if (why != NULL)
     {
         log_warn(proc->logger, "Reputation: not accepting placement %d from %s: %s\n",
@@ -11760,6 +11986,8 @@ static bool handle_place(const process_t *proc, directory_t *queues,
     json_object_set_new(ok, "ballot", _ballot_json(n, by));
     json_object_set_new(ok, "digest", json_string(digest));
     json_object_set_new(ok, "sig", json_string(sig));
+    if (_n_min_config() > 0)   /* our report (see "The declared N_min") */
+        json_object_set_new(ok, "n_min", json_integer(_n_min_config()));
     _place_send(proc, REP_PROTO_PLACE_ACCEPTED, &nmsg->from_whom, ok);
     json_decref(ok);
     json_decref(payload);
@@ -12738,7 +12966,9 @@ static json_t *_place_own_value_valid(const process_t *proc, const char *key,
     {
         json_t *one = json_array();
         json_array_append(one, e);
-        const char *why = _place_value_why(proc, key, one, group);
+        /* Our own value: a roster item we build follows the majority's
+         * reports, not our configuration (Python leaves it unchecked). */
+        const char *why = _place_value_why(proc, key, one, group, false);
         json_decref(one);
         if (why == NULL)
         {
@@ -13207,7 +13437,8 @@ static bool handle_place_grant(const process_t *proc, directory_t *queues,
                                        key[0] != '\0' ? group : NULL);
     if (value == NULL
         || (best != NULL && _place_value_why(proc, key, value,
-                                             key[0] != '\0' ? group : NULL) != NULL))
+                                             key[0] != '\0' ? group : NULL,
+                                             false) != NULL))
     {
         if (best != NULL)
             log_warn(proc->logger, "Reputation: placement %d: the value to carry "
@@ -13243,6 +13474,27 @@ static bool handle_place_accepted(const process_t *proc, directory_t *queues,
     const char *digest = json_string_value(json_object_get(payload, "digest"));
     const char *sig = json_string_value(json_object_get(payload, "sig"));
     pthread_mutex_lock(&rep_state.lock);
+    {
+        /* The sender's N_min report, from any acceptance it sends: a round
+         * closes on its majority, and the reports of the rest would go stale.
+         * Keyed by the authenticated sender; only roster members' reports are
+         * ever counted (_n_min_majority). 0 for none; a malformed one is
+         * dropped. A hint only: each acceptor holds its own configuration. */
+        json_t *nm = json_object_get(payload, "n_min");
+        json_t *seen = json_object_get(rep_state.place_n_min_seen, key);
+        if (seen == NULL)
+        {
+            seen = json_object();
+            json_object_set_new(rep_state.place_n_min_seen, key, seen);
+        }
+        if (nm == NULL || json_is_null(nm))
+            json_object_set_new(seen, voter, json_integer(0));
+        else if (json_is_integer(nm) && json_integer_value(nm) >= 0
+                 && json_integer_value(nm) <= INT_MAX)
+            json_object_set_new(seen, voter, json_integer(json_integer_value(nm)));
+        else
+            json_object_del(seen, voter);
+    }
     rep_place_state_t *st = _place_round_for_locked(proc, key, k, payload);
     bool ours = st != NULL && st->round_value != NULL && digest != NULL
         && strcmp(digest, st->round_digest) == 0;
@@ -13541,6 +13793,10 @@ void reputation_reset_state(int num_peers)
     map_init(&rep_state.attest_sigs);
     map_free(&rep_state.commit_sigs);
     map_init(&rep_state.commit_sigs);
+    json_decref(rep_state.place_n_min_seen);
+    rep_state.place_n_min_seen = json_object();
+    json_decref(rep_state.bar_warned);
+    rep_state.bar_warned = json_object();
     map_free(&rep_state.round_acceptors);
     map_init(&rep_state.round_acceptors);
     map_free(&rep_state.round_granters);
@@ -14318,6 +14574,15 @@ static void _handle_local_tx_score(const process_t *proc,
 int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     _ensure_init();
+
+    /* A misread N_min would quietly size every certificate round for the
+     * wrong F, so a malformed one is fatal. */
+    if (_env_n_min() < 0)
+    {
+        log_error(logger, "Reputation: AT_REP_N_MIN=%s is not a non-negative "
+                  "integer; not starting\n", getenv("AT_REP_N_MIN"));
+        return -1;
+    }
 
     /* rep_state.num_peers is the paxos instance's size and nothing more. The
      * grant and acceptance thresholds do NOT read it: it is sampled here,
