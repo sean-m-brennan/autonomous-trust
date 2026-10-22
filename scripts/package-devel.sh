@@ -67,15 +67,29 @@ fi
 
 build=$(mktemp -d)
 trap 'rm -rf "$build"' EXIT
-cmake -S "$here/src/c" -B "$build" \
+
+# Build from a copy of the sources the package needs, which leaves the checkout
+# untouched (the docker wrapper mounts it read-only). The copy leaves out local
+# build trees, the DTN submodules, and any leftover src/c/autonomous_trust/version.h
+# (git-ignored, from an old build): CMake generates version.h only when the
+# source tree has none, so a leftover one would ship in place of this version.
+mkdir "$build/src"
+(cd "$here" && tar -cf - \
+    --exclude='src/c/build*' \
+    --exclude='src/c/third_party/ION-DTN' \
+    --exclude='src/c/third_party/ud3tn' \
+    --exclude='src/c/autonomous_trust/version.h' \
+    LICENSE src/c src/protobuf) | tar -xmf - -C "$build/src"
+
+cmake -S "$build/src/src/c" -B "$build/bin" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=/usr \
     -DREVISION="$version" \
     -DAT_CONFORMANCE=OFF \
     "${extra[@]}"
-cmake --build "$build" -j"$(nproc)"
-(cd "$build" && cpack -G "$generator")
+cmake --build "$build/bin" -j"$(nproc)"
+(cd "$build/bin" && cpack -G "$generator")
 
 mkdir -p "$outdir"
-cp "$build"/*."${generator,,}" "$outdir"/
+cp "$build"/bin/*."${generator,,}" "$outdir"/
 ls -l "$outdir"

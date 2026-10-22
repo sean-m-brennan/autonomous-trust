@@ -1723,6 +1723,9 @@ set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_RPM_PACKAGE_LICENSE Apache-2.0)
 set(CPACK_RPM_PACKAGE_REQUIRES "libsodium-devel, jansson-devel, libuuid-devel, protobuf-c-devel")
 set(CPACK_RPM_PACKAGE_RELEASE_DIST ON)
+# Owned by the distro's pkgconf package.
+set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
+    ${CPACK_PACKAGING_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
 
 include(CPack)
