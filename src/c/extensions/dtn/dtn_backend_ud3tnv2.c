@@ -525,7 +525,10 @@ static void *subscriber_reader(void *arg)
         if (read_aap_message(sub->fd, &msg) != 0) break;
 
         bool should_ack = true;
-        switch (msg->msg_case) {
+        /* On an int, not the enum: -Wswitch-enum would want the enum's
+         * sentinel named, which protoc-c spells _..._MSG_IS_INT_SIZE in 1.3
+         * (Ubuntu 22.04, EL9) and _..._MSG__CASE_IS_INT_SIZE in 1.5. */
+        switch ((int)msg->msg_case) {
         case AAP2__AAPMESSAGE__MSG_ADU:
             if (handle_pushed_adu(sub, msg) != 0) {
                 log_warn(g.logger, "DTN[ud3tnv2]: ADU handling failed on %s\n",
@@ -540,7 +543,7 @@ static void *subscriber_reader(void *arg)
         case AAP2__AAPMESSAGE__MSG_CONFIG:
         case AAP2__AAPMESSAGE__MSG_DISPATCH_EVENT:
         case AAP2__AAPMESSAGE__MSG_LINK:
-        case _AAP2__AAPMESSAGE__MSG__CASE_IS_INT_SIZE:
+        default:
             /* Not expected from the server on a subscriber connection;
              * ACK and continue rather than tearing down the socket. */
             log_debug(g.logger, "DTN[ud3tnv2]: ignoring msg_case=%d on %s\n",
