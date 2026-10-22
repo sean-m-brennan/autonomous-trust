@@ -46,7 +46,7 @@ from .reputation import (TransactionHistory, ReconcileResult, Reputation, Reputa
                          AttestedScore, SignedAttestation,
                          Checkpoint, SignedCheckpoint, validate_tx_score,
                          validate_tx_channel, commit_designation,
-                         window_root_of, _hex_str,
+                         window_root_of, _hex_str, byzantine_f,
                          PeerReputation, EVIDENCE_FILE, SLASH_MARKS_FILE,
                          evidence_to_dict, place_value_digest, placement_entry,
                          place_designation,
@@ -82,6 +82,23 @@ def _env_float(name, default):
         return float(raw)
     except (TypeError, ValueError):
         return default
+
+
+def _env_n_min(name):
+    """The N_min this node is configured for (RD_13.2 plan §0.4), or None when
+    ``name`` is unset or empty. Anything but a non-negative integer is FATAL:
+    a misread declaration would quietly size every certificate round for the
+    wrong F. 0 is the same as unset. Mirrors C _env_n_min."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == '':
+        return None
+    try:
+        value = int(raw.strip(), 10)
+    except ValueError:
+        raise ValueError('%s=%r is not a non-negative integer' % (name, raw)) from None
+    if value < 0:
+        raise ValueError('%s=%r is not a non-negative integer' % (name, raw))
+    return value or None
 
 
 # Reputation save gate: only peers strictly above this threshold survive a process
@@ -309,6 +326,15 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
     # members are armed will disagree about the floor, which is inherent to
     # the mechanism being a policy rather than a fact.
     SLASH_ENABLED = bool(os.environ.get('AT_SLASH_ENABLED'))
+
+    # The cohort size this node's group should be Byzantine-sized for
+    # (RD_13.2 plan §0.4): F = (N_min - 1) // 3 raises the bar on slash,
+    # checkpoint, attestation and commit certificates to (M + F) // 2 + 1 of
+    # the M members. Not applied from here: a roster entry declares it, and a
+    # declaration changes only once a strict majority of the roster is
+    # configured alike (placement.py, "the declared N_min"). Unset declares
+    # nothing, F = 0.
+    N_MIN = _env_n_min('AT_REP_N_MIN')
 
     # Verifier-attested scores (doc/architecture/reputation.md): the EFFECTIVE
     # tier a verifier must hold in a co-signer's OWN view (score bounded by any
@@ -897,21 +923,6 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         if not keys:
             return list(self.peers.all)
         return [p for p in self.peers.all if str(p.uuid).lower() in keys]
-
-    def _quorum_for_group(self, group_uuid):
-        """floor(roster/2), the bar slashing and the co-signature quorum test
-        (`_quorum_met`) clear with `>`. Paxos rounds use _round_quorum.
-
-        Back-compat: a non-gateway node (no child_groups) always uses the
-        historical roster // 2 over its own members (_roster_peers). Only a
-        gateway — whose self.peers.all conflates the members of every group
-        it belongs to — sizes per-group."""
-        if not self.child_groups:
-            return len(self._roster_peers()) // 2
-        grp = self._group_by_uuid(group_uuid)
-        if grp is None:
-            return len(self._roster_peers()) // 2
-        return len(self._members_of_group(grp)) // 2
 
     def _round_quorum(self, group_uuid):
         """Other members a Paxos round needs, grants and acceptances alike.
@@ -1543,12 +1554,6 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
     # Phase 3. Default-off: absent in legacy scenarios, so byte-pinned
     # corpora are unaffected.
 
-    def _slash_quorum(self, group_uuid=None):
-        """Co-signers required to finalize a slash; reuses Paxos majority
-        sizing. '> quorum' total signers (including the slasher) finalizes,
-        mirroring handle_accepted."""
-        return self._quorum_for_group(group_uuid)
-
     # ----- Quorum co-signatures (slash + checkpoint) -----------------------
     # A three-phase quorum round is only worth what its RECEIVERS can check.
     # Before this, the co-signature bytes were collected and thrown away:
@@ -1665,12 +1670,51 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         return sender
 
     def _quorum_met(self, designation, sigs, group_uuid=None) -> bool:
-        """Receiver-side quorum test over retained co-signatures: more than
-        ``_quorum_for_group`` distinct voters must have signed the exact bytes
-        this node re-derives. Sized against OUR OWN view of the group, so the
-        finalizer cannot also choose the bar it has to clear."""
-        return len(self._verified_cosigners(designation, sigs)) > \
-            self._quorum_for_group(group_uuid)
+        """The slash quorum, at the slasher's tally and at every receiver:
+        a strict majority of the whole group, the slasher's own signature
+        counted, over the signatures of `designation` that verify. Sized from
+        OUR view, so the finalizer cannot also choose the bar it has to clear:
+        the logged roster in force, verified with the keys it records, as
+        commit, placement and attestation are; before a genesis, the live view
+        (the checkpoint majority).
+
+        It used to be more than len(peers) // 2, the roster without this node,
+        which let two members of four finalize a slash, and a slash floors its
+        target into sticky exclusion (RD_13.2 plan §0.4, 2026-10-22)."""
+        roster = self._roster_for_group(group_uuid)
+        if roster is not None:
+            have = len(self._verified_cosigners(designation, sigs, roster))
+            return self._bar_met('slash', designation, have,
+                                 len(roster.roster_members or ()), 1, roster)
+        return self._checkpoint_quorum_met(designation, sigs, group_uuid)
+
+    def _bar_met(self, where, round_key, have, members, extra, roster) -> bool:
+        """Does `have` reach the Byzantine bar over `members` (RD_13.2 plan
+        §0.4)? The bar is (members + F) // 2 + `extra` signatures, F from the
+        N_min `roster` declares: `extra` is 1 where the count includes the
+        round's own author, 0 where the author is the remaining vote. At F = 0
+        that is the strict majority every site already used. Short of a
+        declared bar, warn once per round with the bar and the declaration."""
+        n_min = None if roster is None else roster.roster_n_min
+        f = byzantine_f(n_min)
+        need = (members + f) // 2 + extra
+        if have >= need:
+            return True
+        if f:
+            seen = self.__dict__.setdefault('_bar_warned', set())
+            mark = (where, round_key if isinstance(round_key, (bytes, str))
+                    else repr(round_key))
+            if mark not in seen:
+                if len(seen) > 1024:
+                    seen.clear()
+                seen.add(mark)
+                self.logger.warning(
+                    '%s: %d of the %d signature(s) needed; the group declares '
+                    'N_min %d (F %d) over %d member(s)%s', where, have, need,
+                    n_min, f, members,
+                    '' if members >= n_min else
+                    ', fewer than N_min, so the bar may be out of reach')
+        return False
 
     # ----- Commit certificates (doc/architecture/reputation.md) ------------
     # Every ordinary half needs a quorum certificate: a placed entry carries
@@ -1699,8 +1743,10 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             roster = self._roster_for_group(group_uuid)
         voters = self._verified_cosigners(desig, sigs, roster) - {str(scorer).lower()}
         if roster is not None:
-            # A majority of the logged roster, the scorer the remaining vote.
-            return len(voters) >= len(roster.roster_members or ()) // 2
+            # A majority of the logged roster, the scorer the remaining vote,
+            # raised by the F it declares.
+            return self._bar_met('commit', desig, len(voters),
+                                 len(roster.roster_members or ()), 0, roster)
         return len(voters) >= self._round_quorum(group_uuid)
 
     def _covered_by_checkpoint(self, chain):
@@ -2092,7 +2138,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 return True
             self._slash_sigs.setdefault(key, {})[voter] = sig
             grp_uuid = str(self.group.uuid) if self.group is not None else None
-            if len(self._slash_sigs[key]) > self._slash_quorum(grp_uuid):
+            if self._quorum_met(att.designation, self._slash_sigs[key], grp_uuid):
                 signed = SignedSlash(attestation=att,
                                      sigs=dict(self._slash_sigs[key]))
                 try:
@@ -2276,7 +2322,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             others = max(others - mates, 0)
             if mates and len(voters) < 2:
                 return False
-            return len(voters) > others // 2
+            return self._bar_met('attestation', att.designation, len(voters),
+                                 others, 1, roster)
         members = len(self._roster_peers()) + 1
         mates = len(self._conflicted_members(subject))
         others = members - (1 if self._is_member(subject) else 0)
@@ -2606,9 +2653,14 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         group, so both halves of an even split finalized their own windows and
         could never reconcile after the heal (Agora Phase 4 DDIL, 2026-09-25).
         Odd sizes are unchanged. Paxos rounds now take the same majority
-        (_round_quorum); slashing keeps len(peers) // 2.
-        Mirrors C _ckpt_quorum_for_group."""
-        return (self._checkpoint_roster(group_uuid) + 1) // 2
+        (_round_quorum), and so does slashing (_quorum_met).
+        Mirrors C _ckpt_quorum_for_group.
+
+        A declared N_min raises it by F (RD_13.2 plan §0.4): more than
+        (M + F) // 2 signers, M the whole group."""
+        roster = self._roster_for_group(group_uuid)
+        f = byzantine_f(None if roster is None else roster.roster_n_min)
+        return (self._checkpoint_roster(group_uuid) + 1 + f) // 2
 
     def _checkpoint_roster(self, group_uuid=None) -> int:
         """The roster a checkpoint's quorum is sized from, this node NOT
@@ -2620,9 +2672,12 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 else len(self._members_of_group(grp)))
 
     def _checkpoint_quorum_met(self, designation, sigs, group_uuid=None) -> bool:
-        """``_quorum_met`` with the checkpoint threshold."""
-        return len(self._verified_cosigners(designation, sigs)) > \
-            self._checkpoint_quorum(group_uuid)
+        """``_quorum_met`` with the checkpoint threshold: more than
+        ``_checkpoint_quorum`` verified signers."""
+        return self._bar_met('checkpoint', designation,
+                             len(self._verified_cosigners(designation, sigs)),
+                             self._checkpoint_roster(group_uuid) + 1, 1,
+                             self._roster_for_group(group_uuid))
 
     def forward_checkpoint(self, queues, message):
         """Entry point for a locally-originated checkpoint: putting a

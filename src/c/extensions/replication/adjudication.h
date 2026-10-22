@@ -21,7 +21,7 @@
  *  @{
  *
  * Adjudicating a replicated task by agreement (R+D.md §12.6, slice B), the C
- * twin of `autonomous_trust.core._python.replication.adjudication`.
+ * twin of `autonomous_trust.oracle._python.replication.adjudication`.
  *
  * Several executors return a result for the same task; this decides what that
  * says about each. Same shape as the certificate layer's verifier:

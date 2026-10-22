@@ -1,0 +1,44 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: slash-final-even-group-majority-applied
+byte_pinning: false
+description: |
+    The positive control for slash-final-even-group-half-refused: three of a
+    four-member group is a strict majority of the whole group, so bob applies
+    the slash and floors rogue to 0.1.
+
+participants:
+  - id: alice
+    role: detector
+  - id: bob
+    role: member
+  - id: carol
+    role: member
+  - id: rogue
+    role: target
+
+fixtures:
+  slash_enabled: true
+  reputations:
+    bob:
+      rogue: 0.6
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: slash final
+    payload:
+      target: rogue
+      floor_score: 0.1
+      epoch: 3
+      cosigners: [alice, bob, carol]
+    description: |
+        alice finalizes with three verified signatures of bob's four-member
+        roster in force, and bob applies the floor.
+
+expected_state:
+  bob:
+    reputation_of:
+      rogue: 0.1

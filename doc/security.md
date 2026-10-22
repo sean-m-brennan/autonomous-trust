@@ -85,9 +85,13 @@ measures.
 AT raises the cost of the following attack classes. It does not claim to
 eliminate them, and the honest framing is residual risk, not immunity.
 
-Larger-than-local coordination. Reputation is weighted and consensus is
-Byzantine-tolerant, and cryptographic identity plus evidence-gated slashing make
-disposable Sybil identities expensive. An adversary who can field enough
+Larger-than-local coordination. Reputation is weighted, consensus runs on
+majority quorums whose decisions carry signed certificates every receiver
+checks, and cryptographic identity plus evidence-gated slashing make disposable
+Sybil identities expensive. The quorums are sized for crash faults: signatures
+make a fork detectable, not impossible, and a group may declare an N_min that
+raises the certificate bars toward the Byzantine bound
+([fault model](architecture/reputation.md#fault-model)). An adversary who can field enough
 colluding, well-behaved identities to hold a majority in a local quorum can
 still bias trust within that quorum. Identity cost, reputation weighting,
 hardware attestation, and quorum thresholds raise the price of that majority;

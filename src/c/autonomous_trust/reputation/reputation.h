@@ -354,6 +354,12 @@ typedef struct {
     char   roster_op[TX_ROSTER_OP_LEN];
     uuid_t roster_uuid;
     char   roster_digest[TX_HASH_HEX_LEN + 1];
+    /* A roster entry's declared N_min (RD_13.2 plan section 0.4), 0 for none:
+     * the cohort size the certificate rounds are Byzantine-sized for, F =
+     * (N_min - 1) / 3. Covered by transaction_canonical_bytes ONLY when set,
+     * so an undeclaring roster entry hashes as it always did. APPENDED, for
+     * the CFFI mirror. Mirrors Python Transaction.roster_n_min. */
+    int    roster_n_min;
 } transaction_t;
 
 /* Committed: bilateral, or attested and indexed. The one test every reader of
@@ -390,6 +396,16 @@ int roster_digest(const json_t *members, char out[TX_HASH_HEX_LEN + 1],
  * same change propose the same value. Mirrors Python roster_task_id. */
 void tx_roster_task_uuid(const uuid_t prev, const char *op, const uuid_t member,
                          const char *digest, uuid_t out);
+
+/* tx_roster_task_uuid for an entry declaring @p n_min: "|n_min" follows the
+ * digest when @p n_min > 0, and the name is unchanged otherwise. Mirrors
+ * Python roster_task_id's n_min. */
+void tx_roster_task_uuid_n(const uuid_t prev, const char *op, const uuid_t member,
+                           const char *digest, int n_min, uuid_t out);
+
+/* F, the faults a declared @p n_min tolerates: (n_min - 1) / 3, or 0 for no
+ * declaration. Mirrors Python byzantine_f. */
+int tx_byzantine_f(int n_min);
 
 /* uuid5(AT_ATTEST_NS, "verifier|subject|digest"): the task id an attested
  * entry must carry. Mirrors Python attest_task_id. */

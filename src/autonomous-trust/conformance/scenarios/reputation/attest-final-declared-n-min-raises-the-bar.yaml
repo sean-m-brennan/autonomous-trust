@@ -1,0 +1,47 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-final-declared-n-min-raises-the-bar
+byte_pinning: false
+description: |
+    A declared N_min raises the attestation bar (RD_13.2 plan §0.4). bob's
+    roster in force lists six members and declares N_min 4 (F = 1). Leaving
+    out the subject, carol, five members can witness, and the bar is more than
+    (5 + 1) // 2 = 3 of them, the verifier among them, where an undeclaring
+    roster needs more than two. alice, bob and dave sign, and bob does not pool
+    the attestation.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+  - id: dave
+    role: member
+  - id: erin
+    role: member
+  - id: frank
+    role: member
+
+fixtures:
+  roster: {}
+  local_chain:
+    bob:
+      - {roster: genesis, members: [alice, bob, carol, dave, erin, frank]}
+      - {roster: restate, n_min: 4}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest final
+    payload:
+      subject: carol
+      score: 0.3
+      cosigners: [alice, bob, dave]
+
+expected_state:
+  bob:
+    pool_count: 0

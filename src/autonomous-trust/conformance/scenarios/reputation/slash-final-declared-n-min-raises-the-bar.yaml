@@ -1,0 +1,50 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: slash-final-declared-n-min-raises-the-bar
+byte_pinning: false
+description: |
+    A declared N_min raises the slash bar (RD_13.2 plan §0.4). bob's roster in
+    force lists five members and declares N_min 4, so F = (4 - 1) // 3 = 1 and a
+    slash needs (5 + 1) // 2 + 1 = 4 verified signatures, where an undeclaring
+    roster of five needs three. Three sign, and bob refuses: rogue keeps its score.
+    Paired with slash-final-declared-n-min-bar-met-applied.
+
+participants:
+  - id: alice
+    role: detector
+  - id: bob
+    role: member
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+  - id: rogue
+    role: target
+
+fixtures:
+  slash_enabled: true
+  roster: {}          # the roster in force is the one bob's chain logs
+  local_chain:
+    bob:
+      - {roster: genesis, members: [alice, bob, carol, dave, rogue]}
+      - {roster: restate, n_min: 4}
+  reputations:
+    bob:
+      rogue: 0.6
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: slash final
+    payload:
+      target: rogue
+      floor_score: 0.1
+      epoch: 3
+      cosigners: [alice, carol, dave]
+
+expected_state:
+  bob:
+    reputation_of:
+      rogue: 0.6

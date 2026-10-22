@@ -1,0 +1,51 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: slash-final-even-group-half-refused
+byte_pinning: false
+description: |
+    A slash needs a MAJORITY OF THE WHOLE GROUP, the slasher's own signature
+    counted (RD_13.2 plan §0.4, 2026-10-22), the bar checkpoint finality and
+    Paxos rounds already used. Two of a four-member group is HALF, not a
+    majority, so bob refuses the slash and rogue keeps its score.
+
+    The old bar was more than num_peers / 2 with num_peers counting the roster
+    WITHOUT this node: 1 here, which two signatures cleared. A slash floors its
+    target below COMM_CUTOFF into sticky exclusion, so under the old bar two
+    members of four could exclude a third. Paired with
+    slash-final-even-group-majority-applied, the same shape with three signers.
+
+participants:
+  - id: alice
+    role: detector
+  - id: bob
+    role: member
+  - id: carol
+    role: member
+  - id: rogue
+    role: target
+
+fixtures:
+  slash_enabled: true
+  reputations:
+    bob:
+      rogue: 0.6
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: slash final
+    payload:
+      target: rogue
+      floor_score: 0.1
+      epoch: 3
+      cosigners: [alice, carol]
+    description: |
+        alice finalizes with its own signature and carol's. bob's roster in
+        force lists four members, so the bar is three verified signatures.
+
+expected_state:
+  bob:
+    reputation_of:
+      rogue: 0.6

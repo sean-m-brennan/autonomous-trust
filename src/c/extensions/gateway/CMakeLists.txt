@@ -57,8 +57,8 @@ foreach(_t at_gateway at_gateway_static)
 endforeach()
 
 install(TARGETS at_gateway at_gateway_static
-    LIBRARY DESTINATION lib
-    ARCHIVE DESTINATION lib)
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
 ####################
 # tests (only built when libcheck is available)

@@ -48,6 +48,10 @@ extern char NEG_PROTO_STAT_REQ[];
 extern char NEG_PROTO_STAT_RSP[];
 extern char NEG_PROTO_RESULT[];
 extern char NEG_PROTO_CANCEL[];
+/* Live replication (RD_12.6_LIVE_REPLICATION_PLAN.md section 3.7). */
+extern char NEG_PROTO_REPLAY_CHALLENGE[];
+extern char NEG_PROTO_REPLAY_REVEAL[];
+extern char NEG_PROTO_REPLAY_RESPONSE[];
 
 /****************************
  * Negotiation status

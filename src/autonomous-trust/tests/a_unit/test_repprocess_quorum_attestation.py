@@ -239,14 +239,18 @@ class TestVerifiedCosignerCounting:
 
     def test_quorum_sized_against_our_own_roster(self):
         """The finalizer does not get to choose the bar it must clear: quorum
-        comes from the receiver's own member count."""
+        comes from the receiver's own member count. Three peers and this node
+        are a group of four, and a slash needs a strict majority of it: three
+        (RD_13.2 plan §0.4; two of four used to finalize)."""
         a, b, c = (_identity('a'), _identity('b'), _identity('c'))
-        rp = _rep_process([a, b, c])            # quorum floor(3/2) = 1
+        rp = _rep_process([a, b, c])
         att = _att(a.uuid, uuid4())
         one = {str(a.uuid): _sig(a, att.designation)}
         two = dict(one, **{str(b.uuid): _sig(b, att.designation)})
+        three = dict(two, **{str(c.uuid): _sig(c, att.designation)})
         assert rp._quorum_met(att.designation, one) is False
-        assert rp._quorum_met(att.designation, two) is True
+        assert rp._quorum_met(att.designation, two) is False
+        assert rp._quorum_met(att.designation, three) is True
 
 
 # --- vote attribution -------------------------------------------------------
@@ -314,8 +318,8 @@ class TestVoteAttribution:
                           to_json_string(ack), rp.group, from_whom=voter)
             msg.verified = True
             rp.handle_slash_sign({CfgIds.network: net_q}, msg)
-        # A map keyed by voter, so four deliveries are one vote -- under the
-        # quorum of floor(3/2)=1, hence no finalizer went out.
+        # A map keyed by voter, so four deliveries are one vote -- short of
+        # the three a group of four needs, hence no finalizer went out.
         assert list(rp._slash_sigs[att.key()]) == [str(voter.uuid)]
         assert net_q.empty()
 
@@ -366,10 +370,10 @@ class TestSlashFinalQuorum:
         return rp, members
 
     def test_quorum_of_verified_signatures_applies_the_floor(self):
-        rp, members = self._setup()             # quorum floor(3/2) = 1
+        rp, members = self._setup()             # a group of four: three sign
         target = uuid4()
         att = _att(members[0].uuid, target, floor=0.1, epoch=1)
-        sigs = {str(m.uuid): _sig(m, att.designation) for m in members[:2]}
+        sigs = {str(m.uuid): _sig(m, att.designation) for m in members[:3]}
         msg = _final(rp, ReputationProtocol.slash_final,
                      SignedSlash(attestation=att, sigs=sigs), members[0])
         assert rp.handle_slash_final({CfgIds.network: queue.Queue()},

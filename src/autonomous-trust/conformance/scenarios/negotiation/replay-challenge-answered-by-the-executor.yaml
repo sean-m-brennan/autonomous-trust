@@ -1,0 +1,98 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: replay-challenge-answered-by-the-executor
+byte_pinning: false
+description: |
+    The executor's half of live replication (RD_12.6_LIVE_REPLICATION_PLAN.md
+    §3.7). An executor of a replayable capability keeps the states of its
+    trace, and answers the task's requestor, and only it, about any step:
+    `replay challenge` asks for the chain digest at an index, `replay reveal`
+    for what the verifier needs at the divergent step (h(k-2), s(k-1), s(k)).
+    Both runtimes must send the same bytes, or a requestor of one runtime
+    would convict an honest executor of the other.
+
+    bob keeps the four-state trace s0 .. s3 of task t-r, which alice asked
+    for. carol is no part of the task, and her challenge goes unanswered: the
+    states are shown to the requestor alone. alice asks for the digest at 3
+    (the root), then for the reveal at 2, and the reveal at 4, past the
+    trace's end, where there is no state.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+  - id: carol
+    role: worker
+
+fixtures:
+  retained_traces:
+    bob:
+      - {task: t-r, requestor: alice, states: [s0, s1, s2, s3]}
+
+steps:
+  - id: 1
+    from: carol
+    to: bob
+    function: replay challenge
+    payload: {task_id: t-r, round: 1, index: 1}
+    description: a stranger asks; bob says nothing.
+  - id: 2
+    from: bob
+    to: carol
+    function: replay response
+    in_response_to: 1
+    expect_none: true
+    payload: {}
+  - id: 3
+    from: alice
+    to: bob
+    function: replay challenge
+    payload: {task_id: t-r, round: 1, index: 3}
+  - id: 4
+    from: bob
+    to: alice
+    function: replay response
+    in_response_to: 3
+    no_propagate: true
+    payload: {}
+  - id: 5
+    from: alice
+    to: bob
+    function: replay reveal
+    payload: {task_id: t-r, round: 2, index: 2}
+  - id: 6
+    from: bob
+    to: alice
+    function: replay response
+    in_response_to: 5
+    no_propagate: true
+    payload: {}
+  - id: 7
+    from: alice
+    to: bob
+    function: replay reveal
+    payload: {task_id: t-r, round: 3, index: 4}
+  - id: 8
+    from: bob
+    to: alice
+    function: replay response
+    in_response_to: 7
+    no_propagate: true
+    payload: {}
+
+expected_state:
+  bob:
+    replay_answers:
+      - {index: 3, digest: "04bfaa5c9dcfaa6211749862fc2728902e24f3414623203c5a34e4f52f9b2622"}
+      - index: 2
+        reveal:
+          prev: "9581c5e21a94884538e1212bb666df18bd353eb1c03c20bd473fa6f3fc21162c"
+          pre: s1
+          state: s2
+      - index: 4
+        reveal:
+          prev: "7a795ece0f922bf5090999cded4068f473e8bebe46265e829edf9b7024479d85"
+          pre: s3
+          state: null

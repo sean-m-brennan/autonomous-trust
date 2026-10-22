@@ -495,8 +495,9 @@ def _write_roster(hist, entry, member, sign) -> None:
     """A roster entry of a chain spec, placed alone at the chain's next index
     (doc/architecture/reputation.md, "Who is in the group"): {roster: genesis,
     members: [ids]} or {roster: add, member: id}, its placement certificate
-    signed by `placed_by: [ids]`. `member(id)` returns [uuid, key]. Mirrors the
-    C adapter's _write_roster."""
+    signed by `placed_by: [ids]`. `n_min: N` declares an N_min (RD_13.2 plan
+    §0.4). `member(id)` returns [uuid, key]. Mirrors the C adapter's
+    _write_roster."""
     from autonomous_trust.core.reputation.reputation import (roster_digest,
                                                              roster_task_id)
     op, who = entry['roster'], None
@@ -510,9 +511,10 @@ def _write_roster(hist, entry, member, sign) -> None:
             m = member(entry['member'])
             members, who = members + [m], m[0]
     d = roster_digest(members)
-    tx = Transaction(roster_task_id(prev, op, who, d), roster_op=op,
+    n_min = entry.get('n_min') or None
+    tx = Transaction(roster_task_id(prev, op, who, d, n_min), roster_op=op,
                      roster_uuid=None if who is None else UUID(who),
-                     roster_digest=d, roster_members=members)
+                     roster_digest=d, roster_members=members, roster_n_min=n_min)
     k = hist.next_index
     by = entry.get('placed_by')
     sigs = (sign(by, place_designation(k, hist.head_hash,
@@ -713,6 +715,10 @@ class ReputationAdapter:
         # Scenario-level rather than per-participant, because the C twin's
         # knob is an environment variable and the whole cohort shares it.
         preset_slash_enabled: bool = bool(fixtures.get('slash_enabled', False))
+        # n_min: {pid: N} -- the N_min a participant is configured for
+        # (AT_REP_N_MIN; RD_13.2 plan §0.4). Mirrors the C adapter, which sets
+        # the variable for the participant a step is delivered to.
+        preset_n_min: dict = fixtures.get('n_min', {}) or {}
         # attest_conflicts: [[pid, ...], ...] -- the teams whose members do not
         # witness for each other (ISSUES §2.54). Scenario-level: every node
         # holds the same set, as every node holding one verified team roster
@@ -821,6 +827,7 @@ class ReputationAdapter:
             # the environment at import: the corpus must not depend on how the
             # harness process was launched.
             participant.process.SLASH_ENABLED = preset_slash_enabled
+            participant.process.N_MIN = preset_n_min.get(pid)
 
             if pid in preset_checkpoint:
                 spec_ck = preset_checkpoint[pid]
@@ -850,7 +857,8 @@ class ReputationAdapter:
             def _ident_uuid(other):
                 return identities[other].uuid if other in identities else None
             local = preset_local_chain.get(pid, [])
-            if any('batch' in e or 'certified_by' in e for e in local):
+            if any('batch' in e or 'certified_by' in e or 'roster' in e
+                   for e in local):
                 # A placed (or certified) local chain: built apart, then
                 # loaded verbatim with its certificates, as catch-up loads one.
                 def _sign_ids(ids, desig):
@@ -858,7 +866,12 @@ class ReputationAdapter:
                             ReputationProcess._detached_sig(identities[i], desig)
                             for i in ids if i in identities}
                 tmp = TransactionHistory(max_chain_len=len(local) + 1)
-                _write_chain(tmp, local, _ident_uuid, _sign_ids)
+                def _member(i):
+                    from nacl.encoding import HexEncoder
+                    return [str(identities[i].uuid).lower(),
+                            identities[i].signature.public.encode(
+                                encoder=HexEncoder).decode('ascii')]
+                _write_chain(tmp, local, _ident_uuid, _sign_ids, _member)
                 built = list(tmp)
                 participant.process.history.reconcile(
                     built, certified={t.index for t in built})
@@ -1180,17 +1193,18 @@ class ReputationAdapter:
     def _roster_spec(self, participants, spec, base):
         """A roster entry from its spec (doc/architecture/reputation.md, "Who
         is in the group"): {roster: genesis, members: [pid...]}, {roster: add,
-        member: pid[, key: hex]} or {roster: restate}; an add or restate
-        builds on the recipient's `roster` fixture (`base`). Mirrors the C
-        adapter's _rp_roster_entry."""
+        member: pid[, key: hex]} or {roster: restate}, each optionally
+        declaring `n_min: N`; an add or restate builds on the recipient's
+        `roster` fixture (`base`). Mirrors the C adapter's _rp_roster_entry."""
         from autonomous_trust.core.reputation.reputation import (roster_digest,
                                                                  roster_task_id)
         op = spec['roster']
         who = None
+        n_min = spec.get('n_min') or None
         if op == 'genesis':
             members = [self._roster_member(participants, p) for p in spec['members']]
             d = roster_digest(members)
-            task = roster_task_id(None, 'genesis', None, d)
+            task = roster_task_id(None, 'genesis', None, d, n_min)
         else:
             members = [self._roster_member(participants, p) for p in base or []]
             prev = roster_task_id(None, 'genesis', None, roster_digest(members))
@@ -1201,10 +1215,11 @@ class ReputationAdapter:
                 members = members + [m]
                 who = m[0]
             d = roster_digest(members)
-            task = roster_task_id(prev, op, who, d)
+            task = roster_task_id(prev, op, who, d, n_min)
         return Transaction(task, roster_op=op,
                            roster_uuid=None if who is None else UUID(who),
-                           roster_digest=d, roster_members=members)
+                           roster_digest=d, roster_members=members,
+                           roster_n_min=n_min)
 
     def _place_value(self, participants, payload, base=None):
         """A placement value from its spec: {task_id, p1, p1_score, p2,

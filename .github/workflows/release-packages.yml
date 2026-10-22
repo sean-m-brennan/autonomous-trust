@@ -1,0 +1,105 @@
+name: Release Packages
+
+# Builds the autonomous-trust-devel package (C libraries, headers, pkg-config
+# file) as .deb and .rpm and attaches them to the GitHub release.
+#
+# libautonomous_trust.so links the distro's C++ libprotobuf, whose soname
+# changes between releases, so a package installs cleanly only on the distro it
+# was built on. Each matrix entry builds inside that distro's container:
+#   deb  autonomous-trust-devel_<ver>-1~ubuntu24.04_amd64.deb (and ubuntu22.04, debian12)
+#   rpm  autonomous-trust-devel-<ver>-1.el9.x86_64.rpm        (and .fc44)
+# To add a distro, add a matrix entry; scripts/package-devel.sh knows apt and dnf.
+#
+# Local equivalent (one distro):
+#   docker run --rm -v "$PWD:/src" -w /src ubuntu:24.04 \
+#       scripts/package-devel.sh --deps v0.3.0 dist
+#
+# Triggers: publishing a release, or by hand for an existing release tag
+# (Actions -> Release Packages -> Run workflow), which re-uploads over any
+# packages already attached. A release created by another workflow using
+# GITHUB_TOKEN does not trigger `release` events; use the manual run then.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and attach packages to (e.g. v0.3.0)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  package:
+    name: ${{ matrix.format }} ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      # Let the other distros finish; publish still waits for all of them.
+      fail-fast: false
+      matrix:
+        include:
+          - { format: deb, image: 'ubuntu:22.04' }
+          - { format: deb, image: 'ubuntu:24.04' }
+          - { format: deb, image: 'debian:12' }
+          - { format: rpm, image: 'rockylinux:9' }
+          - { format: rpm, image: 'fedora:44' }
+    steps:
+      # Without git in the container, actions/checkout falls back to a REST
+      # download with no .git, and the submodule below cannot be fetched.
+      - name: Install git
+        run: |
+          if command -v apt-get >/dev/null; then
+            apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+          else
+            dnf install -y git
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      # Only ryu is needed for the library; the DTN submodules are large and
+      # serve the optional AT_NET_DTN build.
+      - name: Fetch ryu submodule
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git submodule update --init --depth 1 src/c/third_party/ryu
+
+      - name: Build package
+        run: scripts/package-devel.sh --deps "$TAG" dist
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: devel-${{ matrix.format }}-${{ strategy.job-index }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: devel-*
+          merge-multiple: true
+          path: dist
+
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"

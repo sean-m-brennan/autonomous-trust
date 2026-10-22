@@ -61,8 +61,8 @@ function(at_extension_library name)
     set_property(TARGET at_${name}_static PROPERTY AT_EXT_DEPENDS "${A_DEPENDS}")
 
     install(TARGETS at_${name} at_${name}_static
-        LIBRARY DESTINATION lib
-        ARCHIVE DESTINATION lib)
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endfunction()
 
 # at_extension_tests(<name> <test>...): test/<test>.c, linked with the

@@ -135,6 +135,53 @@ DEFINE_TEST(test_the_entry_bytes_are_pinned_against_python)
 }
 END_TEST_DEFINITION()
 
+/* A restatement of the genesis declaring N_min 4 (RD_13.2 plan section 0.4):
+ * the declaration follows the roster block in the bytes and the task name,
+ * and nothing changes without one. Pinned against test_placement_n_min.py. */
+static const char T_R4[] = "05b28db3-fb50-5ba5-8a24-a2f053a182fd";
+static const char T_R0[] = "2cbb8fdf-80d6-56f4-8038-e4547d1e00ee";
+static const char R4_HASH[] = "ca90ab36ec77a141a1c4b7882d760e39fe01806ee27e585eb74ee3924c04fa7e";
+
+DEFINE_TEST(test_a_declared_n_min_is_pinned_against_python)
+{
+    uuid_t t0, t;
+    char ts[UUID_STRING_LEN + 1];
+    uuid_parse(T0, t0);
+    tx_roster_task_uuid_n(t0, "restate", NULL, D2, 4, t);
+    uuid_unparse_lower(t, ts);
+    ck_assert_str_eq(ts, T_R4);
+    tx_roster_task_uuid_n(t0, "restate", NULL, D2, 0, t);
+    uuid_unparse_lower(t, ts);
+    ck_assert_str_eq(ts, T_R0);
+    tx_roster_task_uuid(t0, "restate", NULL, D2, t);
+    uuid_unparse_lower(t, ts);
+    ck_assert_str_eq(ts, T_R0);
+
+    transaction_t r;
+    _entry(&r, T_R4, "restate", NULL, D2, 1, G_HASH);
+    r.roster_n_min = 4;
+    char canon[TX_CANON_MAX], want[TX_CANON_MAX], h[TX_HASH_HEX_LEN + 1];
+    ck_assert(transaction_canonical_bytes(&r, canon, sizeof(canon)) > 0);
+    snprintf(want, sizeof(want), "%s|null|null|null|null|1|roster|restate|null|%s|4",
+             T_R4, D2);
+    ck_assert_str_eq(canon, want);
+    transaction_entry_hash(&r, h);
+    ck_assert_str_eq(h, R4_HASH);
+
+    _entry(&r, T_R0, "restate", NULL, D2, 1, G_HASH);
+    ck_assert(transaction_canonical_bytes(&r, canon, sizeof(canon)) > 0);
+    snprintf(want, sizeof(want), "%s|null|null|null|null|1|roster|restate|null|%s",
+             T_R0, D2);
+    ck_assert_str_eq(canon, want);
+
+    ck_assert_int_eq(tx_byzantine_f(0), 0);
+    ck_assert_int_eq(tx_byzantine_f(3), 0);
+    ck_assert_int_eq(tx_byzantine_f(4), 1);
+    ck_assert_int_eq(tx_byzantine_f(7), 2);
+    ck_assert_int_eq(tx_byzantine_f(10), 3);
+}
+END_TEST_DEFINITION()
+
 /* The two entries on the catch-up wire, members beside them. */
 static json_t *_wire(void)
 {
@@ -191,6 +238,52 @@ DEFINE_TEST(test_the_catchup_wire_and_evidence_round_trip)
     ck_assert(reputation_evidence_from_json(doc, &bad, NULL) != 0);
     json_decref(doc);
     tx_history_free(&bad);
+    tx_history_free(&h);
+    tx_history_free(&e);
+}
+END_TEST_DEFINITION()
+
+/* The declaration travels on the catch-up wire and in evidence, and the
+ * entry it is on keeps its hash (R4_HASH) through both. */
+DEFINE_TEST(test_a_declared_n_min_round_trips)
+{
+    json_t *m2 = _members(2), *m2b = _members(2);
+    json_t *arr = json_pack("[{s:s, s:s, s:b, s:s, s:b, s:i, s:s, s:s, s:n, s:s, s:o},"
+                            " {s:s, s:s, s:b, s:s, s:b, s:i, s:s, s:s, s:n, s:s, s:o, s:i}]",
+        "task", T0, "p1", "00000000-0000-0000-0000-000000000000", "p1_set", 0,
+        "p2", "00000000-0000-0000-0000-000000000000", "p2_set", 0, "index", 0,
+        "prev_hash", "", "roster_op", "genesis", "roster_uuid", "roster_digest", D2,
+        "roster_members", m2,
+        "task", T_R4, "p1", "00000000-0000-0000-0000-000000000000", "p1_set", 0,
+        "p2", "00000000-0000-0000-0000-000000000000", "p2_set", 0, "index", 1,
+        "prev_hash", G_HASH, "roster_op", "restate", "roster_uuid", "roster_digest", D2,
+        "roster_members", m2b, "roster_n_min", 4);
+    ck_assert_ptr_nonnull(arr);
+    tx_history_t h, e;
+    ck_assert_ret_ok(tx_history_init(&h));
+    ck_assert_ret_ok(tx_history_init(&e));
+    tx_reconcile_result_t res = { TX_RECONCILE_NONE, -1, 0, 0, NULL };
+    ck_assert_ret_ok(tx_history_reconcile(&h, arr, -1, &res));
+    ck_assert_int_eq(res.status, TX_RECONCILE_EXTENDED);
+    tx_reconcile_result_free(&res);
+    json_decref(arr);
+    ck_assert_str_eq(h.head_hash, R4_HASH);
+    transaction_t r;
+    ck_assert_int_eq(tx_history_roster_at(&h, h.next_index, &r), 0);
+    ck_assert_int_eq(r.roster_n_min, 4);
+
+    json_t *back = NULL;
+    ck_assert_ret_ok(tx_history_era_to_json(&h, 0, tx_history_len(&h), &back));
+    ck_assert_int_eq((int)json_integer_value(json_object_get(json_array_get(back, 1),
+                                                             "roster_n_min")), 4);
+    ck_assert_ptr_null(json_object_get(json_array_get(back, 0), "roster_n_min"));
+    json_decref(back);
+
+    json_t *doc = NULL;
+    ck_assert_ret_ok(reputation_evidence_to_json(&h, NULL, &doc));
+    ck_assert_ret_ok(reputation_evidence_from_json(doc, &e, NULL));
+    ck_assert_str_eq(e.head_hash, R4_HASH);
+    json_decref(doc);
     tx_history_free(&h);
     tx_history_free(&e);
 }
@@ -259,4 +352,6 @@ RUN_TESTS(RepPlaceRoster,
           test_the_digest_and_task_are_pinned_against_python,
           test_a_bad_list_is_refused,
           test_the_entry_bytes_are_pinned_against_python,
-          test_the_catchup_wire_and_evidence_round_trip)
+          test_the_catchup_wire_and_evidence_round_trip,
+          test_a_declared_n_min_is_pinned_against_python,
+          test_a_declared_n_min_round_trips)
