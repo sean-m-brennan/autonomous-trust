@@ -322,6 +322,9 @@ alongside the per-capability tier comparison that replaced it.
 - [Earning standing](reputation.md): what happens to the transaction score the
   requester submits once the result has been verified.
 - [Networking](networking.md): the peer-to-peer channel these messages travel on.
+- [Selective assignment](selection.md): inviting k of the capable peers instead
+  of all of them, by an auditable draw, and estimating what the others would
+  have done.
 - [Integration testing](integration-testing.md): how the task lifecycle is
   exercised end to end.
 

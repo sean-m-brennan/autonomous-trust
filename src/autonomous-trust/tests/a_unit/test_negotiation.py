@@ -96,6 +96,18 @@ class TestTaskInfo:
         assert ti.uuid == uid
         assert ti.size == 3
 
+    def test_no_draw_keeps_the_old_shape(self):
+        # A task nothing selected serializes exactly as before (RD_12.7).
+        assert 'draw' not in TaskInfo('req').to_dict()
+
+    def test_a_draw_round_trips(self):
+        draw = {'head': 'aa' * 32, 'index': 3, 'link': 'bb' * 32}
+        tp = TaskParameters('cap1', when=datetime(2025, 1, 1, 12, 0, 0))
+        task = Task(tp, 'requestor1', draw=draw)
+        assert task.to_dict()['draw'] == draw
+        again = Task(**task.to_dict())
+        assert again.draw == draw
+
 
 class TestTask:
     def _make_task(self, **kwargs):
@@ -126,6 +138,21 @@ class TestTaskStatus:
                         parameters=TaskParameters('x', when=datetime(2025, 1, 1)),
                         requestor='r')
         assert ts.status == Status.pending
+
+
+class TestScoreEcho:
+    def test_pickles_and_is_not_a_message(self):
+        import pickle
+        from autonomous_trust.core._python.negotiation.negotiation import ScoreEcho
+        echo = pickle.loads(pickle.dumps(ScoreEcho(uuid4(), uuid4(), 0.8, 'probe')))
+        assert echo.score == 0.8 and echo.channel == 'probe'
+        assert isinstance(echo.task_uuid, str)
+
+    def test_echo_flag_is_never_serialized(self):
+        tp = TaskParameters('cap1', when=datetime(2025, 1, 1, 12, 0, 0))
+        result = TaskResult(Task(tp, 'requestor1'), result=1)
+        result.echo_score = True
+        assert 'echo_score' not in result.to_dict()
 
 
 class TestTaskResult:

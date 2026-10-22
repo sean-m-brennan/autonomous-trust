@@ -354,6 +354,13 @@ missing mechanism rather than a missing log, and the mechanism (a requestor
 selecting among willing peers) has consequences of its own for redundancy and
 for how bilateral history accumulates. R+D.md §12.7 carries the design.
 
+*Built, 2026-10-22:* the mechanism now exists, opt-in per capability.
+[Selective assignment](architecture/selection.md) draws k of N peers from a
+committed, auditable seed chain, logs each peer's propensity, and runs a doubly
+robust estimator over the log. Its reward model comes from probe outcomes only.
+Its output is a local diagnostic so far. Nothing it estimates enters
+reputation.
+
 ### Self-consistency over a claim archive
 
 The cheapest oracle of all requires no peers, no physics, and no domain

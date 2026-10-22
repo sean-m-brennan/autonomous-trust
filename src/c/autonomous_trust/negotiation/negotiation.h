@@ -125,6 +125,9 @@ typedef struct {
      *  built without an announce (unit tests) leaves it unknown. */
     map_t invited;
     bool  invited_known;
+    /** A selection layer drew the invitees (neg_ext.h), so a decline is
+     *  re-drawn and each scored result is handed back to it. */
+    bool  drawn;
     /** The deadline sweep's record: status requests sent since the deadline
      *  last moved, and when the latest went out (wall clock, seconds). A live
      *  answer resets both; NEG_STATUS_ASKS unanswered rounds drop the tracker. */

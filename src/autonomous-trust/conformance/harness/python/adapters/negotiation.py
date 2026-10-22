@@ -197,6 +197,16 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: results_scored for {slug!r} = {got}, '
                         f'expected {want}')
+            elif key == 'selection_findings':
+                # {<requestor pid>: {<reason>: <count>}}: what this node's
+                # audit of a requestor's draws found (RD_12.7 plan section
+                # 0.2); {} for nothing.
+                from autonomous_trust.oracle._python.selection import hooks as _sel
+                got = {_PARTICIPANT_IDS.get(str(u), u): dict(f)
+                       for u, f in _sel.findings(self.process).items() if f}
+                if got != dict(expected or {}):
+                    raise AssertionError(
+                        f'{self.id}: selection_findings = {got}, expected {expected}')
             elif key == 'replay_answers':
                 # Every `replay response` sent, in order (RD_12.6 plan §3.7).
                 if self.replay_answers != list(expected or []):
@@ -567,6 +577,15 @@ class NegotiationAdapter:
                     str(uuid5(_NS, 'task:%s' % kept['task']))] = (
                     list(kept['states']), str(req.uuid) if req else '',
                     time.monotonic() + 60)
+            # selection: {holder, declaration, root}: the holder draws its
+            # invitees from its own chain (RD_12.7 plan section 3). Mirrors the
+            # C adapter's at_selection_configure.
+            sel = fixtures.get('selection')
+            if isinstance(sel, dict) and sel.get('holder') == pid:
+                from autonomous_trust.oracle._python.selection import hooks as _sel
+                from autonomous_trust.oracle.selection import parse_selection
+                _sel.configure(participant.process, parse_selection(sel['declaration']),
+                               bytes.fromhex(sel['root']), tempfile.mkdtemp())
             handles[pid] = ParticipantHandle(
                 id=pid, role=role, impl=participant,
                 dispatch=lambda msg, p=participant: self._dispatch(p, msg),
@@ -695,7 +714,8 @@ class NegotiationAdapter:
             # similarly routes by task.requestor.
             requestor_is_sender = function in ('invitation', 'status request')
             requestor = sender_identity if requestor_is_sender else recipient
-            task = Task(params, requestor, uuid=task_uuid, seq=seq)
+            task = Task(params, requestor, uuid=task_uuid, seq=seq,
+                        draw=payload.get('draw'))
             obj = task
         elif function == 'status response':
             from autonomous_trust.core.negotiation.negotiation import Status

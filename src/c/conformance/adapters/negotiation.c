@@ -47,6 +47,7 @@
 #include "negotiation/negotiation.h"
 #include "negotiation/neg_proc_priv.h"
 #include "processes/processes.h"
+#include "processes/extension.h"   /* at_extensions_reset */
 #include "structures/array.h"
 #include "structures/map.h"
 #include "utilities/message.h"
@@ -63,6 +64,10 @@
 #include "first_contact/device.h"
 #endif
 #include "config/configuration.h"
+#ifdef AT_CONF_ORACLE_SELECTION   /* libat_selection is built */
+#include "selection/at_selection.h"
+#include "selection/selection.h"
+#endif
 
 /* ------------------------------------------------------------------------- */
 /* Per-participant impl carries a process_t plus the identity used to        */
@@ -391,8 +396,13 @@ static void _restore_first_contact(void)
     unsetenv("AT_FIRST_CONTACT");
 }
 
+/* A fixture this run could not honour, reported by the expected-state check
+ * so the case fails rather than passing on what it did not set up. */
+static const char *g_fixture_err;
+
 static void _apply_fixtures(sce_run_ctx_t *ctx)
 {
+    g_fixture_err = NULL;
     json_t *fixtures = json_object_get(ctx->case_data, "fixtures");
     if (!json_is_object(fixtures)) return;
 
@@ -445,6 +455,35 @@ static void _apply_fixtures(sce_run_ctx_t *ctx)
                 free((void *)states);
             }
         }
+    }
+
+    /* selection: {holder, declaration, root}: the holder draws its invitees
+     * from its own chain (RD_12.7 plan section 3). Mirrors the Python
+     * adapter's selection hooks.configure. Without libat_selection a scenario
+     * naming one cannot be honoured, so it fails rather than passing on a
+     * plain fan-out. */
+    json_t *sel = json_object_get(fixtures, "selection");
+    if (json_is_object(sel))
+    {
+#ifdef AT_CONF_ORACLE_SELECTION
+        sce_participant_t *holder = sce_find_participant(
+            ctx, json_string_value(json_object_get(sel, "holder")));
+        at_selection_model_t model;
+        unsigned char root[AT_SEL_LINK_BYTES];
+        char dir[] = "/tmp/at-conf-neg-selection-XXXXXX";
+        if (holder == NULL
+            || !at_selection_parse(json_object_get(sel, "declaration"), &model, NULL, 0)
+            || at_sel_unhex(json_string_value(json_object_get(sel, "root")), root, sizeof(root)) != 0
+            || mkdtemp(dir) == NULL
+            || at_selection_configure(((np_impl_t *)holder->impl)->proc, &model, root, dir) != 0)
+        {
+            g_fixture_err = "fixtures.selection cannot be configured";
+            return;
+        }
+#else
+        g_fixture_err = "fixtures.selection needs libat_selection";
+        return;
+#endif
     }
 
     json_t *caps = json_object_get(fixtures, "capabilities");
@@ -573,6 +612,11 @@ static json_t *_build_task_json(json_t *payload, const uuid_t task_uuid,
         if (json_is_integer(seq_j)) seq = json_integer_value(seq_j);
     }
     json_object_set_new(j, "seq", json_integer(seq));
+
+    /* A requestor's draw (RD_12.7 plan section 0.1), as the step gives it. */
+    json_t *draw_j = json_object_get(payload, "draw");
+    if (json_is_object(draw_j))
+        json_object_set(j, "draw", draw_j);
 
     if (strcmp(py_type, PY_TYPE_TASK_RESULT) == 0)
     {
@@ -863,6 +907,10 @@ static int _dispatch(sce_run_ctx_t *ctx,
  * code itself to split per-process state — out of scope here. */
 static int _negotiation_check_expected_state(sce_run_ctx_t *ctx)
 {
+    if (g_fixture_err != NULL) {
+        snprintf(ctx->err, sizeof(ctx->err), "%s", g_fixture_err);
+        return -1;
+    }
     json_t *expected = json_object_get(ctx->case_data, "expected_state");
     if (!json_is_object(expected)) return 0;
 
@@ -973,6 +1021,50 @@ static int _negotiation_check_expected_state(sce_run_ctx_t *ctx)
                         return -1;
                     }
                 }
+            } else if (strcmp(key, "selection_findings") == 0) {
+                /* {<requestor pid>: {<reason>: <count>}}: what this node's
+                 * audit of a requestor's draws found, and nothing else (RD_12.7
+                 * plan section 0.2). */
+#ifdef AT_CONF_ORACLE_SELECTION
+                np_impl_t *me = (np_impl_t *)sce_find_participant(ctx, pid)->impl;
+                long want_total = 0;
+                const char *rpid;
+                json_t *reasons;
+                json_object_foreach(val, rpid, reasons) {
+                    sce_participant_t *rp = sce_find_participant(ctx, rpid);
+                    if (rp == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: selection_findings names unknown %s", pid, rpid);
+                        return -1;
+                    }
+                    char ruuid[37];
+                    uuid_unparse_lower(((np_impl_t *)rp->impl)->pub->uuid, ruuid);
+                    const char *reason;
+                    json_t *count;
+                    json_object_foreach(reasons, reason, count) {
+                        long got = at_selection_finding_count(me->proc, ruuid, reason);
+                        want_total += (long)json_integer_value(count);
+                        if (got != (long)json_integer_value(count)) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: selection_findings %s/%s = %ld, expected %lld",
+                                     pid, rpid, reason, got,
+                                     (long long)json_integer_value(count));
+                            return -1;
+                        }
+                    }
+                }
+                long total = at_selection_finding_count(me->proc, NULL, NULL);
+                if (total != want_total) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: selection_findings total %ld, expected %ld",
+                             pid, total, want_total);
+                    return -1;
+                }
+#else
+                snprintf(ctx->err, sizeof(ctx->err),
+                         "%s: selection_findings needs libat_selection", pid);
+                return -1;
+#endif
             } else if (strcmp(key, "replay_answers") == 0) {
                 /* [ {index, digest} | {index, reveal: {prev, pre, state}} ]:
                  * every `replay response` sent, in order (RD_12.6 plan
@@ -1206,6 +1298,9 @@ void at_negotiation_run(const at_case_t *c, at_case_result_t *out)
     /* Wipe singleton neg_state so observables like task_in_stack:false /
      * has_my_task:false are not polluted by prior scenarios. */
     negotiation_reset_state();
+    /* And every extension's, which keys its own state by process: a pointer
+     * the last case freed can come back as this case's participant. */
+    at_extensions_reset();
     g_n_scores = 0;
     g_n_forwards = 0;
     json_decref(g_answers);
