@@ -1,0 +1,45 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: checkpoint-final-declared-n-min-raises-the-bar
+byte_pinning: false
+description: |
+    A declared N_min raises checkpoint finality (RD_13.2 plan §0.4). bob's group
+    has five members and its roster in force declares N_min 4 (F = 1), so a root
+    needs more than (5 + 1) // 2 = 3 signers, where an undeclaring group of five
+    needs three. Three sign, and bob refuses the root.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: member
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+  - id: rogue
+    role: member
+
+fixtures:
+  roster: {}          # the roster in force is the one bob's chain logs
+  local_chain:
+    bob:
+      - {roster: genesis, members: [alice, bob, carol, dave, rogue]}
+      - {roster: restate, n_min: 4}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: checkpoint final
+    payload:
+      root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+      epoch: 7
+      first_index: 0
+      count: 3
+      cosigners: [alice, bob, carol]
+
+expected_state:
+  bob:
+    checkpoint_root: ""

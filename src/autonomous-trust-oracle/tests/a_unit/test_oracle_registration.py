@@ -59,6 +59,11 @@ class TestRegisteredLayers:
         for env, _ in oracles.DECLARATIONS:
             monkeypatch.setenv(env, '/nonexistent/declaration.json')
         oracles.check_env()
+        # Replication checks its declaration as the node starts (RD_12.6
+        # plan §3.1), so it needs a real one; the others read theirs later.
+        decl = tmp_path / 'replication.json'
+        decl.write_text('{"version": 1}')
+        monkeypatch.setenv('AT_REPLICATION', str(decl))
         # The node itself, through its own load -> check_env.
         from autonomous_trust.core.automate import AutonomousTrust
         AutonomousTrust(multiproc=False, silent=True,

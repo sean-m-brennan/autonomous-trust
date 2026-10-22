@@ -33,8 +33,10 @@ import hashlib
 import importlib.util
 import os
 import queue
+import json
 import tempfile
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -95,6 +97,8 @@ class _Participant:
         self.process = process
         self.queues = queues
         self.outbox_buffer: list[Any] = []
+        # The `replay response` payloads sent, without task and round.
+        self.replay_answers: list[dict] = []
 
     def drain_outbox(self) -> list[CapturedMessage]:
         captured: list[CapturedMessage] = []
@@ -193,6 +197,12 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: results_scored for {slug!r} = {got}, '
                         f'expected {want}')
+            elif key == 'replay_answers':
+                # Every `replay response` sent, in order (RD_12.6 plan §3.7).
+                if self.replay_answers != list(expected or []):
+                    raise AssertionError(
+                        f'{self.id}: replay_answers = {self.replay_answers}, '
+                        f'expected {expected}')
             elif key == 'results_forwarded':
                 # {task: <slug>, executors: [<pid>, ...]}: the results handed
                 # on toward the app, in order, by executor (ISSUES §2.8: the
@@ -548,6 +558,15 @@ class NegotiationAdapter:
                     required_tier=cap_tier_fix.get(own_cap, 0))
 
             participant = self._build_one(pid, role, identity, peers, pcap, own_caps)
+            # retained_traces: {<executor>: [{task, requestor, states}]} -- a
+            # trace the executor keeps to answer a verifier (RD_12.6 plan
+            # §3.7). Mirrors the C adapter.
+            for kept in (fixtures.get('retained_traces', {}) or {}).get(pid, []):
+                req = _PARTICIPANT_IDENTITIES.get(kept['requestor'])
+                participant.process.__dict__.setdefault('_traces', {})[
+                    str(uuid5(_NS, 'task:%s' % kept['task']))] = (
+                    list(kept['states']), str(req.uuid) if req else '',
+                    time.monotonic() + 60)
             handles[pid] = ParticipantHandle(
                 id=pid, role=role, impl=participant,
                 dispatch=lambda msg, p=participant: self._dispatch(p, msg),
@@ -601,6 +620,11 @@ class NegotiationAdapter:
         def _record_and_put(item, *args, **kwargs):
             if isinstance(item, Message):
                 captured.outbox_buffer.append(item)
+                if item.function == 'replay response':
+                    answer = json.loads(item.obj) if isinstance(item.obj, str) else dict(item.obj)
+                    answer.pop('task', None)
+                    answer.pop('round', None)
+                    captured.replay_answers.append(answer)
             original_put(item, *args, **kwargs)
 
         queues[CfgIds.network].put = _record_and_put  # type: ignore[method-assign]
@@ -683,6 +707,11 @@ class NegotiationAdapter:
             requestor = recipient or sender_identity
             base_task = Task(params, requestor, uuid=task_uuid)
             obj = TaskResult(task=base_task, result=payload.get('result'))
+        elif function in ('replay challenge', 'replay reveal'):
+            # {task, round, index}: a verifier's question about the trace of
+            # `task_id` (RD_12.6 plan §3.7).
+            obj = json.dumps({'task': str(task_uuid), 'round': int(payload.get('round', 1)),
+                              'index': int(payload.get('index', 0))})
         elif function == 'tier_lost':
             # Local IPC from ReputationProcess: payload describes the
             # affected peer and its new tier. handle_tier_lost reads
@@ -714,6 +743,9 @@ class NegotiationAdapter:
             to_whom=to_whom,
             encrypt=True,
         )
+        # The replay verbs answer only an authenticated sender, as the network
+        # process marks a verified frame.
+        msg.verified = function in ('replay challenge', 'replay reveal')
         return msg
 
 

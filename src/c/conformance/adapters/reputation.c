@@ -414,7 +414,8 @@ static json_t *_rp_roster_member(sce_run_ctx_t *ctx, const char *pid);
 /* A roster entry of a chain spec, placed alone at the chain's next index
  * (doc/architecture/reputation.md, "Who is in the group"): {roster: genesis,
  * members: [ids]} or {roster: add, member: id}, its placement certificate
- * signed by `placed_by: [ids]`. Mirrors the Python adapter's _write_roster. */
+ * signed by `placed_by: [ids]`; `n_min: N` declares an N_min (RD_13.2 plan
+ * section 0.4). Mirrors the Python adapter's _write_roster. */
 static void _write_roster(sce_run_ctx_t *ctx, tx_history_t *hist, json_t *ce)
 {
     const char *op = json_string_value(json_object_get(ce, "roster"));
@@ -469,11 +470,14 @@ static void _write_roster(sce_run_ctx_t *ctx, tx_history_t *hist, json_t *ce)
     tx.roster = true;
     at_strlcpy(tx.roster_op, op, sizeof(tx.roster_op));
     at_strlcpy(tx.roster_digest, d, sizeof(tx.roster_digest));
+    json_t *nm = json_object_get(ce, "n_min");
+    tx.roster_n_min = json_is_integer(nm) ? (int)json_integer_value(nm) : 0;
     uuid_t wu;
     if (who != NULL && uuid_parse(who, wu) == 0)
         uuid_copy(tx.roster_uuid, wu);
-    tx_roster_task_uuid(have_prev ? r.task_uuid : NULL, op,
-                        who != NULL ? tx.roster_uuid : NULL, d, tx.task_uuid);
+    tx_roster_task_uuid_n(have_prev ? r.task_uuid : NULL, op,
+                          who != NULL ? tx.roster_uuid : NULL, d,
+                          tx.roster_n_min, tx.task_uuid);
     int k = hist->next_index;
     char *sigs_text = NULL;
     json_t *by = json_object_get(ce, "placed_by");
@@ -690,6 +694,22 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
     else
         unsetenv("AT_SLASH_ENABLED");
 
+    /* n_min: { "<pid>": N } -- the N_min the participant this step is
+     * delivered to is configured for (RD_13.2 plan section 0.4). Set or
+     * cleared on every install, like AT_SLASH_ENABLED. Mirrors the Python
+     * adapter, which sets each process's N_MIN. */
+    {
+        json_t *nm = json_object_get(json_object_get(g_fixtures, "n_min"), target_id);
+        if (json_is_integer(nm))
+        {
+            char buf[24];
+            snprintf(buf, sizeof(buf), "%lld", (long long)json_integer_value(nm));
+            setenv("AT_REP_N_MIN", buf, 1);
+        }
+        else
+            unsetenv("AT_REP_N_MIN");
+    }
+
     /* Every group places its order. Placement state lives in a directory of
      * its own, emptied before every step: rep_state is reset per step, and a
      * promise persisted by one step must not come back in the next except
@@ -867,7 +887,8 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
         if (json_is_array(entries))
             json_array_foreach(entries, lc_i, lc_e)
                 placed = placed || json_object_get(lc_e, "batch") != NULL
-                                || json_object_get(lc_e, "certified_by") != NULL;
+                                || json_object_get(lc_e, "certified_by") != NULL
+                                || json_object_get(lc_e, "roster") != NULL;
         if (placed)
         {
             /* A placed (or certified) local chain: built apart, then loaded
@@ -1296,21 +1317,26 @@ static int _rp_roster_entry(sce_run_ctx_t *ctx, json_t *e, const char *to_id,
     tx->roster = true;
     at_strlcpy(tx->roster_op, op, sizeof(tx->roster_op));
     at_strlcpy(tx->roster_digest, d, sizeof(tx->roster_digest));
+    json_t *nm = json_object_get(e, "n_min");
+    int n_min = json_is_integer(nm) ? (int)json_integer_value(nm) : 0;
+    tx->roster_n_min = n_min;
     if (strcmp(op, "genesis") == 0)
-        tx_roster_task_uuid(NULL, "genesis", NULL, d, task);
+        tx_roster_task_uuid_n(NULL, "genesis", NULL, d, n_min, task);
     else if (who != NULL && uuid_parse(who, wu) == 0)
     {
         uuid_copy(tx->roster_uuid, wu);
-        tx_roster_task_uuid(prev, "add", wu, d, task);
+        tx_roster_task_uuid_n(prev, "add", wu, d, n_min, task);
     }
     else
-        tx_roster_task_uuid(prev, "restate", NULL, d, task);
+        tx_roster_task_uuid_n(prev, "restate", NULL, d, n_min, task);
     uuid_copy(tx->task_uuid, task);
     char t[UUID_STRING_LEN + 1];
     uuid_unparse_lower(task, t);
     json_t *r = json_pack("{s:s, s:o, s:s, s:o}", "op", op,
                           "uuid", who != NULL ? json_string(who) : json_null(),
                           "digest", d, "members", norm);
+    if (n_min > 0)
+        json_object_set_new(r, "n_min", json_integer(n_min));
     *wire = json_pack("{s:s, s:o}", "task", t, "roster", r);
     json_decref(added);
     json_decref(members);

@@ -32,9 +32,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from autonomous_trust.oracle.replication import (adjudicate, bisect_adjudicate,
-                                                 commit_root, parse_replication,
-                                                 should_replicate, verify)
+from autonomous_trust.oracle.replication import (
+    CORROBORATED, DEFAULT_MAX_STATE_BYTES, ChallengeSession,
+    ReplicationDeclarationError, adjudicate, bisect_adjudicate, commit_root,
+    hash_chain, parse_replication, settle, should_replicate, verify)
 
 from ...common.scenario_loader import Case
 
@@ -71,6 +72,14 @@ class ReplicationAdapter:
             self._adjudicate(model, where, event)
         elif 'bisect' in event:
             self._bisect(model, where, event)
+        elif 'challenge' in event:
+            self._challenge(model, where, event)
+        elif 'declare' in event:
+            self._declare(where, event)
+        elif 'live_prob' in event and 'capability' in event:
+            self._live_prob(model, where, event)
+        elif 'replay' in event and 'capability' in event:
+            self._replay(model, where, event)
         elif 'prob' in event and 'capability' in event:
             # A bare probability-lookup assertion (no draw), for rows that pin
             # only the declaration's resolution of a capability to its number.
@@ -168,3 +177,81 @@ class ReplicationAdapter:
         if abs(actual - want) > TOL:
             raise AssertionError(
                 f'{where}: prob_for({cap!r})={actual!r}, expected {want!r}')
+
+    # --- the live declaration and game (RD_12.6 plan, Phases 1 and 2) -----
+
+    def _declare(self, where: str, event: dict[str, Any]) -> None:
+        """A declaration parsed on its own: `refused: true` pins a refusal."""
+        try:
+            parse_replication(event['declare'])
+            refused = False
+        except ReplicationDeclarationError:
+            refused = True
+        if refused != bool(event.get('refused', False)):
+            raise AssertionError(f'{where}: refused={refused}, expected '
+                                 f'{bool(event.get("refused", False))}')
+
+    def _live_prob(self, model, where: str, event: dict[str, Any]) -> None:
+        cap, want = event['capability'], float(event['live_prob'])
+        actual = model.live_prob_for(cap)
+        if abs(actual - want) > TOL:
+            raise AssertionError(
+                f'{where}: live_prob_for({cap!r})={actual!r}, expected {want!r}')
+
+    def _replay(self, model, where: str, event: dict[str, Any]) -> None:
+        cap, want = event['capability'], event['replay']
+        spec = model.replay_for(cap)
+        actual = None if spec is None else {'max_steps': spec.max_steps,
+                                            'max_state_bytes': spec.max_state_bytes}
+        if actual != want:
+            raise AssertionError(
+                f'{where}: replay_for({cap!r})={actual}, expected {want}')
+
+    def _challenge(self, model, where: str, event: dict[str, Any]) -> None:
+        """Play the live game: each executor answers from its own chain,
+        except at the indices `lies` names; each reveals its own states at k,
+        overridden by `reveal`. The `reference` stands in for re-executing the
+        step (None past its end: the computation is over)."""
+        spec = event['challenge']
+        traces = spec.get('traces', {}) or {}
+        peers = list(traces.keys())
+        if len(peers) != 2:
+            raise AssertionError(f'{where}: challenge needs exactly two traces')
+        side = dict(zip(peers, ('a', 'b')))
+        chains = {p: hash_chain(traces[p]) for p in peers}
+        lies = {p: {int(i): d for i, d in (spec.get('lies', {}) or {}).get(p, {}).items()}
+                for p in peers}
+        session = ChallengeSession(
+            len(traces[peers[0]]), commit_root(traces[peers[0]]),
+            len(traces[peers[1]]), commit_root(traces[peers[1]]))
+        while (step := session.pending()) is not None:
+            index, owe = step
+            given = {}
+            for p in peers:
+                if side[p] in owe:
+                    given[side[p]] = lies[p].get(index, chains[p][index])
+            session.answer(index, given.get('a'), given.get('b'))
+        k = session.divergence
+        if 'asked' in event and session.asked != list(event['asked']):
+            raise AssertionError(
+                f'{where}: asked={session.asked}, expected {event["asked"]}')
+        if 'divergence_index' in event and k != event['divergence_index']:
+            raise AssertionError(
+                f'{where}: divergence_index={k}, expected {event["divergence_index"]}')
+        if k is None:
+            verdicts = {p: CORROBORATED for p in peers}
+        else:
+            reveals = {}
+            for p in peers:
+                st, ch = traces[p], chains[p]
+                r = {'prev': ch[k - 2] if k >= 2 else None,
+                     'pre': st[k - 1] if 1 <= k <= len(st) else None,
+                     'state': st[k] if k < len(st) else None}
+                r.update((spec.get('reveal', {}) or {}).get(p, {}))
+                reveals[side[p]] = r
+            reference = spec.get('reference', []) or []
+            out = settle(session, reveals,
+                         lambda _pre: reference[k] if k < len(reference) else None,
+                         int(spec.get('max_state_bytes', DEFAULT_MAX_STATE_BYTES)))
+            verdicts = {p: out[side[p]] for p in peers}
+        self._check_verdicts_scores(where, event, verdicts)

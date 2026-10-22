@@ -29,4 +29,8 @@ static void __attribute__((constructor)) replication_oracle_register(void)
     (void)neg_oracle_register(&replication_oracle);
 }
 
-void at_replication_link(void) {}
+/* replication_live.c: the requestor's side of live replication. Referenced
+ * here so a static link keeps its registration constructors too. */
+void at_replication_live_link(void);
+
+void at_replication_link(void) { at_replication_live_link(); }

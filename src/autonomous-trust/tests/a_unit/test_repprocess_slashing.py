@@ -343,9 +343,11 @@ class TestSlashFlow:
         # It has NOT applied the floor yet (waits for final).
         assert str(target) not in acc._slashed
 
-        # Acceptor receives the finalized slash -> applies the floor.
+        # Acceptor receives the finalized slash -> applies the floor. Two of a
+        # group of two: the slasher's signature and the acceptor's own.
         signed = SignedSlash(attestation=att,
-                             sigs={str(slasher_id): _cosign(slasher, att)})
+                             sigs={str(slasher_id): _cosign(slasher, att),
+                                   voter: sig})
         final = Message(CfgIds.reputation, ReputationProtocol.slash_final,
                         to_json_string(signed), acc.group,
                         from_whom=slasher)
@@ -371,9 +373,38 @@ class TestSlashFlow:
                                       final) is True
         assert str(target) not in acc._slashed
 
+    def test_slash_sign_even_group_waits_for_a_majority(self):
+        """Two of a group of four is half, not a majority, so the slasher holds
+        the round until a second co-signature arrives (RD_13.2 plan §0.4).
+        The old bar, more than len(peers) // 2, finalized on the first."""
+        rp = _make_rep_process()
+        voters = [_identity('v1'), _identity('v2'), _identity('v3')]
+        rp.protocol.peers.all = list(voters)
+        net_q = queue.Queue()
+        att = SlashAttestation(slasher_uuid=None, target_uuid=uuid4(),
+                               reason=SlashAttestation.REASON_SUSTAINED_ANOMALY,
+                               floor_score=0.1)
+        rp.forward_slash({CfgIds.network: net_q}, att)
+        net_q.get_nowait()  # drain the slash_propose
+        key = att.key()
+
+        def ack(voter):
+            msg = Message(CfgIds.reputation, ReputationProtocol.slash_sign,
+                          to_json_string((key[0], key[1], str(voter.uuid),
+                                          _cosign(voter, att))),
+                          rp.group, from_whom=voter)
+            msg.verified = True
+            assert rp.handle_slash_sign({CfgIds.network: net_q}, msg) is True
+
+        ack(voters[0])
+        assert net_q.empty()                    # two of four: held
+        ack(voters[1])
+        final = net_q.get_nowait()              # three of four: finalized
+        assert final.function == ReputationProtocol.slash_final
+
     def test_slash_sign_finalizes_at_quorum(self):
         rp = _make_rep_process()
-        # One peer -> quorum floor(1/2)=0; a single co-sign (>0) finalizes.
+        # A group of two: ours and one co-signature are a strict majority.
         voter = _identity('voter')
         rp.protocol.peers.all = [voter]
         net_q = queue.Queue()
@@ -486,8 +517,10 @@ class TestSlashEvidence:
         slasher = slasher_id.uuid
         att = _att(slasher, target, floor=0.1, epoch=9)
         att.evidence_ref = rp.build_slash_evidence(tids[0])
+        # A group of two: the slasher and this node both sign.
         signed = SignedSlash(attestation=att,
-                             sigs={str(slasher): _cosign(slasher_id, att)})
+                             sigs={str(slasher): _cosign(slasher_id, att),
+                                   str(rp.identity.uuid): _cosign(rp.identity, att)})
         final = Message(CfgIds.reputation, ReputationProtocol.slash_final,
                         to_json_string(signed), rp.group,
                         from_whom=slasher_id)

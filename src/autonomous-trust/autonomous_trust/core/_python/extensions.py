@@ -152,8 +152,18 @@ class NegotiationHooks:
     the capability's ``required_tier``. A cap may only LOWER the tier
     (:func:`capped_tier` ignores a higher answer), and decides its own gate:
     it is asked whenever the extension is PRESENT, enabled or not, as C's
-    constructor-registered cap is."""
+    constructor-registered cap is.
+
+    ``on_result(proc, queues, task, tracker)`` is asked about every result
+    the requestor accepts, before it goes to the main process (live
+    replication, RD_12.6 plan §3.7). It returns None to leave the result to
+    the core, ``'hold'`` to forward it to the application but hold its score
+    (the feature releases it later, :meth:`NegotiationProcess.release_result`),
+    or ``'consume'`` to take it entirely (neither forwarded nor scored).
+    ``periodic(proc, queues)`` runs once per pass of the negotiation loop."""
     capped_tier: Optional[Callable[[Any, Any, int], int]] = None
+    on_result: Optional[Callable[[Any, Any, Any, Any], Optional[str]]] = None
+    periodic: Optional[Callable[[Any, Any], None]] = None
 
 
 @dataclass(frozen=True)
@@ -413,6 +423,24 @@ def capped_tier(proc, peer_uuid, tier: int) -> int:
         if capped < tier:
             tier = capped
     return tier
+
+
+def negotiation_on_result(proc, queues, task, tracker) -> Optional[str]:
+    """The first answer any extension's ``on_result`` gives (None for none)."""
+    for hooks in negotiation_hooks():
+        if hooks.on_result is None:
+            continue
+        verdict = hooks.on_result(proc, queues, task, tracker)
+        if verdict is not None:
+            return verdict
+    return None
+
+
+def negotiation_periodic(proc, queues) -> None:
+    """Run every extension's negotiation ``periodic``."""
+    for hooks in negotiation_hooks():
+        if hooks.periodic is not None:
+            hooks.periodic(proc, queues)
 
 
 #: The declarations a node's environment can make about a feature, and the

@@ -557,6 +557,24 @@ least that trust tier to invoke the capability (0 means any admitted peer).
 `transaction_weight` sets how much a single use counts toward reputation. See
 [Trust tiers](architecture/trust-tiers.md).
 
+A capability whose computation can be replayed step by step may say so, and
+then a requestor that declares it in `$AT_REPLICATION` can have it checked
+by a second executor ([Replication](architecture/replication.md)):
+
+```python
+from autonomous_trust.core._python.negotiation.replay import Replayable
+
+self.capabilities.register_ability(
+    "integrate", None,
+    replay=Replayable(init=start_state,           # (*args, **kwargs) -> state
+                      step=next_state,            # (state, i) -> state, or None when done
+                      encode=str, decode=parse))  # a state's canonical text, and back
+```
+
+The C twin is `capability_table_set_replay(name, &replay)`, with the
+`capability_replay_t` contract in `processes/capabilities.h`. Every function
+must pickle (no lambdas): a capability crosses into the worker processes.
+
 The node auto-registers a small bootstrap corpus (`at.handshake`,
 `at.time-attest`, `at.echo-challenge`) so new peers have low-stakes interactions
 to earn initial trust. Set `AT_BOOTSTRAP_DISABLED=1` to suppress it.

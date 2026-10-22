@@ -726,10 +726,11 @@ by one. It exists only in development and cohort directories, so at boot it is
 cleared with its placement state and pool, and the group founds it anew (the
 user's call, 2026-10-14).
 
-**Still on the live view.** Checkpoints and slashes keep sizing their quorum
-from the live roster. Merges are out of scope: absorbed members arrive as adds,
-one per instance. A gateway's child chain has its own roster, of that child
-group's members.
+**Still on the live view.** Checkpoints keep sizing their quorum from the live
+roster. Slashes moved to the roster in force on 2026-10-22 (see "Fault model"
+below). Merges are out of scope: absorbed members arrive as adds, one per
+instance. A gateway's child chain has its own roster, of that child group's
+members.
 
 **A contact is not a member.** The live view is the peers in the address map
 of this node's group, or of a child group it gateways (Python
@@ -764,6 +765,107 @@ roster are all run by `tests/a_unit/test_placement_sim.py`. The entry's bytes
 are pinned identically by `tests/a_unit/test_placement_roster.py` and
 `src/c/test/rep_place_roster_test.c`; the C proposer side, the anchor and the
 boot reset by `src/c/test/rep_place_proposer_test.c`.
+
+## Fault model
+
+Every reputation quorum is a strict majority of the group, this node counted.
+That is the crash-fault bound: any two majorities share a member, which is what
+Paxos needs when nobody lies. AT signs everything, and that buys something a
+crash-fault protocol does not have, but it does not make the majorities
+Byzantine-safe (R+D.md §14.0). What the signatures buy is checkability and
+detection, not agreement under a lying majority:
+
+- **Every decision carries a certificate its receivers check.** Slash,
+  checkpoint, attestation, commit and placement certificates are signatures
+  over canonical bytes the receiver re-derives, counted against the receiver's
+  own view of the group. A finalizer cannot choose the bar it has to clear.
+- **A fork is detected and kept, not prevented.** Placement grants are not
+  signed, so a member that hides an accepted value can lead an honest majority
+  to accept a second value at the same index. Two certificates for different
+  values at one index are kept as a fork record holding both (R+D.md §14.1;
+  "Agreeing on an order"), and the members in both signed twice.
+- **The bound is partial synchrony's.** AT runs under DDIL and cannot assume
+  synchrony. With signatures and synchrony, agreement is possible for f < n/2;
+  under partial synchrony signatures do not lift the 3f + 1 bound. The sources
+  are in [Byzantine references](byzantine-references.md).
+
+So the honest description is crash-fault majorities with signed,
+receiver-verified certificates and detectable disagreement. Placement is
+leaderless Multi-Paxos over those majorities. It is not Byzantine Paxos.
+
+**The slash bar** (2026-10-22). A slash finalizes on a strict majority of the
+whole group, the slasher's own signature counted, sized from the roster in
+force and verified with the keys it records, as commit, placement and
+attestation already were. Before a genesis, the live view decides. The old bar
+was more than half the roster without this node, so two members of four
+finalized a slash, and a slash floors its target into sticky exclusion. Python
+`_quorum_met`, C `_quorum_met_for`, at the slasher's tally and at every
+receiver.
+
+**A declared N_min** (2026-10-22, RD_13.2_BYZANTINE_QUORUM_PLAN.md §0.4). A
+roster entry may declare the cohort size N_min the group should be sized for.
+F = (N_min − 1) // 3, and the bars of the four certificate rounds whose votes
+are signed statements rise from a strict majority to (M + F) // 2 + 1 of the M
+members:
+
+| Round | Counted over | Bar at F = 0 | Bar with F |
+|---|---|---|---|
+| Slash | the roster in force, slasher included | M // 2 + 1 | (M + F) // 2 + 1 |
+| Checkpoint | the live group, proposer included | M // 2 + 1 | (M + F) // 2 + 1 |
+| Attestation | members other than the subject and its teammates, verifier included | O // 2 + 1 | (O + F) // 2 + 1 |
+| Commit certificate | the roster in force; the scorer is the remaining vote | M // 2 others | (M + F) // 2 others |
+
+For five members and N_min 4 (F = 1), a slash needs four signatures instead of
+three. The placement certificate stays a strict majority: its grants are
+unsigned, so a higher bar there would add cost and no safety. A round that
+cannot reach the bar is refused, never finalized at a weaker one, and the first
+refusal of each round logs the bar, the declaration and the member count at
+warning level (Python `_bar_met`, C `_bar_met`). F rises only as fast as the
+cohort does: a group smaller than N_min may find the bar out of reach, which is
+the liveness cost the declaration buys its safety with.
+
+*Where the value comes from.* A node is configured with `AT_REP_N_MIN` (unset
+or 0 declares nothing; anything but a non-negative integer stops the
+reputation process at start). A genesis declares nothing and an add carries
+the value in force, so a declaration changes only by a `restate`. Each member
+reports its configured value in every `place accepted`, and the member leading
+a placement restates the roster declaring X once a strict majority of the
+roster in force has reported X, whatever it is configured for itself. An
+acceptor takes a declared value only if it is the one in force or the one it is
+configured for, so a change needs a majority configured alike, and a mismatch
+leaves the value in force. The leader acts on the reports rather than on its
+own configuration because a value an acceptor refuses is dropped silently, and
+Paxos makes every later proposer carry any value already accepted: a minority
+leader proposing its own value would accept it alone and stall that index. A
+proposer carrying a value, or building one from the reports, leaves the
+configuration check to the acceptors. A restatement that changes the value is
+not held to the half-window age a plain one is.
+
+The declaration is in the roster entry's hash only when made, so an undeclaring
+roster entry hashes as it always did, and so is its task id (`|N_min` follows
+the digest). Wire: `roster.n_min` on the placement wire, `roster_n_min` on the
+catch-up wire and in evidence, `n_min` on `place accepted`. Python
+`Transaction.roster_n_min`, C `transaction_t.roster_n_min` (appended, mirrored
+in `_ffi.py`).
+
+| Behavior | Scenario |
+|---|---|
+| Two of four do not finalize a slash; three do | [`slash-final-even-group-half-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/slash-final-even-group-half-refused.yaml), [`slash-final-even-group-majority-applied.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/slash-final-even-group-majority-applied.yaml) |
+| A slash signer outside the roster in force does not count | [`slash-final-signer-outside-roster-not-counted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/slash-final-signer-outside-roster-not-counted.yaml) |
+| A declared N_min raises the slash bar | [`slash-final-declared-n-min-raises-the-bar.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/slash-final-declared-n-min-raises-the-bar.yaml), [`slash-final-declared-n-min-bar-met-applied.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/slash-final-declared-n-min-bar-met-applied.yaml) |
+| ...the checkpoint bar | [`checkpoint-final-declared-n-min-raises-the-bar.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/checkpoint-final-declared-n-min-raises-the-bar.yaml), [`checkpoint-final-declared-n-min-bar-met-stored.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/checkpoint-final-declared-n-min-bar-met-stored.yaml) |
+| ...the attestation bar | [`attest-final-declared-n-min-raises-the-bar.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/attest-final-declared-n-min-raises-the-bar.yaml), [`attest-final-declared-n-min-bar-met-pooled.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/attest-final-declared-n-min-bar-met-pooled.yaml) |
+| ...the commit-certificate bar | [`commit-cert-declared-n-min-raises-the-bar.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-declared-n-min-raises-the-bar.yaml), [`commit-cert-declared-n-min-bar-met-pooled.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-declared-n-min-bar-met-pooled.yaml) |
+| An acceptor takes a change it is configured for, and no other; an add never changes it | [`place-roster-restate-declaring-configured-n-min-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-roster-restate-declaring-configured-n-min-accepted.yaml), [`place-roster-restate-declaring-unconfigured-n-min-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-roster-restate-declaring-unconfigured-n-min-refused.yaml), [`place-roster-add-changing-n-min-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-roster-add-changing-n-min-refused.yaml) |
+
+The leader's trigger needs state across rounds, which the corpus resets, so it
+is run by `tests/a_unit/test_placement_n_min.py` (a configured majority
+declares its value, a minority including the leader changes nothing and keeps
+placing, a leader configured otherwise still declares the majority's) and by
+`src/c/test/rep_place_proposer_test.c`. The bytes and task ids are pinned
+identically there and in `src/c/test/rep_place_roster_test.c`; the slasher's
+tally by `tests/a_unit/test_repprocess_slashing.py` and
+`src/c/test/rep_quorum_test.c`.
 
 ## Warm start, and why it is safe
 

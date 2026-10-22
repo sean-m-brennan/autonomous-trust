@@ -1,0 +1,43 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: place-roster-restate-declaring-unconfigured-n-min-refused
+byte_pinning: false
+description: |
+    An acceptor refuses a roster restatement declaring an N_min that is neither
+    the one in force nor the one it is configured for (RD_13.2 plan §0.4, call
+    8). bob is configured for none and none is in force, so a restatement
+    declaring 4 is refused: a change needs a majority configured alike.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  roster:
+    bob: [alice, bob, carol]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: place
+    payload:
+      k: 0
+      ballot: {n: 5, by: alice}
+      head: ""
+      value:
+        - {roster: restate, n_min: 4}
+  - id: 2
+    from: bob
+    to: alice
+    function: place accepted
+    in_response_to: 1
+    expect_none: true
+    payload: {}

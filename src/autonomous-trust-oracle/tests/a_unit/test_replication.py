@@ -72,6 +72,42 @@ class TestModel:
             parse_replication({'version': 1,
                                'capabilities': {'x': {}}})  # missing prob
 
+    def test_the_environment_names_the_declaration(self, monkeypatch, tmp_path):
+        from autonomous_trust.oracle.replication.model import (
+            EMPTY_MODEL, load_replication_env)
+        monkeypatch.delenv('AT_REPLICATION', raising=False)
+        assert load_replication_env() is EMPTY_MODEL
+        monkeypatch.setenv('AT_REPLICATION', '')
+        assert load_replication_env() is EMPTY_MODEL
+        path = tmp_path / 'replication.json'
+        path.write_text('{"version": 1, "capabilities": '
+                        '{"cmd": {"replicate_prob": 0.5}}}')
+        monkeypatch.setenv('AT_REPLICATION', str(path))
+        assert load_replication_env().prob_for('cmd') == 0.5
+        path.write_text('{"version": 2}')
+        with pytest.raises(ReplicationDeclarationError):
+            load_replication_env()
+
+    def test_only_a_replayable_capability_is_replicated_live(self):
+        m = parse_replication({'version': 1, 'default_prob': 0.05,
+                               'capabilities': {
+                                   'r': {'replicate_prob': 0.3,
+                                         'replay': {'max_steps': 8}},
+                                   'd': {'replay': {}},
+                                   'p': {'replicate_prob': 0.9}}})
+        assert m.replay_for('r').max_steps == 8
+        assert m.replay_for('r').max_state_bytes == 4096
+        assert m.replay_for('p') is None
+        assert m.live_prob_for('r') == 0.3
+        assert m.live_prob_for('d') == pytest.approx(0.05)
+        assert m.live_prob_for('p') == 0.0          # D12: not replayable
+        assert m.prob_for('p') == 0.9               # the pinned lookup stands
+        for bad in ({'max_steps': 0}, {'max_steps': 257}, {'max_steps': True},
+                    {'max_state_bytes': 65537}, 'yes'):
+            with pytest.raises(ReplicationDeclarationError):
+                parse_replication({'version': 1,
+                                   'capabilities': {'x': {'replay': bad}}})
+
     def test_the_empty_model_samples_only_the_default(self):
         assert isinstance(ReplicationModel(), ReplicationModel)
         assert ReplicationModel().prob_for('anything') == pytest.approx(0.05)
@@ -136,3 +172,34 @@ class TestBisection:
                                  'B', ['a', 'b', 'c'], ['a', 'b', 'c', 'd'])
         assert k == 3
         assert v == {'A': CORROBORATED, 'B': OUTVOTED}
+
+
+class TestChallengeSession:
+    """The live game's session refuses what the wire could send it wrong;
+    the game itself is pinned by scenarios/replication/challenge-session.yaml."""
+
+    def _session(self):
+        from autonomous_trust.oracle.replication import ChallengeSession
+        a = hash_chain(['s0', 's1', 's2', 's3'])
+        b = hash_chain(['s0', 's1', 'X2', 'X3'])
+        return ChallengeSession(4, a[-1], 4, b[-1]), a, b
+
+    def test_an_answer_out_of_turn_or_short_is_refused(self):
+        s, a, b = self._session()
+        assert s.pending() == (1, ('a', 'b'))
+        with pytest.raises(ValueError):
+            s.answer(2, a[2], b[2])             # not the index asked
+        with pytest.raises(ValueError):
+            s.answer(1, a[1], None)             # b owes a digest
+        with pytest.raises(ValueError):
+            s.answer(1, a[1], 'short')          # not a digest
+        s.answer(1, a[1], b[1])
+        s.answer(2, a[2], b[2])
+        assert s.done and s.divergence == 2 and s.asked == [1, 2]
+
+    def test_no_dispute_asks_nothing(self):
+        from autonomous_trust.oracle.replication import ChallengeSession
+        root = commit_root(['s0', 's1'])
+        s = ChallengeSession(2, root, 2, root)
+        assert not s.disputed and s.done and s.divergence is None
+        assert s.pending() is None

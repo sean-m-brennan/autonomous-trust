@@ -1022,6 +1022,107 @@ DEFINE_TEST(test_a_chain_from_before_rosters_is_reset)
 }
 END_TEST_DEFINITION()
 
+/* ---- The declared N_min (RD_13.2 plan section 0.4) ---------------------- */
+
+/* An acceptance of g_place from @p who reporting @p n_min (0 for none). */
+static void _accept_n(process_t *proc, identity_t *who, int n_min)
+{
+    char digest[TX_HASH_HEX_LEN + 1];
+    _digest_of(g_place, digest);
+    uint8_t desig[PLACE_DESIG_MAX];
+    size_t dlen = place_designation(
+        (int)json_integer_value(json_object_get(g_place, "k")),
+        json_string_value(json_object_get(g_place, "head")), digest, desig, sizeof(desig));
+    char sig[crypto_sign_BYTES * 2 + 1] = {0};
+    _hex_sig(who, desig, dlen, sig);
+    json_t *extra = json_pack("{s:s, s:s}", "digest", digest, "sig", sig);
+    if (n_min > 0)
+        json_object_set_new(extra, "n_min", json_integer(n_min));
+    json_t *r = _reply(g_place, extra);
+    _send(proc, who, ACCEPTED_FN, r);
+    json_decref(r);
+    json_decref(extra);
+}
+
+/* Place one task with p0 and p1 accepting, then p2's late acceptance; each
+ * reports reported[i]. Leaves nothing captured. */
+static void _place_reporting(process_t *proc, const int reported[3])
+{
+    uuid_t task;
+    _ready_task(p[0], p[1], p[2], me, task);
+    reputation_place_start(proc);
+    ck_assert_ptr_nonnull(g_request);
+    json_t *grant = _reply(g_request, NULL);
+    _send(proc, p[0], GRANT_FN, grant);
+    _send(proc, p[1], GRANT_FN, grant);
+    json_decref(grant);
+    ck_assert_ptr_nonnull(g_place);
+    _accept_n(proc, p[0], reported[0]);
+    _accept_n(proc, p[1], reported[1]);
+    ck_assert_ptr_nonnull(g_placed);
+    _accept_n(proc, p[2], reported[2]);      /* after the round closed */
+    json_decref(g_request);
+    json_decref(g_place);
+    json_decref(g_placed);
+    g_request = g_place = g_placed = NULL;
+}
+
+static int _value_n_min(json_t *place)
+{
+    return (int)json_integer_value(json_object_get(json_object_get(json_array_get(
+        json_object_get(place, "value"), 0), "roster"), "n_min"));
+}
+
+/* Three of the four report 7 and this node is configured for none: the
+ * leader restates the roster declaring the majority's value, not its own.
+ * Mirrors test_placement_n_min.py
+ * test_a_leader_configured_otherwise_still_declares_the_majoritys. */
+DEFINE_TEST(test_the_leader_restates_the_roster_a_majority_reports)
+{
+    unsetenv("AT_REP_N_MIN");
+    process_t *proc = _begin();
+    const int reported[3] = {7, 7, 7};
+    _place_reporting(proc, reported);
+    reputation_maybe_place(proc);
+    ck_assert_ptr_nonnull(g_place);
+    ck_assert_str_eq(_value_op(g_place), "restate");
+    ck_assert_int_eq(_value_n_min(g_place), 7);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* This node and one other are configured for 7, two of four: no majority,
+ * so the leader proposes no change (a minority leader proposing its own value
+ * could stall the instance; RD_13.2 plan section 0.4, call 9). */
+DEFINE_TEST(test_a_minority_including_the_leader_restates_nothing)
+{
+    setenv("AT_REP_N_MIN", "7", 1);
+    process_t *proc = _begin();
+    const int reported[3] = {7, 0, 0};
+    _place_reporting(proc, reported);
+    reputation_maybe_place(proc);
+    ck_assert_ptr_null(g_place);
+    unsetenv("AT_REP_N_MIN");
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* With this node's own configuration, three of four is a majority. */
+DEFINE_TEST(test_a_majority_counting_the_leader_restates_the_roster)
+{
+    setenv("AT_REP_N_MIN", "7", 1);
+    process_t *proc = _begin();
+    const int reported[3] = {7, 7, 0};
+    _place_reporting(proc, reported);
+    reputation_maybe_place(proc);
+    ck_assert_ptr_nonnull(g_place);
+    ck_assert_str_eq(_value_op(g_place), "restate");
+    ck_assert_int_eq(_value_n_min(g_place), 7);
+    unsetenv("AT_REP_N_MIN");
+    _end();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(RepPlaceProposer,
           test_a_chain_from_before_rosters_is_reset,
           test_a_newcomer_adopts_the_history_its_group_signed,
@@ -1040,4 +1141,7 @@ RUN_TESTS(RepPlaceProposer,
           test_a_child_chain_round_goes_to_that_group_alone,
           test_a_round_places_our_ready_items,
           test_a_reported_value_is_carried_instead_of_ours,
-          test_a_nack_ends_the_round_and_the_next_outranks_it)
+          test_a_nack_ends_the_round_and_the_next_outranks_it,
+          test_the_leader_restates_the_roster_a_majority_reports,
+          test_a_minority_including_the_leader_restates_nothing,
+          test_a_majority_counting_the_leader_restates_the_roster)

@@ -22,7 +22,8 @@
  * @brief The R+D.md §12.6 replicated execution layer (libat_replication).
  *
  * Linking libat_replication registers, through negotiation/neg_oracle.h, its
- * declaration only: nothing in the negotiation process calls it yet. It links
+ * declaration, and through negotiation/neg_ext.h the requestor's side of live
+ * replication (replication_live.c, RD_12.6_LIVE_REPLICATION_PLAN.md). It links
  * libat_certificates (SplitMix64). It speaks only when its declaration (no
  * declaration yet) names a model, so linking or loading it changes nothing on
  * its own; a node that declares the layer without it refuses to start

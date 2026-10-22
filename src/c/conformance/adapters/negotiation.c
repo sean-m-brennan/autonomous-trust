@@ -119,6 +119,9 @@ static size_t g_n_scores;
  * adapter reads the results handed to main without `score_only`. */
 static struct { uuid_t task; uuid_t executor; } g_forwards[NEG_SCORES_MAX];
 static size_t g_n_forwards;
+/* The `replay response` payloads sent this scenario, without `task` and
+ * `round` (RD_12.6 plan 3.7). `replay_answers` asserts them. */
+static json_t *g_answers;
 
 static int _send_hook(const char *key,
                       const message_type_t type,
@@ -140,6 +143,21 @@ static int _send_hook(const char *key,
         uuid_copy(g_forwards[g_n_forwards].executor,
                   msg->info.task_result.requestor_uuid);
         g_n_forwards++;
+    }
+    if (type == NET_MESSAGE && msg->info.net_msg.function != NULL
+        && strcmp(msg->info.net_msg.function, NEG_PROTO_REPLAY_RESPONSE) == 0)
+    {
+        json_t *a = NULL;
+        if (net_msg_unpack_json(&msg->info.net_msg, &a) == 0 && json_is_object(a))
+        {
+            json_object_del(a, "task");
+            json_object_del(a, "round");
+            if (g_answers == NULL)
+                g_answers = json_array();
+            json_array_append_new(g_answers, a);
+        }
+        else
+            json_decref(a);
     }
     const char *to_id = _resolve_to_id(msg);
     const char *function = (type == NET_MESSAGE && msg->info.net_msg.function != NULL)
@@ -402,6 +420,33 @@ static void _apply_fixtures(sce_run_ctx_t *ctx)
      * each participant's own-capability allowlist on their process_t.
      * Empty list (e.g. "bob: []") explicitly opts a participant out of
      * the static capability_table and forces refusal-on-not-capable. */
+    /* retained_traces: { "<executor>": [{task: <slug>, requestor: <pid>,
+     * states: [...]}] } -- a trace the executor keeps to answer a verifier
+     * (RD_12.6 plan 3.7). C keeps one table per binary, so the executor
+     * named only says whose it is. Mirrors the Python adapter. */
+    json_t *rt = json_object_get(fixtures, "retained_traces");
+    if (json_is_object(rt))
+    {
+        const char *pid;
+        json_t *list;
+        json_object_foreach(rt, pid, list) {
+            size_t ri;
+            json_t *e;
+            json_array_foreach(list, ri, e) {
+                uuid_t task, req;
+                _uuid5("task:", json_string_value(json_object_get(e, "task")), task);
+                _uuid5("neg:", json_string_value(json_object_get(e, "requestor")), req);
+                json_t *st = json_object_get(e, "states");
+                size_t n = json_array_size(st);
+                const char **states = n > 0 ? calloc(n, sizeof(char *)) : NULL;
+                for (size_t k = 0; k < n; k++)
+                    states[k] = json_string_value(json_array_get(st, k));
+                (void)negotiation_retain_trace_for_test(task, req, states, (int)n);
+                free((void *)states);
+            }
+        }
+    }
+
     json_t *caps = json_object_get(fixtures, "capabilities");
     if (json_is_object(caps))
     {
@@ -675,6 +720,17 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         body = _build_task_json(payload, task_uuid, requestor,
                                 PY_TYPE_TASK_RESULT);
     }
+    else if (strcmp(function, NEG_PROTO_REPLAY_CHALLENGE) == 0
+             || strcmp(function, NEG_PROTO_REPLAY_REVEAL) == 0)
+    {
+        /* {task, round, index}: a verifier's question about the trace of
+         * `task_id` (RD_12.6 plan 3.7). */
+        char t[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(task_uuid, t);
+        body = json_pack("{s:s, s:I, s:I}", "task", t,
+                         "round", (json_int_t)json_integer_value(json_object_get(payload, "round")),
+                         "index", (json_int_t)json_integer_value(json_object_get(payload, "index")));
+    }
     else if (strcmp(function, "tier_lost") == 0)
     {
         /* Local-IPC tier_lost payload: 2-element array
@@ -726,6 +782,10 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     strncpy(out->info.net_msg.process, "negotiation", PROC_NAME_LEN);
     out->info.net_msg.function = (char *)function;
     out->info.net_msg.encrypt = false;
+    /* The replay verbs answer only an authenticated sender, as the network
+     * layer marks a verified frame. */
+    out->info.net_msg.verified = strcmp(function, NEG_PROTO_REPLAY_CHALLENGE) == 0
+        || strcmp(function, NEG_PROTO_REPLAY_REVEAL) == 0;
     memcpy(&out->info.net_msg.from_whom, sender_impl->pub, sizeof(public_identity_t));
     /* A `spawn task` step goes from the requestor to itself, but on a start
      * message `to_whom` is the peer the task is ADDRESSED to (start_task), and
@@ -909,6 +969,21 @@ static int _negotiation_check_expected_state(sce_run_ctx_t *ctx)
                                  json_string_value(who));
                         return -1;
                     }
+                }
+            } else if (strcmp(key, "replay_answers") == 0) {
+                /* [ {index, digest} | {index, reveal: {prev, pre, state}} ]:
+                 * every `replay response` sent, in order (RD_12.6 plan
+                 * 3.7). */
+                json_t *got = g_answers != NULL ? g_answers : json_array();
+                bool same = json_equal(got, val);
+                if (g_answers == NULL)
+                    json_decref(got);
+                if (!same) {
+                    char *gs = json_dumps(g_answers, JSON_COMPACT | JSON_SORT_KEYS);
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: replay_answers = %.300s", pid, gs ? gs : "[]");
+                    free(gs);
+                    return -1;
                 }
             } else if (strcmp(key, "results_forwarded") == 0) {
                 /* {task: <slug>, executors: [<pid>, ...]}: the results handed
@@ -1130,6 +1205,8 @@ void at_negotiation_run(const at_case_t *c, at_case_result_t *out)
     negotiation_reset_state();
     g_n_scores = 0;
     g_n_forwards = 0;
+    json_decref(g_answers);
+    g_answers = NULL;
 
     json_t *parts = json_object_get(c->data, "participants");
     if (!json_is_array(parts))

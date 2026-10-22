@@ -238,7 +238,8 @@ class TaskResult(TaskInfo):
                  certificate=None, prediction=None,
                  requested_capability_name: str = None,
                  requested_args=None, requested_kwargs=None,
-                 requested_at: float = None, **kwargs):
+                 requested_at: float = None, trace_root: str = None,
+                 trace_len: int = None, **kwargs):
         if task is None:
             task_args = {}
         else:
@@ -246,6 +247,17 @@ class TaskResult(TaskInfo):
         super().__init__(**task_args, **kwargs)
         self.result = result
         self.proof = proof
+        # The executor's commitment to its trace (RD_12.6 plan, D9): the last
+        # digest of the hash chain over the states a replayable capability
+        # passed through, and how many there were. None for any other
+        # capability. The executor's to assert, like `certificate`, and safe
+        # for the same reason: a replica's disagreement is settled against it,
+        # and an executor whose later answers contradict it loses.
+        self.trace_root = trace_root
+        self.trace_len = trace_len
+        # The states themselves, local to the executor: they stay here to
+        # answer a verifier, never on the wire (`to_dict` drops them).
+        self.trace_states = None
         # The witness that makes this answer checkable (R+D.md §12.3). A
         # SEPARATE field from `proof`, and from `result`, because the three are
         # different claims: `result` is the answer, `certificate` is what makes
@@ -315,6 +327,11 @@ class TaskResult(TaskInfo):
         # Likewise the requestor's own note that this result is scored but
         # not forwarded to the application (negprocess.handle_results).
         d.pop('score_only', None)
+        d.pop('trace_states', None)
+        # And the requestor's replication bookkeeping (RD_12.6 plan §3.7):
+        # a held score, and the verdict a held result is released with.
+        d.pop('score_hold', None)
+        d.pop('replication_score', None)
         return d
 
     def attach_executor(self, executor_uuid) -> bool:

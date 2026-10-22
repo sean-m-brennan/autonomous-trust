@@ -20,6 +20,7 @@
 #include <math.h>
 #include <errno.h>
 #include <ctype.h>
+#include <limits.h>
 #include <sodium.h>
 
 #include "utilities/portable.h"  /* uuid_generate_sha1 / st_mtim on Darwin */
@@ -124,6 +125,10 @@ int transaction_canonical_bytes(const transaction_t *tx, char *out, size_t outsz
             uuid_unparse_lower(tx->roster_uuid, who);
         n += snprintf(buf + n, sizeof(buf) - n, "|roster|%s|%s|%s", tx->roster_op,
                       who, tx->roster_digest[0] != '\0' ? tx->roster_digest : "null");
+        /* The declaration, only when made: no undeclaring roster entry's
+         * bytes change. */
+        if (tx->roster_n_min > 0 && n > 0 && (size_t)n < sizeof(buf))
+            n += snprintf(buf + n, sizeof(buf) - n, "|%d", tx->roster_n_min);
     }
     if (n < 0 || (size_t)n >= sizeof(buf) || (size_t)n >= outsz)
         return -1;
@@ -223,14 +228,28 @@ bool tx_roster_op_valid(const char *op)
 void tx_roster_task_uuid(const uuid_t prev, const char *op, const uuid_t member,
                          const char *digest, uuid_t out)
 {
+    tx_roster_task_uuid_n(prev, op, member, digest, 0, out);
+}
+
+int tx_byzantine_f(int n_min)
+{
+    return n_min > 0 ? (n_min - 1) / 3 : 0;
+}
+
+void tx_roster_task_uuid_n(const uuid_t prev, const char *op, const uuid_t member,
+                           const char *digest, int n_min, uuid_t out)
+{
     char p[UUID_STRING_LEN + 1] = "null", m[UUID_STRING_LEN + 1] = "null";
     if (prev != NULL)
         uuid_unparse_lower(prev, p);
     if (member != NULL)
         uuid_unparse_lower(member, m);
-    char name[2 * UUID_STRING_LEN + TX_ROSTER_OP_LEN + TX_HASH_HEX_LEN + 8];
-    int n = snprintf(name, sizeof(name), "%s|%s|%s|%s", p, op != NULL ? op : "",
-                     m, digest != NULL ? digest : "");
+    char name[2 * UUID_STRING_LEN + TX_ROSTER_OP_LEN + TX_HASH_HEX_LEN + 24];
+    int n = n_min > 0
+        ? snprintf(name, sizeof(name), "%s|%s|%s|%s|%d", p, op != NULL ? op : "",
+                   m, digest != NULL ? digest : "", n_min)
+        : snprintf(name, sizeof(name), "%s|%s|%s|%s", p, op != NULL ? op : "",
+                   m, digest != NULL ? digest : "");
     if (n < 0 || (size_t)n >= sizeof(name))
         n = (int)strnlen(name, sizeof(name) - 1);
     uuid_generate_sha1(out, AT_ROSTER_NS, name, (size_t)n);
@@ -2173,6 +2192,8 @@ static void _tx_roster_to_json(const tx_history_t *hist, const transaction_t *tx
     const char *members = tx_history_roster_members(hist, tx->roster_digest);
     json_t *mj = members != NULL ? json_loads(members, 0, NULL) : NULL;
     json_object_set_new(obj, "roster_members", mj != NULL ? mj : json_array());
+    if (tx->roster_n_min > 0)
+        json_object_set_new(obj, "roster_n_min", json_integer(tx->roster_n_min));
 }
 
 /* Read a roster entry's fields onto @p tx, keeping its member list in
@@ -2186,9 +2207,21 @@ static void _tx_roster_from_json(const json_t *obj, transaction_t *tx,
     tx->roster_op[0] = '\0';
     memset(tx->roster_uuid, 0, sizeof(tx->roster_uuid));
     tx->roster_digest[0] = '\0';
+    tx->roster_n_min = 0;
     const char *op = json_string_value(json_object_get((json_t *)obj, "roster_op"));
     if (!tx_roster_op_valid(op))
         return;
+    /* The declaration: absent or null is none; anything but a non-negative
+     * integer leaves the entry an ordinary one, as a malformed list does. */
+    json_t *nm = json_object_get((json_t *)obj, "roster_n_min");
+    int n_min = 0;
+    if (nm != NULL && !json_is_null(nm))
+    {
+        if (!json_is_integer(nm) || json_integer_value(nm) < 0
+            || json_integer_value(nm) > INT_MAX)
+            return;
+        n_min = (int)json_integer_value(nm);
+    }
     const char *who = json_string_value(json_object_get((json_t *)obj, "roster_uuid"));
     const char *dig = json_string_value(json_object_get((json_t *)obj, "roster_digest"));
     json_t *members = json_object_get((json_t *)obj, "roster_members");
@@ -2202,6 +2235,7 @@ static void _tx_roster_from_json(const json_t *obj, transaction_t *tx,
     if (who != NULL)
         uuid_copy(tx->roster_uuid, wu);
     at_strlcpy(tx->roster_digest, dig, sizeof(tx->roster_digest));
+    tx->roster_n_min = n_min;
     tx->p1_set = tx->p2_set = false;
     if (hist != NULL)
         (void)tx_history_roster_put(hist, members, NULL);
