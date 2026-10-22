@@ -144,7 +144,8 @@ static void _side_free(repl_side_t *s)
     memset(s, 0, sizeof(*s));
 }
 
-static char *_dup(const char *s)
+/* Not _dup: the Windows CRT declares _dup(int) in io.h. */
+static char *_str_dup(const char *s)
 {
     return s != NULL ? strdup(s) : NULL;
 }
@@ -164,8 +165,8 @@ static void _side_from(repl_side_t *s, const neg_result_info_t *info)
         s->result[n] = '\0';
         s->has_result = true;
     }
-    s->certificate_json = _dup(info->certificate_json);
-    s->prediction_json = _dup(info->prediction_json);
+    s->certificate_json = _str_dup(info->certificate_json);
+    s->prediction_json = _str_dup(info->prediction_json);
     if (info->trace_root != NULL)
         at_strlcpy(s->root, info->trace_root, sizeof(s->root));
     s->len = info->trace_root != NULL ? info->trace_len : 0;
@@ -590,9 +591,9 @@ static bool _handle_replay_response(const process_t *proc, directory_t *queues,
             free(g->side[i].prev);
             free(g->side[i].pre);
             free(g->side[i].state);
-            g->side[i].prev = _dup(json_string_value(json_object_get(rv, "prev")));
-            g->side[i].pre = _dup(json_string_value(json_object_get(rv, "pre")));
-            g->side[i].state = _dup(json_string_value(json_object_get(rv, "state")));
+            g->side[i].prev = _str_dup(json_string_value(json_object_get(rv, "prev")));
+            g->side[i].pre = _str_dup(json_string_value(json_object_get(rv, "pre")));
+            g->side[i].state = _str_dup(json_string_value(json_object_get(rv, "state")));
         }
         g->owed[i] = false;
         if (g->owed[0] || g->owed[1])
