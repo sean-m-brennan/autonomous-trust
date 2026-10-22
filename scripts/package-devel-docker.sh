@@ -1,23 +1,24 @@
 #!/usr/bin/env bash
-# Build autonomous-trust-devel .deb/.rpm packages locally, one per distro, by
-# running scripts/package-devel.sh inside each distro's container. Any
+# Build autonomous-trust-devel .deb/.rpm packages locally by running
+# scripts/package-devel.sh inside each distro's container. Any
 # architecture Docker can run: a foreign one (arm64 on an x86_64 host) runs
 # under QEMU emulation, so expect a build to take several times longer than
 # a native one.
 #
-# The default distros match .github/workflows/release-packages.yml; keep the
-# two lists in step.
+# The default distros match .github/workflows/release-packages.yml (the oldest
+# of each family, whose package installs on the newer ones); keep the lists in
+# step.
 #
 # Usage: package-devel-docker.sh [--arch ARCH] [--distro IMAGE]... VERSION [OUTDIR]
 #   --arch ARCH      amd64 or arm64 (default: this host's)
 #   --distro IMAGE   container image to build in, repeatable
-#                    (default: ubuntu:22.04 ubuntu:24.04 debian:12 rockylinux:9 fedora:44)
+#                    (default: ubuntu:22.04 rockylinux:9)
 #   VERSION          release version, e.g. v0.3.0 (a leading 'v' is dropped)
 #   OUTDIR           where the packages land (default: dist/<ARCH>)
 #
 # Examples:
 #   scripts/package-devel-docker.sh --arch arm64 v0.3.0
-#   scripts/package-devel-docker.sh --arch arm64 --distro ubuntu:24.04 v0.3.0 /tmp/pkgs
+#   scripts/package-devel-docker.sh --arch arm64 --distro ubuntu:22.04 v0.3.0 /tmp/pkgs
 #
 # A foreign architecture needs QEMU registered with binfmt_misc on the host
 # (Docker Desktop has it). On Linux, once per boot:
@@ -45,7 +46,7 @@ done
 [ $# -ge 1 ] && [ $# -le 2 ] || usage
 version=$1
 case "$arch" in amd64|arm64) ;; *) echo "unsupported --arch: $arch" >&2; exit 2 ;; esac
-[ ${#distros[@]} -gt 0 ] || distros=(ubuntu:22.04 ubuntu:24.04 debian:12 rockylinux:9 fedora:44)
+[ ${#distros[@]} -gt 0 ] || distros=(ubuntu:22.04 rockylinux:9)
 
 here=$(cd "$(dirname "$0")/.." && pwd)
 outdir=${2:-$here/dist/$arch}

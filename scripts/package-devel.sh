@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Build the autonomous-trust-devel package (C libraries + headers + pkg-config)
-# as a .deb or .rpm for the distro this runs on. libautonomous_trust.so links
-# that distro's libprotobuf, whose soname changes between releases, so each
-# target distro gets its own package, built in its own container.
+# as a .deb or .rpm for the distro this runs on. The library's dependencies
+# (libsodium, jansson, protobuf-c, libuuid) keep one soname across distros, and
+# glibc runs forward, so a package built on the oldest distro of a family
+# installs on the newer ones: ubuntu:22.04 for Ubuntu 22.04+ and Debian 12+,
+# rockylinux:9 for EL9+ and Fedora.
 #
-# .github/workflows/release-packages.yml runs this once per distro on release.
-# Local equivalent (one distro):
-#   docker run --rm -v "$PWD:/src" -w /src ubuntu:24.04 \
+# .github/workflows/release-packages.yml runs this in those two containers on
+# release. Local equivalent (one package; scripts/package-devel-docker.sh runs
+# both, for any architecture):
+#   docker run --rm -v "$PWD:/src" -w /src ubuntu:22.04 \
 #       scripts/package-devel.sh --deps v0.3.0 dist
 #
 # Usage: package-devel.sh [--deps] VERSION OUTDIR
@@ -56,12 +59,9 @@ install_deps() {
 
 if command -v dpkg-architecture >/dev/null; then
     generator=DEB
-    # ubuntu22.04, debian12: one package per distro, told apart by the release.
-    extra=(-DCMAKE_INSTALL_LIBDIR="lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
-           -DCPACK_DEBIAN_PACKAGE_RELEASE="1~${ID}${VERSION_ID}")
+    extra=(-DCMAKE_INSTALL_LIBDIR="lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)")
 else
     generator=RPM
-    # The release gets the dist tag (.el9, .fc44) from CPACK_RPM_PACKAGE_RELEASE_DIST.
     extra=(-DCMAKE_INSTALL_LIBDIR=lib64)
 fi
 

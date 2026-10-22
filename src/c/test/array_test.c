@@ -16,7 +16,6 @@
 
 #include <stdlib.h>
 #include "autonomous_trust/structures/array_priv.h"
-#include "autonomous_trust/utilities/protobuf_shutdown.h"
 #include "autonomous_trust/utilities/util.h"
 #include "autonomous_trust/utilities/logger.h"
 
