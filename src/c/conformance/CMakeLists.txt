@@ -47,7 +47,8 @@ set(AT_CONFORMANCE_SOURCES
 # adapter" -- a skip, not a failure.
 set(AT_CONFORMANCE_EXTENSIONS)
 foreach(_pair physics:physics calibration:calibration prequential:prequential
-              replication:replication certificates:certificate)
+              replication:replication certificates:certificate
+              selection:selection)
     string(REPLACE ":" ";" _pair ${_pair})
     list(GET _pair 0 _layer)
     list(GET _pair 1 _adapter)

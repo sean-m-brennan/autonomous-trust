@@ -182,8 +182,10 @@ foreach(_t at_dtn at_dtn_static)
 endforeach()
 
 install(TARGETS at_dtn at_dtn_static
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT dtn
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT dtn)
+install(FILES at_dtn.h DESTINATION include COMPONENT dtn)
+at_package_component(dtn)
 
 ####################
 # tests (only built when libcheck is available)

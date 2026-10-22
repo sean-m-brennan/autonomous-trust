@@ -1,0 +1,75 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: invitation-draw-checked
+byte_pinning: false
+description: |
+    A worker checks the draw on every fresh invitation it admits, and logs
+    and counts what fails (RD_12.7 plan section 0.2). The invitation is
+    served anyway. Nothing about selection refuses work or touches reputation.
+
+    alice's chain is the fixture root's. Her first invitation to bob carries
+    draw 1 with its true link, which checks against the head. The second
+    carries index 3 with link 2, which does not hash forward to link 1, so it
+    is a bad link. The third carries another chain's head with no rotation
+    proof, so the head has changed. The fourth carries no draw at all, as an
+    older requestor's would, and is never flagged.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_fetch]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: data_fetch
+      task_id: t-d1
+      seq: 1
+      draw: {head: beb82821ef49b96d977db0cb47004e58bcea8d5a49ac6603ace0bd25af61e4be, index: 1, link: d9bd3a6a13eb58fed222fa46ca1b9cb1a65ff49b413484ed1cc7c895c0d6551c}
+  - id: 2
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: data_fetch
+      task_id: t-d2
+      seq: 2
+      draw: {head: beb82821ef49b96d977db0cb47004e58bcea8d5a49ac6603ace0bd25af61e4be, index: 3, link: b525e7260ad69fe05b210c69b337a0a2c0ca34e33250eb20ab7ff0af3648eaaa}
+  - id: 3
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: data_fetch
+      task_id: t-d3
+      seq: 3
+      draw: {head: fbaa67c8721dae798fc3251941eed2828f34d932348152c8bae68c703814b6fe, index: 5, link: f7e0e88a3472614015b5517e16953dfb1df83aaae645ef8ac14a568c410a4028}
+  - id: 4
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: data_fetch
+      task_id: t-d4
+      seq: 4
+  - id: 5
+    from: bob
+    to: alice
+    function: ack
+    in_response_to: 2
+    no_propagate: true
+    description: the invitation with the bad draw is still served.
+
+expected_state:
+  bob:
+    selection_findings:
+      alice: {bad_link: 1, head_changed: 1}

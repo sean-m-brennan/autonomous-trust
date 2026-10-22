@@ -58,6 +58,9 @@
 #ifdef AT_CONF_ORACLE_REPLICATION
 #include "adapters/replication.h"
 #endif
+#ifdef AT_CONF_ORACLE_SELECTION
+#include "adapters/selection.h"
+#endif
 #include "conformance_registry.h"
 
 /* Adapters that handle kind:negative need the JSON corpus root to resolve
@@ -100,6 +103,10 @@ static void dispatch(const at_case_t *c, at_case_result_t *out) {
 #ifdef AT_CONF_ORACLE_REPLICATION
     } else if (strcmp(c->protocol, "replication") == 0) {
         at_replication_conformance_run(c, out);
+#endif
+#ifdef AT_CONF_ORACLE_SELECTION
+    } else if (strcmp(c->protocol, "selection") == 0) {
+        at_selection_conformance_run(c, out);
 #endif
     } else {
         /* An extension's own protocol (conformance_registry.h). */

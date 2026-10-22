@@ -45,7 +45,6 @@ at_extension_library(first_contact
         fc_net.c
     DEPENDS rendezvous
 )
-install(FILES at_first_contact.h DESTINATION include)
 
 at_extension_tests(first_contact
     contacts_device_test

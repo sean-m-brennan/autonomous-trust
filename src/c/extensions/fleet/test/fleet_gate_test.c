@@ -45,6 +45,7 @@
 #include "reputation/reputation.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
+#include "utilities/util.h"
 
 /* -- what was sent ------------------------------------------------------- */
 
@@ -220,7 +221,7 @@ static void _deliver(const node_t *node, const char *function, json_t *body,
     generic_msg_t msg = {0};
     msg.type = NET_MESSAGE;
     msg.info.net_msg.function = (char *)function;
-    strncpy(msg.info.net_msg.process, node->proc->name, PROC_NAME_LEN);
+    at_strlcpy(msg.info.net_msg.process, node->proc->name, sizeof(msg.info.net_msg.process));
     if (from != NULL)
         _publish(from, &msg.info.net_msg.from_whom);
     ck_assert_int_eq(net_msg_pack_json(&msg.info.net_msg, body), 0);

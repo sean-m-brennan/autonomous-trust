@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Build autonomous-trust-devel .deb/.rpm packages locally by running
-# scripts/package-devel.sh inside each distro's container. Any
+# Build the autonomous-trust-devel and autonomous-trust-<extension>-devel
+# .deb/.rpm packages locally by running scripts/package-devel.sh inside each
+# distro's container (the checkout needs the ryu and ud3tn submodules). Any
 # architecture Docker can run: a foreign one (arm64 on an x86_64 host) runs
 # under QEMU emulation, so expect a build to take several times longer than
 # a native one.
@@ -24,6 +25,11 @@
 # (Docker Desktop has it). On Linux, once per boot:
 #   docker run --privileged --rm tonistiigi/binfmt --install arm64
 set -euo pipefail
+
+# The whole script is one { ... } block, so bash reads it all before running
+# any of it: an edit to this file during a long run (the package install, the
+# build) cannot make the running copy resume mid-line in the new text.
+{
 
 usage() { sed -n '/^# Usage/,/^[^#]/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2; exit 2; }
 
@@ -80,3 +86,5 @@ if [ ${#failed[@]} -gt 0 ]; then
     echo "FAILED: ${failed[*]}" >&2
     exit 1
 fi
+exit
+}
