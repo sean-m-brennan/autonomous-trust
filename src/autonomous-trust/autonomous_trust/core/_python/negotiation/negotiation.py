@@ -130,7 +130,8 @@ class TaskParameters(Configuration):
 
 
 class TaskInfo(Configuration):
-    def __init__(self, requestor, uuid: UUID = None, size=1, seq=0, **kwargs):
+    def __init__(self, requestor, uuid: UUID = None, size=1, seq=0,
+                 draw=None, **kwargs):
         self.uuid = uuid
         if uuid is None:
             self.uuid = uuid4()
@@ -169,6 +170,13 @@ class TaskInfo(Configuration):
         # it -- deliberately inert rather than zeroed, so a task object stays a
         # faithful copy of the invitation it came from.
         self.seq = int(seq or 0)
+        # The requestor's auditable coin for this invitation (RD_12.7 plan
+        # §0.1): {head, index, link[, prev_root]} from its committed seed
+        # chain, set only when a selection layer drew the invitee. Absent from
+        # the wire otherwise, so a task nothing selected serializes exactly
+        # as it always has. JSON only, like TaskResult.trace_root; the proto
+        # form does not carry it.
+        self.draw = dict(draw) if isinstance(draw, dict) else None
         # ignore kwargs
 
     def to_dict(self):
@@ -197,6 +205,8 @@ class TaskInfo(Configuration):
         steps pass a bare uuid string) is left exactly as it was.
         """
         d = super().to_dict()
+        if d.get('draw') is None:
+            d.pop('draw', None)
         req = d.get('requestor')
         if req is not None and not isinstance(req, (dict, str, bytes)):
             try:
@@ -332,6 +342,8 @@ class TaskResult(TaskInfo):
         # a held score, and the verdict a held result is released with.
         d.pop('score_hold', None)
         d.pop('replication_score', None)
+        # A selection layer's request to see this result's score (RD_12.7).
+        d.pop('echo_score', None)
         return d
 
     def attach_executor(self, executor_uuid) -> bool:
@@ -549,3 +561,28 @@ class JobQueue(object):
             if job.start is None:
                 job.start = last
         return datetime.fromtimestamp(job.start, tz=UTC)
+
+
+class ScoreEcho:
+    """The main process's score for one result, handed back to the negotiation
+    process (RD_12.7 plan §3.6): Python scores in main, but the selection log
+    the score joins lives in negotiation. Sent only for a result the
+    negotiation process marked ``echo_score``.
+
+    A local object, never a :class:`Message`, so nothing arriving off the wire
+    can be one: every wire frame reaches the negotiation process as a Message.
+    """
+
+    __slots__ = ('task_uuid', 'executor_uuid', 'score', 'channel')
+
+    def __init__(self, task_uuid, executor_uuid, score: float, channel: str):
+        self.task_uuid = str(task_uuid)
+        self.executor_uuid = str(executor_uuid)
+        self.score = float(score)
+        self.channel = channel
+
+    def __getstate__(self):
+        return (self.task_uuid, self.executor_uuid, self.score, self.channel)
+
+    def __setstate__(self, state):
+        self.task_uuid, self.executor_uuid, self.score, self.channel = state

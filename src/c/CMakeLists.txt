@@ -435,8 +435,9 @@ set(DEPENDENCIES
     ${AT_PLATFORM_LIBS}
     ${LIBUUID_LIBRARY}
     ${LIBSODIUM_LIBRARY}
-    ${Protobuf_LIBRARIES}
-    ${LIBPROTOBUF_LIBRARY}
+    # protobuf-c only. The C++ libprotobuf is a build tool's dependency (protoc
+    # and its google/protobuf/*.proto), not the library's: its soname changes
+    # with every distro release, and linking it tied each package to one.
     ${LIBPROTOBUF_C_LIBRARY}
     ${LIBJANSSON_LIBRARY}
     ${CMAKE_THREAD_LIBS_INIT}
@@ -568,7 +569,6 @@ set(libsrc
     autonomous_trust/utilities/msg_types.c
     autonomous_trust/utilities/msg_registry.c
     autonomous_trust/utilities/probes.c
-    autonomous_trust/utilities/protobuf_shutdown.cpp
     autonomous_trust/utilities/queue_pool.c
     autonomous_trust/utilities/sighandler.c
     autonomous_trust/utilities/socket_helpers.c
@@ -1700,11 +1700,15 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/autonomous_trust.pc
 
 # autonomous-trust-devel: `cpack -G DEB` / `cpack -G RPM` in a build configured
 # with -DCMAKE_INSTALL_PREFIX=/usr. .github/workflows/release-packages.yml builds
-# one per distro, since libautonomous_trust.so needs that distro's libprotobuf
-# soname. Package versions cannot carry '-': a tag's v0.3.0-rc1 becomes
-# 0.3.0~rc1, which sorts before 0.3.0 in both dpkg and rpm.
+# them on the oldest distro of each family (scripts/package-devel.sh says why
+# that one package serves the newer ones). Package versions cannot carry '-'. A git-describe snapshot,
+# 0.2.2-125-g53eea3d1, becomes 0.2.2+125.g53eea3d1, which sorts after 0.2.2;
+# a pre-release tag's 0.3.0-rc1 becomes 0.3.0~rc1, which sorts before 0.3.0
+# (both in dpkg and rpm).
 if(NOT AT_PACKAGE_VERSION)
-    string(REPLACE "-" "~" AT_PACKAGE_VERSION "${AT_PC_VERSION}")
+    string(REGEX REPLACE "-([0-9]+)-g([0-9a-f]+)$" "+\\1.g\\2"
+           AT_PACKAGE_VERSION "${AT_PC_VERSION}")
+    string(REPLACE "-" "~" AT_PACKAGE_VERSION "${AT_PACKAGE_VERSION}")
 endif()
 set(CPACK_PACKAGE_NAME autonomous-trust-devel)
 set(CPACK_PACKAGE_VERSION ${AT_PACKAGE_VERSION})
@@ -1719,10 +1723,10 @@ set(CPACK_PACKAGING_INSTALL_PREFIX ${CMAKE_INSTALL_PREFIX})
 set(CPACK_DEBIAN_PACKAGE_SECTION libdevel)
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_PACKAGE_DEPENDS "libsodium-dev, libjansson-dev, uuid-dev, libprotobuf-c-dev")
+set(CPACK_DEBIAN_PACKAGE_RELEASE 1)
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_RPM_PACKAGE_LICENSE Apache-2.0)
 set(CPACK_RPM_PACKAGE_REQUIRES "libsodium-devel, jansson-devel, libuuid-devel, protobuf-c-devel")
-set(CPACK_RPM_PACKAGE_RELEASE_DIST ON)
 # Owned by the distro's pkgconf package.
 set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
     ${CPACK_PACKAGING_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/pkgconfig)

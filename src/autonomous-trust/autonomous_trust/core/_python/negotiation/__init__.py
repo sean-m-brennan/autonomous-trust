@@ -15,5 +15,5 @@
 # ******************
 
 from .negprocess import NegotiationProcess
-from .negotiation import Task, TaskParameters, TaskStatus, Status, TaskResult
+from .negotiation import Task, TaskParameters, TaskStatus, Status, TaskResult, ScoreEcho
 from .protocol import NegotiationProtocol

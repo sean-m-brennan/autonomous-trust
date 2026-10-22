@@ -160,10 +160,27 @@ class NegotiationHooks:
     the core, ``'hold'`` to forward it to the application but hold its score
     (the feature releases it later, :meth:`NegotiationProcess.release_result`),
     or ``'consume'`` to take it entirely (neither forwarded nor scored).
-    ``periodic(proc, queues)`` runs once per pass of the negotiation loop."""
+    ``periodic(proc, queues)`` runs once per pass of the negotiation loop.
+
+    Selective assignment (RD_12.7 plan §3.1) adds four.
+    ``select_participants(proc, task, peers, target)`` is asked by
+    ``start_task`` with every capable, present peer and the peer the task is
+    addressed to (None for a fan-out). It returns None to leave the task to
+    the core, or the peers to invite instead. It may set ``task.draw``, which
+    the invitation carries. ``on_decline(proc, task, peer_uuid, peers)``
+    is asked when a verified nack drops an invitee. It returns replacement
+    peers to invite, or None. ``on_invitation(proc, queues, task, sender)`` sees
+    every fresh invitation a worker admits, before it is accepted or
+    refused, and only observes. ``on_score(proc, echo)`` receives the
+    main process's :class:`ScoreEcho` for a result the feature asked to see
+    scored (``task.echo_score``)."""
     capped_tier: Optional[Callable[[Any, Any, int], int]] = None
     on_result: Optional[Callable[[Any, Any, Any, Any], Optional[str]]] = None
     periodic: Optional[Callable[[Any, Any], None]] = None
+    select_participants: Optional[Callable[[Any, Any, list, Any], Optional[list]]] = None
+    on_decline: Optional[Callable[[Any, Any, Any, list], Optional[list]]] = None
+    on_invitation: Optional[Callable[[Any, Any, Any, Any], None]] = None
+    on_score: Optional[Callable[[Any, Any], None]] = None
 
 
 @dataclass(frozen=True)
@@ -441,6 +458,42 @@ def negotiation_periodic(proc, queues) -> None:
     for hooks in negotiation_hooks():
         if hooks.periodic is not None:
             hooks.periodic(proc, queues)
+
+
+def negotiation_select(proc, task, peers: list, target) -> Optional[list]:
+    """The first answer any extension's ``select_participants`` gives."""
+    for hooks in negotiation_hooks():
+        if hooks.select_participants is None:
+            continue
+        chosen = hooks.select_participants(proc, task, peers, target)
+        if chosen is not None:
+            return chosen
+    return None
+
+
+def negotiation_on_decline(proc, task, peer_uuid, peers: list) -> Optional[list]:
+    """The first replacement any extension's ``on_decline`` offers."""
+    for hooks in negotiation_hooks():
+        if hooks.on_decline is None:
+            continue
+        chosen = hooks.on_decline(proc, task, peer_uuid, peers)
+        if chosen is not None:
+            return chosen
+    return None
+
+
+def negotiation_on_invitation(proc, queues, task, sender) -> None:
+    """Show every extension a fresh invitation."""
+    for hooks in negotiation_hooks():
+        if hooks.on_invitation is not None:
+            hooks.on_invitation(proc, queues, task, sender)
+
+
+def negotiation_on_score(proc, echo) -> None:
+    """Hand every extension the main process's score echo."""
+    for hooks in negotiation_hooks():
+        if hooks.on_score is not None:
+            hooks.on_score(proc, echo)
 
 
 #: The declarations a node's environment can make about a feature, and the
