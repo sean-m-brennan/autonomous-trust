@@ -239,15 +239,4 @@ void google__protobuf__any__free_unpacked(
     Google__Protobuf__Any *message,
     ProtobufCAllocator *allocator);
 
-/* ================================================================
- * Shutdown helper — called from autonomous_trust.c via the C++
- * wrapper in protobuf_shutdown.cpp.
- * ================================================================ */
-
-/*@
-  assigns \nothing;
-  // Frees internal protobuf library state.  Must be called at most once.
-*/
-void shutdown_protobuf_library(void);
-
 #endif /* PROTOBUF_STUBS_H */

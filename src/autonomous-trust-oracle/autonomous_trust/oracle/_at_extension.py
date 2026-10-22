@@ -29,10 +29,14 @@ from autonomous_trust.core.extensions import Extension, NegotiationHooks
 from autonomous_trust.core._python.negotiation.protocol import NegotiationProtocol
 
 from autonomous_trust.oracle import (calibration, certificates,  # noqa: F401
-                                     physics, prequential, replication)
+                                     physics, prequential, replication,
+                                     selection)
 from autonomous_trust.oracle._python.replication import live
 from autonomous_trust.oracle._python.replication.model import (
     ReplicationDeclarationError, load_replication_env)
+from autonomous_trust.oracle._python.selection import hooks as selection_hooks
+from autonomous_trust.oracle._python.selection.model import (
+    SelectionDeclarationError, load_selection_env)
 
 
 def _enabled() -> bool:
@@ -46,6 +50,23 @@ def _register_handlers(proc, proc_name: str) -> None:
     if proc_name == 'negotiation':
         proc.protocol.register_handler(NegotiationProtocol.replay_response,
                                        partial(live.handle_replay_response, proc))
+        # Selective assignment's audit (RD_12.7 plan §0.1).
+        proc.protocol.register_handler(selection_hooks.AUDIT_QUERY,
+                                       partial(selection_hooks.handle_audit_query, proc))
+        proc.protocol.register_handler(selection_hooks.AUDIT_REPLY,
+                                       partial(selection_hooks.handle_audit_reply, proc))
+
+
+def _on_result(proc, queues, task, tracker):
+    # Selection only marks the result for a score echo and never decides,
+    # so it runs first and live replication gives the answer.
+    selection_hooks.on_result(proc, queues, task, tracker)
+    return live.on_result(proc, queues, task, tracker)
+
+
+def _periodic(proc, queues) -> None:
+    live.periodic(proc, queues)
+    selection_hooks.periodic(proc, queues)
 
 
 def _check_config(cfg_dir, logger) -> None:
@@ -55,10 +76,18 @@ def _check_config(cfg_dir, logger) -> None:
         load_replication_env()
     except (OSError, ValueError, ReplicationDeclarationError) as err:
         raise RuntimeError('$AT_REPLICATION: %s' % err) from err
+    try:
+        load_selection_env()
+    except (OSError, ValueError, SelectionDeclarationError) as err:
+        raise RuntimeError('$AT_SELECTION: %s' % err) from err
 
 
 EXTENSION = Extension(name='oracle', enabled=_enabled,
                       register_handlers=_register_handlers,
                       reset=oracles.reset, check_config=_check_config,
-                      negotiation=NegotiationHooks(on_result=live.on_result,
-                                                   periodic=live.periodic))
+                      negotiation=NegotiationHooks(
+                          on_result=_on_result, periodic=_periodic,
+                          select_participants=selection_hooks.select_participants,
+                          on_decline=selection_hooks.on_decline,
+                          on_invitation=selection_hooks.on_invitation,
+                          on_score=selection_hooks.on_score))

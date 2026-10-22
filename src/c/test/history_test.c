@@ -21,7 +21,6 @@
 #include "autonomous_trust/identity/history.h"
 #include "autonomous_trust/identity/identity.h"
 #include "autonomous_trust/identity/identity_priv.h"
-#include "autonomous_trust/utilities/protobuf_shutdown.h"
 
 #define DEBUG_TESTS 1
 #include "test_setup.h"

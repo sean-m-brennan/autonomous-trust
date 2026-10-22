@@ -27,11 +27,14 @@ from ..freshness import Freshness
 from ..identity.protocol import IdentityProtocol
 from ..network import Message
 from ..processes import Process, ProcMeta
-from ..extensions import (capped_tier, load_extensions, negotiation_on_result,
+from ..extensions import (capped_tier, load_extensions, negotiation_on_decline,
+                          negotiation_on_invitation, negotiation_on_result,
+                          negotiation_on_score, negotiation_select,
                           negotiation_periodic, run_post_fork)
 from .protocol import NegotiationProtocol
 from .negotiation import (Job, JobQueue, Task, TaskParameters, TaskStatus,
-                          TaskTracker, TaskCounter, TaskResult, Status)
+                          TaskTracker, TaskCounter, TaskResult, ScoreEcho,
+                          Status)
 from .replay import trace_chain
 from ..system import CfgIds, max_concurrency, now, proc_idle_floor
 from .. import _probes
@@ -168,6 +171,20 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                     del self.my_tasks[task.uuid]
                     return True
                 participants = present
+            # Selective assignment (RD_12.7 plan §3.1): a selection layer may
+            # draw the invitees from the capable, present peers -- k of them
+            # for a capability it selects on, or the target of a directed
+            # probe -- and stamp the invitation with the draw. With no layer,
+            # or none that selects this task, nothing below changes.
+            chosen = None
+            if participants:
+                wanted = getattr(message, 'to_whom', None)
+                if isinstance(wanted, (list, tuple)):
+                    wanted = wanted[0] if len(wanted) == 1 else None
+                chosen = negotiation_select(self, task, participants, wanted)
+                if chosen is not None:
+                    participants = list(chosen)
+                    tracker.draw = task.draw
             # Optional single-peer addressing (R+D.md §12.7). `to_whom` unset
             # keeps the historical fan-out to every capable peer; set, it
             # narrows the announcement to that one peer.
@@ -189,7 +206,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
             if isinstance(target, (list, tuple)):
                 target = target[0] if len(target) == 1 else None
             target_uuid = getattr(target, 'uuid', None)
-            if target_uuid is not None:
+            if target_uuid is not None and chosen is None:
                 addressed = [p for p in participants
                              if getattr(p, 'uuid', None) == target_uuid]
                 if not addressed:
@@ -264,6 +281,9 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                     getattr(task, 'seq', 0),
                     self.freshness.mark(sender, NegotiationProtocol.announce))
                 return True
+            # A selection layer checks the requestor's coin (RD_12.7 plan
+            # §0.2): it logs and counts a bad draw, and changes nothing here.
+            negotiation_on_invitation(self, queues, task, message.from_whom)
             if task.uuid not in self.proposed_tasks:
                 self.proposed_tasks[task.uuid] = TaskCounter(task)
             self.proposed_tasks[task.uuid].count += 1
@@ -432,10 +452,45 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
             try:
                 self._cancel_participant(queues, message)
                 self.logger.debug('My task refused')
+                self._replace_declined(queues, message)
             except Full:
                 self.logger.error('handle_refuse: Main queue full')
             return True
         return False
+
+    def _capable_present(self, cap_name: str) -> list:
+        """Every known peer advertising ``cap_name`` that the network process
+        has not reported absent: the set ``start_task`` invites from."""
+        absent = getattr(self.protocol, 'absent_peers', set()) or set()
+        out = []
+        for peer_id in self.peer_capabilities.get(cap_name, []):
+            peer = self.peers.find_by_uuid(peer_id)
+            if peer is not None and str(peer.uuid) not in absent:
+                out.append(peer)
+        return out
+
+    def _replace_declined(self, queues, message):
+        """Invite a selection layer's replacement for a peer that declined
+        (RD_12.7 plan §3.5, D5(a)). With no layer, nobody replaces it."""
+        tracker = self.my_tasks.get(message.obj.uuid)
+        if tracker is None or getattr(tracker, 'draw', None) is None:
+            return      # only a drawn invitee has a replacement to draw
+        cap = tracker.capability
+        chosen = negotiation_on_decline(
+            self, tracker, message.from_whom.uuid,
+            self._capable_present(getattr(cap, 'name', cap)))
+        if not chosen:
+            return
+        task = Task(**tracker.to_dict())
+        task.seq = self.freshness.stamp()
+        for peer in chosen:
+            tracker.results[peer.uuid] = None
+            queues[CfgIds.network].put(
+                Message(self.name, NegotiationProtocol.announce,
+                        task.to_json_string(), peer),
+                block=True, timeout=self.q_cadence)
+            self.logger.debug('Declined task %s re-drawn to %s', task.uuid,
+                              getattr(peer, 'nickname', peer))
 
     def handle_stat_req(self, queues, message):
         if message.function == NegotiationProtocol.status_req:
@@ -940,6 +995,8 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                                 if isinstance(message, tuple) and len(message) > 1 and \
                                         isinstance(message[1], Capability):
                                     self.peer_capabilities[message[0]] = message[1]
+                                elif isinstance(message, ScoreEcho):
+                                    negotiation_on_score(self, message)
                                 else:
                                     if isinstance(message, Message):
                                         _probes.counter('proc.negotiation', 'unhandled', message.function)
