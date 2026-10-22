@@ -72,4 +72,90 @@ int neg_ext_capped_tier(const process_t *proc, const unsigned char *peer, int ti
         (void)neg_tier_cap_register(cap);                                      \
     }
 
+/* ---- Live replication (RD_12.6_LIVE_REPLICATION_PLAN.md section 3.7) -----
+ *
+ * The requestor's side of live replication is a feature (libat_replication):
+ * the core asks it about every result it accepts, and gives it the few
+ * negotiation acts it needs. Mirrors Python NegotiationHooks.on_result /
+ * periodic and NegotiationProcess.release_result / start_directed. */
+
+/** What a result hook decides. */
+typedef enum {
+    NEG_RESULT_LEAVE = 0,   /* the core scores and forwards it as ever */
+    NEG_RESULT_HOLD,        /* forwarded, its score held for the feature */
+    NEG_RESULT_CONSUME      /* a replica's: neither forwarded nor scored */
+} neg_result_verdict_t;
+
+/** A result the requestor accepted. Every pointer is valid only during the
+ *  call: a feature that keeps the result copies what it needs. */
+typedef struct {
+    const unsigned char *task;      /* 16 raw uuid bytes */
+    const unsigned char *executor;  /* the authenticated sender */
+    const char *capability;
+    const char *kwargs_json;
+    double issued_at;
+    const char *result;             /* NULL for none */
+    size_t result_len;
+    const char *certificate_json;   /* NULL for none */
+    const char *prediction_json;    /* NULL for none */
+    const char *trace_root;         /* NULL unless a trace was committed */
+    int trace_len;
+} neg_result_info_t;
+
+/** One feature's result hook. */
+typedef struct {
+    const char *name;
+    /** Decide @p info. Called with the negotiation state locked: it must not
+     *  call back into the negotiation process (do that from @c periodic). */
+    neg_result_verdict_t (*on_result)(const process_t *proc,
+                                      const neg_result_info_t *info);
+    /** Once per pass of the negotiation loop, unlocked. */
+    void (*periodic)(const process_t *proc);
+} neg_result_hook_t;
+
+/** Register @p hook (static storage). @return 0; -1 NULL, unnamed, duplicate
+ *  or full (one hook for now). */
+int neg_result_hook_register(const neg_result_hook_t *hook);
+
+/** The first decision any hook makes about @p info (LEAVE for none). */
+neg_result_verdict_t neg_ext_on_result(const process_t *proc,
+                                       const neg_result_info_t *info);
+
+/** Run every hook's @c periodic. */
+void neg_ext_periodic(const process_t *proc);
+
+/** Register @p hook at load time. */
+#define NEG_RESULT_HOOK_REGISTER(tag, hook)                                       \
+    static void __attribute__((constructor)) neg_result_hook_register_##tag(void) \
+    {                                                                             \
+        (void)neg_result_hook_register(hook);                                     \
+    }
+
+/** Release a result whose score a hook held: scored @p score on @p channel
+ *  when @p have_score, else by the ordinary arms. Not with the state locked. */
+void negotiation_release_held(const process_t *proc, const neg_result_info_t *info,
+                              bool have_score, double score, const char *channel);
+
+/** Ask one capable peer, other than @p exclude, this node and any peer
+ *  heard from lately, to run @p capability with @p kwargs_json: the peer at
+ *  @p seed modulo their count, sorted by uuid (Python's rule). Writes the new
+ *  task and its peer. @return 0, or -1 when there is no such peer or the
+ *  invitation did not leave. Not with the state locked. */
+int negotiation_start_replica(const process_t *proc, const char *capability,
+                              const char *kwargs_json, const unsigned char *exclude,
+                              unsigned long long seed, unsigned char *task_out,
+                              unsigned char *peer_out);
+
+/** Propose a verifier-attested score about @p subject (D6 option 3): this
+ *  node as verifier, @p evidence_digest and @p scope 64 lowercase hex. */
+void negotiation_propose_attestation(const process_t *proc,
+                                     const unsigned char *subject, double score,
+                                     const char *channel, const char *capability,
+                                     const char *evidence_digest, const char *scope);
+
+/** Send @p verb with @p payload (borrowed) to @p peer. @return 0 when the
+ *  network queue took it. */
+int negotiation_send_replay(const process_t *proc, const char *verb,
+                            const unsigned char *peer, const char *payload_json);
+
 #endif /* NEG_EXT_H */

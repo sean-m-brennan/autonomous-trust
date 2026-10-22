@@ -62,6 +62,7 @@ from .reputation import (TransactionScore, ReputationProtocol, PeerReputation,
 from .reputation.reputation import Reputation, pair_task_id
 from . import oracles
 from .negotiation.certified import split_certified
+from .negotiation.replay import split_traced, trace_chain
 from .queue_pool import QueuePool
 from .app_verbs import AppRequest, AppEvent, app_verb_target
 from .._zkp import ZKP_AVAILABLE
@@ -1143,8 +1144,18 @@ class AutonomousTrust(Protocol):
                     # its negotiation process, which is where its requestor-side
                     # record of the task lives, so the two runtimes cannot share
                     # a call site, only the rules.
-                    score, channel = score_task_result(
-                        task, logger=self.logger, name=self.name)
+                    # Live replication (RD_12.6 plan §3.7) may hold this
+                    # score until a replica settles it: the application still
+                    # gets the answer now, and the negotiation process
+                    # releases the result later, with the verdict's score or
+                    # for the arms below.
+                    held = getattr(task, 'score_hold', False)
+                    verdict = getattr(task, 'replication_score', None)
+                    if verdict is not None:
+                        score, channel = verdict
+                    elif not held:
+                        score, channel = score_task_result(
+                            task, logger=self.logger, name=self.name)
                     cap_name = getattr(task, 'requested_capability_name', None)
                     # subject_uuid: who the score is ABOUT, stamped on the
                     # requestor side by negprocess.handle_results from the
@@ -1163,13 +1174,14 @@ class AutonomousTrust(Protocol):
                     # (ISSUES §2.50); the executor's own half uses the same.
                     tx_id = (pair_task_id(task.uuid, executor)
                              if executor is not None else task.uuid)
-                    tx = TransactionScore(tx_id, score,
-                                          capability_name=cap_name,
-                                          channel=channel,
-                                          subject_uuid=executor,
-                                          competence=competence_weight(
-                                              cap_name, executor))
-                    queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
+                    if verdict is not None or not held:
+                        tx = TransactionScore(tx_id, score,
+                                              capability_name=cap_name,
+                                              channel=channel,
+                                              subject_uuid=executor,
+                                              competence=competence_weight(
+                                                  cap_name, executor))
+                        queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
                     # The application sees one answer per task; the other
                     # executors' results are scored only (negprocess).
                     if self.external_feedback in queues \
@@ -1301,7 +1313,15 @@ class AutonomousTrust(Protocol):
                     # the requestor would have to know about to read the
                     # answer at all.
                     result, certificate = split_certified(result)
-                    tr = TaskResult(orig_task, result, certificate=certificate)
+                    # A replayable capability returns its answer with the
+                    # states it passed through (RD_12.6 plan, D2 and D9): the
+                    # reply commits to them, and they stay with this node.
+                    result, states = split_traced(result)
+                    trace = trace_chain(states) if states else None
+                    tr = TaskResult(orig_task, result, certificate=certificate,
+                                    trace_root=trace[-1] if trace else None,
+                                    trace_len=len(states) if states else None)
+                    tr.trace_states = states
                     tr.generate_proof()
                     queues[CfgIds.negotiation].put(tr, block=True, timeout=queue_cadence)
                     # Tag the TS with the capability that produced it so the

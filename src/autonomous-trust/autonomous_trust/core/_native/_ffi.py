@@ -688,6 +688,7 @@ ffi.cdef("""
         char roster_op[8];
         unsigned char roster_uuid[16];
         char roster_digest[65];
+        int roster_n_min;        /* declared N_min, 0 for none; appended */
     } transaction_t;
 
     /* tx_history_t/reputations_t contain embedded maps/arrays — opaque */

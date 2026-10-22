@@ -237,14 +237,32 @@ def roster_digest(members) -> str:
     return MerkleTree.get_hash(b'AT-ROSTER\x00' + lines.encode('ascii')).decode('ascii')
 
 
-def roster_task_id(prev_task, op, member, digest) -> UUID:
+def roster_task_id(prev_task, op, member, digest, n_min=None) -> UUID:
     """The task id a roster entry carries: uuid5 over
-    ``prev roster task|op|member|digest`` ('null' for none), so two members
-    proposing the same change propose the same value. Mirrors
-    tx_roster_task_uuid."""
+    ``prev roster task|op|member|digest`` ('null' for none), and ``|n_min``
+    when the entry declares one, so two members proposing the same change
+    propose the same value. Mirrors tx_roster_task_uuid."""
     prev = 'null' if prev_task is None else str(prev_task).lower()
     who = 'null' if member is None else str(member).lower()
-    return uuid5(ROSTER_NS, f'{prev}|{op}|{who}|{digest}')
+    tail = '' if n_min is None else '|%d' % int(n_min)
+    return uuid5(ROSTER_NS, f'{prev}|{op}|{who}|{digest}{tail}')
+
+
+def roster_n_min_norm(value) -> 'int | None':
+    """A roster entry's declared N_min (RD_13.2 plan §0.4): a positive int, or
+    None for no declaration (0 is the same as none). Raises ValueError on
+    anything else. Mirrors tx_roster_n_min_ok."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError('roster n_min is not a non-negative integer')
+    return value or None
+
+
+def byzantine_f(n_min) -> int:
+    """F, the faults a declared N_min tolerates: (N_min - 1) // 3, or 0 for
+    no declaration. Mirrors tx_byzantine_f."""
+    return (int(n_min) - 1) // 3 if n_min else 0
 
 
 #: uuid5(NAMESPACE_URL, 'urn:autonomous-trust:task-pair'). Mirrors AT_PAIR_NS.
@@ -604,7 +622,7 @@ class Transaction(Configuration):
                  attest_scope: str = None, place_from: int = None,
                  place_sigs: dict = None, roster_op: str = None,
                  roster_uuid: UUID = None, roster_digest: str = None,
-                 roster_members: list = None):
+                 roster_members: list = None, roster_n_min: int = None):
         self.task_id = task_id
         self.p1_id = p1_id
         self.p1_score = p1_score
@@ -692,6 +710,13 @@ class Transaction(Configuration):
         self.roster_members = ([[str(u), str(k)] for u, k in
                                 roster_members_norm(roster_members)]
                                if roster_members else None)
+        # The group's declared N_min (RD_13.2 plan §0.4): the cohort size the
+        # Byzantine bar is sized for, F = (N_min - 1) // 3. On a roster entry
+        # only, None for no declaration; in the canonical bytes only when set,
+        # so an undeclaring roster entry hashes as it always did. Mirrors
+        # transaction_t.roster_n_min.
+        self.roster_n_min = (roster_n_min_norm(roster_n_min)
+                             if roster_op is not None else None)
 
     @property
     def is_roster(self) -> bool:
@@ -743,6 +768,8 @@ class Transaction(Configuration):
             for k in ('roster_op', 'roster_uuid', 'roster_digest',
                       'roster_members'):
                 d.pop(k, None)
+        if not d.get('roster_n_min'):
+            d.pop('roster_n_min', None)
         return d
 
     def certificate_of(self, scorer) -> 'dict | None':
@@ -844,6 +871,10 @@ class Transaction(Configuration):
             # is not a channel), and no existing entry's bytes change.
             fields += ['roster', str(self.roster_op), _u(self.roster_uuid),
                        self.roster_digest or 'null']
+            # The declaration, only when made: no undeclaring roster entry's
+            # bytes change.
+            if self.roster_n_min:
+                fields.append(str(int(self.roster_n_min)))
         return '|'.join(fields).encode('utf-8')
 
     def entry_hash(self) -> bytes:
@@ -2165,6 +2196,8 @@ def evidence_to_dict(chain, signed_checkpoint=None, attest_certs=None,
             entries[-1]['roster_digest'] = str(tx.roster_digest)
             entries[-1]['roster_members'] = [list(m) for m in
                                              tx.roster_members or []]
+            if getattr(tx, 'roster_n_min', None):
+                entries[-1]['roster_n_min'] = int(tx.roster_n_min)
         # A placement certificate, on the last entry of each placement:
         # additive, omitted otherwise, outside the entry hash.
         if getattr(tx, 'place_sigs', None) and tx.place_from is not None:
@@ -2210,7 +2243,8 @@ def _roster_fields(entry) -> dict:
     who = entry.get('roster_uuid')
     return {'roster_op': str(entry['roster_op']),
             'roster_uuid': None if who is None else UUID(str(who)),
-            'roster_digest': str(digest), 'roster_members': members}
+            'roster_digest': str(digest), 'roster_members': members,
+            'roster_n_min': roster_n_min_norm(entry.get('roster_n_min'))}
 
 
 def evidence_from_dict(doc):

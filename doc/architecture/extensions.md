@@ -408,7 +408,7 @@ The verification layers of R+D.md §12 are five extension libraries
 | `libat_calibration` | coverage audit (§12.4) | `$AT_CALIBRATION` | arms `calibration.settle` (200, observe) and `calibration.assess` (400, verdict) |
 | `libat_prequential` | prequential competence (§12.5) | `$AT_PREQUENTIAL` | arm `prequential.observe` (210, observe); the competence provider |
 | `libat_certificates` | certificate-carrying interfaces (§12.3) | `$AT_CERTIFICATES` | arm `certificates.check` (300, verdict) |
-| `libat_replication` | replicated execution (§12.6) | — | its declaration only; nothing scores through it yet |
+| `libat_replication` | replicated execution (§12.6) | `$AT_REPLICATION` | live replication through the negotiation result hook (`neg_ext.h`): it holds a sampled result's score, sends a replica, and settles a dispute by the bisection game |
 
 `AT_ORACLE_REPLICATION` requires `AT_ORACLE_CERTIFICATES`, whose SplitMix64 it
 samples with; `libat_replication` links `libat_certificates`.
@@ -434,8 +434,9 @@ with each score; with no provider it is 1.0, the authored weight verbatim.
 needs: names only, never behavior. A layer that is absent cannot declare
 itself, so the table has to live in the core. `negotiation_run` calls
 `neg_oracles_check_env` and refuses to start, with an ERROR naming the
-library, when `$AT_PHYSICS`, `$AT_CALIBRATION`, `$AT_PREQUENTIAL` or
-`$AT_CERTIFICATES` is set and non-empty and its layer is not loaded. A node
+library, when `$AT_PHYSICS`, `$AT_CALIBRATION`, `$AT_PREQUENTIAL`,
+`$AT_CERTIFICATES` or `$AT_REPLICATION` is set and non-empty and its layer is
+not loaded. A node
 declared to check physics that silently did not would accept results physics
 refutes. Refusing is the only safe answer.
 

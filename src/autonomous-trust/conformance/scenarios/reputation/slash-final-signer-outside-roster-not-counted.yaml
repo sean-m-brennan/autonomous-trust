@@ -1,0 +1,54 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: slash-final-signer-outside-roster-not-counted
+byte_pinning: false
+description: |
+    The slash quorum is sized from the LOGGED roster in force and counts only
+    its members, each verified with the key it records, as commit, placement
+    and attestation already were (RD_13.2 plan §0.4, 2026-10-22). Before, it
+    was sized from the live peer list.
+
+    bob's live group has five members, but his roster in force lists four:
+    alice, bob, carol and rogue. dave is live and not in it. The slash carries
+    alice's, carol's and dave's signatures. Counted against the live view (a
+    majority of five is three) it would pass. Against the roster, dave's signature is not a vote,
+    two of four is not a majority, and bob refuses.
+
+participants:
+  - id: alice
+    role: detector
+  - id: bob
+    role: member
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+  - id: rogue
+    role: target
+
+fixtures:
+  slash_enabled: true
+  roster:
+    bob: [alice, bob, carol, rogue]
+  reputations:
+    bob:
+      rogue: 0.6
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: slash final
+    payload:
+      target: rogue
+      floor_score: 0.1
+      epoch: 3
+      cosigners: [alice, carol, dave]
+    description: |
+        Three valid signatures, one of them from outside bob's roster in force.
+
+expected_state:
+  bob:
+    reputation_of:
+      rogue: 0.6

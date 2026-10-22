@@ -132,19 +132,42 @@ Both can be outvoted — two executors wrong in different ways at the same step 
 which is the honest outcome, not a tie. Two identical traces never diverge and
 are not a dispute at all.
 
-## What is wired, and what is gated
+## Live replication
 
-The sampling, the adjudication, and the game are built and pinned bit-for-bit
-across both runtimes by the `replication` conformance protocol
-(`scenarios/replication/`). What is **not** wired is the live dispatch of a
-replica and the interactive challenge/response of the game against real peers.
-The game requires **deterministic replay** of a peer's work — the same inputs
-reproduce the same trace, step for step — which is a real constraint on how a
-capability is written, and one AT cannot impose on an arbitrary capability
-unilaterally (the doc is explicit). The live path is therefore gated on that
-precondition: a capability that declares itself deterministically replayable can
-carry a trace and be disputed; one that cannot is scored by the layers above
-this one and by an agreement-only replication that never reaches the game.
+The sampling, the adjudication and the game are pinned bit for bit across both
+runtimes by the `replication` conformance protocol (`scenarios/replication/`),
+and since 2026-10-22 they run live (`RD_12.6_LIVE_REPLICATION_PLAN.md`, the
+user's calls in §0.1, the wire in §3.7).
+
+**What is replicated.** Only a capability the operator's declaration
+(`$AT_REPLICATION`) gives a `replay` object: one whose code follows the step
+contract, so that its executor can commit to a hash-chained trace (`max_steps`,
+at most 256; `max_state_bytes`, 4096 by default). Its probability is its own
+`replicate_prob`, else `default_prob`. Every other capability's live
+probability is 0. A declaration the node cannot read stops it at start.
+
+**The executor (core).** A replayable capability runs step by step: Python
+`Capability(..., replay=Replayable(init, step, encode, result, decode))`, C
+`capability_t.replay` (`capability_table_set_replay`). Its `TaskResult`
+carries `trace_root` and `trace_len`, and the executor keeps the states for
+60 s to answer the task's requestor, and nobody else, about any step
+(`replay challenge` for a digest, `replay reveal` for h(k-2), s(k-1), s(k)).
+
+**The requestor (this layer).** It attaches to the negotiation process
+through the core's result hook. When a result of a replayable capability
+arrives it draws once from fresh verifier entropy; if sampled, it holds the
+result's score (the application still gets the answer) and sends the same task
+to one other capable peer, drawn uniformly. Agreement within the declared
+tolerance scores both 0.9 on `replication`. A disagreement between two
+committed traces goes to the game, which the requestor settles by
+re-executing the one divergent step with its own step contract; the honest
+executor scores 0.9 and the other 0.1, and the 0.1 also goes out as a
+verifier-attested entry so a cheater cannot keep it off the chain by
+withholding its own half. Without a commitment or a step contract the dispute
+is left to the ordinary arms. Everything is settled within twice the commit
+timeout: a replica that never answered releases the primary to the ordinary
+arms; an executor that goes quiet mid-game is not scored, and the one that
+kept answering is settled by re-running its whole trace.
 
 ## Two honest caveats
 
@@ -160,12 +183,19 @@ not shared error.
 ## Where the code is
 
 * Python: `autonomous_trust.oracle.replication` — `sampling`, `adjudication`,
-  `bisection`, `model`.
+  `bisection` (with the live `ChallengeSession`), `model`, `live` (the
+  requestor). The executor's half is core:
+  `autonomous_trust.core._python.negotiation.replay` and `negprocess`.
 * C twin: `src/c/extensions/replication/` — `sampling`, `adjudication`,
-  `bisection`, `replication` (the declaration).
-* Conformance: `scenarios/replication/{sampling,adjudication,bisection}.yaml`,
-  adapters `conformance/harness/python/adapters/replication.py` and
-  `src/c/conformance/adapters/replication.c`.
+  `bisection`, `replication` (the declaration), `replication_live` (the
+  requestor). Core: `negotiation/neg_replay.{h,c}`, the verbs and the result
+  hook in `negotiation/neg_proc.c` / `neg_ext.h`.
+* Conformance: `scenarios/replication/{sampling,adjudication,bisection,
+  declaration,challenge-session}.yaml` and
+  `scenarios/negotiation/replay-challenge-answered-by-the-executor.yaml`.
+  The requestor's loop is tested in process by
+  `tests/a_unit/test_replication_live.py` and
+  `src/c/extensions/replication/test/replication_live_test.c`.
 
 ---
 

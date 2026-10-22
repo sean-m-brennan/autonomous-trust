@@ -64,3 +64,36 @@ int neg_ext_capped_tier(const process_t *proc, const unsigned char *peer, int ti
     }
     return tier;
 }
+
+/* ---- Live replication's result hook ----------------------------------- */
+
+static const neg_result_hook_t *result_hook;
+
+int neg_result_hook_register(const neg_result_hook_t *hook)
+{
+    if (hook == NULL || hook->name == NULL || hook->name[0] == '\0') {
+        fprintf(stderr, "neg_result_hook_register: refusing an unnamed hook\n");
+        return -1;
+    }
+    if (result_hook != NULL) {
+        fprintf(stderr, "neg_result_hook_register: refusing %s: %s is registered\n",
+                hook->name, result_hook->name);
+        return -1;
+    }
+    result_hook = hook;
+    return 0;
+}
+
+neg_result_verdict_t neg_ext_on_result(const process_t *proc,
+                                       const neg_result_info_t *info)
+{
+    if (result_hook == NULL || result_hook->on_result == NULL)
+        return NEG_RESULT_LEAVE;
+    return result_hook->on_result(proc, info);
+}
+
+void neg_ext_periodic(const process_t *proc)
+{
+    if (result_hook != NULL && result_hook->periodic != NULL)
+        result_hook->periodic(proc);
+}

@@ -15,6 +15,13 @@ description: |
     separate keys, so a reader that does not know the checker still reads the
     answer.
 
+    `trace_root` and `trace_len` (2026-10-22, RD_12.6_LIVE_REPLICATION_PLAN.md
+    D9) are the executor's commitment to the trace of a replayable capability:
+    the last digest of the hash chain over its states, and how many there were
+    (here the three-state chain of s0, s1, s2). Both runtimes always serialize
+    the pair, null for any other capability. This changed the vector's bytes,
+    the plan's one flag day: a build that predates it emits neither key.
+
     `proof` and the `requested_*` trio are pinned at their defaults: Python
     always serializes them, C never fills them, and one key set for both
     runtimes is the whole point of the vector.

@@ -42,8 +42,11 @@ that has not yet joined a group holds neither the group key nor anybody's public
 key.
 
 Lastly, *decentralization without exception*. There is no central authority.
-Groups form organically, reputation is maintained by leaderless Byzantine
-Multi-Paxos, and tasks are negotiated directly between peers. Nothing in the
+Groups form organically, reputation is maintained by leaderless Multi-Paxos
+over majority quorums whose every decision carries a signed certificate the
+receivers check (crash-fault majorities with detectable forks, not Byzantine
+agreement; see [the fault model](reputation.md#fault-model)), and tasks are
+negotiated directly between peers. Nothing in the
 system has a privileged view, which is the property making the whole thing
 survive a partition.
 

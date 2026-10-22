@@ -21,7 +21,7 @@
  *  @{
  *
  * Sampled replication with bisection dispute resolution, the C twin of
- * `autonomous_trust.core._python.replication`. Build-order step 6 of
+ * `autonomous_trust.oracle._python.replication`. Build-order step 6 of
  * doc/verification_oracle.md: replicate a random fraction of tasks, scale the
  * fraction to consequence, and resolve a disagreement by bisecting a
  * hash-chained trace rather than re-running. The outcome lands on the
@@ -46,11 +46,24 @@
 /** The probability for a capability the declaration does not name. */
 #define AT_REPLICATION_DEFAULT_PROB 0.05
 
+/** The default bound on one revealed state, in bytes (RD_12.6 plan 0.1). */
+#define AT_REPL_DEFAULT_MAX_STATE_BYTES 4096
+
+/** The largest max_state_bytes a declaration may ask for. */
+#define AT_REPL_MAX_STATE_BYTES_LIMIT 65536
+
 typedef struct
 {
     char   capability[AT_REPL_NAME_LEN + 1];
     double prob;
     double tolerance;   /* numeric agreement tolerance (slice B); 0 = exact */
+    bool   has_prob;    /* replicate_prob given, else default_prob applies */
+    /* Declared deterministically replayable (RD_12.6 plan section 0.1, D1,
+     * D2): its executor commits to a trace of at most max_steps states, none
+     * over max_state_bytes. Only these are replicated live (D12). */
+    bool   replay;
+    int    max_steps;
+    int    max_state_bytes;
 } at_replication_cap_t;
 
 typedef struct
@@ -74,10 +87,32 @@ bool at_replication_model_load(const char *path,
                                at_replication_model_t *out,
                                char *err, size_t err_len);
 
+/** The environment variable naming the declaration file, as Python's
+ * REPLICATION_ENV. */
+#define AT_REPLICATION_ENV "AT_REPLICATION"
+
+/** @brief Load the declaration named by $AT_REPLICATION, or the empty model
+ * (default_prob only) when it is unset or empty. Mirrors Python
+ * `load_replication_env`. */
+bool at_replication_model_load_env(at_replication_model_t *out,
+                                   char *err, size_t err_len);
+
 /** @brief The replication probability for @p capability: its own declared
  * number, or default_prob when the declaration does not name it. */
 double at_replication_prob_for(const at_replication_model_t *model,
                                const char *capability);
+
+/** @brief The replay contract declared for @p capability: true, with its
+ * bounds, when it is declared replayable. Mirrors Python `replay_for`. */
+bool at_replication_replay_for(const at_replication_model_t *model,
+                               const char *capability, int *max_steps,
+                               int *max_state_bytes);
+
+/** @brief The probability a running node replicates @p capability with:
+ * at_replication_prob_for for a replayable capability, 0.0 for any other
+ * (D12). Mirrors Python `live_prob_for`. */
+double at_replication_live_prob_for(const at_replication_model_t *model,
+                                    const char *capability);
 
 /** @brief The numeric agreement tolerance for @p capability; 0.0 (exact) when
  * the declaration does not name one. Mirrors Python `tolerance_for`. */

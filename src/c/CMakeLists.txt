@@ -41,6 +41,12 @@ endif()
 
 project(autonomous_trust C CXX)
 
+# Where install() puts libraries: lib unless the caller says otherwise. The rpm
+# packages pass lib64, the directory the Fedora/RHEL loader searches.
+if(NOT CMAKE_INSTALL_LIBDIR)
+    set(CMAKE_INSTALL_LIBDIR lib)
+endif()
+
 if(WIN32)
     # Windows (MinGW-w64, UCRT): the POSIX the sources are written against comes
     # from compat/win32 — stand-ins for the POSIX headers MinGW lacks, and
@@ -519,6 +525,7 @@ set(libsrc
     autonomous_trust/negotiation/neg_oracle.c
     autonomous_trust/negotiation/neg_ext.c
     autonomous_trust/negotiation/neg_certified.c
+    autonomous_trust/negotiation/neg_replay.c
     autonomous_trust/reputation/reputation.c
     autonomous_trust/reputation/rep_proc.c
     autonomous_trust/reputation/rep_ext.c
@@ -621,6 +628,20 @@ set(libhdr
     autonomous_trust/negotiation/negotiation.h
     autonomous_trust/reputation/reputation.h
     autonomous_trust/config/generate.h
+    # Not app-facing, but the headers above include them: without these an
+    # installed tree cannot compile `#include <autonomous_trust.h>`.
+    autonomous_trust/identity/group.h
+    autonomous_trust/identity/identity_priv.h
+    autonomous_trust/negotiation/task.h
+    autonomous_trust/network/net_wire_format.h
+    autonomous_trust/network/network.h
+    autonomous_trust/processes/process_tracker.h
+    autonomous_trust/processes/process_tracker_priv.h
+    autonomous_trust/processes/processes.h
+    autonomous_trust/reputation/tx_channel.h
+    autonomous_trust/utilities/allocation.h
+    autonomous_trust/utilities/compiler.h
+    autonomous_trust/utilities/util.h
 )
 
 
@@ -1448,6 +1469,10 @@ set_source_files_properties(test/peer_rtt_update_test.c PROPERTIES COMPILE_FLAGS
 target_link_libraries(peer_rtt_update_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME peer_rtt_update_test COMMAND $<TARGET_FILE:peer_rtt_update_test>)
 
+add_executable(neg_replay_test test/neg_replay_test.c)
+set_source_files_properties(test/neg_replay_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(neg_replay_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME neg_replay_test COMMAND $<TARGET_FILE:neg_replay_test>)
 add_executable(neg_oracle_test test/neg_oracle_test.c)
 set_source_files_properties(test/neg_oracle_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(neg_oracle_test PRIVATE ${AT_TEST_LIBS})
@@ -1631,7 +1656,8 @@ if(WIN32 AND LIBCHECK_LIBRARY)
     endforeach()
 endif()
 
-if(EXISTS ${CMAKE_SOURCE_DIR}/../autonomous-trust/conformance)
+option(AT_CONFORMANCE "Build the conformance harness when the corpus is present" ON)
+if(AT_CONFORMANCE AND EXISTS ${CMAKE_SOURCE_DIR}/../autonomous-trust/conformance)
     add_subdirectory(conformance)
 endif()
 
@@ -1640,15 +1666,63 @@ endif()
 
 install(TARGETS autonomous_trust 
         RUNTIME DESTINATION bin
-        LIBRARY DESTINATION lib
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         PUBLIC_HEADER DESTINATION include
         FILE_SET HEADERS
         )
 install(TARGETS autonomous_trust_static
         RUNTIME DESTINATION bin
-        LIBRARY DESTINATION lib
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         PUBLIC_HEADER DESTINATION include
         FILE_SET HEADERS
         )
+
+# The generated message headers, in the build tree's layout: they include each
+# other as autonomous_trust/core/protobuf/..., and identity.h includes
+# identity/identity.pb-c.h relative to core/protobuf.
+install(DIRECTORY ${PROTO_BINARY_DIR}/autonomous_trust
+        DESTINATION include
+        FILES_MATCHING PATTERN "*.pb-c.h")
+
+# The headers include each other relative to include/autonomous_trust
+# (`utilities/allocation.h`) and include/autonomous_trust/core/protobuf, and
+# embed structs anonymously (-fms-extensions); pkg-config says so.
+if(VERSION)
+    set(AT_PC_VERSION ${VERSION})
+else()
+    set(AT_PC_VERSION ${REVISION})
+endif()
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust.pc.in
+               ${CMAKE_CURRENT_BINARY_DIR}/autonomous_trust.pc @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/autonomous_trust.pc
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+
+# autonomous-trust-devel: `cpack -G DEB` / `cpack -G RPM` in a build configured
+# with -DCMAKE_INSTALL_PREFIX=/usr. .github/workflows/release-packages.yml builds
+# one per distro, since libautonomous_trust.so needs that distro's libprotobuf
+# soname. Package versions cannot carry '-': a tag's v0.3.0-rc1 becomes
+# 0.3.0~rc1, which sorts before 0.3.0 in both dpkg and rpm.
+if(NOT AT_PACKAGE_VERSION)
+    string(REPLACE "-" "~" AT_PACKAGE_VERSION "${AT_PC_VERSION}")
+endif()
+set(CPACK_PACKAGE_NAME autonomous-trust-devel)
+set(CPACK_PACKAGE_VERSION ${AT_PACKAGE_VERSION})
+set(CPACK_PACKAGE_CONTACT "Sean M Brennan <sean.brennan@tekfive.com>")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+    "Autonomous Trust C library: shared and static libraries, extensions and headers")
+set(CPACK_PACKAGE_HOMEPAGE_URL https://github.com/sean-m-brennan/autonomous-trust)
+set(CPACK_RESOURCE_FILE_LICENSE ${top_src_dir}/LICENSE)
+set(CPACK_PACKAGING_INSTALL_PREFIX ${CMAKE_INSTALL_PREFIX})
+# Library dependencies come from the binaries (dpkg-shlibdeps, rpm's
+# find-requires); these are the -dev packages the installed headers include.
+set(CPACK_DEBIAN_PACKAGE_SECTION libdevel)
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "libsodium-dev, libjansson-dev, uuid-dev, libprotobuf-c-dev")
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+set(CPACK_RPM_PACKAGE_LICENSE Apache-2.0)
+set(CPACK_RPM_PACKAGE_REQUIRES "libsodium-devel, jansson-devel, libuuid-devel, protobuf-c-devel")
+set(CPACK_RPM_PACKAGE_RELEASE_DIST ON)
+set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
 
 include(CPack)

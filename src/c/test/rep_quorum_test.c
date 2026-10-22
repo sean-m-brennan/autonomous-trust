@@ -433,8 +433,10 @@ DEFINE_TEST(test_replayed_ack_counts_once)
 {
     /* THE C-specific defect: the tally was a bare count, so four deliveries of
      * one ack read as four votes and a single peer finalized alone. Three peers
-     * put quorum at floor(3/2) = 1, so two distinct voters are needed — one
-     * voter must never get there however often it speaks. */
+     * and this node are a group of four, and a slash needs a strict majority of
+     * it, three distinct voters — one voter must never get there however often
+     * it speaks, and two (half the group) must not either (RD_13.2 plan
+     * section 0.4; two used to finalize). */
     _begin(3);
     identity_t *me = _mk_identity("alice", "10.0.0.1");
     identity_t *bob = _mk_identity("bob", "10.0.0.2");
@@ -458,16 +460,22 @@ DEFINE_TEST(test_replayed_ack_counts_once)
     size_t dlen = _slash_desig(me_u, rogue_u, "peer_exclude", 0.1, 5, desig,
                                sizeof(desig));
     char bob_sig[SIG_HEX_LEN + 1], carol_sig[SIG_HEX_LEN + 1];
+    char me_sig[SIG_HEX_LEN + 1];
     _sign_hex(bob, desig, dlen, bob_sig);
     _sign_hex(carol, desig, dlen, carol_sig);
+    _sign_hex(me, desig, dlen, me_sig);
 
     for (int i = 0; i < 4; i++)
         _ack(proc, bob, bob_u, rogue_u, 5, bob_sig);
     ck_assert_uint_eq(g_slash_final_count, 0);   /* one voter, one vote */
 
-    /* A SECOND distinct voter crosses quorum, so the round is not simply
-     * stuck — the negative control for the control. */
+    /* A second distinct voter is half the group: still held. */
     _ack(proc, carol, carol_u, rogue_u, 5, carol_sig);
+    ck_assert_uint_eq(g_slash_final_count, 0);
+
+    /* A THIRD distinct voter crosses quorum, so the round is not simply
+     * stuck — the negative control for the control. */
+    _ack(proc, me, me_u, rogue_u, 5, me_sig);
     ck_assert(g_slash_final_count > 0);
     _end();
 }

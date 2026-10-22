@@ -1,0 +1,43 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: checkpoint-final-declared-n-min-bar-met-stored
+byte_pinning: false
+description: |
+    The positive control for checkpoint-final-declared-n-min-raises-the-bar:
+    four of five signers clear the bar N_min 4 sets, and bob stores the root.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: member
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+  - id: rogue
+    role: member
+
+fixtures:
+  roster: {}          # the roster in force is the one bob's chain logs
+  local_chain:
+    bob:
+      - {roster: genesis, members: [alice, bob, carol, dave, rogue]}
+      - {roster: restate, n_min: 4}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: checkpoint final
+    payload:
+      root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+      epoch: 7
+      first_index: 0
+      count: 3
+      cosigners: [alice, bob, carol, dave]
+
+expected_state:
+  bob:
+    checkpoint_root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
