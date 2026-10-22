@@ -1,0 +1,57 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: refusal-unverified-keeps-participant
+byte_pinning: false
+description: |
+    An unsigned nack does not cancel a participant (RD_2.6 plan §2.8, the
+    user's call 2026-10-21).
+
+    A nack names only the task, so if an unsigned one counted, anyone who
+    learned the task id could cancel any participant out of it. bob's
+    unsigned nack is ignored, and after carol reports the task is still
+    waiting on bob. The twin of refusal-drops-participant.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+  - id: carol
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_fetch]
+    carol: [data_fetch]
+
+steps:
+  - id: 1
+    from: alice
+    to: alice
+    function: spawn task
+    payload:
+      capability: data_fetch
+      task_id: t-forged-decline
+    description: alice spawns the task and invites bob and carol.
+  - id: 2
+    from: bob
+    to: alice
+    function: nack
+    payload:
+      task_id: t-forged-decline
+      unverified: true
+    description: a nack in bob's name arrives unsigned.
+  - id: 3
+    from: carol
+    to: alice
+    function: report results
+    payload:
+      task_id: t-forged-decline
+      result: done
+    description: carol reports.
+
+expected_state:
+  alice:
+    results_scored: {task: t-forged-decline, executors: [carol]}
+    has_my_task: {slug: t-forged-decline, present: true}

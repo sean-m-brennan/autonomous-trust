@@ -575,6 +575,13 @@ The C twin is `capability_table_set_replay(name, &replay)`, with the
 `capability_replay_t` contract in `processes/capabilities.h`. Every function
 must pickle (no lambdas): a capability crosses into the worker processes.
 
+A requestor can assign a capability's tasks to k of its capable peers rather
+than to all of them, by naming a selection declaration in `$AT_SELECTION`
+(`config/cfg/selection.example.json`). Each drawn invitation carries the
+requestor's auditable coin, and every node checks the coins it is shown. See
+[Selective assignment](architecture/selection.md). Unset, every task fans out
+as before.
+
 The node auto-registers a small bootstrap corpus (`at.handshake`,
 `at.time-attest`, `at.echo-challenge`) so new peers have low-stakes interactions
 to earn initial trust. Set `AT_BOOTSTRAP_DISABLED=1` to suppress it.

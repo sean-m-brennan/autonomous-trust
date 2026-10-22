@@ -1,0 +1,95 @@
+schema_version: '1'
+kind: scenario
+protocol: selection
+name: declaration
+byte_pinning: false
+description: |
+  The selection declaration a requestor reads from $AT_SELECTION
+  (RD_12.7_SELECTIVE_ASSIGNMENT_PLAN.md section 3.3, D1(b) and D4(b)).
+
+  Rows 1-4 resolve policies: a capability's own k and floor, a capability
+  naming only k inheriting the default floor, an explicit k null (never
+  selected), and an unnamed capability falling to the default (fan out).
+  The refusals are each fatal to the whole declaration: a version other than
+  the integer 1 (2, true, 1.0), a floor outside [0, 1] or not a number (a
+  string Python's float() would read is refused, as C refuses it), a k that is
+  not a positive integer or null (0, 2.0, true), an unknown key in a policy or
+  at the top, a probe block that is not an object or has a negative floor, and
+  a log bound of 0. The last three rows are accepted.
+participants:
+- {id: requestor, role: requestor}
+- {id: peer, role: peer}
+fixtures:
+  selection:
+    version: 1
+    default: {k: null, floor: 0.05}
+    probe: {floor: 0.1}
+    capabilities:
+      demo.query: {k: 1, floor: 0.1}
+      demo.pair: {k: 2}
+      demo.command-issue: {k: null, note: never selected; full fan-out}
+    log_records: 16
+  events:
+  - {policy: demo.query, k: 1, floor: 0.1, selects: true}
+  - {policy: demo.pair, k: 2, floor: 0.05, selects: true}
+  - {policy: demo.command-issue, k: null, floor: 0.05, selects: false}
+  - {policy: unlisted, k: null, floor: 0.05, selects: false}
+  - declare: {version: 2}
+    refused: true
+  - declare: {version: true}
+    refused: true
+  - declare: {version: 1.0}
+    refused: true
+  - declare:
+      version: 1
+      default: {floor: 1.5}
+    refused: true
+  - declare:
+      version: 1
+      default: {floor: '0.5'}
+    refused: true
+  - declare:
+      version: 1
+      default: {k: 0}
+    refused: true
+  - declare:
+      version: 1
+      default: {k: 2.0}
+    refused: true
+  - declare:
+      version: 1
+      default: {k: true}
+    refused: true
+  - declare:
+      version: 1
+      capabilities:
+        x: {k: 1, typo: 1}
+    refused: true
+  - declare:
+      version: 1
+      probe: []
+    refused: true
+  - declare:
+      version: 1
+      probe: {floor: -0.1}
+    refused: true
+  - declare: {version: 1, log_records: 0}
+    refused: true
+  - declare: {version: 1, surprise: 1}
+    refused: true
+  - declare: {version: 1}
+    refused: false
+  - declare:
+      version: 1
+      default: {k: 1024, floor: 0}
+    refused: false
+  - declare:
+      version: 1
+      probe: {}
+    refused: false
+steps:
+- id: 1
+  from: requestor
+  to: peer
+  function: noop
+  payload: {}

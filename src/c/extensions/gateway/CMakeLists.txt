@@ -57,8 +57,10 @@ foreach(_t at_gateway at_gateway_static)
 endforeach()
 
 install(TARGETS at_gateway at_gateway_static
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT gateway
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT gateway)
+install(FILES at_gateway.h DESTINATION include COMPONENT gateway)
+at_package_component(gateway)
 
 ####################
 # tests (only built when libcheck is available)

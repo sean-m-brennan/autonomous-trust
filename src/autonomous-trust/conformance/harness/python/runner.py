@@ -55,6 +55,7 @@ try:
 except ImportError:
     DtnAdapter = None
 from .adapters.replication import ReplicationAdapter
+from .adapters.selection import SelectionAdapter
 from .adapters.identity import IdentityAdapter
 from .adapters.negotiation import NegotiationAdapter
 from .adapters.network import NetworkAdapter
@@ -124,6 +125,7 @@ def _adapters() -> dict[str, Any]:
         'calibration': CalibrationAdapter(corpus_root=CORPUS_ROOT),
         'prequential': PrequentialAdapter(corpus_root=CORPUS_ROOT),
         'replication': ReplicationAdapter(corpus_root=CORPUS_ROOT),
+        'selection': SelectionAdapter(corpus_root=CORPUS_ROOT),
         **({'contacts': ContactsAdapter(corpus_root=CORPUS_ROOT)}
            if ContactsAdapter is not None else {}),
         **({'dtn': DtnAdapter(corpus_root=CORPUS_ROOT)}

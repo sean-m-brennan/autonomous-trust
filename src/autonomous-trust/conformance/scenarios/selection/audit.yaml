@@ -1,0 +1,175 @@
+schema_version: '1'
+kind: scenario
+protocol: selection
+name: audit
+byte_pinning: false
+description: |
+  The audit of a requestor's draws (RD_12.7 plan sections 0.1-0.2, D3(c)).
+
+  The requestor draws six tasks (indices 1-6). The peer is shown draws 1 and 5,
+  as a peer selected only for those would be. Draw 5 after 1 is a gap, so the
+  peer asks about 2, 3 and 4. A re-announce of 5 is no finding. Draw 3 shown
+  after 5 has an index that did not increase. Draw 6 with draw 5's link is a bad
+  link, and a link that is not hex is malformed.
+
+  Each audit answer gives only the asker's own row: its position, propensity
+  and selection, the stream offset of the draw that decided it, and the
+  interval it had to fall in. For every row the peer recomputes the coin from
+  the link and finds the answer consistent. A row selected in a draw the peer
+  was never shown is flagged as selected-uninvited. A stranger gets no row, and
+  an index never drawn is unknown. A tampered answer is caught: a flipped
+  selection is inconsistent with the coin, another draw's link fails against
+  the head, and a non-numeric bound is malformed. The last row is a different
+  head with no rotation proof.
+participants:
+- {id: requestor, role: requestor}
+- {id: peer, role: peer}
+fixtures:
+  selection:
+    version: 1
+    capabilities:
+      q: {k: 2}
+      one: {k: 1}
+    log_records: 16
+  root: 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+  events:
+  - decide:
+      task: t1
+      capability: one
+      peers: [a, b, c]
+      weights: [1, 2, 3]
+      k: 1
+      floor: 0.05
+    selected: [b]
+    index: 1
+  - decide:
+      task: t2
+      capability: q
+      peers: [a, b, c]
+      weights: [1, 2, 3]
+      k: 2
+      floor: 0.05
+    selected: [a, b, c]
+    index: 2
+  - decide:
+      task: t3
+      capability: q
+      peers: [a, b, c]
+      weights: [1, 2, 3]
+      k: 2
+      floor: 0.05
+    selected: [a, c]
+    index: 3
+  - decide:
+      task: t4
+      capability: one
+      peers: [a, b, c]
+      weights: [1, 2, 3]
+      k: 1
+      floor: 0.05
+    selected: [c]
+    index: 4
+  - decide:
+      task: t5
+      capability: q
+      peers: [a, b, c]
+      weights: [1, 2, 3]
+      k: 2
+      floor: 0.05
+    selected: [a, b, c]
+    index: 5
+  - decide:
+      task: t6
+      capability: one
+      peers: [a, b, c]
+      weights: [1, 2, 3]
+      k: 1
+      floor: 0.05
+    selected: [c]
+    index: 6
+  - check_draw: {index: 1}
+    finding: null
+    gap: []
+  - check_draw: {index: 5}
+    finding: null
+    gap: [2, 3, 4]
+  - check_draw: {index: 5}
+    finding: null
+    gap: []
+  - check_draw: {index: 3}
+    finding: index_not_increasing
+    gap: []
+  - check_draw:
+      index: 6
+      tamper: {link: 9d224465a2386de005e8fc3ba5ea7229ba2ce633e4c3f8e280db47547bcf5317}
+    finding: bad_link
+    gap: []
+  - check_draw:
+      index: 6
+      tamper: {link: zz}
+    finding: malformed
+    gap: []
+  - check_answer: {index: 2, asker: a}
+    finding: audit_selected_uninvited
+  - check_answer: {index: 2, asker: b}
+    finding: audit_selected_uninvited
+  - check_answer: {index: 2, asker: c}
+    finding: audit_selected_uninvited
+  - check_answer: {index: 3, asker: a}
+    finding: audit_selected_uninvited
+  - check_answer: {index: 3, asker: b}
+    finding: null
+  - check_answer: {index: 3, asker: c}
+    finding: audit_selected_uninvited
+  - check_answer: {index: 4, asker: a}
+    finding: null
+  - check_answer: {index: 4, asker: b}
+    finding: null
+  - check_answer: {index: 4, asker: c}
+    finding: audit_selected_uninvited
+  - audit: {index: 2, asker: a}
+    answer:
+      index: 2
+      status: ok
+      head: beb82821ef49b96d977db0cb47004e58bcea8d5a49ac6603ace0bd25af61e4be
+      link: b525e7260ad69fe05b210c69b337a0a2c0ca34e33250eb20ab7ff0af3648eaaa
+      task: t2
+      eligible_count: 3
+      row: {position: 0, eligible: true, propensity: 0.38530324074074074, selected: true, draw_at: 0,
+        lo: 0.0, hi: 0.3833333333333333}
+  - audit: {index: 2, asker: stranger}
+    answer: {status: ok, row: null, eligible_count: 3}
+  - audit: {index: 99, asker: a}
+    answer: {status: unknown}
+  - check_answer:
+      index: 2
+      asker: a
+      tamper:
+        row: {selected: false}
+    finding: audit_inconsistent
+  - check_answer:
+      index: 2
+      asker: a
+      tamper: {link: e5cae5c0da19bc7b8bfbee318ba69f3bdafda4fa611f3813458018844231e81c}
+    finding: audit_bad_link
+  - check_answer:
+      index: 2
+      asker: a
+      tamper: {status: unknown}
+    finding: audit_unknown
+  - check_answer:
+      index: 2
+      asker: a
+      tamper:
+        row: {lo: x}
+    finding: audit_malformed
+  - check_draw:
+      draw: {head: fbaa67c8721dae798fc3251941eed2828f34d932348152c8bae68c703814b6fe, index: 1, link: c0ac6c9c4856626d4f0f0998fb6c9ef48355abf26dbd183893beaddc4469c058}
+    finding: head_changed
+    gap: []
+steps:
+- id: 1
+  from: requestor
+  to: peer
+  function: noop
+  payload: {}

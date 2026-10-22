@@ -121,7 +121,8 @@ int neg_result_hook_register(const neg_result_hook_t *hook);
 neg_result_verdict_t neg_ext_on_result(const process_t *proc,
                                        const neg_result_info_t *info);
 
-/** Run every hook's @c periodic. */
+/** Run every hook's @c periodic (the result hook's and the selection
+ *  hook's). */
 void neg_ext_periodic(const process_t *proc);
 
 /** Register @p hook at load time. */
@@ -157,5 +158,67 @@ void negotiation_propose_attestation(const process_t *proc,
  *  network queue took it. */
 int negotiation_send_replay(const process_t *proc, const char *verb,
                             const unsigned char *peer, const char *payload_json);
+
+/* ---- Selective assignment (RD_12.7_SELECTIVE_ASSIGNMENT_PLAN.md section 3) ---
+ *
+ * A requestor may assign a task to k of its N capable peers, or draw a
+ * probe's target, through a feature (libat_selection). The core asks it
+ * before an announce goes out and after a verified decline; shows it every
+ * fresh invitation a worker admits; and hands it every scored result of a
+ * task it drew. Mirrors Python NegotiationHooks.select_participants,
+ * on_decline, on_invitation and on_score. Every call is made with the
+ * negotiation state locked, so none may call back into the negotiation
+ * process: a feature that has to send does it from its periodic pass. */
+
+/** The capable, present peers a task may go to, in the core's peer order. */
+typedef struct {
+    const unsigned char (*uuid)[16];
+    const int *tier;            /* each one's trust tier, as the core reads it */
+    size_t n;
+} neg_candidates_t;
+
+/** One feature's selection hooks. */
+typedef struct {
+    const char *name;
+    /** Choose the invitees of @p task_uuid (36-char string) for
+     *  @p capability among @p cands: @p target is the peer the start was
+     *  addressed to (16 raw bytes), NULL for a fan-out. On true, @p selected
+     *  holds one flag per candidate and @p draw_json the invitation's draw.
+     *  False leaves the task to the core. */
+    bool (*select)(const process_t *proc, const char *task_uuid,
+                   const char *capability, const neg_candidates_t *cands,
+                   const unsigned char *target, bool *selected,
+                   char *draw_json, size_t draw_len);
+    /** @p peer declined @p task_uuid: choose its replacement among
+     *  @p cands, as @c select does. False for none. */
+    bool (*on_decline)(const process_t *proc, const char *task_uuid,
+                       const char *capability, const unsigned char *peer,
+                       const neg_candidates_t *cands, bool *selected,
+                       char *draw_json, size_t draw_len);
+    /** A fresh invitation from @p requestor carrying @p draw_json (never
+     *  empty). Observes only. */
+    void (*on_invitation)(const process_t *proc, const unsigned char *requestor,
+                          const char *draw_json);
+    /** @p executor's result for drawn task @p task_uuid scored @p score. */
+    void (*on_score)(const process_t *proc, const char *task_uuid,
+                     const unsigned char *executor, double score);
+    /** Once per pass of the negotiation loop, unlocked: where the feature
+     *  sends. */
+    void (*periodic)(const process_t *proc);
+} neg_select_hook_t;
+
+/** Register @p hook (static storage). @return 0; -1 NULL, unnamed, duplicate
+ *  or full (one hook for now). */
+int neg_select_hook_register(const neg_select_hook_t *hook);
+
+/** The registered hook, or NULL. */
+const neg_select_hook_t *neg_ext_select_hook(void);
+
+/** Register @p hook at load time. */
+#define NEG_SELECT_HOOK_REGISTER(tag, hook)                                       \
+    static void __attribute__((constructor)) neg_select_hook_register_##tag(void) \
+    {                                                                             \
+        (void)neg_select_hook_register(hook);                                     \
+    }
 
 #endif /* NEG_EXT_H */

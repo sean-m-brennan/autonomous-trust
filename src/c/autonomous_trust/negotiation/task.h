@@ -31,6 +31,10 @@
  *  value, which @c job_t and @c proposed_tasks both rely on. */
 #define TASK_KWARGS_LEN 255
 
+/** Bound on a selection draw's JSON (see @c task_t::draw_json): three
+ *  64-hex fields, an index and the keys, with room to spare. */
+#define TASK_DRAW_LEN 383
+
 typedef struct {
     capability_t capability;
     datetime_t when;
@@ -69,6 +73,13 @@ typedef struct {
      *  its own copy on the tracker -- has nothing to check the answer
      *  against. See @ref verify_bootstrap_result and R+D.md §12.7. */
     char kwargs_json[TASK_KWARGS_LEN + 1];
+    /** The requestor's auditable coin for this invitation (RD_12.7 plan
+     *  section 0.1): a compact JSON object {head, index, link[, prev_root]}
+     *  from its committed seed chain, "" when nothing selected the invitee.
+     *  The "draw" key of the JSON form, omitted when empty, so a task nothing
+     *  selected serializes as it always has; the proto form does not carry
+     *  it. C twin of Python @c TaskInfo.draw. */
+    char draw_json[TASK_DRAW_LEN + 1];
 } task_t;
 
 /*@

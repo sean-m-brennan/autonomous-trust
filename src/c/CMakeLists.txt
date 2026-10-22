@@ -242,6 +242,12 @@ option(AT_ORACLE_REPLICATION  "Build the replicated-execution layer (libat_repli
 if(AT_ORACLE_REPLICATION AND NOT AT_ORACLE_CERTIFICATES)
     message(FATAL_ERROR "AT_ORACLE_REPLICATION=ON requires AT_ORACLE_CERTIFICATES=ON (SplitMix64)")
 endif()
+# Selective assignment (R+D.md §12.7): inert until $AT_SELECTION names a
+# declaration, like the layers above.
+option(AT_ORACLE_SELECTION    "Build the selective-assignment layer (libat_selection)" ON)
+if(AT_ORACLE_SELECTION AND NOT AT_ORACLE_CERTIFICATES)
+    message(FATAL_ERROR "AT_ORACLE_SELECTION=ON requires AT_ORACLE_CERTIFICATES=ON (SplitMix64)")
+endif()
 
 if(AT_STATIC AND APPLE)
     message(FATAL_ERROR "AT_STATIC is not supported on macOS: Apple's linker has no -static for user programs")
@@ -409,7 +415,13 @@ endif()
 # check (testing only — optional for non-test builds)
 find_path(LIBCHECK_INCLUDE_DIR check.h HINTS ${CONDA_ROOT})
 find_library(LIBCHECK_LIBRARY NAMES check libcheck.so libcheck.a HINTS ${CONDA_ROOT})
-if(LIBCHECK_LIBRARY)
+# Off for builds that only want the libraries (scripts/package-devel.sh): every
+# test target is gated on LIBCHECK_LIBRARY, which this hides.
+option(AT_TESTS "Build the unit tests (needs libcheck)" ON)
+if(NOT AT_TESTS)
+    set(LIBCHECK_LIBRARY "")
+    message("-- Tests off (AT_TESTS=OFF)")
+elseif(LIBCHECK_LIBRARY)
     include_directories(${LIBCHECK_INCLUDE_DIR})
     message("-- Found libcheck at ${LIBCHECK_LIBRARY}")
 else()
@@ -1573,7 +1585,7 @@ if(AT_NET_GATEWAY)
     add_subdirectory(extensions/gateway)
 endif()
 # Certificates before replication, which links it.
-foreach(_layer PHYSICS CALIBRATION CERTIFICATES PREQUENTIAL REPLICATION)
+foreach(_layer PHYSICS CALIBRATION CERTIFICATES PREQUENTIAL REPLICATION SELECTION)
     if(AT_ORACLE_${_layer})
         string(TOLOWER ${_layer} _dir)
         add_subdirectory(extensions/${_dir})
@@ -1664,18 +1676,19 @@ endif()
 ####################
 # Packaging
 
+# COMPONENT binds to the artifact kind before it, so each kind names one.
 install(TARGETS autonomous_trust 
-        RUNTIME DESTINATION bin
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        PUBLIC_HEADER DESTINATION include
-        FILE_SET HEADERS
+        RUNTIME DESTINATION bin COMPONENT core
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT core
+        PUBLIC_HEADER DESTINATION include COMPONENT core
+        FILE_SET HEADERS COMPONENT core
         )
 install(TARGETS autonomous_trust_static
-        RUNTIME DESTINATION bin
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        PUBLIC_HEADER DESTINATION include
-        FILE_SET HEADERS
+        RUNTIME DESTINATION bin COMPONENT core
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT core
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT core
+        PUBLIC_HEADER DESTINATION include COMPONENT core
+        FILE_SET HEADERS COMPONENT core
         )
 
 # The generated message headers, in the build tree's layout: they include each
@@ -1683,6 +1696,7 @@ install(TARGETS autonomous_trust_static
 # identity/identity.pb-c.h relative to core/protobuf.
 install(DIRECTORY ${PROTO_BINARY_DIR}/autonomous_trust
         DESTINATION include
+        COMPONENT core
         FILES_MATCHING PATTERN "*.pb-c.h")
 
 # The headers include each other relative to include/autonomous_trust
@@ -1696,12 +1710,19 @@ endif()
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust.pc.in
                ${CMAKE_CURRENT_BINARY_DIR}/autonomous_trust.pc @ONLY)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/autonomous_trust.pc
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
+        COMPONENT core)
 
-# autonomous-trust-devel: `cpack -G DEB` / `cpack -G RPM` in a build configured
-# with -DCMAKE_INSTALL_PREFIX=/usr. .github/workflows/release-packages.yml builds
-# them on the oldest distro of each family (scripts/package-devel.sh says why
-# that one package serves the newer ones). Package versions cannot carry '-'. A git-describe snapshot,
+# `cpack -G DEB` / `cpack -G RPM` in a build configured with
+# -DCMAKE_INSTALL_PREFIX=/usr makes one package per install COMPONENT:
+#   core         autonomous-trust-devel: libautonomous_trust, its headers, .pc
+#   <extension>  autonomous-trust-<extension>-devel: libat_<extension> and its
+#                at_<extension>.h, for each extension built (AT_ZTA,
+#                AT_NET_DTN, ... decide which), as at_package_component()
+#                registered it
+# .github/workflows/release-packages.yml builds them on the oldest distro of
+# each family (scripts/package-devel.sh says why one package serves the newer
+# ones). Package versions cannot carry '-'. A git-describe snapshot,
 # 0.2.2-125-g53eea3d1, becomes 0.2.2+125.g53eea3d1, which sorts after 0.2.2;
 # a pre-release tag's 0.3.0-rc1 becomes 0.3.0~rc1, which sorts before 0.3.0
 # (both in dpkg and rpm).
@@ -1710,26 +1731,72 @@ if(NOT AT_PACKAGE_VERSION)
            AT_PACKAGE_VERSION "${AT_PC_VERSION}")
     string(REPLACE "-" "~" AT_PACKAGE_VERSION "${AT_PACKAGE_VERSION}")
 endif()
+set(AT_PACKAGE_RELEASE 1)
 set(CPACK_PACKAGE_NAME autonomous-trust-devel)
 set(CPACK_PACKAGE_VERSION ${AT_PACKAGE_VERSION})
 set(CPACK_PACKAGE_CONTACT "Sean M Brennan <sean.brennan@tekfive.com>")
-set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
-    "Autonomous Trust C library: shared and static libraries, extensions and headers")
 set(CPACK_PACKAGE_HOMEPAGE_URL https://github.com/sean-m-brennan/autonomous-trust)
 set(CPACK_RESOURCE_FILE_LICENSE ${top_src_dir}/LICENSE)
 set(CPACK_PACKAGING_INSTALL_PREFIX ${CMAKE_INSTALL_PREFIX})
-# Library dependencies come from the binaries (dpkg-shlibdeps, rpm's
-# find-requires); these are the -dev packages the installed headers include.
+set(CPACK_DEB_COMPONENT_INSTALL ON)
+set(CPACK_RPM_COMPONENT_INSTALL ON)
 set(CPACK_DEBIAN_PACKAGE_SECTION libdevel)
-set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
-set(CPACK_DEBIAN_PACKAGE_DEPENDS "libsodium-dev, libjansson-dev, uuid-dev, libprotobuf-c-dev")
-set(CPACK_DEBIAN_PACKAGE_RELEASE 1)
+set(CPACK_DEBIAN_PACKAGE_RELEASE ${AT_PACKAGE_RELEASE})
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_RPM_PACKAGE_LICENSE Apache-2.0)
-set(CPACK_RPM_PACKAGE_REQUIRES "libsodium-devel, jansson-devel, libuuid-devel, protobuf-c-devel")
+set(CPACK_RPM_PACKAGE_RELEASE ${AT_PACKAGE_RELEASE})
+set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
 # Owned by the distro's pkgconf package.
 set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
     ${CPACK_PACKAGING_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/pkgconfig)
-set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
+
+# Core. Its library dependencies come from the binary (dpkg-shlibdeps, rpm's
+# find-requires); these are the -dev packages the installed headers include.
+set(CPACK_COMPONENT_CORE_DESCRIPTION
+    "Autonomous Trust C library: shared and static libraries, headers, pkg-config file")
+set(CPACK_DEBIAN_CORE_PACKAGE_NAME autonomous-trust-devel)
+set(CPACK_DEBIAN_CORE_PACKAGE_SHLIBDEPS ON)
+set(CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
+    "libsodium-dev, libjansson-dev, uuid-dev, libprotobuf-c-dev")
+set(CPACK_RPM_CORE_PACKAGE_NAME autonomous-trust-devel)
+set(CPACK_RPM_CORE_PACKAGE_REQUIRES
+    "libsodium-devel, jansson-devel, libuuid-devel, protobuf-c-devel")
+
+# Extensions. Each requires the core package (and the packages of the
+# extensions it depends on) at exactly this version: an extension uses the
+# core's private headers and is ABI-bound to the build it came from. That
+# requirement also carries the core's library dependencies; anything more is
+# the extension's DEB_DEPENDS / RPM_REQUIRES. dpkg-shlibdeps is off for them,
+# because it cannot resolve libautonomous_trust.so from another package's
+# staging tree; rpm still adds soname requirements from the binaries.
+get_property(AT_PACKAGE_COMPONENTS GLOBAL PROPERTY AT_PACKAGE_COMPONENTS)
+set(CPACK_COMPONENTS_ALL core ${AT_PACKAGE_COMPONENTS})
+foreach(_c ${AT_PACKAGE_COMPONENTS})
+    string(TOUPPER ${_c} _C)
+    string(REPLACE "_" "-" _pkg "autonomous-trust-${_c}-devel")
+    set(_deb "autonomous-trust-devel (= ${AT_PACKAGE_VERSION}-${AT_PACKAGE_RELEASE})")
+    set(_rpm "autonomous-trust-devel = ${AT_PACKAGE_VERSION}-${AT_PACKAGE_RELEASE}")
+    get_property(_deps GLOBAL PROPERTY AT_PACKAGE_DEPENDS_${_c})
+    foreach(_d ${_deps})
+        string(REPLACE "_" "-" _dpkg "autonomous-trust-${_d}-devel")
+        string(APPEND _deb ", ${_dpkg} (= ${AT_PACKAGE_VERSION}-${AT_PACKAGE_RELEASE})")
+        string(APPEND _rpm ", ${_dpkg} = ${AT_PACKAGE_VERSION}-${AT_PACKAGE_RELEASE}")
+    endforeach()
+    get_property(_extra GLOBAL PROPERTY AT_PACKAGE_DEB_DEPENDS_${_c})
+    foreach(_x ${_extra})
+        string(APPEND _deb ", ${_x}")
+    endforeach()
+    get_property(_extra GLOBAL PROPERTY AT_PACKAGE_RPM_REQUIRES_${_c})
+    foreach(_x ${_extra})
+        string(APPEND _rpm ", ${_x}")
+    endforeach()
+    set(CPACK_COMPONENT_${_C}_DESCRIPTION
+        "Autonomous Trust ${_c} extension: shared and static libraries, header")
+    set(CPACK_DEBIAN_${_C}_PACKAGE_NAME ${_pkg})
+    set(CPACK_DEBIAN_${_C}_PACKAGE_SHLIBDEPS OFF)
+    set(CPACK_DEBIAN_${_C}_PACKAGE_DEPENDS "${_deb}")
+    set(CPACK_RPM_${_C}_PACKAGE_NAME ${_pkg})
+    set(CPACK_RPM_${_C}_PACKAGE_REQUIRES "${_rpm}")
+endforeach()
 
 include(CPack)
