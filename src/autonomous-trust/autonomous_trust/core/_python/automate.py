@@ -54,7 +54,8 @@ from .bootstrap_capabilities import (
 from .capabilities import Capabilities, Capability, PeerCapabilities
 from .system import CfgIds, PackageHash, queue_cadence, max_concurrency, now, preferred_proto_ver, QueueType
 from .protocol import Protocol
-from .negotiation import Task, TaskParameters, TaskStatus, Status, TaskResult, NegotiationProtocol
+from .negotiation import (Task, TaskParameters, TaskStatus, Status, TaskResult,
+                          NegotiationProtocol, ScoreEcho)
 from .network import Message, require_synced_clock
 from .reputation import (TransactionScore, ReputationProtocol, PeerReputation,
                          TX_CHANNEL_CERTIFICATE, TX_CHANNEL_TASK_OUTCOME,
@@ -1182,6 +1183,12 @@ class AutonomousTrust(Protocol):
                                               competence=competence_weight(
                                                   cap_name, executor))
                         queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
+                        # A selection layer joins this score into its
+                        # decision log, which lives in negotiation (RD_12.7).
+                        if getattr(task, 'echo_score', False) and executor is not None:
+                            queues[CfgIds.negotiation].put(
+                                ScoreEcho(task.uuid, executor, score, channel),
+                                block=True, timeout=queue_cadence)
                     # The application sees one answer per task; the other
                     # executors' results are scored only (negprocess).
                     if self.external_feedback in queues \

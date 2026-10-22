@@ -783,9 +783,12 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     out->info.net_msg.function = (char *)function;
     out->info.net_msg.encrypt = false;
     /* The replay verbs answer only an authenticated sender, as the network
-     * layer marks a verified frame. */
+     * layer marks a verified frame. So does a nack (RD_2.6 plan §2.8), which
+     * a step sends unsigned with `unverified: true`. */
     out->info.net_msg.verified = strcmp(function, NEG_PROTO_REPLAY_CHALLENGE) == 0
-        || strcmp(function, NEG_PROTO_REPLAY_REVEAL) == 0;
+        || strcmp(function, NEG_PROTO_REPLAY_REVEAL) == 0
+        || (strcmp(function, "nack") == 0
+            && !json_is_true(json_object_get(payload, "unverified")));
     memcpy(&out->info.net_msg.from_whom, sender_impl->pub, sizeof(public_identity_t));
     /* A `spawn task` step goes from the requestor to itself, but on a start
      * message `to_whom` is the peer the task is ADDRESSED to (start_task), and

@@ -744,8 +744,10 @@ class NegotiationAdapter:
             encrypt=True,
         )
         # The replay verbs answer only an authenticated sender, as the network
-        # process marks a verified frame.
-        msg.verified = function in ('replay challenge', 'replay reveal')
+        # process marks a verified frame. So does a nack (RD_2.6 plan §2.8),
+        # which a step sends unsigned with `unverified: true`. Mirrors C.
+        msg.verified = (function in ('replay challenge', 'replay reveal')
+                        or (function == 'nack' and not payload.get('unverified')))
         return msg
 
 

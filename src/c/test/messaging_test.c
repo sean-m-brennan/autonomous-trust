@@ -20,7 +20,6 @@
 
 #include "autonomous_trust/utilities/message.h"
 #include "autonomous_trust/utilities/msg_types.h"
-#include "autonomous_trust/utilities/protobuf_shutdown.h"
 #include "autonomous_trust/utilities/util.h"
 #include "autonomous_trust/utilities/logger.h"
 #include "autonomous_trust/config/configuration.h"

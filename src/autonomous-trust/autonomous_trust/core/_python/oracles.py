@@ -66,6 +66,7 @@ DECLARATIONS: tuple[tuple[str, str], ...] = (
     ('AT_PREQUENTIAL', 'prequential'),
     ('AT_CERTIFICATES', 'certificates'),
     ('AT_REPLICATION', 'replication'),
+    ('AT_SELECTION', 'selection'),
 )
 
 

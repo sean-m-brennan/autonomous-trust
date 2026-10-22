@@ -38,7 +38,6 @@
 #include "processes/process_tracker_priv.h"
 #include "structures/array.h"
 #include "structures/map.h"
-#include "utilities/protobuf_shutdown.h"
 #include "network/network.h"
 #include "negotiation/negotiation.h"
 #include "reputation/reputation.h"
@@ -826,7 +825,6 @@ int run_autonomous_trust(char *q_in, char *q_out,
         close(fd1);
     if (fd2 > 0)
         close(fd2);
-    shutdown_protobuf_library();
 
     /* Clean up PID file */
     if (pid_path[0] != '\0')

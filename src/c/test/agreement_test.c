@@ -18,7 +18,6 @@
 #include <sodium.h>
 
 #include "autonomous_trust/algorithms/agreement.h"
-#include "autonomous_trust/utilities/protobuf_shutdown.h"
 
 #define DEBUG_TESTS 1
 #include "test_setup.h"

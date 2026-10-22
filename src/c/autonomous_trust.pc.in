@@ -8,5 +8,5 @@ URL: https://github.com/sean-m-brennan/autonomous-trust
 Version: @AT_PC_VERSION@
 Requires: libsodium jansson uuid libprotobuf-c
 Libs: -L${libdir} -lautonomous_trust
-Libs.private: -lprotobuf -lstdc++ -lpthread -lm
+Libs.private: -lpthread -lm
 Cflags: -fms-extensions -I${includedir} -I${includedir}/autonomous_trust -I${includedir}/autonomous_trust/core/protobuf
