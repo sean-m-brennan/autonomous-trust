@@ -1,0 +1,176 @@
+schema_version: '1'
+kind: scenario
+protocol: selection
+name: estimate
+byte_pinning: false
+description: |
+  The doubly robust estimator over the decision log (RD_12.7 plan section
+  3.7, D8(b)), a diagnostic only (D7(a)).
+
+  Six probes at floor 0.1 build the reward model: each peer's mean probe
+  outcome, shrunk toward the mean over all probes by two pseudo-observations.
+  Five ordinary tasks of q follow. Four are scored and one is declined, and a
+  decline contributes only the model term. The estimate pins, per capability,
+  the decisions with an outcome, the outcomes, and the value of the logged,
+  uniform and greedy policies, each
+  sum_i pi_i (rhat_i + [observed_i / mu_i](r_i - rhat_i)) / sum_i pi_i averaged
+  over decisions, and the logged policy's regret against the other two. An
+  outcome for a peer no decision selected is not recorded.
+participants:
+- {id: requestor, role: requestor}
+- {id: peer, role: peer}
+fixtures:
+  selection:
+    version: 1
+    probe: {floor: 0.1}
+    capabilities:
+      q: {k: 1}
+  root: 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+  events:
+  - decide:
+      task: p1
+      capability: at.handshake
+      peers: [a, b, c]
+      weights: [1.0, 1.0, 1.0]
+      k: 1
+      floor: 0.1
+      purpose: probe
+    selected: [b]
+    index: 1
+  - outcome: {task: p1, peer: b, score: 0.5}
+    recorded: true
+  - decide:
+      task: p2
+      capability: at.handshake
+      peers: [a, b, c]
+      weights: [1.0, 1.0, 1.0]
+      k: 1
+      floor: 0.1
+      purpose: probe
+    selected: [b]
+    index: 2
+  - outcome: {task: p2, peer: b, score: 0.5}
+    recorded: true
+  - decide:
+      task: p3
+      capability: at.handshake
+      peers: [a, b, c]
+      weights: [1.0, 1.0, 1.0]
+      k: 1
+      floor: 0.1
+      purpose: probe
+    selected: [a]
+    index: 3
+  - outcome: {task: p3, peer: a, score: 0.9}
+    recorded: true
+  - decide:
+      task: p4
+      capability: at.handshake
+      peers: [a, b, c]
+      weights: [1.0, 1.0, 1.0]
+      k: 1
+      floor: 0.1
+      purpose: probe
+    selected: [b]
+    index: 4
+  - outcome: {task: p4, peer: b, score: 0.5}
+    recorded: true
+  - decide:
+      task: p5
+      capability: at.handshake
+      peers: [a, b, c]
+      weights: [1.0, 1.0, 1.0]
+      k: 1
+      floor: 0.1
+      purpose: probe
+    selected: [a]
+    index: 5
+  - outcome: {task: p5, peer: a, score: 0.9}
+    recorded: true
+  - decide:
+      task: p6
+      capability: at.handshake
+      peers: [a, b, c]
+      weights: [1.0, 1.0, 1.0]
+      k: 1
+      floor: 0.1
+      purpose: probe
+    selected: [c]
+    index: 6
+  - outcome: {task: p6, peer: c, score: 0.1}
+    recorded: true
+  - decide:
+      task: t1
+      capability: q
+      peers: [a, b, c]
+      weights: [1, 2, 3]
+      k: 1
+      floor: 0.05
+    selected: [b]
+    index: 7
+  - outcome: {task: t1, peer: b, score: 0.45}
+    recorded: true
+  - decide:
+      task: t2
+      capability: q
+      peers: [a, b, c]
+      weights: [1, 2, 3]
+      k: 1
+      floor: 0.05
+    selected: [c]
+    index: 8
+  - outcome: {task: t2, peer: c, score: 0.05}
+    recorded: true
+  - decide:
+      task: t3
+      capability: q
+      peers: [a, b, c]
+      weights: [1, 2, 3]
+      k: 1
+      floor: 0.05
+    selected: [a]
+    index: 9
+  - decline: {task: t3, peer: a}
+    recorded: true
+  - decide:
+      task: t4
+      capability: q
+      peers: [a, b, c]
+      weights: [1, 2, 3]
+      k: 1
+      floor: 0.05
+    selected: [b]
+    index: 10
+  - outcome: {task: t4, peer: b, score: 0.45}
+    recorded: true
+  - decide:
+      task: t5
+      capability: q
+      peers: [a, b, c]
+      weights: [1, 2, 3]
+      k: 1
+      floor: 0.05
+    selected: [c]
+    index: 11
+  - outcome: {task: t5, peer: c, score: 0.05}
+    recorded: true
+  - outcome: {task: t1, peer: nobody, score: 1.0}
+    recorded: false
+  - estimate: {}
+    result:
+      at.handshake:
+        decisions: 6
+        observed: 6
+        value: {logged: 0.5474074074074075, uniform: 0.5474074074074075, greedy: 0.9}
+        regret: {uniform: 0.0, greedy: 0.35259259259259257}
+      q:
+        decisions: 4
+        observed: 4
+        value: {logged: 0.2925, uniform: 0.39199805068226123, greedy: 0.7333333333333334}
+        regret: {uniform: 0.09949805068226125, greedy: 0.4408333333333334}
+steps:
+- id: 1
+  from: requestor
+  to: peer
+  function: noop
+  payload: {}

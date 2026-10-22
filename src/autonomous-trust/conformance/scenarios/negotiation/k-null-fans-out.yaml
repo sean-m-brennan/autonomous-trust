@@ -1,0 +1,66 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: k-null-fans-out
+byte_pinning: false
+description: |
+    With a selection declaration loaded, a capability it does not select still
+    fans out to every capable peer, which is today's behavior and the default
+    (RD_12.7 plan section 3.3: k null). alice's declaration selects only
+    demo.query. data_fetch is unnamed, so it falls to the default k null,
+    and bob, carol and dave are all invited, with no draw.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+  - id: carol
+    role: worker
+  - id: dave
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_fetch]
+    carol: [data_fetch]
+    dave: [data_fetch]
+  selection:
+    holder: alice
+    root: 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+    declaration:
+      version: 1
+      default: {k: null}
+      capabilities:
+        demo.query: {k: 1}
+
+steps:
+  - id: 1
+    from: alice
+    to: alice
+    function: spawn task
+    payload:
+      capability: data_fetch
+      task_id: t-fanout
+  - id: 2
+    from: alice
+    to: bob
+    function: invitation
+    in_response_to: 1
+    no_propagate: true
+  - id: 3
+    from: alice
+    to: carol
+    function: invitation
+    in_response_to: 1
+    no_propagate: true
+  - id: 4
+    from: alice
+    to: dave
+    function: invitation
+    in_response_to: 1
+    no_propagate: true
+
+expected_state:
+  alice:
+    has_my_task: t-fanout

@@ -1,0 +1,45 @@
+schema_version: '1'
+kind: scenario
+protocol: selection
+name: chain
+byte_pinning: false
+description: |
+  The committed seed chain (RD_12.7 plan section 0.1). The requestor
+  publishes head = H^N(root), N = 65536, and draw n is seeded by link(n) =
+  H^(N-n)(root), so link(65536) is the root itself. H is SHA-256. A link checks
+  against the head as H^n(link) == head, or forward from a link already checked
+  (known_index), which costs only the gap. Indices outside [1, N] never check.
+  The links straddle a checkpoint (255, 256, 257) because the requestor
+  produces each one from the nearest checkpoint below it.
+participants:
+- {id: requestor, role: requestor}
+- {id: peer, role: peer}
+fixtures:
+  root: 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+  events:
+  - {head: true, hex: beb82821ef49b96d977db0cb47004e58bcea8d5a49ac6603ace0bd25af61e4be}
+  - {link: 1, hex: d9bd3a6a13eb58fed222fa46ca1b9cb1a65ff49b413484ed1cc7c895c0d6551c}
+  - {link: 2, hex: b525e7260ad69fe05b210c69b337a0a2c0ca34e33250eb20ab7ff0af3648eaaa}
+  - {link: 255, hex: ccfc94fccfceae5c5397b819cc9c012952819ec1c62a22fd49165a3bef122527}
+  - {link: 256, hex: 279a63a7ac3f3e2cd8f012f50b8e1088d5617590dae6192ade6615998c215db6}
+  - {link: 257, hex: f7f6bc7bc3bb115227afbb19fdeb61446ac775aab757bde9ded9bbacf6252720}
+  - {link: 65535, hex: 630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd}
+  - {link: 65536, hex: 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f}
+  - verify: {index: 300, link_of: 300}
+    ok: true
+  - verify: {index: 300, link_of: 299}
+    ok: false
+  - verify: {index: 300, link_of: 300, known_index: 7}
+    ok: true
+  - verify: {index: 300, link_of: 301, known_index: 7}
+    ok: false
+  - verify: {index: 0, link_of: 1}
+    ok: false
+  - verify: {index: 65537, link_of: 1}
+    ok: false
+steps:
+- id: 1
+  from: requestor
+  to: peer
+  function: noop
+  payload: {}

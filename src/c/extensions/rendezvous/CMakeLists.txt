@@ -29,7 +29,6 @@ at_extension_library(rendezvous
         rdv_net.c
         rdv_roster.c
 )
-install(FILES at_rendezvous.h DESTINATION include)
 
 at_extension_tests(rendezvous
     net_relay_test

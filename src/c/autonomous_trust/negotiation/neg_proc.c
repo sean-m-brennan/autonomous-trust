@@ -691,6 +691,17 @@ static void _task_info_into_json(const process_t *proc, const task_t *task,
      * other verbs carry whatever the task already held and nothing reads it
      * there. */
     json_object_set_new(j, "seq", json_integer((json_int_t)task->seq));
+    /* A selection layer's draw (RD_12.7 plan section 0.1), only when one drew
+     * this invitee: a task nothing selected keeps its old shape. */
+    if (task->draw_json[0] != '\0')
+    {
+        json_error_t jerr;
+        json_t *draw = json_loads(task->draw_json, 0, &jerr);
+        if (json_is_object(draw))
+            json_object_set_new(j, "draw", draw);
+        else
+            json_decref(draw);
+    }
 }
 
 /****************************
@@ -910,6 +921,20 @@ static int _task_from_json(const json_t *j, task_t *task)
     json_t *j_seq = json_object_get(j, "seq");
     if (json_is_integer(j_seq))
         task->seq = (int64_t)json_integer_value(j_seq);
+
+    /* The requestor's draw, kept whole or not at all, as kwargs is. */
+    task->draw_json[0] = '\0';
+    json_t *j_draw = json_object_get(j, "draw");
+    if (json_is_object(j_draw))
+    {
+        char *dumped = json_dumps(j_draw, JSON_COMPACT | JSON_SORT_KEYS);
+        if (dumped != NULL)
+        {
+            if (strlen(dumped) < sizeof(task->draw_json))
+                at_strlcpy(task->draw_json, dumped, sizeof(task->draw_json));
+            free(dumped);
+        }
+    }
 
     /* A TaskResult carries no `parameters` (it extends TaskInfo), so their
      * absence is normal for that verb and leaves the caller's memset zeros. */
@@ -1136,6 +1161,68 @@ static bool _peer_has_capability(const process_t *proc, const char *peer_uuid_st
  * a cadence for it to come back around. Caller holds neg_state.lock.
  *
  * @p target_uuid, when non-zero, narrows the fan-out to one peer. */
+/* The candidates a selection layer draws from: every capable, present peer
+ * in the core's peer order, with its tier and its index in the peer table.
+ * Caller holds neg_state.lock and the peers read lock. */
+typedef struct {
+    neg_candidates_t cands;
+    unsigned char (*uuid)[16];
+    int *tier;
+    size_t *at;
+    bool *flags;
+} sel_cands_t;
+
+static void _sel_cands_free(sel_cands_t *sc)
+{
+    free(sc->uuid);
+    free(sc->tier);
+    free(sc->at);
+    free(sc->flags);
+    memset(sc, 0, sizeof(*sc));
+}
+
+static int _sel_cands_build(const process_t *proc, const char *cap_name, sel_cands_t *sc)
+{
+    memset(sc, 0, sizeof(*sc));
+    size_t n_peers = proc->protocol.num_peers;
+    sc->uuid = calloc(n_peers ? n_peers : 1, sizeof(*sc->uuid));
+    sc->tier = calloc(n_peers ? n_peers : 1, sizeof(*sc->tier));
+    sc->at = calloc(n_peers ? n_peers : 1, sizeof(*sc->at));
+    sc->flags = calloc(n_peers ? n_peers : 1, sizeof(*sc->flags));
+    if (sc->uuid == NULL || sc->tier == NULL || sc->at == NULL || sc->flags == NULL)
+    {
+        _sel_cands_free(sc);
+        return -1;
+    }
+    size_t nc = 0;
+    for (size_t i = 0; i < n_peers; i++)
+    {
+        char peer_uuid_str[UUID_STRING_LEN + 1] = {0};
+        uuid_unparse_lower(proc->protocol.peers[i].uuid, peer_uuid_str);
+        if (!_peer_has_capability(proc, peer_uuid_str, cap_name)
+            || proc->protocol.peer_absent[i])
+            continue;
+        memcpy(sc->uuid[nc], proc->protocol.peers[i].uuid, 16);
+        int tier = _peer_tier_override_locked(proc, proc->protocol.peers[i].uuid);
+        sc->tier[nc] = tier >= 0 ? tier : identity_get_peer_tier(proc->protocol.peers[i].uuid);
+        sc->at[nc++] = i;
+    }
+    sc->cands.uuid = (const unsigned char (*)[16])sc->uuid;
+    sc->cands.tier = sc->tier;
+    sc->cands.n = nc;
+    return 0;
+}
+
+/* The chosen flags by peer-table index, or NULL when out of memory. */
+static bool *_sel_cands_chosen(const sel_cands_t *sc, size_t n_peers)
+{
+    bool *chosen = calloc(n_peers ? n_peers : 1, sizeof(*chosen));
+    if (chosen != NULL)
+        for (size_t c = 0; c < sc->cands.n; c++)
+            chosen[sc->at[c]] = sc->flags[c];
+    return chosen;
+}
+
 static int _announce_task_locked(const process_t *proc, task_t *task,
                                  const uuid_t target_uuid)
 {
@@ -1188,9 +1275,6 @@ static int _announce_task_locked(const process_t *proc, task_t *task,
         return 0;
     }
 
-    /* Build JSON payload for invitation */
-    json_t *invite_json = _task_to_json(proc, task);
-
     /* An addressed start narrows the fan-out to one peer. A probe has to be
      * able to say "this peer": fanned out, an invitation is answered by
      * whichever peer replies first, so a broadcast cannot express a directed
@@ -1204,27 +1288,66 @@ static int _announce_task_locked(const process_t *proc, task_t *task,
     bool addressed = (target_uuid != NULL
                       && uuid_compare(target_uuid, zero_uuid) != 0);
 
+    /* Selective assignment (RD_12.7 plan section 3.1): a selection layer may
+     * draw the invitees from the capable, present peers -- k of them for a
+     * capability it selects on, or the target of a directed probe -- and
+     * stamp the invitation with the draw. With no layer, or none that selects
+     * this task, nothing below changes. Mirrors Python start_task. */
+    peers_read_lock(proc);
+    bool *chosen = NULL;
+    size_t n_peers = proc->protocol.num_peers;
+    const neg_select_hook_t *sel = neg_ext_select_hook();
+    if (sel != NULL && sel->select != NULL && n_peers > 0)
+    {
+        sel_cands_t sc;
+        if (_sel_cands_build(proc, task->capability.name, &sc) == 0)
+        {
+            char task_uuid_s[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(task->uuid, task_uuid_s);
+            if (sc.cands.n > 0
+                && sel->select(proc, task_uuid_s, task->capability.name, &sc.cands,
+                               addressed ? target_uuid : NULL, sc.flags,
+                               task->draw_json, sizeof(task->draw_json)))
+            {
+                chosen = _sel_cands_chosen(&sc, n_peers);
+                if (tracker != NULL)
+                    tracker->drawn = true;
+            }
+        }
+        _sel_cands_free(&sc);
+    }
+
+    /* Build JSON payload for invitation, after the draw it may carry. */
+    json_t *invite_json = _task_to_json(proc, task);
+
     /* Send invitation to capable peers */
     int invited = 0;
     int sent = 0;   /* of those, the invitations the network queue took */
-    peers_read_lock(proc);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         char peer_uuid_str[UUID_STRING_LEN + 1] = {0};
         uuid_unparse_lower(proc->protocol.peers[i].uuid, peer_uuid_str);
 
-        if (addressed && uuid_compare(proc->protocol.peers[i].uuid, target_uuid) != 0)
-            continue;
+        if (chosen != NULL)
+        {
+            if (!chosen[i])
+                continue;
+        }
+        else
+        {
+            if (addressed && uuid_compare(proc->protocol.peers[i].uuid, target_uuid) != 0)
+                continue;
 
-        /* Filter by capability if peer_capabilities map is available */
-        if (!_peer_has_capability(proc, peer_uuid_str, task->capability.name))
-            continue;
+            /* Filter by capability if peer_capabilities map is available */
+            if (!_peer_has_capability(proc, peer_uuid_str, task->capability.name))
+                continue;
 
-        /* Not a peer the network process has heard from lately: asking it to
-         * work would only time out (doc/architecture/peer-presence.md). It
-         * stays a member; it is just not invited. */
-        if (proc->protocol.peer_absent[i])
-            continue;
+            /* Not a peer the network process has heard from lately: asking it
+             * to work would only time out (doc/architecture/peer-presence.md).
+             * It stays a member; it is just not invited. */
+            if (proc->protocol.peer_absent[i])
+                continue;
+        }
 
         generic_msg_t invite = {0};
         invite.type = NET_MESSAGE;
@@ -1246,6 +1369,7 @@ static int _announce_task_locked(const process_t *proc, task_t *task,
         invited++;
     }
     peers_read_unlock(proc);
+    free(chosen);
 
     if (invite_json)
         json_decref(invite_json);
@@ -1401,6 +1525,15 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
                                             NEG_PROTO_ANNOUNCE));
         pthread_mutex_unlock(&neg_state.lock);
         return true;
+    }
+
+    /* A selection layer checks the requestor's coin (RD_12.7 plan section
+     * 0.2): it logs and counts a bad draw, and changes nothing here. */
+    {
+        const neg_select_hook_t *sel = neg_ext_select_hook();
+        if (have_task && task.draw_json[0] != '\0' && sel != NULL
+            && sel->on_invitation != NULL)
+            sel->on_invitation(proc, nmsg->from_whom.uuid, task.draw_json);
     }
 
     /* Flood detection: count how many times we have seen this task */
@@ -1760,6 +1893,68 @@ static void _cancel_participant(const process_t *proc,
                  task_uuid_str ? task_uuid_str : "?", peer_str);
 }
 
+/* Invite a selection layer's replacement for a drawn invitee that declined
+ * (RD_12.7 plan section 3.5, D5(a)), from the task this node announced
+ * (proposed_tasks) with the new draw and a fresh stamp. Mirrors Python
+ * NegotiationProcess._replace_declined. Caller holds neg_state.lock. */
+static void _replace_declined_locked(const process_t *proc, task_tracker_t *tracker,
+                                     const char *task_uuid_str, const uuid_t peer)
+{
+    const neg_select_hook_t *sel = neg_ext_select_hook();
+    if (sel == NULL || sel->on_decline == NULL)
+        return;
+    data_t *task_dat = NULL;
+    task_t *announced = NULL;
+    if (map_get(&neg_state.proposed_tasks, (char *)task_uuid_str, &task_dat) != 0 || task_dat == NULL
+        || data_object_ptr(task_dat, (ptr_t *)&announced) != 0 || announced == NULL)
+        return;
+    task_t task;
+    memcpy(&task, announced, sizeof(task));
+
+    peers_read_lock(proc);
+    sel_cands_t sc;
+    bool *chosen = NULL;
+    if (_sel_cands_build(proc, task.capability.name, &sc) == 0)
+    {
+        if (sc.cands.n > 0
+            && sel->on_decline(proc, task_uuid_str, task.capability.name, peer,
+                               &sc.cands, sc.flags, task.draw_json,
+                               sizeof(task.draw_json)))
+            chosen = _sel_cands_chosen(&sc, proc->protocol.num_peers);
+    }
+    _sel_cands_free(&sc);
+    if (chosen == NULL)
+    {
+        peers_read_unlock(proc);
+        return;
+    }
+    task.seq = freshness_stamp(&neg_state.freshness, proc->logger);
+    json_t *invite_json = task.seq > 0 ? _task_to_json(proc, &task) : NULL;
+    for (size_t i = 0; invite_json != NULL && i < proc->protocol.num_peers; i++)
+    {
+        if (!chosen[i])
+            continue;
+        generic_msg_t invite = {0};
+        invite.type = NET_MESSAGE;
+        strncpy(invite.info.net_msg.process, "negotiation", PROC_NAME_LEN);
+        invite.info.net_msg.function = NEG_PROTO_ANNOUNCE;
+        invite.info.net_msg.encrypt = true;
+        memcpy(&invite.info.net_msg.to_whom, &proc->protocol.peers[i],
+               sizeof(public_identity_t));
+        strncpy(invite.info.net_msg.return_to, "negotiation", PROC_NAME_LEN);
+        net_msg_pack_json(&invite.info.net_msg, invite_json);
+        (void)_neg_send(proc, "network", &invite, "a re-drawn invitation");
+        net_msg_free_obj(&invite.info.net_msg);
+        task_tracker_add_invited(tracker, proc->protocol.peers[i].uuid);
+        tracker->expected++;
+        log_debug(proc->logger, "Negotiation: declined task %s re-drawn to %s\n",
+                  task_uuid_str, proc->protocol.peers[i].nickname);
+    }
+    peers_read_unlock(proc);
+    json_decref(invite_json);
+    free(chosen);
+}
+
 /****************************
  * Handler: handle_refuse (nack) — NEG_PROTO_REFUSE
  * Extract task UUID, decrement expected count in tracker; log failure if insufficient.
@@ -1815,8 +2010,13 @@ static bool handle_refuse(const process_t *proc, directory_t *queues, generic_ms
         {
             task_tracker_t *tracker = NULL;
             if (data_object_ptr(trk_dat, (ptr_t *)&tracker) == 0 && tracker)
+            {
                 _cancel_participant(proc, tracker, task_uuid_str,
                                     nmsg->from_whom.uuid);
+                if (tracker->drawn)
+                    _replace_declined_locked(proc, tracker, task_uuid_str,
+                                             nmsg->from_whom.uuid);
+            }
         }
     }
 
@@ -2604,6 +2804,10 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
                                      channel, nmsg->from_whom.uuid,
                                      negotiation_competence_weight(
                                          tracker->capability_name, subject));
+                    /* A drawn task's outcome joins the selection log. */
+                    const neg_select_hook_t *sel = neg_ext_select_hook();
+                    if (tracker->drawn && sel != NULL && sel->on_score != NULL)
+                        sel->on_score(proc, task_uuid_str, nmsg->from_whom.uuid, score);
                 }
 
                 /* The first answer goes to the main process, so the app

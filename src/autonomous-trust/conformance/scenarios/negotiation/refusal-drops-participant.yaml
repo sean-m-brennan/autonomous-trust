@@ -1,0 +1,58 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: refusal-drops-participant
+byte_pinning: false
+description: |
+    A signed nack from an invitee removes it from the requestor's task
+    (RD_12.7 plan, Phase 1).
+
+    The invite-refuse-* scenarios cover the worker's side, the nack being
+    sent. This one covers the requestor receiving it. alice invites bob and
+    carol; bob declines, so the task no longer waits on him, and carol's
+    result alone completes it. Python left `handle_refuse` unregistered until
+    2026-10-21, so a nack fell through to "Unhandled message" there and the
+    task waited on bob until the deadline sweep gave it up.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+  - id: carol
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_fetch]
+    carol: [data_fetch]
+
+steps:
+  - id: 1
+    from: alice
+    to: alice
+    function: spawn task
+    payload:
+      capability: data_fetch
+      task_id: t-decline
+    description: alice spawns the task and invites bob and carol.
+  - id: 2
+    from: bob
+    to: alice
+    function: nack
+    payload:
+      task_id: t-decline
+    description: bob declines, in a signed nack.
+  - id: 3
+    from: carol
+    to: alice
+    function: report results
+    payload:
+      task_id: t-decline
+      result: done
+    description: carol reports, and she is the last invitee owing a result.
+
+expected_state:
+  alice:
+    results_scored: {task: t-decline, executors: [carol]}
+    has_my_task: {slug: t-decline, present: false}

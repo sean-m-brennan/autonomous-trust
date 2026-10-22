@@ -398,7 +398,7 @@ follow DTN's shape: `at_gateway` links the core `.so` by file, and
 
 ## Oracle layers (`negotiation/neg_oracle.h`, `core/_python/oracles.py`)
 
-The verification layers of R+D.md §12 are five extension libraries
+The verification layers of R+D.md §12 are six extension libraries
 (FEATURE_SPLIT_PLAN Phase 3), `src/c/extensions/<layer>/`, each built by
 `AT_ORACLE_<LAYER>` (all ON by default):
 
@@ -409,9 +409,11 @@ The verification layers of R+D.md §12 are five extension libraries
 | `libat_prequential` | prequential competence (§12.5) | `$AT_PREQUENTIAL` | arm `prequential.observe` (210, observe); the competence provider |
 | `libat_certificates` | certificate-carrying interfaces (§12.3) | `$AT_CERTIFICATES` | arm `certificates.check` (300, verdict) |
 | `libat_replication` | replicated execution (§12.6) | `$AT_REPLICATION` | live replication through the negotiation result hook (`neg_ext.h`): it holds a sampled result's score, sends a replica, and settles a dispute by the bisection game |
+| `libat_selection` | selective assignment (§12.7) | `$AT_SELECTION` | the negotiation selection hook (`neg_ext.h`): it draws a task's invitees or a probe's target from a committed seed chain, re-draws a decline, checks the draw on an invitation, and answers the `selection audit` verb ([Selective assignment](selection.md)) |
 
-`AT_ORACLE_REPLICATION` requires `AT_ORACLE_CERTIFICATES`, whose SplitMix64 it
-samples with; `libat_replication` links `libat_certificates`.
+`AT_ORACLE_REPLICATION` and `AT_ORACLE_SELECTION` require
+`AT_ORACLE_CERTIFICATES`, whose SplitMix64 they draw with; both libraries link
+`libat_certificates`.
 
 **The registry.** A layer registers from load-time constructors: it
 *declares* itself (`NEG_ORACLE_REGISTER`, carrying its reset), adds its *arms*
@@ -435,7 +437,7 @@ needs: names only, never behavior. A layer that is absent cannot declare
 itself, so the table has to live in the core. `negotiation_run` calls
 `neg_oracles_check_env` and refuses to start, with an ERROR naming the
 library, when `$AT_PHYSICS`, `$AT_CALIBRATION`, `$AT_PREQUENTIAL`,
-`$AT_CERTIFICATES` or `$AT_REPLICATION` is set and non-empty and its layer is
+`$AT_CERTIFICATES`, `$AT_REPLICATION` or `$AT_SELECTION` is set and non-empty and its layer is
 not loaded. A node
 declared to check physics that silently did not would accept results physics
 refutes. Refusing is the only safe answer.

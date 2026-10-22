@@ -1,0 +1,181 @@
+schema_version: '1'
+kind: scenario
+protocol: selection
+name: draw
+byte_pinning: false
+description: |
+  The draw (RD_12.7 plan section 3.2): weights in, a subset and its exact
+  inclusion probabilities out, one SplitMix64 stream per decision.
+
+  The propensities rows pin p_i = floor + (1 - n*floor) * w_i / W, summed left
+  to right: zero weights read as all equal, and a floor no distribution can
+  meet (3 * 0.5 > 1) degrades to uniform and says so.
+
+  The draw rows pin both kinds. k = 1 is one categorical draw (its propensity is
+  p_i). k > 1 is a Bernoulli draw per peer at pi_i = clamp(k * p_i, floor, 1),
+  and the logged inclusion is pi_i + E * p_i, where E is the probability the
+  round comes up empty and falls back to one categorical draw. Seed 1 is a
+  round that came up empty, so its one selection is the fallback's. k null, and
+  k at least the eligible count, select everyone at probability 1. The seed
+  2^63 - 1, the largest a JSON integer carries in both, checks the
+  high bits reach the seed.
+participants:
+- {id: requestor, role: requestor}
+- {id: peer, role: peer}
+fixtures:
+  events:
+  - propensities:
+      weights: [1, 2, 3, 4]
+      floor: 0.05
+    probs: [0.13, 0.21000000000000002, 0.29, 0.37000000000000005]
+    degraded: false
+  - propensities:
+      weights: [0, 1, 9]
+      floor: 0.1
+    probs: [0.1, 0.16999999999999998, 0.73]
+    degraded: false
+  - propensities:
+      weights: [0, 0]
+      floor: 0.0
+    probs: [0.5, 0.5]
+    degraded: false
+  - propensities:
+      weights: [1, 2, 3]
+      floor: 0.5
+    probs: [0.3333333333333333, 0.3333333333333333, 0.3333333333333333]
+    degraded: true
+  - propensities:
+      weights: [5]
+      floor: 0.2
+    probs: [1.0]
+    degraded: false
+  - draw:
+      weights: [1, 2, 3, 4]
+      k: 1
+      floor: 0.05
+      seed: 1
+    selected: [2]
+    inclusion: [0.13, 0.21000000000000002, 0.29, 0.37000000000000005]
+    kind: categorical
+    fallback: false
+    degraded: false
+  - draw:
+      weights: [1, 2, 3, 4]
+      k: 1
+      floor: 0.05
+      seed: 42
+    selected: [3]
+    inclusion: [0.13, 0.21000000000000002, 0.29, 0.37000000000000005]
+    kind: categorical
+    fallback: false
+    degraded: false
+  - draw:
+      weights: [1, 2, 3, 4]
+      k: 1
+      floor: 0.05
+      seed: 9001
+    selected: [1]
+    inclusion: [0.13, 0.21000000000000002, 0.29, 0.37000000000000005]
+    kind: categorical
+    fallback: false
+    degraded: false
+  - draw:
+      weights: [1, 2, 3, 4]
+      k: 1
+      floor: 0.05
+      seed: 9223372036854775807
+    selected: [1]
+    inclusion: [0.13, 0.21000000000000002, 0.29, 0.37000000000000005]
+    kind: categorical
+    fallback: false
+    degraded: false
+  - draw:
+      weights: [1, 2, 3, 4, 5, 6]
+      k: 2
+      floor: 0.05
+      seed: 1
+    selected: [5]
+    inclusion: [0.17335429526748972, 0.24269601337448557, 0.31203773148148145, 0.3813794495884773, 0.45072116769547327,
+      0.5200628858024692]
+    kind: bernoulli
+    fallback: true
+    degraded: false
+  - draw:
+      weights: [1, 2, 3, 4, 5, 6]
+      k: 2
+      floor: 0.05
+      seed: 42
+    selected: [1, 2, 3, 4]
+    inclusion: [0.17335429526748972, 0.24269601337448557, 0.31203773148148145, 0.3813794495884773, 0.45072116769547327,
+      0.5200628858024692]
+    kind: bernoulli
+    fallback: false
+    degraded: false
+  - draw:
+      weights: [1, 2, 3, 4, 5, 6]
+      k: 2
+      floor: 0.05
+      seed: 9001
+    selected: [2]
+    inclusion: [0.17335429526748972, 0.24269601337448557, 0.31203773148148145, 0.3813794495884773, 0.45072116769547327,
+      0.5200628858024692]
+    kind: bernoulli
+    fallback: true
+    degraded: false
+  - draw:
+      weights: [1, 1, 1, 1, 1, 1, 1, 1]
+      k: 2
+      floor: 0.0
+      seed: 1
+    selected: [2]
+    inclusion: [0.2625141143798828, 0.2625141143798828, 0.2625141143798828, 0.2625141143798828, 0.2625141143798828,
+      0.2625141143798828, 0.2625141143798828, 0.2625141143798828]
+    kind: bernoulli
+    fallback: true
+    degraded: false
+  - draw:
+      weights: [1, 2]
+      k: null
+      floor: 0.05
+      seed: 7
+    selected: [0, 1]
+    inclusion: [1.0, 1.0]
+    kind: all
+    fallback: false
+    degraded: false
+  - draw:
+      weights: [1, 2, 3]
+      k: 3
+      floor: 0.05
+      seed: 7
+    selected: [0, 1, 2]
+    inclusion: [1.0, 1.0, 1.0]
+    kind: all
+    fallback: false
+    degraded: false
+  - draw:
+      weights: [3, 1]
+      k: 1
+      floor: 0.0
+      seed: 7
+    selected: [0]
+    inclusion: [0.75, 0.25]
+    kind: categorical
+    fallback: false
+    degraded: false
+  - draw:
+      weights: [1, 2, 3]
+      k: 1
+      floor: 0.5
+      seed: 7
+    selected: [1]
+    inclusion: [0.3333333333333333, 0.3333333333333333, 0.3333333333333333]
+    kind: categorical
+    fallback: false
+    degraded: true
+steps:
+- id: 1
+  from: requestor
+  to: peer
+  function: noop
+  payload: {}
