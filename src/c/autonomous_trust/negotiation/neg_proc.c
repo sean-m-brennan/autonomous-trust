@@ -3080,8 +3080,10 @@ static void _complete_job(const process_t *proc, job_t *job,
     }
     uuid_t pair;
     tx_pair_task_uuid(job->task.uuid, me->uuid, pair);
+    /* It names the requestor, whose half names us back: two halves pair
+     * only when each names the other (R+D.md §14.2). */
     _submit_tx_score(proc, pair, 0.9, job->task.capability.name,
-                     TX_CHANNEL_TASK_OUTCOME, NULL,
+                     TX_CHANNEL_TASK_OUTCOME, job->task.requestor_uuid,
                      NEG_NEUTRAL_COMPETENCE);
 }
 

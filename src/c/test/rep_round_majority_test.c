@@ -190,7 +190,9 @@ static process_t *_group(identity_t *me, identity_t **others, size_t n)
 static void _propose(process_t *proc, identity_t *me, uuid_t task)
 {
     uuid_t subject;
-    uuid_clear(subject);
+    /* Our half names whom it scores (R+D.md §14.2); which peer does not
+     * matter here. */
+    uuid_generate(subject);
     uuid_generate(task);
     _forward_transaction(proc, task, me->uuid, 0.9, "at.handshake", NULL,
                          subject, 0.0);

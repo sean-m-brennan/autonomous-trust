@@ -38,7 +38,8 @@ from autonomous_trust.core.reputation.protocol import ReputationProtocol
 from autonomous_trust.core.reputation.repprocess import ReputationProcess
 from autonomous_trust.core.reputation.reputation import (
     Checkpoint, Transaction, TransactionHistory, TransactionScore,
-    commit_designation, evidence_from_dict, evidence_to_dict, window_root_of)
+    commit_designation, evidence_from_dict, evidence_to_dict, half_designation,
+    window_root_of)
 from autonomous_trust.core.system import CfgIds
 from unittest.mock import MagicMock
 
@@ -81,6 +82,25 @@ def _msg(function, obj, sender):
 def _sign(ident, scorer, task, score, channel=None):
     return ReputationProcess._detached_sig(
         ident, commit_designation(scorer.uuid, task, score, channel))
+
+
+def _half(scorer, other, task, score, channel=None):
+    """`scorer`'s own signature over its half, naming `other` (R+D.md
+    §14.2)."""
+    return ReputationProcess._detached_sig(
+        scorer, half_designation(task, scorer.uuid, other.uuid, score, channel))
+
+
+def _sign_halves(chain, people):
+    """Each scorer in `chain` signs its own half, as every commit does."""
+    by = {str(i.uuid): i for i in people}
+    for tx in chain:
+        if tx.p1_id is None or tx.p2_id is None:
+            continue
+        a, b = by[str(tx.p1_id)], by[str(tx.p2_id)]
+        tx.attach_half_sig(a.uuid, _half(a, b, tx.task_id, tx.p1_score))
+        tx.attach_half_sig(b.uuid, _half(b, a, tx.task_id, tx.p2_score))
+    return chain
 
 
 @pytest.fixture
@@ -218,7 +238,7 @@ class TestRound:
         acc1, q1 = _node(a1, _roster(a1, four))
         acc2, q2 = _node(a2, _roster(a2, four))
         obs, _ = _node(o, _roster(o, four))
-        score = TransactionScore(uuid4(), 0.9)
+        score = TransactionScore(uuid4(), 0.9, subject_uuid=o.uuid)
         idx = (7, 1)
         prop.proposals[idx] = score
 
@@ -244,7 +264,10 @@ class TestRound:
                    if m.function == ReputationProtocol.committed]
         assert len(commits) == 1
         parsed = from_json_string(commits[0].obj)
-        assert len(parsed) == 6 and len(parsed[5]) == 2
+        assert len(parsed) == 8 and len(parsed[5]) == 2
+        # Whom the half names, and the scorer's own signature over it.
+        assert parsed[6] == str(o.uuid)
+        assert parsed[7] == _half(p, o, score.task_id, 0.9)
         # The half waits in the pool, beside its certificate, to be placed.
         assert prop.history.pooled(score.task_id).certificate_of(p.uuid) \
             == parsed[5]
@@ -295,7 +318,7 @@ def _certified_chain(signers_by_node, n, scorers):
             sigs = {str(s.uuid): _sign(s, scorer, t, 0.9)
                     for s in signers_by_node if s is not scorer}
             h.update(t, scorer.uuid, 0.9, certificate=sigs)
-    return list(h)
+    return _sign_halves(list(h), signers_by_node)
 
 
 class TestCatchup:
@@ -327,13 +350,31 @@ class TestCatchup:
             t = uuid4()
             h.update(t, p.uuid, 0.9)
             h.update(t, a1.uuid, 0.9)
-        chain = list(h)
+        chain = _sign_halves(list(h), four)
         obs._finalized = Checkpoint(proposer_uuid=p.uuid,
                                     root=window_root_of(chain[:2]), epoch=1,
                                     first_index=0, count=2)
         # Entries 0 and 1 are covered; entry 2 is the uncertified tail.
         assert not obs._chain_certified(chain, self.MSG)
         assert obs._chain_certified(chain[:2], self.MSG)
+
+    def test_a_checkpoint_does_not_excuse_an_unsigned_half(self, four):
+        """The user's call, 2026-10-22: the majority that could forge a
+        half also signs the checkpoint, so its cover excuses a missing
+        certificate and never a missing scorer signature (R+D.md §14.2)."""
+        p, a1, _, o = four
+        obs, _ = _node(o, _roster(o, four))
+        h = TransactionHistory()
+        for _ in range(2):
+            t = uuid4()
+            h.update(t, p.uuid, 0.9)
+            h.update(t, a1.uuid, 0.9)
+        chain = _sign_halves(list(h), four)
+        chain[1].half_sigs.pop(str(a1.uuid))
+        obs._finalized = Checkpoint(proposer_uuid=p.uuid,
+                                    root=window_root_of(chain), epoch=1,
+                                    first_index=0, count=2)
+        assert not obs._chain_certified(chain, self.MSG)
 
     def test_a_checkpoint_the_segment_does_not_reproduce_covers_nothing(self, four):
         p, a1, _, o = four

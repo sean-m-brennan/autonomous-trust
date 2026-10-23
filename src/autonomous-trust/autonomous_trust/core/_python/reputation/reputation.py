@@ -542,6 +542,27 @@ def commit_designation(scorer, task_id, score, channel=None) -> bytes:
             + b'|' + str(chan).encode())
 
 
+def half_designation(task_id, scorer, counterparty, score, channel=None) -> bytes:
+    """The bytes a SCORER signs over its own half (R+D.md §14.2;
+    doc/architecture/reputation.md, "Signed halves"): that `scorer` gave
+    `counterparty` this score, on this channel, for this task.
+
+    A commit certificate is the acceptors' word that a round ran; this is the
+    scorer's own, and nobody else can make it. It names the counterparty, so a
+    half pairs only with the half of the peer it names, and that peer's half
+    must name it back. Same encoding as :func:`commit_designation`: ``%.17g``,
+    lowercase uuids, the channel normalized. Index and link are not covered,
+    for the reason attestation gives: they differ per node until chains
+    reconcile. Mirrors C half_designation."""
+    chan = channel if channel else TX_CHANNEL_DEFAULT
+    return (b'AT-HALF\x00'
+            + str(task_id).lower().encode()
+            + b'|' + str(scorer).lower().encode()
+            + b'|' + str(counterparty).lower().encode()
+            + b'|' + format(float(score), '.17g').encode()
+            + b'|' + str(chan).encode())
+
+
 # Upper bound on the entries one placement decides (doc/architecture/
 # reputation.md, "Agreeing on an order").
 PLACE_BATCH_MAX = 32
@@ -560,6 +581,7 @@ def placement_entry(tx: 'Transaction') -> 'Transaction':
     out.prev_hash = None
     out.place_from = None
     out.place_sigs = None
+    out.names = None
     if (not out.attested and out.p1_id is not None and out.p2_id is not None
             and str(out.p2_id).lower() < str(out.p1_id).lower()):
         out.p1_id, out.p2_id = out.p2_id, out.p1_id
@@ -622,7 +644,8 @@ class Transaction(Configuration):
                  attest_scope: str = None, place_from: int = None,
                  place_sigs: dict = None, roster_op: str = None,
                  roster_uuid: UUID = None, roster_digest: str = None,
-                 roster_members: list = None, roster_n_min: int = None):
+                 roster_members: list = None, roster_n_min: int = None,
+                 half_sigs: dict = None, names: dict = None):
         self.task_id = task_id
         self.p1_id = p1_id
         self.p1_score = p1_score
@@ -682,6 +705,19 @@ class Transaction(Configuration):
                              if isinstance(v, dict)}
                             if isinstance(commit_sigs, dict) and commit_sigs
                             else None)
+        # Each ordinary half's SCORER signature (R+D.md §14.2): scorer uuid
+        # str -> signature hex over `half_designation`, which names the other
+        # side. Outside the canonical bytes like the certificates (the user's
+        # call, 2026-10-22), so a signed entry hashes as an unsigned one did.
+        self.half_sigs = ({str(k): str(v) for k, v in half_sigs.items() if v}
+                          if isinstance(half_sigs, dict) and half_sigs
+                          else None)
+        # Whom a POOLED half names, scorer uuid str -> counterparty uuid str,
+        # while it waits for that counterparty. A paired entry needs none (the
+        # other side is the counterparty), so this never travels or persists
+        # with an entry; the pool document carries it per half.
+        self.names = ({str(k): str(v) for k, v in names.items() if v}
+                      if isinstance(names, dict) and names else None)
         # The placement certificate (doc/architecture/reputation.md, "Agreeing
         # on an order"), on the LAST entry a decided placement wrote:
         # `place_from` is the index the placement began at and `place_sigs`
@@ -759,6 +795,11 @@ class Transaction(Configuration):
         # cuts one, so its entries keep the shape they always had.
         if not d.get('commit_sigs'):
             d.pop('commit_sigs', None)
+        # And the scorers' signatures: an entry cut before them keeps its
+        # shape. `names` is the pool's, never an entry's.
+        if not d.get('half_sigs'):
+            d.pop('half_sigs', None)
+        d.pop('names', None)
         # And the placement certificate: only a placement's last entry has one.
         if not d.get('place_sigs'):
             d.pop('place_sigs', None)
@@ -784,6 +825,31 @@ class Transaction(Configuration):
         if self.commit_sigs is None:
             self.commit_sigs = {}
         self.commit_sigs[str(scorer)] = dict(sigs)
+
+    def half_sig_of(self, scorer) -> 'str | None':
+        """`scorer`'s own signature over its half, or None."""
+        return (self.half_sigs or {}).get(str(scorer))
+
+    def attach_half_sig(self, scorer, sig) -> None:
+        """Keep `sig` as `scorer`'s signature over its half. The caller has
+        verified it; an empty one is not kept."""
+        if not sig:
+            return
+        if self.half_sigs is None:
+            self.half_sigs = {}
+        self.half_sigs[str(scorer)] = str(sig)
+
+    def counterparty_of(self, scorer) -> 'str | None':
+        """Whom `scorer`'s half names: the other side of a paired entry, or
+        what a pooled half recorded. None when neither is known."""
+        key = str(scorer)
+        if self.p1_id is not None and self.p2_id is not None:
+            if str(self.p1_id) == key:
+                return str(self.p2_id)
+            if str(self.p2_id) == key:
+                return str(self.p1_id)
+            return None
+        return (self.names or {}).get(key)
 
     def about(self, peer_uuid):
         """``(score, author)``: the score this entry holds ABOUT `peer_uuid` and
@@ -1205,12 +1271,23 @@ class TransactionHistory(Mapping):
             self._pool.popitem(last=False)
 
     def record_half(self, task_id: UUID, peer_id: UUID, score: float,
-                    channel: str = None, certificate: dict = None) -> str:
+                    channel: str = None, certificate: dict = None,
+                    counterparty=None, half_sig: str = None) -> str:
         """Put a committed half in the pool. Returns 'pending' (the task has
         one half), 'ready' (both, so its entry can be placed), 'dup' (this
-        scorer's half is already held), 'placed' (the task is in the chain) or
-        'tombstoned' (it was, and has been evicted). Nothing here touches the
-        chain. Mirrors C tx_history_record_half."""
+        scorer's half is already held), 'placed' (the task is in the chain),
+        'tombstoned' (it was, and has been evicted) or 'mismatch' (the half
+        the task holds and this one do not name each other). Nothing here
+        touches the chain. Mirrors C tx_history_record_half.
+
+        `counterparty` is whom the half names and `half_sig` its scorer's
+        signature (R+D.md §14.2); the caller has verified both. Two halves pair
+        only when each names the other. When they do not, the held half gives
+        way only if this one proves it can never pair: this scorer is the one
+        the held half names, and this scorer's signed half names somebody
+        else. Otherwise the first stays and this one is refused. A half with
+        no name (a pool written before names, a fixture) pairs as it always
+        did."""
         if self._placed(task_id):
             return 'placed'
         if task_id in self._evicted_task_ids:
@@ -1228,12 +1305,34 @@ class TransactionHistory(Mapping):
             if certificate and tx.certificate_of(peer_id) != certificate:
                 tx.attach_certificate(peer_id, certificate)
                 self.pool_rev += 1
+            if half_sig and not tx.half_sig_of(peer_id):
+                tx.attach_half_sig(peer_id, half_sig)
+                self.pool_rev += 1
             return 'dup'
         if len(tx) == 2:
             return 'dup'
+        me = None if peer_id is None else str(peer_id).lower()
+        named = None if counterparty is None else str(counterparty).lower()
+        if len(tx) == 1 and me is not None:
+            held = str(tx.p1_id if tx.p1_id is not None else tx.p2_id).lower()
+            held_names = tx.counterparty_of(held)
+            held_names = None if held_names is None else held_names.lower()
+            if (held_names is not None and held_names != me) or \
+                    (named is not None and named != held):
+                if held_names == me:
+                    # The held half names us and we name somebody else: our
+                    # signature says it will never pair. Ours takes its place.
+                    tx = Transaction(task_id)
+                    self._pool[task_id] = tx
+                else:
+                    return 'mismatch'
         tx.add(peer_id, score, channel)
         if certificate:
             tx.attach_certificate(peer_id, certificate)
+        if half_sig:
+            tx.attach_half_sig(peer_id, half_sig)
+        if named is not None and peer_id is not None:
+            tx.names = dict(tx.names or {}, **{str(peer_id): named})
         self.pool_rev += 1
         return 'ready' if len(tx) == 2 else 'pending'
 
@@ -1291,6 +1390,13 @@ class TransactionHistory(Mapping):
                 cert = tx.certificate_of(uid)
                 if cert:
                     half['cert'] = {str(k): _hex_str(v) for k, v in cert.items()}
+                # Whom a lone half names; a paired one names the other side.
+                names = tx.counterparty_of(uid) if len(tx) == 1 else None
+                if names:
+                    half['names'] = str(names)
+                sig = tx.half_sig_of(uid)
+                if sig:
+                    half['sig'] = _hex_str(sig)
                 halves.append(half)
             items.append({'task': str(tx.task_id), 'halves': halves})
         return {'schema': POOL_SCHEMA, 'pool': items}
@@ -1322,8 +1428,13 @@ class TransactionHistory(Mapping):
                     cert = half.get('cert')
                     cert = ({str(k): str(v) for k, v in cert.items()}
                             if isinstance(cert, dict) else None)
+                    names = half.get('names')
+                    sig = half.get('sig')
                     self.record_half(task, UUID(str(half['by'])), float(score),
-                                     half.get('channel') or None, cert)
+                                     half.get('channel') or None, cert,
+                                     counterparty=(UUID(str(names)) if names
+                                                   else None),
+                                     half_sig=str(sig) if sig else None)
             except (KeyError, TypeError, ValueError, AttributeError):
                 continue
         return len(self._pool)
@@ -1718,7 +1829,9 @@ class TransactionHistory(Mapping):
                                      (tx.p2_id, tx.p2_score, tx.p2_channel)):
                 if uid is not None and tx.certificate_of(uid):
                     self.record_half(tx.task_id, uid, score, chan,
-                                     certificate=tx.certificate_of(uid))
+                                     certificate=tx.certificate_of(uid),
+                                     counterparty=tx.counterparty_of(uid),
+                                     half_sig=tx.half_sig_of(uid))
             back += self.pooled(tx.task_id) is not None
         return back
 
@@ -2187,6 +2300,11 @@ def evidence_to_dict(chain, signed_checkpoint=None, attest_certs=None,
             entries[-1]['commit_sigs'] = {
                 str(scorer): {str(k): _hex_str(v) for k, v in sigs.items()}
                 for scorer, sigs in tx.commit_sigs.items()}
+        # The scorers' own signatures (R+D.md §14.2): additive, outside the
+        # entry hash, like the certificates.
+        if not tx.attested and getattr(tx, 'half_sigs', None):
+            entries[-1]['half_sigs'] = {str(scorer): _hex_str(sig)
+                                        for scorer, sig in tx.half_sigs.items()}
         # A roster entry: its fields are in the entry hash, its member list
         # beside it (checked against the digest on the way back in).
         if getattr(tx, 'roster_op', None) is not None:
@@ -2304,6 +2422,11 @@ def evidence_from_dict(doc):
                                              for k, v in sigs.items()}
                                for scorer, sigs in entry['commit_sigs'].items()
                                if isinstance(sigs, dict)}),
+            half_sigs=(None if entry.get('attested')
+                       or not isinstance(entry.get('half_sigs'), dict)
+                       else {str(scorer): str(sig) for scorer, sig
+                             in entry['half_sigs'].items()
+                             if isinstance(sig, str)}),
             place_from=(int(entry['place_from'])
                         if isinstance(entry.get('place_from'), int)
                         and not isinstance(entry.get('place_from'), bool)

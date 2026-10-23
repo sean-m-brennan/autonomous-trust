@@ -130,10 +130,12 @@ void reputation_set_num_updates(int n);
 void reputation_set_update_page_bytes(size_t bytes);
 
 /** Pre-install OUR round (@p id1, @p id2) as _forward_transaction leaves it
- *  for handle_accepted: its score, and @p task_uuid's evidence @p channel
- *  (NULL or "" for the default). The conformance `proposals` fixture. */
+ *  for handle_accepted: its score, @p task_uuid's evidence @p channel (NULL or
+ *  "" for the default), and whom our half names, @p subject (NULL for none,
+ *  R+D.md §14.2). The conformance `proposals` fixture. */
 void reputation_install_proposal(int64_t id1, int64_t id2, double score,
-                                 const uuid_t task_uuid, const char *channel);
+                                 const uuid_t task_uuid, const char *channel,
+                                 const uuid_t subject);
 
 /** Keep placement state under @p dir rather than the config directory, or
  *  NULL for the config directory. Test and conformance seam: every
@@ -162,6 +164,15 @@ int reputation_install_chain_json(const json_t *arr);
  *  ordered placement. Returns tx_history_record_half's status. */
 int reputation_record_half(const uuid_t task, const uuid_t scorer, double score,
                            const char *channel, const char *cert_json);
+
+/** reputation_record_half_on for a half that names @p counterparty (NULL for
+ *  none) and carries its scorer's signature @p half_sig (may be NULL), R+D.md
+ *  §14.2. Returns tx_history_record_signed_half's status. */
+int reputation_record_named_half_on(const char *chain_key, const uuid_t task,
+                                    const uuid_t scorer, double score,
+                                    const char *channel, const char *cert_json,
+                                    const uuid_t counterparty,
+                                    const char *half_sig);
 
 /** reputation_record_half on chain @p chain_key ("" is the primary, else a
  *  child group's uuid), creating the child chain on first use. */
@@ -231,6 +242,10 @@ int reputation_get_committed_tx_count(void);
  *  `certified_halves` expected_state assertions (doc/architecture/reputation.md, "Commit certificates").
  *  Mirrors the Python adapter's reading of Transaction.commit_sigs. */
 void reputation_get_commit_cert_counts(int *halves_held, int *certified_halves);
+/** How many of those halves carry their scorer's own signature (R+D.md
+ *  §14.2), for the `signed_halves` expected_state assertion. Mirrors the
+ *  Python adapter's reading of Transaction.half_sigs. */
+int reputation_get_signed_half_count(void);
 
 /** Write the RFC 6962 ordered Merkle root over the resident committed window
  *  (transaction_window_root) into `out` (must hold TX_HASH_HEX_LEN + 1 bytes)

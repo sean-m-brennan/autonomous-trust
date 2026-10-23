@@ -988,6 +988,10 @@ static json_t *_peer_chain(const identity_t *p1, const identity_t *p2, const cha
                                            0.3 + 0.02 * (*c - 'a'), NULL));
         ck_assert_ret_ok(tx_history_update(&h, g_ft[*c - 'a'], p2->uuid,
                                            0.9 - 0.02 * (*c - 'a'), NULL));
+        /* Each scorer signs its own half (R+D.md §14.2): a checkpoint does
+         * not excuse a missing one. */
+        rps_sign_half(&h, g_ft[*c - 'a'], p1, p2, 0.3 + 0.02 * (*c - 'a'));
+        rps_sign_half(&h, g_ft[*c - 'a'], p2, p1, 0.9 - 0.02 * (*c - 'a'));
     }
     json_t *arr = NULL;
     ck_assert_ret_ok(tx_history_era_to_json(&h, 0, tx_history_len(&h), &arr));

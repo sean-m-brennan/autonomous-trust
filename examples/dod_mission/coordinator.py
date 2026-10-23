@@ -44,7 +44,7 @@ from autonomous_trust.core import (
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
 from autonomous_trust.core.reputation.reputation import (
-    TransactionScore, SlashAttestation)
+    TransactionScore, SlashAttestation, pair_task_id)
 from autonomous_trust.services.data import Reading
 from autonomous_trust.core.config.generate import (
     generate_identity, generate_worker_config,
@@ -901,7 +901,8 @@ class DoDMissionCoordinator(TransitiveTrustMixin, AutonomousTrust):
                         peer_name, entry)
                     continue
                 try:
-                    self.submit_reading_for_validation(reading, queues)
+                    self.submit_reading_for_validation(reading, queues,
+                                                       sender_uuid=uuid_str)
                 except Exception:
                     logger.exception(
                         "Validator/chart dispatch failed for %s",
@@ -1512,7 +1513,8 @@ class DoDMissionCoordinator(TransitiveTrustMixin, AutonomousTrust):
         except queue.Full:
             pass
 
-    def submit_reading_for_validation(self, reading, queues=None) -> None:
+    def submit_reading_for_validation(self, reading, queues=None,
+                                      sender_uuid=None) -> None:
         """Push a reading through validators + charts, and accumulate
         per-batch anomaly state so we can submit a TransactionScore
         for the batch as a whole once it has settled (see
@@ -1579,9 +1581,11 @@ class DoDMissionCoordinator(TransitiveTrustMixin, AutonomousTrust):
         if batch_id is not None:
             state = self._batch_state.get(batch_id)
             if state is None:
+                # The sender's uuid is whom our half names (R+D.md §14.2).
                 state = {"submitted": False, "anomalous": False,
                          "first_tick": self._tick_count,
-                         "peer_name": reading.peer_name}
+                         "peer_name": reading.peer_name,
+                         "sender_uuid": sender_uuid}
                 self._batch_state[batch_id] = state
                 if not DoDMissionCoordinator._logged_first_batch_seen:
                     logger.info(
@@ -1722,8 +1726,19 @@ class DoDMissionCoordinator(TransitiveTrustMixin, AutonomousTrust):
             # configured transaction_weight (4×) — see
             # examples/dod_mission/trust_ladder.yaml and
             # dod-demo-implementation-plan.md §Phase 6 / scope #3.
-            ts = TransactionScore(task_id=batch_id, score=score,
-                                  capability_name="dod.sensor-report")
+            # One pair per consumer: our half names the sender, under the
+            # batch's pair id with us, which is the id the sender's half for
+            # us carries (R+D.md §14.2). A batch whose sender we never saw
+            # has nobody to name, so it is not scored.
+            sender = state.get("sender_uuid")
+            me = getattr(getattr(self, 'identity', None), 'uuid', None)
+            if sender is None or me is None:
+                state["submitted"] = True
+                continue
+            ts = TransactionScore(task_id=pair_task_id(batch_id, me),
+                                  score=score,
+                                  capability_name="dod.sensor-report",
+                                  subject_uuid=sender)
             try:
                 queues[CfgIds.reputation].put(
                     ts, block=True, timeout=queue_cadence)

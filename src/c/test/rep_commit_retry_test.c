@@ -212,7 +212,8 @@ static void _cohort(cohort_t *c)
 static void _propose(cohort_t *c)
 {
     uuid_t subject;
-    uuid_clear(subject);
+    /* Our half names whom it scores (R+D.md §14.2). */
+    uuid_copy(subject, c->alice->uuid);
     _forward_transaction(c->proc, c->task, c->me->uuid, 0.9, "agora-post",
                          NULL, subject, 0.0);
 }
@@ -508,7 +509,8 @@ static bool _probe(cohort_t *c, uuid_t task)
     if (!_admit_new_half(c->proc, task, "at.handshake"))
         return false;
     uuid_t subject;
-    uuid_clear(subject);
+    /* Our half names whom it scores (R+D.md §14.2). */
+    uuid_copy(subject, c->alice->uuid);
     _forward_transaction(c->proc, task, c->me->uuid, 0.9, "at.handshake",
                          NULL, subject, 0.0);
     return true;

@@ -229,10 +229,14 @@ def _tuple_json(tpl):
 def _commit_from(rp, tpl):
     """A `committed` as its proposer sends it: signed, from the peer whose
     half it writes (ISSUES.md §2.16, shape 2), and certified. tpl = (task,
-    peer, score[, group]). The certificate is a stand-in `rp` accepts: routing
-    is the subject here, certificates are test_commit_certificates'."""
-    tpl = tuple(tpl) + (None,) * (5 - len(tpl)) + ({'signer': 'ab'},)
+    peer, score[, group]). The certificate and the scorer's signature over a
+    half naming a stand-in counterparty are stand-ins `rp` accepts: routing is
+    the subject here, certificates are test_commit_certificates' and signed
+    halves test_bilateral_halves'."""
+    tpl = tuple(tpl) + (None,) * (5 - len(tpl)) + (
+        {'signer': 'ab'}, str(uuid4()), 'cd')
     rp._commit_cert_ok = lambda *a, **k: True
+    rp._half_sig_ok = lambda *a, **k: True
     msg = Message(CfgIds.reputation, ReputationProtocol.committed,
                   _tuple_json(tpl), None, from_whom=rp.identity)
     msg.verified = True
