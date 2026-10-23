@@ -249,7 +249,8 @@ class TestProbeBackpressure:
         """A NEW probe half through the local entry point. Admitted?"""
         before = len(rp.awaiting_commit)
         rp.forward_transaction(queues, TransactionScore(
-            uuid4(), 0.9, capability_name='at.handshake'))
+            uuid4(), 0.9, capability_name='at.handshake',
+            subject_uuid=uuid4()))
         return len(rp.awaiting_commit) == before + 1
 
     def test_probe_halves_are_capped_app_halves_are_not(self):

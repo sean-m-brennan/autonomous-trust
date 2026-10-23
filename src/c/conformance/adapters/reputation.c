@@ -122,6 +122,7 @@ typedef struct {
      * (doc/architecture/reputation.md, "Commit certificates"). */
     int halves_held;
     int certified_halves;
+    int signed_halves;   /* carrying their scorer's signature (R+D.md §14.2) */
     /* Ordered placement (doc/architecture/reputation.md, "Agreeing on an
      * order"): the primary chain's tasks in index order, and the ballot this
      * node has promised. */
@@ -386,11 +387,26 @@ static const uuid_t *_uuid_of(sce_run_ctx_t *ctx, const char *pid)
  * can make an entry this node's OWN half), else the synthetic
  * "chainp1:<task>" / "chainp2:<task>" derivation. The two builders must agree
  * so the chains hash-match up to the fork. Mirrors the Python adapter. */
-static void _chain_half_uuid(sce_run_ctx_t *ctx, json_t *entry, int half,
-                             const char *task, uuid_t out)
+/* The participant id of one half of a chain entry: its `p1_id` / `p2_id`,
+ * else the scenario's `chain_parties` fixture ([p1, p2]), else NULL. Mirrors
+ * the Python adapter's _chain_half_pid. */
+static const char *_chain_half_pid(json_t *entry, int half)
 {
     const char *pid = json_string_value(
         json_object_get(entry, half == 1 ? "p1_id" : "p2_id"));
+    if (pid == NULL)
+        pid = json_string_value(json_array_get(
+            json_object_get(g_fixtures, "chain_parties"), (size_t)(half - 1)));
+    return pid;
+}
+
+/* The `chain_parties` fixture names the two participants a chain entry is
+ * between when it names none, so its halves can be signed by their scorers
+ * (R+D.md §14.2); without either, the synthetic halves nobody can sign. */
+static void _chain_half_uuid(sce_run_ctx_t *ctx, json_t *entry, int half,
+                             const char *task, uuid_t out)
+{
+    const char *pid = _chain_half_pid(entry, half);
     const uuid_t *u = (pid != NULL) ? _uuid_of(ctx, pid) : NULL;
     if (u != NULL)
         uuid_copy(out, *u);
@@ -401,6 +417,8 @@ static void _chain_half_uuid(sce_run_ctx_t *ctx, json_t *entry, int half,
 static json_t *_rp_cosignatures(sce_run_ctx_t *ctx, json_t *payload,
                                 const uint8_t *desig, size_t dlen,
                                 const char *exclude);
+static bool _rp_sign_as(sce_run_ctx_t *ctx, const char *pid,
+                        const uint8_t *desig, size_t dlen, char *hex_out);
 
 /* Write a `local_chain` / `latest update` chain spec into @p hist through the
  * production writers. An entry without "batch" is written the legacy way
@@ -613,6 +631,64 @@ static void _attach_spec_certs(sce_run_ctx_t *ctx, json_t *arr, json_t *spec)
     }
 }
 
+/* Each half of a chain spec entry between two participants is signed by its
+ * scorer over half_designation (R+D.md §14.2), as "half_sigs" on @p arr (the
+ * era_to_json of the written chain, matched by task), unless the entry
+ * says `unsigned: true`; `half_forged_by: id` signs both halves with that
+ * participant's key instead. Mirrors the Python adapter's _write_chain. */
+static void _attach_spec_half_sigs(sce_run_ctx_t *ctx, json_t *arr, json_t *spec)
+{
+    /* By task, not position: a chain longer than the window keeps only its
+     * newest entries, so @p arr may start past the spec's first. */
+    for (size_t si = 0; arr != NULL && si < json_array_size(spec); si++)
+    {
+        json_t *spec_e = json_array_get(spec, si);
+        const char *task = json_string_value(json_object_get(spec_e, "task"));
+        if (task == NULL)
+            continue;
+        uuid_t want;
+        char want_str[UUID_STRING_LEN + 1];
+        _uuid5("chain:", task, want);
+        uuid_unparse_lower(want, want_str);
+        json_t *ae = NULL;
+        for (size_t ai = 0; ae == NULL && ai < json_array_size(arr); ai++)
+        {
+            const char *at = json_string_value(json_object_get(json_array_get(arr, ai),
+                                                               "task"));
+            if (at != NULL && strcmp(at, want_str) == 0)
+                ae = json_array_get(arr, ai);
+        }
+        if (ae == NULL)
+            continue;
+        const char *pid[2] = { _chain_half_pid(spec_e, 1), _chain_half_pid(spec_e, 2) };
+        if (task == NULL || json_is_true(json_object_get(spec_e, "unsigned"))
+            || pid[0] == NULL || pid[1] == NULL)
+            continue;
+        const uuid_t *u[2] = { _uuid_of(ctx, pid[0]), _uuid_of(ctx, pid[1]) };
+        if (u[0] == NULL || u[1] == NULL)
+            continue;
+        uuid_t tk;
+        _uuid5("chain:", task, tk);
+        double ps[2] = { json_number_value(json_object_get(spec_e, "p1")),
+                         json_number_value(json_object_get(spec_e, "p2")) };
+        const char *forger = json_string_value(json_object_get(spec_e, "half_forged_by"));
+        json_t *all = json_object();
+        for (int k = 0; k < 2; k++)
+        {
+            uint8_t desig[HALF_DESIG_MAX];
+            size_t dlen = half_designation(tk, *u[k], *u[1 - k], ps[k], NULL,
+                                           desig, sizeof(desig));
+            char sig[crypto_sign_BYTES * 2 + 1] = {0};
+            if (!_rp_sign_as(ctx, forger != NULL ? forger : pid[k], desig, dlen, sig))
+                continue;
+            char su[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(*u[k], su);
+            json_object_set_new(all, su, json_string(sig));
+        }
+        json_object_set_new(ae, "half_sigs", all);
+    }
+}
+
 /* Reset rep_state and re-install the per-participant fixtures relevant
  * to the dispatcher (target). Run BEFORE every handler dispatch so each
  * step sees the right slice of state. */
@@ -799,8 +875,16 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
             const char *slug = json_string_value(json_object_get(e, "task_id"));
             uuid_t task_uuid;
             _uuid5("tx:", slug != NULL ? slug : "default", task_uuid);
+            /* Whom the proposer's half names (R+D.md §14.2): `names`, else
+             * the first other participant. Mirrors the Python adapter. */
+            const char *prop_names = json_string_value(json_object_get(e, "names"));
+            for (size_t j = 0; prop_names == NULL && j < ctx->participant_count; j++)
+                if (strcmp(ctx->participants[j].id, target_id) != 0)
+                    prop_names = ctx->participants[j].id;
+            const uuid_t *prop_named = prop_names != NULL ? _uuid_of(ctx, prop_names) : NULL;
             reputation_install_proposal(e_id1, e_id2, score, task_uuid,
-                                        json_string_value(json_object_get(e, "channel")));
+                                        json_string_value(json_object_get(e, "channel")),
+                                        prop_named != NULL ? *prop_named : NULL);
         }
     }
 
@@ -860,12 +944,19 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
                         *p2_uuid, p2_score,
                         json_string_value(json_object_get(e, "p2_channel")));
                 else if (p1_uuid && p2_id == NULL)
+                {
                     /* One side only: a half waits in the primary chain's
-                     * pool for its placement. Mirrors the Python adapter's
+                     * pool for its placement. `names: id` is whom it names
+                     * (R+D.md §14.2); absent, it pairs as a half held before
+                     * names did. Mirrors the Python adapter's
                      * history.record_half. */
-                    (void)reputation_record_half(task_uuid, *p1_uuid, p1_score,
+                    const char *held_names = json_string_value(json_object_get(e, "names"));
+                    const uuid_t *held_named = held_names != NULL
+                        ? _uuid_of(ctx, held_names) : NULL;
+                    (void)reputation_record_named_half_on("", task_uuid, *p1_uuid, p1_score,
                         json_string_value(json_object_get(e, "p1_channel")),
-                        NULL);
+                        NULL, held_named != NULL ? *held_named : NULL, NULL);
+                }
                 /* A staged pair carries each half's channel when the
                  * fixture names one (R+D.md §12.8). */
             }
@@ -899,6 +990,7 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
             json_t *arr = NULL;
             tx_history_era_to_json(&tmp, 0, tx_history_len(&tmp), &arr);
             _attach_spec_certs(ctx, arr, entries);
+            _attach_spec_half_sigs(ctx, arr, entries);
             if (arr != NULL)
                 reputation_install_chain_json(arr);
             json_decref(arr);
@@ -1168,6 +1260,68 @@ static int _rp_sign_hex(const rp_impl_t *impl, const uint8_t *desig,
     return 0;
 }
 
+/* @p pid's own signature over @p desig, hex into @p hex_out
+ * (RP_SIG_HEX_LEN + 1). False for an unknown participant. */
+static bool _rp_sign_as(sce_run_ctx_t *ctx, const char *pid,
+                        const uint8_t *desig, size_t dlen, char *hex_out)
+{
+    sce_participant_t *p = pid != NULL ? sce_find_participant(ctx, pid) : NULL;
+    const rp_impl_t *impl = p != NULL ? (const rp_impl_t *)p->impl : NULL;
+    return impl != NULL && dlen > 0 && _rp_sign_hex(impl, desig, dlen, hex_out) == 0;
+}
+
+/* Elements 7 and 8 of a `committed` (R+D.md §14.2), on @p body as "names"
+ * and "half_sig": whom the half names, and its scorer's signature over it.
+ * `names` defaults to the scorer of the half the recipient's fixture pools
+ * for this task, else the recipient. Negative controls: `unsigned: true`
+ * omits the signature, `unnamed: true` the name, `half_forged_by: id` signs
+ * with that participant's key, `half_names: id` signs a half naming
+ * somebody other than the one sent, `half_score` signs another score.
+ * Mirrors the Python adapter's _half_elements. */
+static void _rp_half_elements(sce_run_ctx_t *ctx, json_t *payload,
+                              const char *to_id, const char *scorer_id,
+                              const char *task_slug, const uuid_t task,
+                              double score, const char *channel, json_t *body)
+{
+    const char *names = json_string_value(json_object_get(payload, "names"));
+    json_t *held = json_object_get(json_object_get(g_fixtures, "tx_history"), to_id);
+    for (size_t i = 0; names == NULL && i < json_array_size(held); i++)
+    {
+        json_t *e = json_array_get(held, i);
+        const char *slug = json_string_value(json_object_get(e, "task_id"));
+        if (slug != NULL && strcmp(slug, task_slug) == 0
+            && json_object_get(e, "p2") == NULL
+            && !json_is_true(json_object_get(e, "attested")))
+            names = json_string_value(json_object_get(e, "p1"));
+    }
+    if (names == NULL)
+        names = to_id;
+    const uuid_t *scorer = _uuid_of(ctx, scorer_id);
+    const uuid_t *named = names != NULL ? _uuid_of(ctx, names) : NULL;
+    const char *signed_pid = json_string_value(json_object_get(payload, "half_names"));
+    const uuid_t *signed_name = signed_pid != NULL ? _uuid_of(ctx, signed_pid) : named;
+    const char *forger = json_string_value(json_object_get(payload, "half_forged_by"));
+    json_t *hs_j = json_object_get(payload, "half_score");
+    double signed_score = json_is_number(hs_j) ? json_number_value(hs_j) : score;
+    if (scorer == NULL || named == NULL || signed_name == NULL)
+        return;
+    if (!json_is_true(json_object_get(payload, "unnamed")))
+    {
+        char ns[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(*named, ns);
+        json_object_set_new(body, "names", json_string(ns));
+    }
+    if (!json_is_true(json_object_get(payload, "unsigned")))
+    {
+        uint8_t desig[HALF_DESIG_MAX];
+        size_t dlen = half_designation(task, *scorer, *signed_name, signed_score,
+                                       channel, desig, sizeof(desig));
+        char sig[RP_SIG_HEX_LEN + 1] = {0};
+        if (_rp_sign_as(ctx, forger != NULL ? forger : scorer_id, desig, dlen, sig))
+            json_object_set_new(body, "half_sig", json_string(sig));
+    }
+}
+
 /* Build the `sigs` map a *_final step carries: {voter_uuid: sig_hex}.
  *
  * `cosigners` names the co-signers (participant ids); the default is every
@@ -1433,6 +1587,22 @@ static int _rp_place_value(sce_run_ctx_t *ctx, json_t *payload, json_t **out_val
             }
             json_decref(who);
         }
+        /* Each scorer signs its own half naming the other (R+D.md §14.2),
+         * unless the spec says `unsigned`. */
+        if (!json_is_true(json_object_get(e, "unsigned")))
+            for (int side = 0; side < 2; side++)
+            {
+                uint8_t desig[HALF_DESIG_MAX];
+                size_t dlen = half_designation(tx->task_uuid,
+                                               side == 0 ? tx->p1_uuid : tx->p2_uuid,
+                                               side == 0 ? tx->p2_uuid : tx->p1_uuid,
+                                               side == 0 ? tx->p1_score : tx->p2_score,
+                                               NULL, desig, sizeof(desig));
+                char sig[RP_SIG_HEX_LEN + 1] = {0};
+                if (_rp_sign_as(ctx, side == 0 ? pa : pb, desig, dlen, sig))
+                    json_object_set_new(d, side == 0 ? "p1_sig" : "p2_sig",
+                                        json_string(sig));
+            }
         json_array_append_new(*out_value, d);
         n++;
     }
@@ -1699,6 +1869,8 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                 json_object_set_new(body, "certificate",
                                     _rp_cosignatures(ctx, payload, desig,
                                                      dlen, NULL));
+                _rp_half_elements(ctx, payload, to_id, proposer_id, task_slug,
+                                  task_uuid, score, channel, body);
             }
         }
     }
@@ -1796,6 +1968,7 @@ static int _build_inbound(sce_run_ctx_t *ctx,
             json_t *arr = NULL;
             tx_history_era_to_json(&tmp, 0, tx_history_len(&tmp), &arr);
             _attach_spec_certs(ctx, arr, spec);
+            _attach_spec_half_sigs(ctx, arr, spec);
             json_t *tamper = payload ? json_object_get(payload, "tamper") : NULL;
             if (arr != NULL && tamper != NULL && json_is_true(tamper)
                 && json_array_size(arr) >= 2)
@@ -2341,6 +2514,7 @@ static int _dispatch(sce_run_ctx_t *ctx,
         s->chain_len     = reputation_get_chain_len();
         s->committed_tx_count = reputation_get_committed_tx_count();
         reputation_get_commit_cert_counts(&s->halves_held, &s->certified_halves);
+        s->signed_halves = reputation_get_signed_half_count();
         reputation_get_window_root(s->window_root);
         reputation_get_checkpoint_root(s->checkpoint_root);
         s->chain_task_n = reputation_get_chain_tasks(s->chain_tasks, 64);
@@ -2549,10 +2723,12 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                 }
             }
             else if (strcmp(key, "halves_held") == 0
-                     || strcmp(key, "certified_halves") == 0)
+                     || strcmp(key, "certified_halves") == 0
+                     || strcmp(key, "signed_halves") == 0)
             {
-                bool held = strcmp(key, "halves_held") == 0;
-                int have = held ? snap->halves_held : snap->certified_halves;
+                int have = strcmp(key, "halves_held") == 0 ? snap->halves_held
+                         : strcmp(key, "certified_halves") == 0 ? snap->certified_halves
+                         : snap->signed_halves;
                 int want = (int)json_integer_value(val);
                 if (have != want)
                 {

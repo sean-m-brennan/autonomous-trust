@@ -312,7 +312,7 @@ class TestHandleUpdateDeeper:
 class TestForwardTransactionDeeper:
     def test_valid_transaction_score(self):
         rp = _make_rep_process()
-        score = TransactionScore(uuid4(), 0.8)
+        score = TransactionScore(uuid4(), 0.8, subject_uuid=uuid4())
         net_q = queue.Queue()
         result = rp.forward_transaction({CfgIds.network: net_q}, score)
         assert result is True
@@ -332,7 +332,7 @@ class TestForwardTransactionDeeper:
         """
         rp = _make_rep_process()
         tid = uuid4()
-        score = TransactionScore(tid, 0.7)
+        score = TransactionScore(tid, 0.7, subject_uuid=uuid4())
         net_q = queue.Queue()
         rp.forward_transaction({CfgIds.network: net_q}, score)
         # Paxos round started — the transaction proposal is on the wire,
@@ -952,22 +952,25 @@ class TestScoreRangeAtTheRemoteBoundary:
     def _rp():
         rp = _make_rep_process()
         rp._commit_cert_ok = lambda *a, **k: True
+        rp._half_sig_ok = lambda *a, **k: True
         return rp
 
     @staticmethod
-    def _committed(score_json, peer_id=None, task_id=None):
+    def _committed(score_json, peer_id=None, task_id=None, names=None):
         """`committed` carries a BARE float, so it bypasses the constructor
         entirely -- and it is the path that pools a half on every acceptor.
-        It carries a stand-in certificate, which `_rp` accepts: the range
-        check is the subject here, certificates are test_commit_certificates'."""
+        It carries a stand-in certificate and scorer signature, which `_rp`
+        accepts: the range check is the subject here, certificates are
+        test_commit_certificates' and signed halves test_bilateral_halves'."""
         peer_id = peer_id or uuid4()
         task_id = task_id or uuid4()
+        names = names or uuid4()
         msg = MagicMock()
         msg.function = ReputationProtocol.committed
         msg.obj = ('[{"__type__": "UUID", "__value__": "%s"}, '
                    '{"__type__": "UUID", "__value__": "%s"}, %s, null, null, '
-                   '{"signer": "ab"}]'
-                   % (task_id, peer_id, score_json))
+                   '{"signer": "ab"}, "%s", "cd"]'
+                   % (task_id, peer_id, score_json, names))
         msg.verified = True
         msg.from_whom = _make_mock_peer()
         # A commit writes its SENDER's own half (ISSUES.md §2.16, shape 2), so
@@ -1006,18 +1009,22 @@ class TestScoreRangeAtTheRemoteBoundary:
         """The negative control: the drop must not swallow honest traffic.
         Two sides of ONE task make an entry ready to be placed."""
         rp = self._rp()
-        task_id = uuid4()
-        assert rp.handle_committed(None, self._committed('0.9', task_id=task_id)) is True
-        assert rp.handle_committed(None, self._committed('0.8', task_id=task_id)) is True
+        task_id, a, b = uuid4(), uuid4(), uuid4()
+        assert rp.handle_committed(None, self._committed(
+            '0.9', peer_id=a, task_id=task_id, names=b)) is True
+        assert rp.handle_committed(None, self._committed(
+            '0.8', peer_id=b, task_id=task_id, names=a)) is True
         assert len(rp.history.pooled(task_id)) == 2
 
     def test_a_rejected_side_cannot_complete_a_transaction(self):
         """The consequence that matters: one honest side plus one out-of-range
         side must NOT commit, or the rejection would only have delayed it."""
         rp = self._rp()
-        task_id = uuid4()
-        rp.handle_committed(None, self._committed('0.9', task_id=task_id))
-        rp.handle_committed(None, self._committed('42.0', task_id=task_id))
+        task_id, a, b = uuid4(), uuid4(), uuid4()
+        rp.handle_committed(None, self._committed('0.9', peer_id=a,
+                                                  task_id=task_id, names=b))
+        rp.handle_committed(None, self._committed('42.0', peer_id=b,
+                                                  task_id=task_id, names=a))
         assert len(rp.history) == 0
         assert len(rp.history.pooled(task_id)) == 1
 

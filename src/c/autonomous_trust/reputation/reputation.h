@@ -262,6 +262,10 @@ typedef struct {
      * verbatim. Mirrors Python TransactionScore.competence. See
      * prequential/prequential.h. */
     double competence;
+    /* Whom this half names: the peer it scores (R+D.md §14.2). Staged so the
+     * commit can sign a half naming it; a half that names nobody is never
+     * proposed. Mirrors Python TransactionScore.subject_uuid. */
+    uuid_t subject_uuid;
 } tx_score_t;
 
 /****************************
@@ -495,6 +499,11 @@ typedef struct {
      * per round. Outside the entry hash, like attest_certs; dropped on
      * eviction. Mirrors Python Transaction.commit_sigs. */
     map_t         commit_certs;
+    /* Each ordinary half's SCORER signature (R+D.md §14.2): "<task>|<scorer>"
+     * -> signature hex over half_designation, which names the other side.
+     * Outside the entry hash like commit_certs; dropped on eviction. Mirrors
+     * Python Transaction.half_sigs. */
+    map_t         half_sigs;
     /* Ordered placement (doc/architecture/reputation.md, "Agreeing on an
      * order"). Committed halves and certified attestations wait in the POOL,
      * by task, until a decided placement writes their entry; nothing in it is
@@ -506,6 +515,11 @@ typedef struct {
      * JSON of a half, "<task>" -> quorum certificate JSON of an attestation.
      * Moved beside the entry when it is placed. */
     map_t         pool_certs;
+    /* Pooled halves' names and scorer signatures: "<task>|<scorer>" ->
+     * "<counterparty uuid>|<signature hex>", either part possibly empty. The
+     * signature moves to half_sigs when the entry is placed; the name is the
+     * other side by then. Mirrors Python Transaction.names / half_sigs. */
+    map_t         pool_halves;
     /* Bumped on every change to the pool, so the process persists it
      * (reputation-pool.cfg.json) only when there is something new. Mirrors
      * Python TransactionHistory.pool_rev. */
@@ -550,7 +564,8 @@ typedef enum {
     TX_HALF_READY,         /* both: its entry can be placed */
     TX_HALF_DUP,           /* this scorer's half (or a whole entry) is held */
     TX_HALF_PLACED,        /* the task is in the chain */
-    TX_HALF_TOMBSTONED     /* it was, and has been evicted */
+    TX_HALF_TOMBSTONED,    /* it was, and has been evicted */
+    TX_HALF_MISMATCH       /* the held half and this one do not name each other */
 } tx_half_status_t;
 
 /* tx_history_apply_placed's outcomes. Mirrors the Python strings. */
@@ -627,6 +642,26 @@ const char *tx_history_attest_cert(const tx_history_t *hist, const uuid_t task_u
 int  tx_history_record_half(tx_history_t *hist, const uuid_t task_uuid,
                             const uuid_t peer_uuid, double score,
                             const char *channel, const char *cert_json);
+/* tx_history_record_half for a half that names @p counterparty (NULL: names
+ * nobody, as a half held before names did) and carries its scorer's signature
+ * @p half_sig (hex, may be NULL); the caller has verified both (R+D.md §14.2).
+ * Two halves pair only when each names the other. When they do not, the held
+ * half gives way only if this one proves it can never pair -- this scorer is
+ * the one it names, and this half names somebody else -- and otherwise this
+ * one is refused with TX_HALF_MISMATCH. Mirrors Python record_half. */
+int  tx_history_record_signed_half(tx_history_t *hist, const uuid_t task_uuid,
+                                   const uuid_t peer_uuid, double score,
+                                   const char *channel, const char *cert_json,
+                                   const uuid_t counterparty,
+                                   const char *half_sig);
+/* Whom @p scorer's pooled half of @p task_uuid names: true and @p out set when
+ * known (the other side of a paired entry, or the name the half carried). */
+bool tx_history_pool_names(const tx_history_t *hist, const uuid_t task_uuid,
+                           const uuid_t scorer, uuid_t out);
+/* @p scorer's own signature over its pooled half of @p task_uuid (hex), or
+ * NULL. Borrowed. */
+const char *tx_history_pool_half_sig(const tx_history_t *hist,
+                                     const uuid_t task_uuid, const uuid_t scorer);
 /* Put a certified attested entry in the pool, ready to be placed. Returns 0,
  * or EINVAL and changes nothing when it is malformed or its task was ever
  * held. Mirrors Python TransactionHistory.pool_attested. */
@@ -718,6 +753,32 @@ int tx_history_attach_commit_cert(tx_history_t *hist, const uuid_t task,
  *         text, or NULL. Borrowed: valid until the history next changes. */
 const char *tx_history_commit_cert(const tx_history_t *hist, const uuid_t task,
                                    const uuid_t scorer);
+
+/* Room for half_designation: tag, task, two uuids, a %.17g score, a channel. */
+#define HALF_DESIG_MAX (16 + 3 * UUID_STRING_LEN + 32 + TX_CHANNEL_NAMELEN)
+/**
+ * @brief The bytes a SCORER signs over its own half (R+D.md §14.2):
+ *        "AT-HALF\0" task "|" scorer "|" counterparty "|" %.17g score "|"
+ *        channel.
+ *
+ * Lowercase uuids, the channel normalized (NULL / "" == task_outcome), as
+ * commit_designation. Index and link are not covered. Mirrors Python
+ * half_designation.
+ *
+ * @return the designation's length, or 0 if @p cap is too small.
+ */
+size_t half_designation(const uuid_t task, const uuid_t scorer,
+                        const uuid_t counterparty, double score,
+                        const char *channel, uint8_t *out, size_t cap);
+/** @brief Keep @p sig_hex as @p scorer's own signature over its half of
+ *         @p task. The caller has verified it. Nothing is kept unless the
+ *         history holds that half of an ordinary entry. @return 0 or -1. */
+int tx_history_attach_half_sig(tx_history_t *hist, const uuid_t task,
+                               const uuid_t scorer, const char *sig_hex);
+/** @brief @p scorer's own signature over its half of @p task (hex), or NULL.
+ *         Borrowed: valid until the history next changes. */
+const char *tx_history_half_sig(const tx_history_t *hist, const uuid_t task,
+                                const uuid_t scorer);
 
 int  tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
                        const uuid_t peer_uuid, double score,

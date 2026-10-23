@@ -51,7 +51,7 @@ from autonomous_trust.core.negotiation import (
     Task, TaskParameters, NegotiationProtocol)
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
-from autonomous_trust.core.reputation.reputation import TransactionScore
+from autonomous_trust.core.reputation.reputation import TransactionScore, pair_task_id
 from autonomous_trust.core.system import queue_cadence
 from autonomous_trust.services.data.reading import Reading
 from autonomous_trust.services.data.server import DataProtocol
@@ -204,10 +204,13 @@ class _DemoProcessMixin:
     Bilateral scoring (Option C): each emitted reading is stamped with a
     fresh ``metadata["task_id"]`` and, after broadcast, the peer submits its
     own 0.9 "I delivered this batch" TransactionScore for that task_id
-    (decimated by _ts_keep). This pairs with the coordinator's verdict TS
-    (0.8 clean / 0.3 anomalous) on the SAME task_id, so the two Paxos commits
-    form a bilateral Transaction that folds the verdict into the subject
-    peer's consensus reputation. Without both halves the coordinator's
+    (decimated by _ts_keep), one per subscribed coordinator, naming it. Each
+    pairs with that coordinator's verdict TS (0.8 clean / 0.3 anomalous),
+    which names this peer, under the batch's pair id with the coordinator
+    (pair_task_id(task_id, coordinator)), so the two commits form a bilateral
+    Transaction that folds the verdict into the subject peer's consensus
+    reputation. Two halves pair only when each names the other (R+D.md
+    §14.2). Without both halves the coordinator's
     validation never reaches the scored peer. Mirrors
     examples/dod_mission/participant.py::DoDDataProcess.
     """
@@ -283,11 +286,20 @@ class _DemoProcessMixin:
         denom = int(os.environ.get("AT_TS_DECIMATION", "30"))
         if not _ts_keep(batch_id, denom):
             return
-        ts = TransactionScore(task_id=batch_id, score=0.9,
-                              capability_name="multi.sensor-report")
+        # One pair per consumer: a half for each subscribed coordinator,
+        # naming it, under the batch's pair id with it, which is the id that
+        # coordinator's verdict half carries (R+D.md §14.2).
         try:
-            queues[CfgIds.reputation].put(
-                ts, block=True, timeout=self.q_cadence)
+            for _proc_name, peer in list(self.clients.values()):  # type: ignore[attr-defined]
+                client = getattr(peer, 'uuid', None)
+                if client is None:
+                    continue
+                ts = TransactionScore(task_id=pair_task_id(batch_id, client),
+                                      score=0.9,
+                                      capability_name="multi.sensor-report",
+                                      subject_uuid=client)
+                queues[CfgIds.reputation].put(
+                    ts, block=True, timeout=self.q_cadence)
             if not _DemoProcessMixin._logged_first_sender_ts:
                 self.logger.info(
                     "Demo sender-side TransactionScore submitted (batch=%s, "

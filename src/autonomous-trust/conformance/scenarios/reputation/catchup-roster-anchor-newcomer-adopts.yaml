@@ -23,6 +23,8 @@ participants:
     role: member
 
 fixtures:
+  # Real scorers, so each half carries its scorer's signature (R+D.md §14.2).
+  chain_parties: [carol, dave]
   roster: {}          # an unfounded chain: no roster in force
 
 steps:

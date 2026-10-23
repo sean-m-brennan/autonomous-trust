@@ -25,6 +25,8 @@ participants:
     role: member
 
 fixtures:
+  # Real scorers, so each half carries its scorer's signature (R+D.md §14.2).
+  chain_parties: [carol, dave]
   local_chain:
     bob:
       - {task: a, p1: 0.7, p2: 0.5, batch: 1, placed_by: [alice, bob, carol]}

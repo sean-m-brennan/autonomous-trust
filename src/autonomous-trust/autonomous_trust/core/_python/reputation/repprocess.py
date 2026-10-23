@@ -45,7 +45,7 @@ from .reputation import (TransactionHistory, ReconcileResult, Reputation, Reputa
                          TransactionScore, SlashAttestation, SignedSlash,
                          AttestedScore, SignedAttestation,
                          Checkpoint, SignedCheckpoint, validate_tx_score,
-                         validate_tx_channel, commit_designation,
+                         validate_tx_channel, commit_designation, half_designation,
                          window_root_of, _hex_str, byzantine_f,
                          PeerReputation, EVIDENCE_FILE, SLASH_MARKS_FILE,
                          evidence_to_dict, place_value_digest, placement_entry,
@@ -1284,6 +1284,18 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
 
     def forward_transaction(self, queues, message):
         if isinstance(message, TransactionScore):
+            # A half names whom it is about, and its scorer signs that
+            # (R+D.md §14.2). One that names nobody, or this node, could never
+            # be signed, so no round is run for it (the user's call,
+            # 2026-10-22: the counterparty is mandatory).
+            subject = getattr(message, 'subject_uuid', None)
+            if subject is None or str(subject) == str(self.identity.uuid):
+                self.logger.warning(
+                    'Dropping our half of task %s (%s): it names %s, and a '
+                    'half must name the peer it scores',
+                    str(message.task_id)[:8], message.capability_name,
+                    'this node' if subject is not None else 'no counterparty')
+                return True
             if not self.admit_new_half(message):
                 return True
             try:
@@ -1370,6 +1382,28 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 # CTFT's `p1==peer && p2==self` check then rejects.
                 if idx in self.committed_paxos_rounds:
                     return True
+                # Our own signature over our half, naming whom it is about
+                # (R+D.md §14.2). forward_transaction refused a half that names
+                # nobody, so this fails only on a round that is not ours.
+                counterparty = getattr(score, 'subject_uuid', None)
+                half_sig = None
+                if counterparty is not None \
+                        and str(peer_id) == str(self.identity.uuid):
+                    try:
+                        half_sig = self._detached_sig(
+                            self.identity, half_designation(
+                                score.task_id, peer_id, counterparty,
+                                score.score, score.channel))
+                    except Exception:
+                        half_sig = None
+                if half_sig is None:
+                    self.logger.error(
+                        'handle_accepted: cannot sign our half of task %s '
+                        '(it names %s); not committing it',
+                        str(getattr(score, 'task_id', ''))[:8],
+                        str(counterparty)[:8] if counterparty else 'nobody')
+                    self.committed_paxos_rounds[idx] = None
+                    return True
                 self.committed_paxos_rounds[idx] = None
                 while (len(self.committed_paxos_rounds)
                         > self.COMMITTED_ROUNDS_CAP):
@@ -1383,7 +1417,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 # — primary for leaf nodes, a child chain on a gateway.
                 self._record_committed_half(
                     round_group_uuid, score.task_id, peer_id, score.score,
-                    score.channel, certificate)
+                    score.channel, certificate, counterparty, half_sig)
                 self.commit_sigs_pending.pop(score.task_id, None)
                 self.acceptances.pop(idx, None)
                 # Our half is in: stop watching it (ISSUES §2.24).
@@ -1423,13 +1457,12 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                     # with `task_outcome` must hash the same -- which they do,
                     # since both normalize to no channel block.
                     #
-                    # The certificate rides as element 6, and only in a group
-                    # that requires it, so every other commit is the five
-                    # elements it always was.
+                    # The certificate rides as element 6. Elements 7 and 8
+                    # are whom the half names and the scorer's signature over
+                    # it (R+D.md §14.2): a commit without them is refused.
                     commit_obj = (score.task_id, peer_id, score.score,
-                                  round_group_uuid, score.channel)
-                    if certificate is not None:
-                        commit_obj = commit_obj + (certificate,)
+                                  round_group_uuid, score.channel,
+                                  certificate, str(counterparty), half_sig)
                     commit_msg = Message(
                         self.name, ReputationProtocol.committed,
                         to_json_string(commit_obj),
@@ -1470,6 +1503,12 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 # that requires one.
                 sigs = (parsed[5] if len(parsed) > 5
                         and isinstance(parsed[5], dict) else None)
+                # Elements 7 and 8: whom the half names, and its scorer's
+                # signature over it (R+D.md §14.2).
+                counterparty = (UUID(parsed[6]) if len(parsed) > 6
+                                and isinstance(parsed[6], str) else None)
+                half_sig = (parsed[7] if len(parsed) > 7
+                            and isinstance(parsed[7], str) else None)
             except Exception:
                 self.logger.warning(
                     'handle_committed: malformed payload %r', message.obj)
@@ -1528,9 +1567,24 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                     'its certificate does not meet our quorum' if sigs
                     else 'it carries no commit certificate')
                 return True
+            # Signed halves (R+D.md §14.2): the scorer's own word on its half
+            # and on whom it is about. The certificate says a round ran; only
+            # this says the scorer ran it.
+            if not self._half_sig_ok(task_id, peer_id, counterparty, score,
+                                     channel, half_sig,
+                                     self._chain_for_group(group_uuid)):
+                self.logger.warning(
+                    'Rejecting committed from %s: %s',
+                    getattr(message.from_whom, 'nickname', '?'),
+                    'its half names no counterparty' if counterparty is None
+                    else 'it carries no valid signature by its scorer over '
+                         'its half')
+                return True
             chain = self._chain_for_group(group_uuid)
-            self._record_committed_half(
-                group_uuid, task_id, peer_id, score, channel, sigs)
+            if self._record_committed_half(
+                    group_uuid, task_id, peer_id, score, channel, sigs,
+                    counterparty, half_sig) == 'mismatch':
+                return True
             self._note_interaction(peer_id)
             self.logger.info(
                 'Recorded committed tx from %s: task=%s score=%.2f via %s '
@@ -1748,6 +1802,86 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             return self._bar_met('commit', desig, len(voters),
                                  len(roster.roster_members or ()), 0, roster)
         return len(voters) >= self._round_quorum(group_uuid)
+
+    # ----- Signed halves (R+D.md §14.2) ---------------------------------
+    # A commit certificate is the acceptors' word that a round ran; it is not
+    # the scorer's. Without the scorer's own signature a majority of the
+    # roster could certify, and place, a half "by" a member that never wrote
+    # it. Every new ordinary half therefore carries its scorer's signature over
+    # `half_designation`, which names its counterparty, and is refused without
+    # one, on every path: commit, placement and catch-up. Only an entry this
+    # node already holds is exempt (the user's calls, 2026-10-22).
+
+    def _scorer_key_sources(self, scorer, hist=None):
+        """Where `scorer`'s key may come from: the identity this node holds
+        for it (itself, or a roster peer) when there is one, and otherwise
+        every roster entry in OUR chain that lists it, newest first, so a
+        member who has since left is still checkable. Never a roster a
+        segment brought with it."""
+        ident = self._cosigner_identity(scorer)
+        if ident is not None:
+            return [None]
+        hist = self.history if hist is None else hist
+        key = str(scorer).lower()
+        rosters = [tx for tx in hist if getattr(tx, 'is_roster', False)
+                   and key in dict(tx.roster_members or ())]
+        anchor = getattr(hist, 'roster_anchor', None)
+        if anchor is not None and key in dict(anchor.roster_members or ()):
+            rosters.append(anchor)
+        rosters.sort(key=lambda r: -1 if r.index is None else r.index,
+                     reverse=True)
+        return rosters
+
+    def _half_sig_ok(self, task_id, scorer, counterparty, score, channel,
+                     sig, hist=None) -> bool:
+        """Is `sig` `scorer`'s own signature over its half, naming
+        `counterparty`? False for a half that names nobody or names its own
+        scorer, and for any key we cannot resolve."""
+        if not sig or scorer is None or counterparty is None \
+                or str(scorer).lower() == str(counterparty).lower():
+            return False
+        try:
+            desig = half_designation(task_id, scorer, counterparty, score,
+                                     channel)
+        except (TypeError, ValueError):
+            return False
+        return any(self._verify_cosignature(desig, scorer, sig, roster)
+                   for roster in self._scorer_key_sources(scorer, hist))
+
+    def _entry_halves_signed(self, tx, hist=None) -> 'str | None':
+        """None when every ordinary half of `tx` carries its scorer's
+        signature naming the other side, else the scorer whose does not. An
+        attested or roster entry has no ordinary half."""
+        if getattr(tx, 'attested', False) or getattr(tx, 'is_roster', False):
+            return None
+        for scorer, other, score, chan in (
+                (tx.p1_id, tx.p2_id, tx.p1_score, tx.p1_channel),
+                (tx.p2_id, tx.p1_id, tx.p2_score, tx.p2_channel)):
+            if not self._half_sig_ok(tx.task_id, scorer, other, score, chan,
+                                     tx.half_sig_of(scorer), hist):
+                return str(scorer)
+        return None
+
+    def _half_sigs_ok(self, chain, message, key: str = '') -> bool:
+        """Catch-up's half of signed halves: every ordinary entry in `chain`
+        that we do not already hold identically carries both scorers'
+        signatures. Checkpoint or placement cover does not excuse one: the
+        majority that could forge a half also signs those (the user's call,
+        2026-10-22)."""
+        hist = self._chain_for_key(key)
+        for tx in chain:
+            if getattr(tx, 'index', None) is None \
+                    or self._held_identically(tx, hist):
+                continue
+            who = self._entry_halves_signed(tx, hist)
+            if who is not None:
+                self.logger.warning(
+                    'Rejecting chain from %s: entry %s (task %s) has no valid '
+                    'signature by %s over its own half',
+                    getattr(message.from_whom, 'nickname', '?'), tx.index,
+                    str(tx.task_id)[:8], who[:8])
+                return False
+        return True
 
     def _covered_by_checkpoint(self, chain):
         """``(first, end)`` of the latest quorum-attested primary checkpoint
@@ -4037,7 +4171,10 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         checked each half's and each attestation's certificate against the
         roster in force when they accepted it (the user's call, 2026-10-14).
         A segment whose placement certificate does not verify is refused
-        whole."""
+        whole. So is one carrying a new ordinary half its scorer did not sign
+        (R+D.md §14.2), placed or not."""
+        if not self._half_sigs_ok(chain, message, key):
+            return False
         seg = sorted((t for t in chain if getattr(t, 'index', None) is not None),
                      key=lambda t: t.index)
         covered = self._placement_certified_indices(
@@ -4072,11 +4209,21 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         return False
 
     def _record_committed_half(self, group_uuid, task_id, scorer, score,
-                               channel, certificate):
+                               channel, certificate, counterparty=None,
+                               half_sig=None) -> str:
         """Put a committed half in its chain's pool, where it waits to be
-        placed (doc/architecture/reputation.md, "Agreeing on an order")."""
-        self._chain_for_group(group_uuid).record_half(
-            task_id, scorer, score, channel, certificate=certificate)
+        placed (doc/architecture/reputation.md, "Agreeing on an order").
+        Returns record_half's outcome; a half that does not pair with the one
+        the task holds ('mismatch') is logged and left out."""
+        got = self._chain_for_group(group_uuid).record_half(
+            task_id, scorer, score, channel, certificate=certificate,
+            counterparty=counterparty, half_sig=half_sig)
+        if got == 'mismatch':
+            self.logger.warning(
+                'Not pooling %s\'s half of task %s: it names %s, and the half '
+                'the task holds does not pair with it', str(scorer)[:8],
+                str(task_id)[:8], str(counterparty)[:8])
+        return got
 
     #: Seconds after a peer is first seen at which our pending halves are
     #: handed to it (ISSUES §2.62). Mirrors C REP_HANDOFF_AT.
@@ -4134,11 +4281,11 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             for tx in halves:
                 # The same tuple handle_accepted broadcasts; the primary chain
                 # carries no group uuid.
-                commit_obj = (tx.task_id, tx.p1_id, tx.p1_score, None,
-                              tx.p1_channel)
                 cert = tx.certificate_of(tx.p1_id)
-                if cert:
-                    commit_obj = commit_obj + (cert,)
+                commit_obj = (tx.task_id, tx.p1_id, tx.p1_score, None,
+                              tx.p1_channel, cert or None,
+                              tx.counterparty_of(tx.p1_id),
+                              tx.half_sig_of(tx.p1_id))
                 try:
                     queues[CfgIds.network].put(
                         Message(self.name, ReputationProtocol.committed,

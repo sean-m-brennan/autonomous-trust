@@ -177,7 +177,7 @@ from nacl.encoding import HexEncoder  # noqa: E402
 from autonomous_trust.core.reputation.reputation import (  # noqa: E402
     commit_designation, place_designation, place_value_digest)
 from autonomous_trust.core.reputation.repprocess import ReputationProcess  # noqa: E402
-from tests.a_unit.test_commit_certificates import _ident, _node  # noqa: E402
+from tests.a_unit.test_commit_certificates import _half, _ident, _node  # noqa: E402
 
 
 def _key(ident):
@@ -212,7 +212,9 @@ class TestJudgedByRoster:
         entry = Transaction(t, p1_id=dee.uuid, p1_score=0.9, p2_id=amy.uuid,
                             p2_score=0.8,
                             commit_sigs={str(dee.uuid): _half_cert([ada], dee, t, 0.9),
-                                         str(amy.uuid): _half_cert([ada], amy, t, 0.8)})
+                                         str(amy.uuid): _half_cert([ada], amy, t, 0.8)},
+                            half_sigs={str(dee.uuid): _half(dee, amy, t, 0.9),
+                                       str(amy.uuid): _half(amy, dee, t, 0.8)})
         from autonomous_trust.core.reputation.reputation import placement_entry
         entries = [placement_entry(entry)]
         desig = place_designation(1, rp.history.head_hash,
@@ -366,7 +368,10 @@ class TestAnchor:
         _place(src, 0, _roster_of([a, b, c]), [a, b, c])
         t = uuid4()
         _place(src, 1, Transaction(t, p1_id=a.uuid, p1_score=0.9, p2_id=b.uuid,
-                                   p2_score=0.8), [a, b])
+                                   p2_score=0.8,
+                                   half_sigs={str(a.uuid): _half(a, b, t, 0.9),
+                                              str(b.uuid): _half(b, a, t, 0.8)}),
+               [a, b])
         _place(src, 2, _add_of(src, d), [a, b])
         rp, _q = _node(d, [a, b, c])
         return rp, src, (a, b, c, d)
@@ -380,6 +385,14 @@ class TestAnchor:
         rp._reconcile_into(None, '', seg, 'a')
         assert rp.history.next_index == 3
         assert rp.history.latest_roster().roster_op == 'add'
+
+    def test_a_placed_half_its_scorer_never_signed_is_refused(self):
+        """A placement certificate is the majority's word; it does not stand
+        in for the scorer's own (R+D.md §14.2, the user's call 2026-10-22)."""
+        rp, src, (a, b, c, d) = self._group()
+        seg = list(src)
+        seg[1].half_sigs.pop(str(b.uuid))
+        assert not rp._chain_certified(seg, self.MSG)
 
     def test_a_history_only_an_insider_signed_is_refused(self):
         rp, src, (a, b, c, d) = self._group()

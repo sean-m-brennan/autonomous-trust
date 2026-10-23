@@ -223,7 +223,10 @@ DEFINE_TEST(test_a_window_over_the_page_size_goes_in_pages)
     process_t *proc = _mk_process(me);
     _stage_chain(me, bob, cal);
 
-    _ask(proc, bob, 0);                     /* default: fits in one */
+    /* A page size it fits in: unpaged. (The default no longer holds this
+     * window whole since each entry carries its scorers' signatures, R+D.md
+     * §14.2.) */
+    _ask(proc, bob, 1 << 16);
     ck_assert_int_eq((int)g_num_sent, 1);
     ck_assert(json_is_array(g_sent[0]));    /* unpaged, as before */
     json_t *whole = json_incref(g_sent[0]);

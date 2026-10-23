@@ -34,7 +34,8 @@ import pytest
 
 import autonomous_trust.core._python.reputation.placement as placement_mod
 from autonomous_trust.core.identity import Identity
-from autonomous_trust.core.reputation.reputation import commit_designation
+from autonomous_trust.core.reputation.reputation import (commit_designation,
+                                                         half_designation)
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
 from autonomous_trust.core.reputation.repprocess import ReputationProcess
 from autonomous_trust.core.system import CfgIds
@@ -164,14 +165,17 @@ class Sim:
         ia, ib = self.idents[a], self.idents[b]
         others = [x for x in self.idents if x is not ia and x is not ib]
         halves = []
-        for who, score in ((ia, 0.9), (ib, 0.6)):
+        for who, other, score in ((ia, ib, 0.9), (ib, ia, 0.6)):
             cert = {str(s.uuid): ReputationProcess._detached_sig(
                 s, commit_designation(who.uuid, task, score)) for s in others}
-            halves.append((who.uuid, score, cert))
+            sig = ReputationProcess._detached_sig(
+                who, half_designation(task, who.uuid, other.uuid, score))
+            halves.append((who.uuid, other.uuid, score, cert, sig))
         for i in (at if at is not None else range(len(self.nodes))):
             rp, _q = self.nodes[i]
-            for who, score, cert in self.rng.sample(halves, 2):
-                rp.history.record_half(task, who, score, certificate=cert)
+            for who, other, score, cert, sig in self.rng.sample(halves, 2):
+                rp.history.record_half(task, who, score, certificate=cert,
+                                       counterparty=other, half_sig=sig)
         return task
 
     def index_of(self, uuid_str):
@@ -237,7 +241,9 @@ def test_a_minority_island_places_nothing(tmp_path, monkeypatch):
         for who, score in ((held.p1_id, held.p1_score),
                            (held.p2_id, held.p2_score)):
             rp.history.record_half(minority, who, score,
-                                   certificate=held.certificate_of(who))
+                                   certificate=held.certificate_of(who),
+                                   counterparty=held.counterparty_of(who),
+                                   half_sig=held.half_sig_of(who))
     sim.run(30)
     assert sim.chains({0, 1, 2}) == [[majority, minority]] * 3
 

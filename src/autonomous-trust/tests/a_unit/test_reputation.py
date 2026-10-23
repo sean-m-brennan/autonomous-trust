@@ -1339,6 +1339,8 @@ class TestProposerHistoryBilateral:
         # A stand-in certificate passes: certificates are
         # test_commit_certificates'.
         stub._commit_cert_ok = lambda *a, **k: True
+        # Likewise a stand-in scorer signature: test_bilateral_halves'.
+        stub._half_sig_ok = lambda *a, **k: True
         stub._record_committed_half = lambda *a: \
             ReputationProcess._record_committed_half(stub, *a)
         stub.identity = SimpleNamespace(uuid=self_id)
@@ -1351,7 +1353,8 @@ class TestProposerHistoryBilateral:
         # §2.16, shape 2), so it comes from the proposer it names.
         msg = SimpleNamespace(
             function=ReputationProtocol.committed,
-            obj=to_json_string((task, peer_id, 0.7, None, None, {'s': 'ab'})),
+            obj=to_json_string((task, peer_id, 0.7, None, None, {'s': 'ab'},
+                                str(self_id), 'cd')),
             verified=True, from_whom=SimpleNamespace(uuid=peer_id, nickname='p'),
         )
         ReputationProcess.handle_committed(stub, {}, msg)
@@ -1366,7 +1369,8 @@ class TestProposerHistoryBilateral:
         # avoid double-write (handle_accepted already wrote it).
         msg_self = SimpleNamespace(
             function=ReputationProtocol.committed,
-            obj=to_json_string((task, self_id, 0.9, None, None, {'s': 'ab'})),
+            obj=to_json_string((task, self_id, 0.9, None, None, {'s': 'ab'},
+                                str(peer_id), 'cd')),
             verified=True, from_whom=SimpleNamespace(uuid=self_id, nickname='s'),
         )
         ReputationProcess.handle_committed(stub, {}, msg_self)
@@ -1403,6 +1407,7 @@ class TestProposerHistoryBilateral:
             _note_interaction=lambda *a, **k: None,
             _fold_committed_tx=lambda *a, **k: None,
             _commit_cert_ok=lambda *a, **k: True,
+            _half_sig_ok=lambda *a, **k: True,
             identity=SimpleNamespace(uuid=self_id),
             logger=SimpleNamespace(
                 warning=lambda *a, **k: None, debug=lambda *a, **k: None,
@@ -1412,7 +1417,8 @@ class TestProposerHistoryBilateral:
             ReputationProcess._record_committed_half(stub, *a)
         msg = SimpleNamespace(
             function=ReputationProtocol.committed,
-            obj=to_json_string((task, peer_id, 0.3, None, None, {'s': 'ab'})),
+            obj=to_json_string((task, peer_id, 0.3, None, None, {'s': 'ab'},
+                                str(self_id), 'cd')),
             verified=True, from_whom=SimpleNamespace(uuid=peer_id, nickname='p'),
         )
         ReputationProcess.handle_committed(stub, {}, msg)
@@ -1438,7 +1444,7 @@ class TestProposerHistoryBilateral:
         stub.admit_new_half = lambda m: True   # §2.60 probe gate: not under test
 
         task = uuid4()
-        ts = TransactionScore(task_id=task, score=0.9)
+        ts = TransactionScore(task_id=task, score=0.9, subject_uuid=uuid4())
 
         ReputationProcess.forward_transaction(stub, queues={}, message=ts)
 
