@@ -1193,6 +1193,10 @@ int reputation_consensus_by_tier(const tx_history_t *hist, const uuid_t peer_uui
  * can lose harmlessly, while these marks are the memory a replayed slash has to
  * clear, so the two must not share a failure. */
 #define REP_SLASH_MARKS_FILE "reputation-slash-marks"
+/** Chain entries held only by catch-up under the join policy (RD_14.4 plan,
+ *  D2 (b)): chain key ("" primary) -> sorted absolute indices. Shared with
+ *  Python's CATCHUP_MARKS_FILE. */
+#define REP_CATCHUP_MARKS_FILE "reputation-catchup-marks"
 
 /* Hex length of a detached Ed25519 signature (crypto_sign_BYTES * 2). Defined
  * here rather than only in rep_proc.c because the evidence document carries

@@ -1139,6 +1139,45 @@ def credential_anchored(proc, signer) -> bool:
     return False
 
 
+def anchor_classes(proc, ident) -> frozenset:
+    """The join-policy anchor classes ``ident`` holds through ZTA (RD_14.4
+    plan, Phase 2). ``zta``: a credential that chains to one of our trust
+    anchors, is not revoked, and is BOUND to this identity, whatever the
+    admission binding_mode, since a certificate is public and a cohort could
+    hand us anyone's. ``operator``: on such a credential, operator-class, an
+    operator-key binding that verifies, naming THIS node's operator key (the
+    user's call: the operator's other nodes). Nothing when the policy is off.
+    Mirrors C _hook_anchor_classes."""
+    if ident is None:
+        return frozenset()
+    policy = zta_policy(proc)
+    if not policy.enabled:
+        return frozenset()
+    anchors = zta_anchor_verifiers(proc)
+    san_template = getattr(policy, 'san_uri_template', '') or ''
+    own_key = bytes(getattr(getattr(proc, 'identity', None), 'operator_pubkey', b'') or b'')
+    claimed = bytes(getattr(ident, 'operator_pubkey', b'') or b'')
+    op_binding = bytes(getattr(ident, 'operator_key_binding', b'') or b'')
+    found = set()
+    for cred, binding, _issuer in zta_credentials(proc, ident):
+        matched, is_operator, _failure, _defer = zta_match_anchors(proc, cred, anchors)
+        if not matched:
+            continue
+        if any(verifier.check_revocation(result.credential_hash).status
+               is ZtaStatus.REVOKED for _name, verifier, result in matched):
+            continue
+        if not identity_is_bound(ident, cred, binding, san_template,
+                                 operator_pubkey=claimed,
+                                 operator_key_binding=op_binding):
+            continue
+        found.add('zta')
+        if (own_key and claimed == own_key and op_binding
+                and (is_operator or is_operator_credential(proc, ident, cred))
+                and verify_operator_binding(ident, cred, claimed, op_binding)):
+            found.add('operator')
+    return frozenset(found)
+
+
 def on_tick(proc, queues, tick) -> None:
     """Background re-verification (doc/architecture/zta-integration.md), asked every
     ZTA_REVERIFY_CHECK_SEC whether the POLICY's own, much longer, interval has

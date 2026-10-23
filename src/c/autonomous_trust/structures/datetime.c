@@ -172,16 +172,17 @@ int str_to_offset(const char *str, float *offset)
 /* Frama-C: skipped — [solver-timeout] snprintf stub assigns cascade */
 int offset_to_str(float offset, char *str)
 {
-    const char *sign = "";
-    if (offset >= 0)
-        sign = "+";
-    float hour;
-    float frac = fabsf(modff(offset, &hour));
-    int minutes = (int)(60 * frac);
-    int seconds = (int)(3600 * (frac - (60.0 / minutes)));
+    /* Python's isoformat: "+HH:MM", or "+HH:MM:SS" when the offset has
+     * seconds. The sign is taken from the whole offset, so -0:30 keeps it. */
+    long total = lroundf(offset * 3600.0f);
+    char sign = (total < 0) ? '-' : '+';
+    total = labs(total);
+    int hours = (int)(total / 3600);
+    int minutes = (int)((total % 3600) / 60);
+    int seconds = (int)(total % 60);
     if (seconds > 0)
-        return snprintf(str, MAX_TZ_OFFSET_STR + 1, "%s%d:%d:%d", sign, (int)hour, minutes, seconds);
-    return snprintf(str, MAX_TZ_OFFSET_STR + 1, "%s%d:%d", sign, (int)hour, minutes);
+        return snprintf(str, MAX_TZ_OFFSET_STR + 1, "%c%02d:%02d:%02d", sign, hours, minutes, seconds);
+    return snprintf(str, MAX_TZ_OFFSET_STR + 1, "%c%02d:%02d", sign, hours, minutes);
 }
 
 const char *conversions[] = {"%f", "%z", "%Z"};

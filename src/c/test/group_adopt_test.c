@@ -219,6 +219,77 @@ DEFINE_TEST(test_a_joiner_learns_every_member_from_every_history)
 }
 END_TEST_DEFINITION()
 
+/* [group, steps], with @p n plain steps (C's full_history form). */
+static json_t *_history_with_steps(const group_t *g, int n)
+{
+    json_t *g_json = NULL;
+    ck_assert_ret_ok(group_to_json(g, &g_json));
+    json_t *steps = json_array();
+    for (int i = 0; i < n; i++) {
+        uuid_t u;
+        char us[UUID_STRING_LEN + 1];
+        uuid_generate(u);
+        uuid_unparse_lower(u, us);
+        json_array_append_new(steps, json_pack(
+            "{s:s, s:s, s:s}", "uuid", us,
+            "timestamp", "2026-10-23T02:04:43.067288+00:00",
+            "payload", "abababababababababababababababababababababababababababababababab"));
+    }
+    json_t *hist = json_array();
+    json_array_append_new(hist, g_json);
+    json_array_append_new(hist, steps);
+    return hist;
+}
+
+DEFINE_TEST(test_a_returning_node_rejoins_its_own_group)
+{
+    /* RD_14.4 plan D10 (the user's call, 2026-10-23): the group this node
+     * persisted wins over a longer history, as in Python's choose_group. */
+    identity_t *me = _mk_identity("10.0.0.5", "returner");
+    process_t *proc = _mk_process(me);
+    identity_reset_state();
+    group_t ours = {0}, theirs = {0};
+    ck_assert_ret_ok(group_init(NULL, (char *)"10.0.0.5", &ours));
+    ck_assert_ret_ok(group_init(NULL, (char *)"10.0.0.6", &theirs));
+    identity_set_configured_group(&ours, NULL);
+    identity_stash_history(_history_with_steps(&theirs, 3));
+    identity_stash_history(_history_with_steps(&ours, 0));
+
+    directory_t queues;
+    ck_assert_ret_ok(array_init(&queues));
+    ck_assert_ret_ok(array_append(&queues, string_data(strdup("identity"), 8)));
+    ck_assert(identity_adopt_group_from_histories(proc, &queues));
+    ck_assert_int_eq(uuid_compare(proc->protocol.group.uuid, ours.uuid), 0);
+
+    /* Without it, the longer history wins. */
+    identity_reset_state();
+    identity_stash_history(_history_with_steps(&theirs, 3));
+    identity_stash_history(_history_with_steps(&ours, 0));
+    ck_assert(identity_adopt_group_from_histories(proc, &queues));
+    ck_assert_int_eq(uuid_compare(proc->protocol.group.uuid, theirs.uuid), 0);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_a_zero_step_history_is_adopted_when_nothing_longer_is)
+{
+    /* D10: a lone node's freshly minted group (no steps yet) is adopted, so
+     * the two share a key at once; Python does the same since 2026-10-23. */
+    identity_t *me = _mk_identity("10.0.0.5", "joiner");
+    process_t *proc = _mk_process(me);
+    identity_reset_state();
+    group_t lone = {0};
+    ck_assert_ret_ok(group_init(NULL, (char *)"10.0.0.6", &lone));
+    identity_stash_history(_history_with_steps(&lone, 0));
+    directory_t queues;
+    ck_assert_ret_ok(array_init(&queues));
+    ck_assert_ret_ok(array_append(&queues, string_data(strdup("identity"), 8)));
+    ck_assert(identity_adopt_group_from_histories(proc, &queues));
+    ck_assert_int_eq(uuid_compare(proc->protocol.group.uuid, lone.uuid), 0);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(GroupAdopt,
           test_a_group_adopted_from_history_reaches_the_network,
-          test_a_joiner_learns_every_member_from_every_history)
+          test_a_joiner_learns_every_member_from_every_history,
+          test_a_returning_node_rejoins_its_own_group,
+          test_a_zero_step_history_is_adopted_when_nothing_longer_is)

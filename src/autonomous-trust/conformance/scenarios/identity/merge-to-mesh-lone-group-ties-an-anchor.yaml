@@ -1,0 +1,58 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: merge-to-mesh-lone-group-ties-an-anchor
+byte_pinning: false
+description: |
+    The other half of "anchors break, lone ties" (RD_14.4_HOSTILE_JOIN_PLAN.md
+    Phase 3, D1, the user's call 2026-10-23). The newcomer minted a group of
+    its own and nobody has joined it: a group of one. bob, a verified
+    contact, offers a younger group. Facing an anchored candidate a group of
+    one counts as anchored too, so the two tie and `created` decides: the
+    newcomer keeps its older group.
+
+    That is what lets two mutual anchors that self-bootstrap at once
+    converge. Each sees the other's offer as anchored; if an anchored offer
+    beat a group of one outright, each would take the other's group and the
+    two would stay split until partition recovery. With the tie, both apply
+    the same created/uuid rule to the same two groups and pick the same one.
+    Contrast merge-to-mesh-anchor-beats-created, where the newcomer's group
+    has a second member.
+
+participants:
+  - id: newcomer
+    role: new_node
+  - id: bob
+    role: border_guard
+
+fixtures:
+  first_contact:
+    enabled: true
+  contacts:
+    bob:
+      verified: true
+  join_policy:
+    version: 1
+    enabled: true
+    anchors: [verified_contact]
+  self_bootstrapped: [newcomer]
+  groups:
+    newcomer:
+      uuid: "c0000000-0000-4000-8000-0000000000a1"
+      size: 1
+      created: 100.0
+    bob:
+      uuid: "c0000000-0000-4000-8000-0000000000b1"
+      size: 1
+      created: 200.0
+
+steps:
+  - id: 1
+    from: bob
+    to: newcomer
+    function: full_history
+    description: The newcomer keeps its own, older group.
+
+expected_state:
+  newcomer:
+    group_uuid: "c0000000-0000-4000-8000-0000000000a1"

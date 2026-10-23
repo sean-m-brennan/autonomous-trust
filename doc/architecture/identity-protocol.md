@@ -58,10 +58,16 @@ the software package it is running, and its capability list.
 
 *Phase 2, choose a group.* The node waits for existing peers to send it group
 histories. Each history contains a group key and the identity history structure.
-After a timeout, one of two things happens. If histories arrived, the node
-selects the one with the longest step list, adopts that group, and sends back
-any steps the group is missing. If none arrived, the node concludes it is alone
-and creates a group of its own.
+After a timeout, one of three things happens. If histories arrived, the node
+selects one, adopts that group, and sends back any steps the group is missing
+(`history_diff`). It takes the group it belonged to before, if a history offers
+it. Otherwise it takes the history with the longest step list, the first to
+arrive on a tie, and a history with no steps counts when nothing longer is
+offered. A lone node that minted its group a moment ago is joined, not
+duplicated. If none is usable, a node that kept its group in `group.cfg.json`
+rejoins it. Failing that, the node concludes it is alone and creates a group of
+its own. Both runtimes write `group.cfg.json` in the same form (Python's
+configuration schema), so either can read the other's.
 
 *Phase 3, border guard.* Once in a group, the node takes up the duty every
 member holds, which is guarding the boundary for everybody else. This phase does

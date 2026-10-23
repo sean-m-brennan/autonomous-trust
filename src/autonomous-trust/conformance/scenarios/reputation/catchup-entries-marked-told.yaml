@@ -1,0 +1,49 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: catchup-entries-marked-told
+byte_pinning: false
+description: |
+    Catch-up under the join policy (RD_14.4_HOSTILE_JOIN_PLAN.md Phase 3,
+    D2 (b)). bob joins as in catchup-roster-anchor-newcomer-adopts and adopts
+    the chain alice hands him, as he would without the policy. He also marks,
+    locally, every entry he was not party to: the genesis roster (0), carol
+    and dave's task (1) and the roster entry adding him (2) are what the
+    cohort told him; task b (3), between bob and carol, has bob's own signed
+    half in it and is not. The marks never go on the wire; nothing reads them
+    until the told ceiling (Phase 4).
+
+participants:
+  - id: alice
+    role: provider
+  - id: bob
+    role: consumer
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  chain_parties: [carol, dave]
+  roster: {}
+  join_policy:
+    version: 1
+    enabled: true
+    anchors: [verified_contact]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: latest update
+    payload:
+      chain:
+        - {roster: genesis, members: [alice, carol, dave], placed_by: [alice, carol, dave]}
+        - {task: a, p1: 0.7, p2: 0.5, batch: 1, placed_by: [alice, carol], certified_by: [alice, carol, dave]}
+        - {roster: add, member: bob, placed_by: [alice, carol]}
+        - {task: b, p1_id: bob, p2_id: carol, p1: 0.6, p2: 0.6, batch: 2, placed_by: [alice, carol, dave], certified_by: [alice, carol, dave]}
+
+expected_state:
+  bob:
+    committed_tx_count: 4
+    catchup_told: [0, 1, 2]

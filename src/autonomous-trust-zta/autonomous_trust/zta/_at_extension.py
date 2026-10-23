@@ -24,7 +24,7 @@ the identity hooks below; the core names none of it.
 """
 from autonomous_trust.core.extensions import Extension, IdentityHooks
 
-from autonomous_trust.zta.admission import (admission_gate, credential_anchored, gateway_refused,
+from autonomous_trust.zta.admission import (admission_gate, anchor_classes, credential_anchored, gateway_refused,
                         init_state, join_refused, on_tick, operator_credential,
                         register_delegation_handlers)
 from autonomous_trust.zta.delegation import ZTA_PROCESS
@@ -63,6 +63,7 @@ EXTENSION = Extension(
     identity=IdentityHooks(admission_gate=admission_gate, join_refused=join_refused,
                            gateway_refused=gateway_refused,
                            operator_credential=operator_credential,
-                           credential_anchored=credential_anchored, on_tick=on_tick),
+                           credential_anchored=credential_anchored, on_tick=on_tick,
+                           anchor_classes=anchor_classes),
     # Members' zta_verified / zta_revoked are addressed to C's process name.
     process_aliases=((ZTA_PROCESS, 'identity'),))
