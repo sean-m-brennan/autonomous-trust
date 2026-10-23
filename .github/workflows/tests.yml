@@ -27,11 +27,8 @@ name: Tests
 # ruleset) for master/main, mark the check names `python-tests` and
 # `c-tests` as Required status checks. See the bottom of this file.
 
+# Automatic triggers are disabled for now; run by hand (Actions > Run workflow).
 on:
-  push:
-    branches: [master, main, 'feature/**']
-  pull_request:
-    branches: [master, main]
   workflow_dispatch:
 
 # A newer push to the same branch/PR cancels the older still-running checks

@@ -15,11 +15,8 @@ name: ARM64 Cross-Build
 # point `runs-on` at it to drop native builds to ~3 min (see
 # STRETCH_GOAL_3_EMBEDDED_PLAN.md §5 Phase 1 / §7 Q2).
 
+# Automatic triggers are disabled for now; run by hand (Actions > Run workflow).
 on:
-  push:
-    branches: [master, main, 'feature/**']
-  pull_request:
-    branches: [master, main]
   workflow_dispatch:
 
 jobs:
