@@ -1,0 +1,38 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: join-policy-absent-is-inert
+byte_pinning: false
+description: |
+    The join policy is opt-in (RD_14.4_HOSTILE_JOIN_PLAN.md Phase 2; the
+    user's call, D9). With no join_policy fixture, as with $AT_JOIN_POLICY
+    unset, the joiner counts nobody as an anchor: not even a verified contact,
+    whom first contact does recognize. Every path the policy will gate then
+    behaves as before.
+
+participants:
+  - id: joiner
+    role: new_node
+  - id: bob
+    role: border_guard
+
+fixtures:
+  first_contact:
+    enabled: true
+  contacts:
+    bob:
+      verified: true
+
+steps:
+  - id: 1
+    from: joiner
+    to: joiner
+    function: trigger_choose_group
+    description: |
+        No history is stashed, so this adopts nothing; it is here because a
+        scenario needs a step.
+
+expected_state:
+  joiner:
+    anchors:
+      bob: []

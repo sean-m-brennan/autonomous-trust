@@ -463,17 +463,22 @@ static int _ic_run_attest_pull(sce_run_ctx_t *ctx, ic_impl_t *puller,
  *                    harvested credential)
  */
 static int _scenario_operator_binding(const char *root, const char *variant,
-                                      public_identity_t *pub)
+                                      public_identity_t *pub,
+                                      const public_identity_t *key_of)
 {
     if (root == NULL || variant == NULL || pub == NULL)
         return -1;
+    /* key_of (variant "valid:<pid>") derives the key from ANOTHER
+     * participant's uuid: two nodes under one operator. */
+    if (key_of == NULL)
+        key_of = pub;
 
     /* The derived operator key: SHA-256 over a domain tag and the uuid. Keep
      * this tag byte-identical to the Python adapter's. */
     static const char TAG[] = "conformance-operator-key:";
     uint8_t seed[sizeof(TAG) - 1 + UUID_LEN];
     memcpy(seed, TAG, sizeof(TAG) - 1);
-    memcpy(seed + sizeof(TAG) - 1, pub->uuid, UUID_LEN);
+    memcpy(seed + sizeof(TAG) - 1, key_of->uuid, UUID_LEN);
     uint8_t op_pub[crypto_sign_PUBLICKEYBYTES];
     crypto_hash_sha256(op_pub, seed, sizeof(seed));
 
@@ -694,8 +699,27 @@ static void _apply_zta_fixtures(sce_run_ctx_t *ctx, json_t *fixtures) {
             sce_participant_t *p = sce_find_participant(ctx, pid);
             if (p == NULL) continue;
             ic_impl_t *impl = (ic_impl_t *)p->impl;
-            if (_scenario_operator_binding(root, json_string_value(bv),
-                                           impl->pub) != 0) {
+            /* "valid:<pid>": valid, under <pid>'s operator key. */
+            char variant[64];
+            at_strlcpy(variant, json_string_value(bv), sizeof(variant));
+            const public_identity_t *key_of = NULL;
+            char *colon = strchr(variant, ':');
+            if (colon != NULL) {
+                *colon = '\0';
+                sce_participant_t *kp = sce_find_participant(ctx, colon + 1);
+                if (kp == NULL) {
+                    fprintf(stderr, "conformance: %s: operator_bindings names unknown "
+                            "participant %s\n", pid, colon + 1);
+                    exit(2);
+                }
+                key_of = ((ic_impl_t *)kp->impl)->pub;
+            }
+            if (_scenario_operator_binding(root, variant, impl->pub, key_of) == 0)
+                /* The node's own identity carries its key too, as an opted-in
+                 * node's does and Python's fixture leaves it. */
+                memcpy(impl->full->operator_pubkey, impl->pub->operator_pubkey,
+                       sizeof(impl->full->operator_pubkey));
+            else {
                 /* Fatal, not skipped. This applier is void and cannot fail a
                  * scenario, and a skipped mint would leave the participant
                  * advertising nothing — which is precisely the expected
@@ -957,6 +981,12 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
                     }
                     /* key_epoch: how many rotations this group key has been
                      * through (ISSUES §2.31). Mirrors the Python fixture. */
+                    /* created: the group's claimed age, which _merge_to_mesh's
+                     * tiebreak reads (RD_14.4 plan, Phase 3); 0 = unknown, as
+                     * the Python fixture's default. */
+                    json_t *gcr = json_object_get(gspec, "created");
+                    impl->proc->protocol.group.created =
+                        json_is_number(gcr) ? json_number_value(gcr) : 0.0;
                     json_t *gke = json_object_get(gspec, "key_epoch");
                     if (json_is_integer(gke))
                         impl->proc->protocol.group.key_epoch =
@@ -2672,6 +2702,25 @@ static int _dispatch(sce_run_ctx_t *ctx,
         if (privates != NULL) json_decref(privates);
         return 0;
     }
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
+        && strcmp(inbound->info.net_msg.function, "trigger_choose_group") == 0) {
+        /* Pseudo-function: end choose_group's wait now and adopt from the
+         * histories stashed so far (RD_14.4 plan, Phase 1). The wait itself is
+         * a timer and not observable. Mirrors the Python adapter's
+         * trigger_choose_group handling. */
+        array_t *cq = NULL;
+        array_create(&cq);
+        static const char *const cq_names[] = {"network", "identity",
+                                               "negotiation", "main"};
+        for (size_t i = 0; i < sizeof(cq_names) / sizeof(cq_names[0]); i++) {
+            data_t *qn = string_data((string_t)cq_names[i], strlen(cq_names[i]));
+            if (qn != NULL) array_append(cq, qn);
+        }
+        (void)identity_adopt_group_from_histories(impl->proc, cq);
+        array_free(cq);
+        return 0;
+    }
     /* directory_t is array_t of sibling-process queue names. Populate it
      * with the names handlers expect to find: _announce_identity (the
      * partition-recovery request_access re-broadcast) returns early unless
@@ -3551,6 +3600,36 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                              pid, got, want);
                     return -1;
                 }
+            } else if (strcmp(key, "anchors") == 0) {
+                /* The join-policy anchor classes this participant counts for
+                 * each named participant's PUBLISHED identity, as
+                 * {participant_id: [class, ...]}, order-free (RD_14.4 plan,
+                 * Phase 2). Mirrors Python process.anchor_classes. */
+                const char *tpid;
+                json_t *twant;
+                json_object_foreach(val, tpid, twant) {
+                    sce_participant_t *tp = sce_find_participant(ctx, tpid);
+                    if (tp == NULL || !json_is_array(twant)) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: anchors names unknown participant %s "
+                                 "or wants no list", pid, tpid);
+                        return -1;
+                    }
+                    uint32_t want = 0;
+                    size_t wi;
+                    json_t *wv;
+                    json_array_foreach(twant, wi, wv)
+                        want |= at_join_policy_class(json_string_value(wv));
+                    uint32_t got = identity_anchor_classes(
+                        proc, ((ic_impl_t *)tp->impl)->pub);
+                    if (got != want) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: anchors[%s]=0x%x, expected 0x%x "
+                                 "(verified_contact=1 unverified_contact=2 "
+                                 "zta=4 operator=8)", pid, tpid, got, want);
+                        return -1;
+                    }
+                }
             } else if (strcmp(key, "group_uuid") == 0) {
                 /* This participant's PRIMARY group, pinned by fixtures.groups
                  * so the scenario can state it language-agnostically. The
@@ -3640,6 +3719,20 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                 if (got != want) {
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: provisional_peer_count=%d, expected %d",
+                             pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "join_provisional_count") == 0) {
+                /* Members marked provisional by an adoption under the join
+                 * policy (RD_14.4 plan, D1 (d)); not the admission hold above.
+                 * Mirrors the Python adapter's join_provisional_count. */
+                int want = (int)json_integer_value(val);
+                json_t *prov = identity_provisional_members();
+                int got = (int)json_array_size(prov);
+                json_decref(prov);
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: join_provisional_count=%d, expected %d",
                              pid, got, want);
                     return -1;
                 }
@@ -4154,6 +4247,40 @@ void at_identity_run_ext(const at_case_t *c, at_case_result_t *out,
     /* Wipe singleton id_state so observables (peer_caps_count etc.) are
      * not polluted by prior scenarios. Preserves synchronous_dispatch. */
     identity_reset_state();
+
+    /* join_policy fixture: the declaration's own JSON (RD_14.4 plan, Phase
+     * 2). One per node in C, so one per scenario; Python installs it on every
+     * participant. A fixture that does not parse fails the case. */
+    {
+        json_t *fx = json_object_get(c->data, "fixtures");
+        json_t *jp = json_is_object(fx) ? json_object_get(fx, "join_policy") : NULL;
+        if (jp != NULL) {
+            char *text = json_dumps(jp, JSON_COMPACT);
+            at_join_policy_t policy;
+            char perr[256] = {0};
+            bool ok = text != NULL && at_join_policy_parse(text, &policy, perr, sizeof(perr));
+            free(text);
+            if (!ok) {
+                at_case_result_set_fail(out, 0, "JoinPolicyError",
+                                        perr[0] ? perr : "join_policy fixture");
+                return;
+            }
+            identity_set_join_policy(&policy);
+        }
+        /* self_bootstrapped fixture: [pid, ...] that minted a group of their
+         * own, so a history arriving now takes _merge_to_mesh. id_state is one
+         * per node, so any pid listed sets it; a scenario lists the one node
+         * that receives histories. Mirrors the Python fixture. */
+        json_t *sb = json_is_object(fx) ? json_object_get(fx, "self_bootstrapped") : NULL;
+        if (json_is_array(sb) && json_array_size(sb) > 0)
+            identity_set_self_bootstrapped(true);
+        /* choosing fixture: [pid, ...] whose choose_group wait is running, so
+         * histories are stashed for trigger_choose_group. Mirrors the Python
+         * fixture; one id_state per node, as above. */
+        json_t *ch = json_is_object(fx) ? json_object_get(fx, "choosing") : NULL;
+        if (json_is_array(ch) && json_array_size(ch) > 0)
+            identity_set_choosing_group(true);
+    }
 
     /* First contact is OPT-IN, and the opt-in is read when the process
      * registers its handlers -- so it has to be set BEFORE the participants

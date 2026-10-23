@@ -863,11 +863,72 @@ static bool _fc_is_contact(const process_t *proc, const char *uuid_str)
     return known;
 }
 
+/* The heap buffers public_identity_from_json may have filled. */
+static void _fc_release_identity(public_identity_t *id)
+{
+    free(id->zta_credential);
+    id->zta_credential = NULL;
+    free(id->operator_key_binding);
+    id->operator_key_binding = NULL;
+    public_identity_zta_credentials_clear(id);
+}
+
+/* Whether the device record @p dev is @p ident, by uuid and keys. */
+static bool _fc_device_is(const at_contact_device_t *dev, const public_identity_t *ident)
+{
+    public_identity_t known;
+    if (at_contact_device_identity(dev, &known) != 0)
+        return false;
+    bool same = identity_same_keys(&known, ident);
+    _fc_release_identity(&known);
+    return same;
+}
+
+/* The join-policy anchor classes @p ident holds through first contact
+ * (RD_14.4 plan, Phase 2): verified or unverified contact for a recorded
+ * contact or a device its operator vouched for, by the contact's state, and
+ * operator for a sibling (a device under this node's own operator key).
+ * Matched on uuid AND keys, since a uuid is public. Only while first contact
+ * is enabled. Mirrors Python first_contact._anchor_classes. */
+static uint32_t _fc_anchor_classes(const process_t *proc, const public_identity_t *ident)
+{
+    (void)proc;
+    if (ident == NULL || !at_first_contact_enabled())
+        return 0;
+    char dir[CFG_PATH_LEN + 1] = {0};
+    if (get_data_dir(dir, sizeof(dir)) <= 0)
+        return 0;
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(ident->uuid, uuid_str);
+    uint32_t found = 0;
+    contacts_t store;
+    contacts_init(&store);
+    (void)contacts_load(dir, &store);
+    const contact_t *c = contacts_get(&store, uuid_str);
+    if (c != NULL) {
+        bool match = identity_same_keys(&c->identity, ident);
+        for (size_t i = 0; !match && i < c->devices_count; i++)
+            match = strcmp(c->devices[i].uuid, uuid_str) == 0
+                    && _fc_device_is(&c->devices[i], ident);
+        if (match)
+            found |= c->verified ? AT_ANCHOR_VERIFIED_CONTACT : AT_ANCHOR_UNVERIFIED_CONTACT;
+    }
+    contacts_free(&store);
+    at_siblings_t sib;
+    at_siblings_load(dir, &sib);
+    const at_contact_device_t *dev = at_siblings_get(&sib, uuid_str);
+    if (dev != NULL && _fc_device_is(dev, ident))
+        found |= AT_ANCHOR_OPERATOR;
+    at_siblings_free(&sib);
+    return found;
+}
+
 static const identity_ext_t first_contact_identity_ext = {
     .name = "first_contact",
     .run_start = _fc_run_start,
     .periodic_resync = _fc_periodic,
     .is_contact = _fc_is_contact,
+    .anchor_classes = _fc_anchor_classes,
 };
 IDENTITY_EXT_REGISTER(first_contact, &first_contact_identity_ext)
 

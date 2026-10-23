@@ -59,6 +59,8 @@ from autonomous_trust.core.reputation.reputation import (
 from autonomous_trust.core.reputation.placement import entry_to_dict
 from autonomous_trust.core.reputation.reputation import TransactionHistory
 from autonomous_trust.core.system import CfgIds, PackageHash
+from autonomous_trust.core._python.identity.join_policy import (
+    INERT as INERT_JOIN_POLICY, parse_join_policy)
 from autonomous_trust.core._python.identity.peer_standing import (
     PeerStanding, STANDING_CAPPED)
 
@@ -161,6 +163,14 @@ class _Participant:
                 if actual != want:
                     raise AssertionError(f'{self.id}: {key} differ '
                                          f'({len(actual)} held)')
+            elif key == 'catchup_told':
+                # [index, ...], order-free: the primary-chain entries marked
+                # told by catch-up under the join policy (RD_14.4 plan,
+                # D2 (b)). C mirrors via reputation_catchup_marks.
+                actual = sorted(self.process._catchup_marks.get('', set()))
+                if actual != sorted(int(i) for i in expected or []):
+                    raise AssertionError(f'{self.id}: catchup_told={actual}, '
+                                         f'expected {sorted(expected or [])}')
             elif key == 'equivocations':
                 # {count, index, both: [pid, ...]}: how many equivocation
                 # records the primary chain holds, and the newest one's fork
@@ -1036,6 +1046,14 @@ class ReputationAdapter:
                         continue
                     proc._member_since[str(identities[other_pid].uuid)] = (
                         None, _time.time() - float(ago))
+            # join_policy: the declaration's own JSON (RD_14.4 plan, Phase 3),
+            # under which catch-up is marked. Always set, and the marks
+            # cleared, so nothing a case's config dir holds leaks in. Mirrors
+            # the C adapter's reputation_set_join_policy.
+            participant.process.join_policy = (
+                parse_join_policy(fixtures['join_policy'])
+                if fixtures.get('join_policy') is not None else INERT_JOIN_POLICY)
+            participant.process._catchup_marks = {}
             if preset_peer_standing.get(pid):
                 # ACT on them, not merely record them: the C adapter's
                 # reputation_apply_peer_standing does the unwind at install time,

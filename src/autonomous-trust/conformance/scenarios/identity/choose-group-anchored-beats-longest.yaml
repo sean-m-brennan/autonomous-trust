@@ -1,0 +1,72 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: choose-group-anchored-beats-longest
+byte_pinning: false
+description: |
+    Anchor-first join selection (RD_14.4_HOSTILE_JOIN_PLAN.md Phase 3, D1 (c)).
+    Two cohorts hand the newcomer a history: horde's first, and larger, then
+    bob's. bob is a verified contact and the policy counts verified contacts,
+    so bob's offer is anchored and the newcomer adopts bob's group, where
+    longest-history (and first arrival on a tie) would have taken horde's.
+
+    Anchored means OFFERED BY an anchor, the box-decrypted sender, not that
+    the history lists one: horde's history could list bob too.
+
+    Both histories reach the newcomer during its choose_group wait (the
+    `choosing` fixture), and the trigger ends the wait. C's harness ships
+    histories with no steps, so on C the default rule here is first arrival;
+    Python's horde history is at least as long. Either way horde wins
+    without the policy (choose-group-no-anchor-falls-back).
+
+    Of the adopted group's members the newcomer marks bob's filler
+    provisional; bob, the anchored sender, is not.
+
+participants:
+  - id: newcomer
+    role: new_node
+  - id: horde
+    role: border_guard
+  - id: bob
+    role: border_guard
+
+fixtures:
+  first_contact:
+    enabled: true
+  contacts:
+    bob:
+      verified: true
+  join_policy:
+    version: 1
+    enabled: true
+    anchors: [verified_contact]
+  choosing: [newcomer]
+  groups:
+    horde:
+      uuid: "c0000000-0000-4000-8000-0000000000d1"
+      size: 3
+    bob:
+      uuid: "c0000000-0000-4000-8000-0000000000b1"
+      size: 2
+
+steps:
+  - id: 1
+    from: horde
+    to: newcomer
+    function: full_history
+
+  - id: 2
+    from: bob
+    to: newcomer
+    function: full_history
+
+  - id: 3
+    from: newcomer
+    to: newcomer
+    function: trigger_choose_group
+    description: The wait ends; the newcomer adopts bob's group.
+
+expected_state:
+  newcomer:
+    group_uuid: "c0000000-0000-4000-8000-0000000000b1"
+    join_provisional_count: 1

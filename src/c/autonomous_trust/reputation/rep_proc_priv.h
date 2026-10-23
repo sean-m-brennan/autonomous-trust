@@ -21,6 +21,7 @@
 #include <uuid/uuid.h>
 
 #include "processes/processes.h"
+#include "identity/join_policy.h"
 
 /*@
   requires \valid(proc);
@@ -113,6 +114,19 @@ void reputation_set_synchronous_dispatch(bool enabled);
  *  participant's handler runs against its own pre-installed state.
  *  Idempotent. */
 void reputation_reset_state(int num_peers);
+
+/** The join policy reputation marks catch-up under (RD_14.4 plan, D2 (b));
+ *  NULL: inert. Read from $AT_JOIN_POLICY at start; reset by
+ *  reputation_reset_state. Mirrors Python ReputationProcess.join_policy. */
+void reputation_set_join_policy(const at_join_policy_t *policy);
+
+/** Whether chain @p key's ("" or NULL: primary) entry at absolute @p index
+ *  arrived by catch-up under the join policy and names us in neither slot.
+ *  Mirrors Python ReputationProcess.is_told. */
+bool reputation_is_told(const char *key, int index);
+
+/** The catch-up marks, chain key -> indices: a new object the caller decrefs. */
+json_t *reputation_catchup_marks(void);
 
 /** Pre-install the dispatching participant's chain length, as if it had
  *  committed @p len entries. */

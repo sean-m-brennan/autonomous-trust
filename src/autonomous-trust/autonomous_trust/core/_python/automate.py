@@ -324,6 +324,13 @@ class AutonomousTrust(Protocol):
         # on with no ZTA extension, or one ZTA cannot honour (FEATURE_SPLIT_PLAN
         # Phase 6). Both refuse the start rather than run with ZTA silently off.
         extensions_check_config(logger=self._logger)
+        # The join policy (RD_14.4 plan, D9): malformed, or naming an anchor
+        # class no installed extension answers, refuses the start. Installed,
+        # as C can see only what is linked: one installed but switched off
+        # anchors nobody.
+        from .identity.join_policy import check_join_policy
+        check_join_policy([ext.name for ext in all_extensions()],
+                          logger=self._logger)
         self._logger.info('Extensions: %s',
                           ', '.join(ext.name for ext in all_extensions()) or 'none')
         self.identity = None  # of type Identity (can't import)

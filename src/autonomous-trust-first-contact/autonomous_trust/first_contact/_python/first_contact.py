@@ -645,11 +645,43 @@ def _is_contact(proc, peer_uuid) -> bool:  # noqa: ARG001 -- the hook's shape
     return enabled() and str(peer_uuid) in _contact_records()
 
 
+def _anchor_classes(proc, ident) -> frozenset:
+    """The join-policy anchor classes ``ident`` holds through first contact
+    (RD_14.4 plan, Phase 2): ``verified_contact`` or ``unverified_contact``
+    for a recorded contact or a device its operator vouched for, by the
+    contact's state, and ``operator`` for a sibling (a device under this
+    node's own operator key). Matched on uuid AND keys (``_same_keys``): a
+    uuid is public, so a cohort could list a contact's uuid with keys of its
+    own. Only while first contact is enabled. Mirrors C _fc_anchor_classes."""
+    from autonomous_trust.core.identity.join_policy import (
+        ANCHOR_OPERATOR, ANCHOR_UNVERIFIED_CONTACT, ANCHOR_VERIFIED_CONTACT)
+    if ident is None or not enabled():
+        return frozenset()
+    uuid = str(getattr(ident, 'uuid', ''))
+    found = set()
+    try:
+        contacts = Contacts.load()
+    except (OSError, ValueError, TypeError):
+        contacts = None
+    if contacts is not None:
+        for contact in contacts.all():
+            for known in contact.identities():
+                if str(known.uuid) == uuid and proc._same_keys(known, ident):
+                    found.add(ANCHOR_VERIFIED_CONTACT if contact.verified
+                              else ANCHOR_UNVERIFIED_CONTACT)
+    from .siblings import Siblings
+    sibling = Siblings.load().get(uuid)
+    if sibling is not None and proc._same_keys(sibling.identity, ident):
+        found.add(ANCHOR_OPERATOR)
+    return frozenset(found)
+
+
 EXTENSION = Extension(name='first_contact', enabled=enabled,
                       register_handlers=_register_extension,
                       identity=IdentityHooks(on_start=_on_start,
                                              periodic_resync=_periodic,
-                                             is_contact=_is_contact),
+                                             is_contact=_is_contact,
+                                             anchor_classes=_anchor_classes),
                       app_verbs=tuple((verb, CfgIds.identity) for verb in _app_verbs()),
                       negotiation=NegotiationHooks(capped_tier=_capped_tier),
                       # Each arrives before the sender is a peer here, so there

@@ -1,0 +1,52 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: join-policy-zta-anchor-needs-a-binding
+byte_pinning: false
+description: |
+    RD_14.4_HOSTILE_JOIN_PLAN.md Phase 2, D6, the zta class. Both peers
+    present the same chain-valid credential. bob's is bound to him; carol's
+    binding names another node (a harvested credential). Only bob is an
+    anchor. The binding is required whatever the admission binding_mode,
+    since a certificate is public and a cohort could hand a joiner anyone's:
+    the policy here is `prefer`, under which admission would take carol's
+    unbound-to-her credential.
+
+participants:
+  - id: joiner
+    role: new_node
+  - id: bob
+    role: border_guard
+  - id: carol
+    role: border_guard
+
+fixtures:
+  zta_policy:
+    enabled: true
+    require_at_admission: true
+    binding_mode: prefer
+    verifier_type: x509
+    ca_bundle_path: testdata/zta/operator-ca-bundle.pem
+  credentials:
+    bob: testdata/zta/certs/operator_leaf.der
+    carol: testdata/zta/certs/operator_leaf.der
+  zta_bindings:
+    bob: valid
+    carol: other-identity
+  join_policy:
+    version: 1
+    enabled: true
+    anchors: [zta]
+
+steps:
+  - id: 1
+    from: joiner
+    to: joiner
+    function: trigger_choose_group
+    description: No history is stashed; a scenario needs a step.
+
+expected_state:
+  joiner:
+    anchors:
+      bob: [zta]
+      carol: []

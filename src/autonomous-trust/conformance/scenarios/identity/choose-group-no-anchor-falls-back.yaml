@@ -1,0 +1,63 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: choose-group-no-anchor-falls-back
+byte_pinning: false
+description: |
+    The fallback of anchor-first join selection (RD_14.4_HOSTILE_JOIN_PLAN.md
+    Phase 3, D1 (c)): with no offer from an anchor, the existing rule runs.
+    As choose-group-anchored-beats-longest, except bob was recorded but never
+    verified, and the policy counts only verified contacts. Neither offer is
+    anchored, so the newcomer adopts horde's, the longer (Python) and first
+    (C) of the two.
+
+    The policy is still on, so the members horde's group introduced are
+    marked provisional: horde itself (not anchored) and its two fillers.
+
+participants:
+  - id: newcomer
+    role: new_node
+  - id: horde
+    role: border_guard
+  - id: bob
+    role: border_guard
+
+fixtures:
+  first_contact:
+    enabled: true
+  contacts:
+    bob:
+      verified: false
+  join_policy:
+    version: 1
+    enabled: true
+    anchors: [verified_contact]
+  choosing: [newcomer]
+  groups:
+    horde:
+      uuid: "c0000000-0000-4000-8000-0000000000d1"
+      size: 3
+    bob:
+      uuid: "c0000000-0000-4000-8000-0000000000b1"
+      size: 2
+
+steps:
+  - id: 1
+    from: horde
+    to: newcomer
+    function: full_history
+
+  - id: 2
+    from: bob
+    to: newcomer
+    function: full_history
+
+  - id: 3
+    from: newcomer
+    to: newcomer
+    function: trigger_choose_group
+
+expected_state:
+  newcomer:
+    group_uuid: "c0000000-0000-4000-8000-0000000000d1"
+    join_provisional_count: 3
