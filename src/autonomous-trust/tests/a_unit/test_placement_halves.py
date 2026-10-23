@@ -39,7 +39,9 @@ def _placing(me, everyone):
 
 def _proposal(rp, q):
     """What `rp` sends for a fresh half of its own, by function."""
-    rp._start_paxos(q, TransactionScore(uuid4(), 0.9))
+    # Our half names whom it scores (R+D.md §14.2); which peer does not
+    # matter here.
+    rp._start_paxos(q, TransactionScore(uuid4(), 0.9, subject_uuid=uuid4()))
     out = {}
     for m in _sent(q):
         out.setdefault(m.function, []).append(m)

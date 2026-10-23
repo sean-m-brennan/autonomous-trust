@@ -55,7 +55,7 @@ def test_a_round_needs_half_the_others(n, others):
 def _proposer(members):
     p = members[0]
     rp, q = _node(p, _roster(p, members))
-    score = TransactionScore(uuid4(), 0.9)
+    score = TransactionScore(uuid4(), 0.9, subject_uuid=uuid4())
     rp.proposals[(7, 1)] = score
     return rp, q, score
 
@@ -63,7 +63,7 @@ def _proposer(members):
 def _accept(rp, q, voter, idx=(7, 1)):
     """`voter` accepts round `idx`, signing the half it carries (any half,
     for a round the proposer never ran)."""
-    score = rp.proposals.get(idx) or TransactionScore(uuid4(), 0.9)
+    score = rp.proposals.get(idx) or TransactionScore(uuid4(), 0.9, subject_uuid=uuid4())
     sig = _sign(voter, rp.identity, score.task_id, score.score)
     rp.handle_accepted(q, _msg(ReputationProtocol.accepted,
                                (idx[0], idx[1], rp.identity.uuid, sig), voter))

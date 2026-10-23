@@ -334,6 +334,15 @@ static json_t *_roster_for_group(const process_t *proc, const char *group_uuid);
 static bool _verify_cosignature_in(const process_t *proc, const json_t *roster,
                                    const char *voter, const uint8_t *desig,
                                    size_t dlen, const char *sig_hex);
+static bool _half_sig_ok(const process_t *proc, const char *chain_key,
+                         const uuid_t task, const uuid_t scorer,
+                         const uuid_t counterparty, double score,
+                         const char *channel, const char *sig_hex);
+static bool _entry_halves_signed(const process_t *proc, const char *chain_key,
+                                 const transaction_t *t, const char *sig1,
+                                 const char *sig2, char *who_out);
+static bool _chain_json_half_signed(const process_t *proc, json_t *arr,
+                                    const char *key);
 
 /* Slash "reason" that lifts (rather than floors) a target: releases the
  * slash floor, restores the score to PREREP_NEUTRAL, and re-admits it.
@@ -473,6 +482,7 @@ typedef struct {
     int    retries;      /* how many it gets before it is parked or given up */
     double parked_at;    /* when the retries ran out (§2.60); 0 = not parked */
     double last_proposed; /* when a round last went out for it */
+    uuid_t subject;      /* whom our half names (R+D.md §14.2) */
 } rep_awaiting_t;
 
 /* A checkpoint proposal parked for a later co-sign (ISSUES §2.29). Everything
@@ -633,6 +643,11 @@ static struct {
      * the floor and reads it back when the round commits -- its OWN claim,
      * never the acceptor's echo of it (R+D.md §12.8). */
     map_t task_channels;
+    /* Whom our half of a task names (R+D.md §14.2), stashed beside its
+     * channel for the same reason: the staged tx_score_t is gone by the time
+     * the round commits and the half is signed. Bounded in lockstep with
+     * task_weights, like task_channels. */
+    map_t task_subjects;
     /* --- Slashing (fast-penalty path) ---
      * Mirrors Python ReputationProcess._slashed / _slash_sigs /
      * _slash_pending. A finalized slash floors the target's reputation
@@ -889,6 +904,7 @@ static void _ensure_init(void)
         rep_state.task_weights_ring_len = 0;
         map_init(&rep_state.task_tiers);
         map_init(&rep_state.task_channels);
+        map_init(&rep_state.task_subjects);
         map_init(&rep_state.slashed);
         map_init(&rep_state.slash_sigs);
         map_init(&rep_state.slash_pending);
@@ -1400,6 +1416,7 @@ static void _record_task_weight_locked(char *task_uuid_str, int weight)
         map_remove(&rep_state.task_weights, task_uuid_str);
         map_remove(&rep_state.task_tiers, task_uuid_str);  /* lockstep (doc/architecture/network-wire-format.md) */
         map_remove(&rep_state.task_channels, task_uuid_str);   /* same lockstep */
+        map_remove(&rep_state.task_subjects, task_uuid_str);   /* same lockstep */
         /* Best-effort ring compaction: walk and remove matching slot.
          * O(N) but N <= 2*MAX_CHAIN_LEN, and refresh hits are rare. */
         for (int i = 0; i < rep_state.task_weights_ring_len; i++)
@@ -1443,6 +1460,8 @@ static void _record_task_weight_locked(char *task_uuid_str, int weight)
                        rep_state.task_weights_ring[evict_slot]);
             map_remove(&rep_state.task_channels,        /* same lockstep */
                        rep_state.task_weights_ring[evict_slot]);
+            map_remove(&rep_state.task_subjects,        /* same lockstep */
+                       rep_state.task_weights_ring[evict_slot]);
             rep_state.task_weights_ring[evict_slot][0] = '\0';
         }
     }
@@ -1485,6 +1504,34 @@ static void _record_task_channel_locked(char *task_uuid_str, const char *channel
     data_t *c_dat = string_data((string_t)channel, strlen(channel) + 1);
     if (c_dat == NULL) return;
     map_set(&rep_state.task_channels, task_uuid_str, c_dat);
+}
+
+/* Record whom our half of a task names into rep_state.task_subjects, evicted
+ * with its weight key like the channel. Caller must hold rep_state.lock. */
+static void _record_task_subject_locked(const char *task_uuid_str,
+                                        const uuid_t subject)
+{
+    if (task_uuid_str == NULL || task_uuid_str[0] == '\0' || subject == NULL
+        || uuid_is_null(subject))
+        return;
+    char s[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(subject, s);
+    data_t *d = string_data((string_t)s, strlen(s) + 1);
+    if (d != NULL)
+        map_set(&rep_state.task_subjects, (map_key_t)task_uuid_str, d);
+}
+
+/* Whom our half of @p task_uuid_str names: true and @p out set when one was
+ * recorded. Caller must hold rep_state.lock. */
+static bool _task_subject_locked(const char *task_uuid_str, uuid_t out)
+{
+    data_t *dat = NULL;
+    string_t val = NULL;
+    if (task_uuid_str == NULL
+        || map_get(&rep_state.task_subjects, (map_key_t)task_uuid_str, &dat) != 0
+        || dat == NULL || data_string_ptr(dat, &val) != 0 || val == NULL)
+        return false;
+    return uuid_parse((const char *)val, out) == 0;
 }
 
 /* The channel recorded for @p task_uuid_str, or NULL when none was (which
@@ -2273,6 +2320,8 @@ static void _propose_half(const process_t *proc, int64_t id1, int64_t id2,
      * multiplier has to outlive `tx` so this re-record reproduces the
      * weight the round started with (R+D.md §12.5). */
     double competence_local = tx->competence;
+    uuid_t subject_local;
+    uuid_copy(subject_local, tx->subject_uuid);
     if (task_uuid_str[0] != '\0')
     {
         /* Our own round, so the channel counts (R+D.md §12.8). */
@@ -2285,6 +2334,8 @@ static void _propose_half(const process_t *proc, int64_t id1, int64_t id2,
          * the committed fact now, and `tx` is freed by the map_remove
          * below. */
         _record_task_channel_locked(task_uuid_str, channel_local);
+        /* ...and whom it names, which the commit signs (R+D.md §14.2). */
+        _record_task_subject_locked(task_uuid_str, subject_local);
     }
 
     map_remove(&rep_state.my_requests, round_key);
@@ -2847,6 +2898,41 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
             if (stashed != NULL)
                 at_strlcpy(commit_channel, stashed, sizeof(commit_channel));
         }
+        /* Our own signature over our half, naming whom it is about (R+D.md
+         * §14.2). _forward_transaction refused a half that names nobody, so
+         * this fails only for a round that is not ours to sign. Mirrors
+         * Python handle_accepted. */
+        uuid_t subject;
+        uuid_clear(subject);
+        char subject_str[UUID_STRING_LEN + 1] = "";
+        char half_sig[REP_SIG_HEX_LEN + 1] = "";
+        bool half_signed = false;
+        if (have_task_uuid)
+        {
+            pthread_mutex_lock(&rep_state.lock);
+            bool named = _task_subject_locked(task_uuid_str, subject);
+            pthread_mutex_unlock(&rep_state.lock);
+            uint8_t hd[HALF_DESIG_MAX];
+            size_t hlen = (named && uuid_compare(subject, peer_uuid) != 0)
+                ? half_designation(task_uuid, peer_uuid, subject, score,
+                                   commit_channel, hd, sizeof(hd))
+                : 0;
+            half_signed = hlen > 0
+                && _cosign_hex(proc, hd, hlen, half_sig, sizeof(half_sig)) == 0;
+            if (half_signed)
+                uuid_unparse_lower(subject, subject_str);
+        }
+        if (!half_signed)
+        {
+            log_error(proc->logger,
+                      "Reputation: handle_accepted: cannot sign our half of "
+                      "task %s (it names %s); not committing it\n",
+                      have_task_uuid ? task_uuid_str : "-",
+                      uuid_is_null(subject) ? "nobody" : "this node");
+            json_decref(certificate);
+            json_decref(payload);
+            return true;
+        }
         if (have_task_uuid)
         {
             /* The half waits in the pool until a placement writes its entry
@@ -2855,8 +2941,9 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
             char *text = certificate != NULL
                 ? json_dumps(certificate, JSON_COMPACT | JSON_SORT_KEYS) : NULL;
             pthread_mutex_lock(&rep_state.lock);
-            (void)tx_history_record_half(chain, task_uuid, peer_uuid, score,
-                                         commit_channel, text);
+            (void)tx_history_record_signed_half(chain, task_uuid, peer_uuid, score,
+                                                commit_channel, text, subject,
+                                                half_sig);
             _drop_cosigs_locked(&rep_state.commit_sigs, task_uuid_str);
             pthread_mutex_unlock(&rep_state.lock);
             free(text);
@@ -2914,6 +3001,10 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
             /* The certificate the round carried. */
             if (certificate != NULL)
                 json_object_set(commit_json, "certificate", certificate);
+            /* Whom the half names, and our signature over it (R+D.md §14.2):
+             * a commit without them is refused. */
+            json_object_set_new(commit_json, "names", json_string(subject_str));
+            json_object_set_new(commit_json, "half_sig", json_string(half_sig));
 
             generic_msg_t bcast = {0};
             bcast.type = NET_MESSAGE;
@@ -3080,17 +3171,46 @@ static bool handle_committed(const process_t *proc, directory_t *queues, generic
         json_decref(payload);
         return true;
     }
+    /* Signed halves (R+D.md §14.2): the scorer's own word on its half and on
+     * whom it is about. The certificate says a round ran; only this says the
+     * scorer ran it. Mirrors Python handle_committed. */
+    (void)uuid_parse(task_uuid_str, task_uuid);
+    const char *names_str = json_string_value(json_object_get(payload, "names"));
+    const char *half_sig = json_string_value(json_object_get(payload, "half_sig"));
+    uuid_t names;
+    bool named = names_str != NULL && uuid_parse(names_str, names) == 0;
+    char chain_key[UUID_STRING_LEN + 1];
+    _chain_key(proc, group_str, chain_key, sizeof(chain_key));
+    if (!named || !_half_sig_ok(proc, chain_key, task_uuid, peer_uuid, names,
+                                score, chan_borrowed, half_sig))
+    {
+        log_warn(proc->logger, "Reputation: rejecting committed from %s: %s\n",
+                 nmsg->from_whom.nickname,
+                 named ? "it carries no valid signature by its scorer over "
+                         "its half"
+                       : "its half names no counterparty");
+        json_decref(payload);
+        return true;
+    }
     char *cert_text = json_dumps(cert, JSON_COMPACT | JSON_SORT_KEYS);
 
     /* To the pool, to wait for its placement (certified implies a parsed
      * task uuid). Mirrors Python _record_committed_half. */
-    (void)uuid_parse(task_uuid_str, task_uuid);
     pthread_mutex_lock(&rep_state.lock);
     tx_history_t *chain = _chain_for_group_locked(proc, group_str);
-    (void)tx_history_record_half(chain, task_uuid, peer_uuid, score,
-                                 chan_borrowed, cert_text);
+    int got = tx_history_record_signed_half(chain, task_uuid, peer_uuid, score,
+                                            chan_borrowed, cert_text, names,
+                                            half_sig);
     pthread_mutex_unlock(&rep_state.lock);
     free(cert_text);
+    if (got == TX_HALF_MISMATCH)
+    {
+        log_warn(proc->logger, "Reputation: not pooling %.8s's half of task "
+                 "%.8s: it names %.8s, and the half the task holds does not "
+                 "pair with it\n", peer_uuid_str, task_uuid_str, names_str);
+        json_decref(payload);
+        return true;
+    }
     _note_interaction(peer_uuid);   /* idle clock; see doc/architecture/reputation.md decay */
     log_debug(proc->logger, "Reputation: Recorded committed tx from %s via %s\n",
               peer_uuid_str, tx_channel_or_default(chan_borrowed));
@@ -4365,6 +4485,7 @@ static void _await_commit_locked(const tx_score_t *tx, const uuid_t proposer)
                sizeof(w->capability_name));
     at_strlcpy(w->channel, tx->channel, sizeof(w->channel));
     w->competence = tx->competence;
+    uuid_copy(w->subject, tx->subject_uuid);
     w->deadline = deadline;
     w->attempts = 0;
     w->retries = REP_COMMIT_RETRIES;
@@ -4618,6 +4739,21 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
 {
     char task_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(task_uuid, task_str);
+    /* A half names whom it is about, and its scorer signs that (R+D.md
+     * §14.2). One that names nobody, or this node, could never be signed, so
+     * no round is run for it (the user's call, 2026-10-22: the counterparty
+     * is mandatory). Mirrors Python forward_transaction. */
+    if (subject_uuid == NULL || uuid_is_null(subject_uuid)
+        || uuid_compare(subject_uuid, peer_uuid) == 0)
+    {
+        log_warn(proc->logger,
+                 "Reputation: dropping our half of task %s (%s): it names %s, "
+                 "and a half must name the peer it scores\n", task_str,
+                 (capability_name && capability_name[0]) ? capability_name : "-",
+                 (subject_uuid != NULL && !uuid_is_null(subject_uuid))
+                     ? "this node" : "no counterparty");
+        return;
+    }
     /* The channel is logged AND acted on (R+D.md §12.8): "score 0.30 via
      * certificate" says a proof failed where "score 0.30" alone does not, and
      * because this is our OWN evidence it also weights the EMA below.
@@ -4669,6 +4805,7 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
         /* Stage the learned multiplier too (R+D.md §12.5), so _propose_half
          * re-records the SAME weight this round was started with. */
         tx->competence = competence;
+        uuid_copy(tx->subject_uuid, subject_uuid);
         data_t *tx_dat = object_ptr_data(tx, sizeof(tx_score_t));
         /* KEYED BY THE ROUND: _propose_half looks it up by (id1, id2). */
         map_set(&rep_state.my_requests, round_key, tx_dat);
@@ -5125,6 +5262,181 @@ static size_t _verified_cosigners_in(const process_t *proc, const json_t *roster
             count++;
     }
     return count;
+}
+
+/* ---- Signed halves (R+D.md §14.2) -------------------------------------
+ *
+ * A commit certificate is the acceptors' word that a round ran; it is not the
+ * scorer's. Without the scorer's own signature a majority of the roster could
+ * certify, and place, a half "by" a member that never wrote it. Every new
+ * ordinary half therefore carries its scorer's signature over
+ * half_designation, which names its counterparty, and is refused without one
+ * on every path: commit, placement and catch-up. Only an entry this node
+ * already holds is exempt (the user's calls, 2026-10-22). Mirrors the Python
+ * block of the same name. */
+
+/* @p scorer_str's key from a roster logged in OUR chain @p chain_key that
+ * lists it, newest first (the anchor last), verified against @p sig_hex:
+ * how a member who has since left is still checkable. Never a roster a
+ * segment brought with it. Caller holds rep_state.lock. */
+static bool _half_sig_by_logged_roster_locked(const process_t *proc,
+                                              const char *chain_key,
+                                              const char *scorer_str,
+                                              const uint8_t *desig, size_t dlen,
+                                              const char *sig_hex)
+{
+    tx_history_t *chain = _chain_for_key_locked(chain_key);
+    for (int i = chain->chain_len - 1; i >= -1; i--)
+    {
+        const char *digest = NULL;
+        if (i >= 0)
+        {
+            const transaction_t *t = &chain->chain[i];
+            if (!t->roster || !tx_is_committed(t))
+                continue;
+            digest = t->roster_digest;
+        }
+        else if (chain->roster_anchor[0] != '\0')
+            digest = chain->roster_anchor;
+        if (digest == NULL)
+            continue;
+        const char *text = tx_history_roster_members(chain, digest);
+        json_t *roster = text != NULL ? json_loads(text, 0, NULL) : NULL;
+        bool listed = roster != NULL && _roster_key_of(roster, scorer_str) != NULL;
+        bool ok = listed && _verify_cosignature_in(proc, roster, scorer_str,
+                                                   desig, dlen, sig_hex);
+        json_decref(roster);
+        if (listed)
+            return ok;
+    }
+    return false;
+}
+
+/* Is @p sig_hex @p scorer's own signature over its half, naming
+ * @p counterparty? False for a half that names nobody or its own scorer, and
+ * for any key we cannot resolve: the identity we hold for the scorer when
+ * there is one, else the rosters logged in chain @p chain_key. Caller must
+ * NOT hold rep_state.lock or the peers lock. Mirrors Python _half_sig_ok. */
+static bool _half_sig_ok(const process_t *proc, const char *chain_key,
+                         const uuid_t task, const uuid_t scorer,
+                         const uuid_t counterparty, double score,
+                         const char *channel, const char *sig_hex)
+{
+    if (proc == NULL || counterparty == NULL || sig_hex == NULL
+        || uuid_compare(scorer, counterparty) == 0)
+        return false;
+    uint8_t desig[HALF_DESIG_MAX];
+    size_t dlen = half_designation(task, scorer, counterparty, score, channel,
+                                   desig, sizeof(desig));
+    if (dlen == 0)
+        return false;
+    char scorer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(scorer, scorer_str);
+    unsigned char pk[crypto_sign_PUBLICKEYBYTES];
+    if (_cosigner_pubkey(proc, scorer_str, pk))
+    {
+        unsigned char sig[crypto_sign_BYTES];
+        return strnlen(sig_hex, REP_SIG_HEX_LEN + 2) == REP_SIG_HEX_LEN
+            && unhexlify((const unsigned char *)sig_hex, REP_SIG_HEX_LEN, sig) == 0
+            && crypto_sign_verify_detached(sig, desig, dlen, pk) == 0;
+    }
+    pthread_mutex_lock(&rep_state.lock);
+    bool ok = _half_sig_by_logged_roster_locked(proc, chain_key != NULL
+                                                    ? chain_key : "",
+                                                scorer_str, desig, dlen, sig_hex);
+    pthread_mutex_unlock(&rep_state.lock);
+    return ok;
+}
+
+/* Does every ordinary half of @p t carry its scorer's signature (@p sig1 for
+ * p1, @p sig2 for p2) naming the other side? An attested or roster entry has
+ * no ordinary half. On false, @p who_out (UUID_STRING_LEN + 1, may be NULL)
+ * names the scorer whose does not. Mirrors Python _entry_halves_signed. */
+static bool _entry_halves_signed(const process_t *proc, const char *chain_key,
+                                 const transaction_t *t, const char *sig1,
+                                 const char *sig2, char *who_out)
+{
+    if (t->attested || t->roster)
+        return true;
+    if (!t->p1_set || !t->p2_set)
+    {
+        if (who_out != NULL)
+            uuid_unparse_lower(t->p1_set ? t->p2_uuid : t->p1_uuid, who_out);
+        return false;
+    }
+    if (!_half_sig_ok(proc, chain_key, t->task_uuid, t->p1_uuid, t->p2_uuid,
+                      t->p1_score, t->p1_channel, sig1))
+    {
+        if (who_out != NULL)
+            uuid_unparse_lower(t->p1_uuid, who_out);
+        return false;
+    }
+    if (!_half_sig_ok(proc, chain_key, t->task_uuid, t->p2_uuid, t->p1_uuid,
+                      t->p2_score, t->p2_channel, sig2))
+    {
+        if (who_out != NULL)
+            uuid_unparse_lower(t->p2_uuid, who_out);
+        return false;
+    }
+    return true;
+}
+
+/* Catch-up's half of signed halves: every ordinary entry of segment @p arr
+ * that we do not already hold identically carries both scorers' signatures.
+ * Checkpoint or placement cover does not excuse one: the majority that could
+ * forge a half also signs those (the user's call, 2026-10-22). Mirrors Python
+ * _half_sigs_ok. Caller must NOT hold rep_state.lock or the peers lock. */
+static bool _chain_json_half_signed(const process_t *proc, json_t *arr,
+                                    const char *key)
+{
+    if (!json_is_array(arr) || json_array_size(arr) == 0)
+        return true;
+    tx_history_t *seg = NULL;
+    if (tx_history_create(&seg) != 0 || seg == NULL)
+        return false;
+    tx_reconcile_result_t res = { TX_RECONCILE_NONE, -1, 0, 0, NULL };
+    tx_history_reconcile(seg, arr, -1, &res);
+    tx_reconcile_status_t status = res.status;
+    tx_reconcile_result_free(&res);
+    if (status == TX_RECONCILE_REJECTED)
+    {
+        tx_history_destroy(seg);
+        return true;   /* not ours to judge: the merge itself refuses it */
+    }
+    bool ok = true;
+    for (int i = 0; ok && i < seg->chain_len; i++)
+    {
+        const transaction_t *t = &seg->chain[i];
+        if (t->attested || t->roster || !tx_is_committed(t))
+            continue;
+        /* Held at the same index, hashing the same: nothing new to prove. */
+        transaction_t held;
+        pthread_mutex_lock(&rep_state.lock);
+        bool same = tx_history_by_task(_chain_for_key_locked(key), t->task_uuid,
+                                       &held) == 0
+            && held.index == t->index;
+        if (same)
+        {
+            char a[TX_HASH_HEX_LEN + 1], b[TX_HASH_HEX_LEN + 1];
+            transaction_entry_hash(&held, a);
+            transaction_entry_hash(t, b);
+            same = strcmp(a, b) == 0;
+        }
+        pthread_mutex_unlock(&rep_state.lock);
+        if (same)
+            continue;
+        char who[UUID_STRING_LEN + 1] = "";
+        ok = _entry_halves_signed(proc, key, t,
+                                  tx_history_half_sig(seg, t->task_uuid, t->p1_uuid),
+                                  tx_history_half_sig(seg, t->task_uuid, t->p2_uuid),
+                                  who);
+        if (!ok)
+            log_warn(proc->logger, "Reputation: rejecting chain: entry %d has "
+                     "no valid signature by %.8s over its own half\n",
+                     t->index, who);
+    }
+    tx_history_destroy(seg);
+    return ok;
 }
 
 /* The N_min the roster in force for @p group_uuid's chain declares (RD_13.2
@@ -6533,6 +6845,10 @@ static bool _chain_json_certified(const process_t *proc, json_t *arr,
     const char *group = (key != NULL && key[0] != '\0') ? key : NULL;
     if (!json_is_array(arr))
         return _chain_json_certified_all(proc, arr, key);
+    /* A new ordinary half its scorer did not sign refuses the segment,
+     * placed or not (R+D.md §14.2). */
+    if (!_chain_json_half_signed(proc, arr, key))
+        return false;
     int n = 0;
     bool refused = false;
     int *covered = _placement_certified_indices(proc, key, group, arr, &n, &refused);
@@ -10232,8 +10548,6 @@ void _retry_uncommitted_halves(const process_t *proc, double present)
             map_remove(&rep_state.awaiting_commit, due_key[i]);
     pthread_mutex_unlock(&rep_state.lock);
 
-    uuid_t no_subject;
-    uuid_clear(no_subject);
     for (size_t i = 0; i < n_due; i++)
     {
         char task_str[UUID_STRING_LEN + 1];
@@ -10278,7 +10592,7 @@ void _retry_uncommitted_halves(const process_t *proc, double present)
                              due[i].capability_name[0] != '\0'
                                  ? due[i].capability_name : NULL,
                              due[i].channel[0] != '\0' ? due[i].channel : NULL,
-                             no_subject, due[i].competence);
+                             due[i].subject, due[i].competence);
         if (act[i] == REP_HALF_PARKED_RETRY) {
             /* The next slow retry counts from this pass, whatever clock
              * _await_commit_locked read. */
@@ -10316,6 +10630,8 @@ typedef struct {
     double score;
     char   channel[TX_CHANNEL_NAMELEN + 1];
     char  *cert;   /* owned JSON text, or NULL */
+    char   names[UUID_STRING_LEN + 1];       /* whom it names, or "" */
+    char   half_sig[REP_SIG_HEX_LEN + 1];    /* our signature over it, or "" */
 } rep_handoff_half_t;
 
 size_t _hand_off_pending_halves(const process_t *proc, double present,
@@ -10429,6 +10745,12 @@ size_t _hand_off_pending_halves(const process_t *proc, double present,
             at_strlcpy(h->channel, t->p1_channel, sizeof(h->channel));
             const char *cert = tx_history_pool_cert(chain, t->task_uuid, self_uuid);
             h->cert = (cert != NULL) ? strdup(cert) : NULL;
+            uuid_t names;
+            h->names[0] = '\0';
+            if (tx_history_pool_names(chain, t->task_uuid, self_uuid, names))
+                uuid_unparse_lower(names, h->names);
+            const char *hs = tx_history_pool_half_sig(chain, t->task_uuid, self_uuid);
+            at_strlcpy(h->half_sig, hs != NULL ? hs : "", sizeof(h->half_sig));
         }
     }
     pthread_mutex_unlock(&rep_state.lock);
@@ -10464,6 +10786,13 @@ size_t _hand_off_pending_halves(const process_t *proc, double present,
                 else
                     json_decref(cert);
             }
+            /* Whom it names and our signature, as the commit carried them
+             * (R+D.md §14.2). */
+            if (h->names[0] != '\0')
+                json_object_set_new(commit_json, "names", json_string(h->names));
+            if (h->half_sig[0] != '\0')
+                json_object_set_new(commit_json, "half_sig",
+                                    json_string(h->half_sig));
             generic_msg_t out = {0};
             out.type = NET_MESSAGE;
             strncpy(out.info.net_msg.process, "reputation", PROC_NAME_LEN);
@@ -10920,6 +11249,14 @@ static bool _place_entry_from_json(const json_t *d, transaction_t *tx,
     return true;
 }
 
+/* The scorer signature a placement entry @p d carries for side @p side (0:
+ * p1, 1: p2), or NULL (R+D.md §14.2). Borrowed from @p d. */
+static const char *_place_entry_sig(const json_t *d, int side)
+{
+    return json_string_value(json_object_get((json_t *)d,
+                                             side == 0 ? "p1_sig" : "p2_sig"));
+}
+
 /* --- pool persistence --------------------------------------------------- */
 
 /* The certificate JSON text kept under @p key in @p m, parsed, or NULL. */
@@ -10985,6 +11322,20 @@ static json_t *_pool_to_json(const tx_history_t *h)
             json_t *cert = _pool_cert_json(&h->pool_certs, key);
             if (cert != NULL)
                 json_object_set_new(half, "cert", cert);
+            /* Whom a lone half names (a paired one names the other side),
+             * and its scorer's signature (R+D.md §14.2). */
+            uuid_t by_uuid, names;
+            (void)uuid_parse(by, by_uuid);
+            if (!(tx->p1_set && tx->p2_set)
+                && tx_history_pool_names(h, tx->task_uuid, by_uuid, names))
+            {
+                char ns[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(names, ns);
+                json_object_set_new(half, "names", json_string(ns));
+            }
+            const char *hsig = tx_history_pool_half_sig(h, tx->task_uuid, by_uuid);
+            if (hsig != NULL)
+                json_object_set_new(half, "sig", json_string(hsig));
             json_array_append_new(halves, half);
         }
         json_object_set_new(d, "halves", halves);
@@ -11039,8 +11390,13 @@ static int _pool_from_json(tx_history_t *h, const json_t *doc)
                 || !(json_number_value(score) >= 0.0 && json_number_value(score) <= 1.0))
                 continue;
             char *text = json_is_object(cert) ? json_dumps(cert, JSON_COMPACT) : NULL;
-            (void)tx_history_record_half(h, task_uuid, by_uuid, json_number_value(score),
-                                         chan, text);
+            const char *names_str = json_string_value(json_object_get(half, "names"));
+            uuid_t names;
+            bool named = names_str != NULL && uuid_parse(names_str, names) == 0;
+            (void)tx_history_record_signed_half(
+                h, task_uuid, by_uuid, json_number_value(score), chan, text,
+                named ? names : NULL,
+                json_string_value(json_object_get(half, "sig")));
             free(text);
         }
     }
@@ -11670,6 +12026,10 @@ static const char *_place_value_why(const process_t *proc, const char *key,
                  || !_commit_cert_ok(proc, tx->p2_uuid, tx->task_uuid, tx->p2_score,
                                      tx->p2_channel, c2, group))
             why = "a half is not certified";
+        else if (!_entry_halves_signed(proc, key, tx,
+                     _place_entry_sig(json_array_get(value, (size_t)i), 0),
+                     _place_entry_sig(json_array_get(value, (size_t)i), 1), NULL))
+            why = "a half is not signed by its scorer";
     }
     free(entries);
     return why;
@@ -12417,8 +12777,26 @@ static bool _apply_placement(const process_t *proc, const char *key, int k,
         free(entries);
         return false;
     }
+    /* A placement certificate is the majority's word, and so is every commit
+     * certificate in it; a scorer's own signature is not (R+D.md §14.2). An
+     * entry missing one is refused whatever signed the placement. Mirrors
+     * Python _apply_placement. */
+    for (int i = 0; i < m; i++)
+    {
+        json_t *e = json_array_get(value, (size_t)i);
+        char who[UUID_STRING_LEN + 1] = "";
+        if (!_entry_halves_signed(proc, key, &entries[i], _place_entry_sig(e, 0),
+                                  _place_entry_sig(e, 1), who))
+        {
+            log_warn(proc->logger, "Reputation: refusing placement %d: an entry "
+                     "carries no valid signature by %.8s over its own half\n",
+                     k, who);
+            free(entries);
+            return false;
+        }
+    }
     /* Each half's commit certificate travels in the value; keep it with the
-     * entry, as a commit would. */
+     * entry, as a commit would, and so does each scorer's signature. */
     char *sigs_text = json_dumps(sigs, JSON_COMPACT | JSON_SORT_KEYS);
     uuid_t self_uuid;
     bool have_self = _resolve_self_uuid(proc, self_uuid);
@@ -12481,6 +12859,10 @@ static bool _apply_placement(const process_t *proc, const char *key, int k,
                 if (t != NULL)
                     (void)tx_history_attach_commit_cert(chain, tx->task_uuid, scorer, t);
                 free(t);
+                const char *hs = _place_entry_sig(json_array_get(value, (size_t)i),
+                                                  side);
+                if (hs != NULL)
+                    (void)tx_history_attach_half_sig(chain, tx->task_uuid, scorer, hs);
             }
         }
         if (have_self && ((tx->p1_set && uuid_compare(tx->p1_uuid, self_uuid) == 0)
@@ -13072,6 +13454,12 @@ static json_t *_place_ready_value_locked(const tx_history_t *chain)
                     && data_string_ptr(cd, &text) == 0 && text != NULL)
                     json_object_set_new(d, side == 0 ? "p1_cert" : "p2_cert",
                                         json_loads(text, 0, NULL));
+                /* The scorer's own signature (R+D.md §14.2). */
+                const char *hs = tx_history_pool_half_sig(
+                    chain, tx->task_uuid, side == 0 ? tx->p1_uuid : tx->p2_uuid);
+                if (hs != NULL)
+                    json_object_set_new(d, side == 0 ? "p1_sig" : "p2_sig",
+                                        json_string(hs));
             }
         }
         json_array_append_new(value, d);
@@ -13781,6 +14169,8 @@ void reputation_reset_state(int num_peers)
     map_init(&rep_state.task_tiers);
     map_free(&rep_state.task_channels);   /* same lockstep */
     map_init(&rep_state.task_channels);
+    map_free(&rep_state.task_subjects);   /* same lockstep */
+    map_init(&rep_state.task_subjects);
     map_free(&rep_state.slashed);
     map_init(&rep_state.slashed);
     map_free(&rep_state.slash_sigs);
@@ -13904,7 +14294,8 @@ void reputation_set_num_updates(int n)
 }
 
 void reputation_install_proposal(int64_t id1, int64_t id2, double score,
-                                 const uuid_t task_uuid, const char *channel)
+                                 const uuid_t task_uuid, const char *channel,
+                                 const uuid_t subject)
 {
     _ensure_init();
     pthread_mutex_lock(&rep_state.lock);
@@ -13917,6 +14308,12 @@ void reputation_install_proposal(int64_t id1, int64_t id2, double score,
         char task_str[UUID_STRING_LEN + 1];
         uuid_unparse_lower(task_uuid, task_str);
         _record_task_channel_locked(task_str, channel);
+    }
+    if (task_uuid != NULL)
+    {
+        char task_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(task_uuid, task_str);
+        _record_task_subject_locked(task_str, subject);
     }
     pthread_mutex_unlock(&rep_state.lock);
 }
@@ -13988,6 +14385,37 @@ void reputation_get_commit_cert_counts(int *halves_held, int *certified_halves)
     }
     if (halves_held != NULL) *halves_held = held;
     if (certified_halves != NULL) *certified_halves = certified;
+}
+
+int reputation_get_signed_half_count(void)
+{
+    int signed_halves = 0;
+    if (!rep_state.initialized)
+        return 0;
+    pthread_mutex_lock(&rep_state.lock);
+    const tx_history_t *h = &rep_state.history;
+    for (int i = 0; i < h->chain_len; i++)
+    {
+        const transaction_t *t = &h->chain[i];
+        if (t->attested || t->roster)
+            continue;
+        signed_halves += t->p1_set
+            && tx_history_half_sig(h, t->task_uuid, t->p1_uuid) != NULL;
+        signed_halves += t->p2_set
+            && tx_history_half_sig(h, t->task_uuid, t->p2_uuid) != NULL;
+    }
+    for (int i = 0; i < h->pool_len; i++)
+    {
+        const transaction_t *t = &h->pool[i];
+        if (t->attested)
+            continue;
+        signed_halves += t->p1_set
+            && tx_history_pool_half_sig(h, t->task_uuid, t->p1_uuid) != NULL;
+        signed_halves += t->p2_set
+            && tx_history_pool_half_sig(h, t->task_uuid, t->p2_uuid) != NULL;
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    return signed_halves;
 }
 
 void reputation_set_placement_dir(const char *dir)
@@ -14135,6 +14563,21 @@ int reputation_record_half(const uuid_t task, const uuid_t scorer, double score,
                            const char *channel, const char *cert_json)
 {
     return reputation_record_half_on("", task, scorer, score, channel, cert_json);
+}
+
+int reputation_record_named_half_on(const char *chain_key, const uuid_t task,
+                                    const uuid_t scorer, double score,
+                                    const char *channel, const char *cert_json,
+                                    const uuid_t counterparty,
+                                    const char *half_sig)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    int rc = tx_history_record_signed_half(_chain_for_key_locked(chain_key), task,
+                                           scorer, score, channel, cert_json,
+                                           counterparty, half_sig);
+    pthread_mutex_unlock(&rep_state.lock);
+    return rc;
 }
 
 int reputation_record_half_on(const char *chain_key, const uuid_t task,

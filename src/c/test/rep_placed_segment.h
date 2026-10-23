@@ -84,9 +84,27 @@ static inline void rps_found(tx_history_t *h, identity_t **members, int n)
     rps_place(h, &g, members, n);
 }
 
+/* @p scorer's own signature over its half of @p task naming @p other
+ * (R+D.md §14.2), kept on @p h beside the placed entry. */
+static inline void rps_sign_half(tx_history_t *h, const uuid_t task,
+                                 const identity_t *scorer,
+                                 const identity_t *other, double score)
+{
+    uint8_t desig[HALF_DESIG_MAX];
+    size_t dlen = half_designation(task, scorer->uuid, other->uuid, score, NULL,
+                                   desig, sizeof(desig));
+    ck_assert(dlen > 0);
+    unsigned char sig[crypto_sign_BYTES];
+    ck_assert(crypto_sign_detached(sig, NULL, desig, dlen,
+                                   scorer->signature.private) == 0);
+    char hex[crypto_sign_BYTES * 2 + 1];
+    hexlify(sig, crypto_sign_BYTES, (unsigned char *)hex);
+    ck_assert_int_eq(tx_history_attach_half_sig(h, task, scorer->uuid, hex), 0);
+}
+
 /* Place a bilateral entry for @p task between @p a and @p b on @p h, signed
- * by all @p n @p signers. The halves are ordered by uuid, as a placement
- * orders them. */
+ * by all @p n @p signers, each half by its scorer. The halves are ordered by
+ * uuid, as a placement orders them. */
 static inline void rps_pair(tx_history_t *h, const uuid_t task,
                             identity_t *a, double a_score,
                             identity_t *b, double b_score,
@@ -107,6 +125,8 @@ static inline void rps_pair(tx_history_t *h, const uuid_t task,
     t.p1_score = a_score;
     t.p2_score = b_score;
     rps_place(h, &t, signers, n);
+    rps_sign_half(h, task, a, b, a_score);
+    rps_sign_half(h, task, b, a, b_score);
 }
 
 #endif /* REP_PLACED_SEGMENT_H */

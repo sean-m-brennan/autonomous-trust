@@ -111,6 +111,9 @@ def entry_to_dict(tx: Transaction) -> dict:
         cert = tx.certificate_of(uid)
         if cert:
             d[side + '_cert'] = {str(k): _hex(v) for k, v in cert.items()}
+        sig = tx.half_sig_of(uid)
+        if sig:
+            d[side + '_sig'] = _hex(sig)
     return d
 
 
@@ -161,16 +164,21 @@ def entry_from_dict(d) -> Transaction:
                            attest_scope=d.get('attest_scope') or None,
                            attest_sigs=_sigs('attest_sigs'))
     p1, p2 = UUID(str(d['p1'])), UUID(str(d['p2']))
-    certs = {}
+    certs, half_sigs = {}, {}
     for side, uid in (('p1', p1), ('p2', p2)):
         cert = _sigs(side + '_cert')
         if cert:
             certs[str(uid)] = cert
+        sig = d.get(side + '_sig')
+        if sig is not None:
+            if not isinstance(sig, str):
+                raise ValueError('%s_sig is not a string' % side)
+            half_sigs[str(uid)] = sig
     return Transaction(task, p1_id=p1, p1_score=_score('p1_score'),
                        p2_id=p2, p2_score=_score('p2_score'),
                        p1_channel=d.get('p1_channel') or None,
                        p2_channel=d.get('p2_channel') or None,
-                       commit_sigs=certs or None)
+                       commit_sigs=certs or None, half_sigs=half_sigs or None)
 
 
 def value_from_list(raw):
@@ -462,6 +470,10 @@ class PlacementMixin:
                                             tx.certificate_of(uid), group):
                     return 'half %s of %s is not certified' % (
                         str(uid)[:8], str(tx.task_id)[:8])
+            who = self._entry_halves_signed(tx, chain)
+            if who is not None:
+                return 'half %s of %s is not signed by its scorer' % (
+                    who[:8], str(tx.task_id)[:8])
         return None
 
     def handle_place(self, queues, message):
@@ -646,6 +658,17 @@ class PlacementMixin:
             self.logger.warning('Refusing placement %d: its certificate does '
                                 'not meet our quorum', k)
             return False
+        # A placement certificate is the majority's word, and so is every
+        # commit certificate in it; a scorer's own signature is not
+        # (R+D.md §14.2). An entry missing one is refused whatever signed
+        # the placement.
+        for tx in entries:
+            who = self._entry_halves_signed(tx, chain)
+            if who is not None:
+                self.logger.warning(
+                    'Refusing placement %d: task %s carries no valid signature '
+                    'by %s over its own half', k, str(tx.task_id)[:8], who[:8])
+                return False
         chain.apply_placed(k, entries, sigs)
         me = str(self.identity.uuid)
         for i, tx in enumerate(entries):

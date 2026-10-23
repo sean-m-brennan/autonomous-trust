@@ -698,10 +698,14 @@ int tx_history_init(tx_history_t *hist)
     if (err != 0) return err;
     err = map_init(&hist->commit_certs);
     if (err != 0) return err;
+    err = map_init(&hist->half_sigs);
+    if (err != 0) return err;
     hist->pool_len = 0;
     hist->pool_rev = 0;
     hist->roster_anchor[0] = '\0';
     err = map_init(&hist->pool_certs);
+    if (err != 0) return err;
+    err = map_init(&hist->pool_halves);
     if (err != 0) return err;
     err = map_init(&hist->decided);
     if (err != 0) return err;
@@ -1340,6 +1344,37 @@ static int _pool_slot(const tx_history_t *hist, const uuid_t task_uuid)
     return -1;
 }
 
+/* One part of a pooled half's "<counterparty>|<sig>" record under @p key:
+ * the signature (@p want_sig), or the record from its counterparty on (read up
+ * to the '|'). NULL when that part is empty. Borrowed. */
+static const char *_pool_half_part(const tx_history_t *hist, const char *key,
+                                   bool want_sig)
+{
+    data_t *d = NULL;
+    char *text = NULL;
+    if (map_get((map_t *)&hist->pool_halves, (map_key_t)key, &d) != 0 || d == NULL
+        || data_string_ptr(d, &text) != 0 || text == NULL)
+        return NULL;
+    const char *bar = strchr(text, '|');
+    if (bar == NULL)
+        return NULL;
+    if (want_sig)
+        return bar[1] != '\0' ? bar + 1 : NULL;
+    return bar != text ? text : NULL;
+}
+
+/* Move a pooled half's scorer signature under @p key to the chain's
+ * half_sigs, dropping its name: placed, the other side is its counterparty. */
+static void _move_pool_half_sig(tx_history_t *hist, const char *key)
+{
+    const char *sig = _pool_half_part(hist, key, true);
+    if (sig != NULL)
+        map_set(&hist->half_sigs, (map_key_t)key,
+                string_data((string_t)sig, strlen(sig)));
+    map_remove(&hist->pool_halves, (map_key_t)key);
+}
+
+
 /* Forget the certificates kept for pooled @p tx. */
 static void _drop_pool_certs(tx_history_t *hist, const transaction_t *tx)
 {
@@ -1354,11 +1389,13 @@ static void _drop_pool_certs(tx_history_t *hist, const transaction_t *tx)
     {
         _commit_cert_key(tx->task_uuid, tx->p1_uuid, key);
         map_remove(&hist->pool_certs, key);
+        map_remove(&hist->pool_halves, key);
     }
     if (tx->p2_set)
     {
         _commit_cert_key(tx->task_uuid, tx->p2_uuid, key);
         map_remove(&hist->pool_certs, key);
+        map_remove(&hist->pool_halves, key);
     }
 }
 
@@ -1426,6 +1463,89 @@ int tx_history_record_half(tx_history_t *hist, const uuid_t task_uuid,
                            const uuid_t peer_uuid, double score,
                            const char *channel, const char *cert_json)
 {
+    return tx_history_record_signed_half(hist, task_uuid, peer_uuid, score,
+                                         channel, cert_json, NULL, NULL);
+}
+
+/* Keep @p counterparty / @p half_sig for the pooled half under @p key, as
+ * "<counterparty>|<sig>". An absent part is left as it was. */
+static void _set_pool_half(tx_history_t *hist, const char *key,
+                           const uuid_t counterparty, const char *half_sig)
+{
+    char cp[UUID_STRING_LEN + 1] = "";
+    const char *old_sig = _pool_half_part(hist, key, true);
+    char old_cp[UUID_STRING_LEN + 1] = "";
+    const char *held_cp = _pool_half_part(hist, key, false);
+    if (held_cp != NULL)
+        at_strlcpy(old_cp, held_cp, sizeof(old_cp));   /* stops at the '|' */
+    if (counterparty != NULL)
+        uuid_unparse_lower(counterparty, cp);
+    else
+        at_strlcpy(cp, old_cp, sizeof(cp));
+    const char *sig = (half_sig != NULL && half_sig[0] != '\0') ? half_sig
+                    : old_sig != NULL ? old_sig : "";
+    if (cp[0] == '\0' && sig[0] == '\0')
+        return;
+    size_t len = strlen(cp) + 1 + strlen(sig);
+    char *text = malloc(len + 1);
+    if (text == NULL)
+        return;
+    snprintf(text, len + 1, "%s|%s", cp, sig);
+    map_set(&hist->pool_halves, (map_key_t)key, string_data((string_t)text, len));
+    free(text);
+}
+
+bool tx_history_pool_names(const tx_history_t *hist, const uuid_t task_uuid,
+                           const uuid_t scorer, uuid_t out)
+{
+    if (hist == NULL)
+        return false;
+    int slot = _pool_slot(hist, task_uuid);
+    if (slot < 0)
+        return false;
+    const transaction_t *tx = &hist->pool[slot];
+    if (tx->attested)
+        return false;
+    if (tx->p1_set && tx->p2_set)
+    {
+        if (uuid_compare(tx->p1_uuid, scorer) == 0)
+        {
+            uuid_copy(out, tx->p2_uuid);
+            return true;
+        }
+        if (uuid_compare(tx->p2_uuid, scorer) == 0)
+        {
+            uuid_copy(out, tx->p1_uuid);
+            return true;
+        }
+        return false;
+    }
+    char key[2 * UUID_STRING_LEN + 2];
+    _commit_cert_key(task_uuid, scorer, key);
+    const char *cp = _pool_half_part(hist, key, false);
+    char buf[UUID_STRING_LEN + 1] = "";
+    if (cp == NULL)
+        return false;
+    at_strlcpy(buf, cp, sizeof(buf));
+    return uuid_parse(buf, out) == 0;
+}
+
+const char *tx_history_pool_half_sig(const tx_history_t *hist,
+                                     const uuid_t task_uuid, const uuid_t scorer)
+{
+    if (hist == NULL || _pool_slot(hist, task_uuid) < 0)
+        return NULL;
+    char key[2 * UUID_STRING_LEN + 2];
+    _commit_cert_key(task_uuid, scorer, key);
+    return _pool_half_part(hist, key, true);
+}
+
+int tx_history_record_signed_half(tx_history_t *hist, const uuid_t task_uuid,
+                                  const uuid_t peer_uuid, double score,
+                                  const char *channel, const char *cert_json,
+                                  const uuid_t counterparty,
+                                  const char *half_sig)
+{
     if (hist == NULL)
         return -1;
     if (channel != NULL && channel[0] != '\0' && !tx_channel_valid(channel))
@@ -1466,10 +1586,38 @@ int tx_history_record_half(tx_history_t *hist, const uuid_t task_uuid,
                 hist->pool_rev++;
             }
         }
+        if (half_sig != NULL && half_sig[0] != '\0'
+            && _pool_half_part(hist, key, true) == NULL)
+        {
+            _set_pool_half(hist, key, NULL, half_sig);
+            hist->pool_rev++;
+        }
         return TX_HALF_DUP;
     }
     if (tx->p1_set && tx->p2_set)
         return TX_HALF_DUP;
+    /* Two halves pair only when each names the other (R+D.md §14.2). */
+    if (tx->p1_set != tx->p2_set)
+    {
+        const unsigned char *held = tx->p1_set ? tx->p1_uuid : tx->p2_uuid;
+        uuid_t held_names;
+        bool held_named = tx_history_pool_names(hist, task_uuid, held, held_names);
+        bool mismatch = (held_named && uuid_compare(held_names, peer_uuid) != 0)
+                     || (counterparty != NULL && uuid_compare(counterparty, held) != 0);
+        if (mismatch)
+        {
+            if (!(held_named && uuid_compare(held_names, peer_uuid) == 0))
+                return TX_HALF_MISMATCH;
+            /* The held half names us and we name somebody else: our
+             * signature says it will never pair. Ours takes its place. */
+            _drop_pool_certs(hist, tx);
+            uuid_t task_copy;
+            uuid_copy(task_copy, tx->task_uuid);
+            memset(tx, 0, sizeof(*tx));
+            tx->index = -1;
+            uuid_copy(tx->task_uuid, task_copy);
+        }
+    }
     const char *chan = channel != NULL ? channel : "";
     if (!tx->p1_set)
     {
@@ -1488,6 +1636,7 @@ int tx_history_record_half(tx_history_t *hist, const uuid_t task_uuid,
     if (have_cert)
         map_set(&hist->pool_certs, (map_key_t)key,
                 string_data((string_t)cert_json, strlen(cert_json)));
+    _set_pool_half(hist, key, counterparty, half_sig);
     hist->pool_rev++;
     return (tx->p1_set && tx->p2_set) ? TX_HALF_READY : TX_HALF_PENDING;
 }
@@ -1675,8 +1824,10 @@ static void _append_placed(tx_history_t *hist, const transaction_t *entries,
             char key[2 * UUID_STRING_LEN + 2];
             _commit_cert_key(tx.task_uuid, tx.p1_uuid, key);
             _move_pool_cert(hist, key, &hist->commit_certs, key);
+            _move_pool_half_sig(hist, key);
             _commit_cert_key(tx.task_uuid, tx.p2_uuid, key);
             _move_pool_cert(hist, key, &hist->commit_certs, key);
+            _move_pool_half_sig(hist, key);
         }
         int slot = _pool_slot(hist, tx.task_uuid);
         if (slot >= 0)
@@ -1918,6 +2069,108 @@ const char *tx_history_commit_cert(const tx_history_t *hist, const uuid_t task,
     return text;
 }
 
+/****************************
+ * Signed halves (R+D.md §14.2)
+ ****************************/
+
+size_t half_designation(const uuid_t task, const uuid_t scorer,
+                        const uuid_t counterparty, double score,
+                        const char *channel, uint8_t *out, size_t cap)
+{
+    static const char tag[] = "AT-HALF";
+    size_t tag_len = sizeof(tag);   /* includes the NUL separator */
+    if (out == NULL || cap <= tag_len)
+        return 0;
+    char t_str[UUID_STRING_LEN + 1];
+    char s_str[UUID_STRING_LEN + 1];
+    char c_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(task, t_str);
+    uuid_unparse_lower(scorer, s_str);
+    uuid_unparse_lower(counterparty, c_str);
+    int n = snprintf((char *)out + tag_len, cap - tag_len, "%s|%s|%s|%.17g|%s",
+                     t_str, s_str, c_str, score, tx_channel_or_default(channel));
+    if (n < 0 || (size_t)n >= cap - tag_len)
+        return 0;
+    memcpy(out, tag, tag_len);
+    return tag_len + (size_t)n;
+}
+
+int tx_history_attach_half_sig(tx_history_t *hist, const uuid_t task,
+                               const uuid_t scorer, const char *sig_hex)
+{
+    if (hist == NULL || sig_hex == NULL || sig_hex[0] == '\0')
+        return -1;
+    int slot = _slot_of_task(hist, task);
+    if (slot < 0 || !_holds_half(&hist->chain[slot], scorer))
+        return -1;
+    char key[2 * UUID_STRING_LEN + 2];
+    _commit_cert_key(task, scorer, key);
+    return map_set(&hist->half_sigs, (map_key_t)key,
+                   string_data((string_t)sig_hex, strlen(sig_hex)));
+}
+
+const char *tx_history_half_sig(const tx_history_t *hist, const uuid_t task,
+                                const uuid_t scorer)
+{
+    if (hist == NULL)
+        return NULL;
+    char key[2 * UUID_STRING_LEN + 2];
+    _commit_cert_key(task, scorer, key);
+    data_t *d = NULL;
+    char *text = NULL;
+    if (map_get((map_t *)&hist->half_sigs, key, &d) != 0 || d == NULL
+        || data_string_ptr(d, &text) != 0)
+        return NULL;
+    return text;
+}
+
+/* {scorer: sig hex} for @p tx's halves, or NULL when it holds none. The key
+ * is "half_sigs" on the catch-up wire and in the evidence document, as in
+ * Python. Caller owns the reference. */
+static json_t *_half_sigs_json(const tx_history_t *hist, const transaction_t *tx)
+{
+    if (tx->attested)
+        return NULL;
+    json_t *out = NULL;
+    const uuid_t *scorers[2] = { tx->p1_set ? &tx->p1_uuid : NULL,
+                                 tx->p2_set ? &tx->p2_uuid : NULL };
+    for (int k = 0; k < 2; k++)
+    {
+        if (scorers[k] == NULL)
+            continue;
+        const char *sig = tx_history_half_sig(hist, tx->task_uuid, *scorers[k]);
+        if (sig == NULL || sig[0] == '\0')
+            continue;
+        if (out == NULL)
+            out = json_object();
+        char s_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(*scorers[k], s_str);
+        json_object_set_new(out, s_str, json_string(sig));
+    }
+    return out;
+}
+
+/* Attach the "half_sigs" an entry @p obj carries to the halves it names in
+ * @p hist. The caller verified them (catch-up) or wrote them (evidence). */
+static void _half_sigs_from_json(tx_history_t *hist, const json_t *obj,
+                                 const char *task_key)
+{
+    json_t *all = json_object_get((json_t *)obj, "half_sigs");
+    const char *task_str = json_string_value(json_object_get((json_t *)obj, task_key));
+    uuid_t task;
+    if (!json_is_object(all) || task_str == NULL || uuid_parse(task_str, task) != 0)
+        return;
+    const char *scorer_str = NULL;
+    json_t *sig = NULL;
+    json_object_foreach(all, scorer_str, sig)
+    {
+        uuid_t scorer;
+        if (!json_is_string(sig) || uuid_parse(scorer_str, scorer) != 0)
+            continue;
+        (void)tx_history_attach_half_sig(hist, task, scorer, json_string_value(sig));
+    }
+}
+
 /* Forget both halves' certificates of @p tx (eviction, or a fork dropping it). */
 static void _drop_commit_certs(tx_history_t *hist, const transaction_t *tx)
 {
@@ -1926,11 +2179,13 @@ static void _drop_commit_certs(tx_history_t *hist, const transaction_t *tx)
     {
         _commit_cert_key(tx->task_uuid, tx->p1_uuid, key);
         map_remove(&hist->commit_certs, key);
+        map_remove(&hist->half_sigs, key);
     }
     if (tx->p2_set)
     {
         _commit_cert_key(tx->task_uuid, tx->p2_uuid, key);
         map_remove(&hist->commit_certs, key);
+        map_remove(&hist->half_sigs, key);
     }
 }
 
@@ -2099,7 +2354,9 @@ void tx_history_free(tx_history_t *hist)
     map_free(&hist->evicted_set);
     map_free(&hist->attest_certs);
     map_free(&hist->commit_certs);
+    map_free(&hist->half_sigs);
     map_free(&hist->pool_certs);
+    map_free(&hist->pool_halves);
     map_free(&hist->decided);
     map_free(&hist->decided_sigs);
     map_free(&hist->place_certs);
@@ -2323,6 +2580,9 @@ int tx_history_era_to_json(const tx_history_t *hist, int start_idx, int end_idx,
         json_t *commit_sigs = _commit_sigs_json(hist, tx);
         if (commit_sigs != NULL)
             json_object_set_new(obj, "commit_sigs", commit_sigs);
+        json_t *half_sigs = _half_sigs_json(hist, tx);
+        if (half_sigs != NULL)
+            json_object_set_new(obj, "half_sigs", half_sigs);
         /* A placement's certificate, on its last entry. */
         _place_cert_to_json(hist, task_str, obj);
         _tx_roster_to_json(hist, tx, obj);
@@ -2957,11 +3217,16 @@ done:
             const char *cert = set[side]
                 ? tx_history_commit_cert(hist, t->task_uuid, who[side]) : NULL;
             char *copy = cert != NULL ? strdup(cert) : NULL;
+            const char *hs = set[side]
+                ? tx_history_half_sig(hist, t->task_uuid, who[side]) : NULL;
+            char *hs_copy = hs != NULL ? strdup(hs) : NULL;
             if (copy != NULL)
-                (void)tx_history_record_half(hist, t->task_uuid, who[side],
-                                             sc[side], ch[side][0] != '\0'
-                                             ? ch[side] : NULL, copy);
+                (void)tx_history_record_signed_half(
+                    hist, t->task_uuid, who[side], sc[side],
+                    ch[side][0] != '\0' ? ch[side] : NULL, copy,
+                    set[1 - side] ? who[1 - side] : NULL, hs_copy);
             free(copy);
+            free(hs_copy);
         }
         if (tx_history_pooled(hist, t->task_uuid) != NULL)
             res.pooled++;
@@ -2982,7 +3247,10 @@ done:
         json_array_foreach((json_t *)arr, ci, co)
         {
             if (!json_is_true(json_object_get(co, "attested")))
+            {
                 _commit_sigs_from_json(hist, co, "task");
+                _half_sigs_from_json(hist, co, "task");
+            }
             /* A placement certificate on an entry now held (the caller
              * verified it). */
             const char *pt = json_string_value(json_object_get(co, "task"));
@@ -3150,6 +3418,9 @@ int reputation_evidence_to_json(const tx_history_t *hist,
         json_t *commit_sigs = _commit_sigs_json(hist, tx);
         if (commit_sigs != NULL)
             json_object_set_new(obj, "commit_sigs", commit_sigs);
+        json_t *half_sigs = _half_sigs_json(hist, tx);
+        if (half_sigs != NULL)
+            json_object_set_new(obj, "half_sigs", half_sigs);
         /* A placement certificate, on the last entry of each placement:
          * additive, omitted otherwise. Mirrors Python evidence_to_dict. */
         {
@@ -3360,6 +3631,7 @@ int reputation_evidence_from_json(const json_t *doc, tx_history_t *hist_out,
         if (!json_is_true(json_object_get(obj, "attested")))
         {
             _commit_sigs_from_json(hist_out, obj, "task_id");
+            _half_sigs_from_json(hist_out, obj, "task_id");
             continue;
         }
         json_t *sigs = json_object_get(obj, "attest_sigs");

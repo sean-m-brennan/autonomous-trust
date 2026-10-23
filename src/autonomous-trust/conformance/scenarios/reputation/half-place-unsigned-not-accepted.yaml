@@ -1,0 +1,44 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: half-place-unsigned-not-accepted
+byte_pinning: false
+description: |
+    Signed halves (R+D.md §14.2; doc/architecture/reputation.md, "Signed
+    halves"). A commit certificate is the acceptors' word that a round ran; a
+    half also carries its scorer's own signature over AT-HALF, which names the
+    counterparty, and two halves pair only when each names the other.
+
+    carol's and dave's halves are certified, but neither scorer signed its half,
+    so bob does not accept the value.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: proposer
+  - id: dave
+    role: member
+
+fixtures: {}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: place
+    payload:
+      k: 0
+      ballot: {n: 5, by: alice}
+      head: ""
+      value:
+          - {task_id: t-1, p1: carol, p1_score: 0.9, p2: dave, p2_score: 0.7, unsigned: true}
+  - id: 2
+    from: bob
+    to: alice
+    function: place accepted
+    in_response_to: 1
+    expect_none: true
+    payload: {}

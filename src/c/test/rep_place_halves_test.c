@@ -176,10 +176,12 @@ static void _offer(process_t *proc, bool certify, bool name_group)
 
 static void _propose(process_t *proc)
 {
-    uuid_t task, nobody;
+    uuid_t task, other;
     uuid_generate(task);
-    uuid_clear(nobody);
-    _forward_transaction(proc, task, me->uuid, 0.9, NULL, NULL, nobody, 0.0);
+    /* Our half names whom it scores (R+D.md §14.2); which peer does not
+     * matter here. */
+    uuid_generate(other);
+    _forward_transaction(proc, task, me->uuid, 0.9, NULL, NULL, other, 0.0);
 }
 
 DEFINE_TEST(test_a_placing_proposer_sends_its_half_without_asking)

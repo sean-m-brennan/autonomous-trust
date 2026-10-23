@@ -357,7 +357,7 @@ rather than open.
 |---------|----------|-----------|---------|
 | `transaction` | `transaction` | proposer to group | Propose the half, asking to be certified and naming its group |
 | `tx accepted` | `accepted` | peer to proposer | Accept the half, signing its commit designation |
-| `tx committed` | `committed` | proposer to group | Announce the certified half, certificate included |
+| `tx committed` | `committed` | proposer to group | Announce the certified half, certificate, name and scorer signature included |
 | `update needed` | `outdated` | behind-peer to top peers | Sync: request missing history |
 | `latest update` | `update` | peer to behind-peer | Sync: send a history segment |
 | `request reputation` | `rep_req` | any process to reputation | Query: compute a score |
@@ -414,9 +414,11 @@ carried every round however large the group grew.
 
 *Commit broadcast.* Once the signatures make a certificate, the proposer puts
 its half in its chain's pool and broadcasts `tx committed` carrying the task
-identifier, the proposer identifier, the score, the group, the channel and the
-certificate. Each member checks the certificate against its own roster and
-pools the same half; the proposer skips its own bounce-back. This step looks
+identifier, the proposer identifier, the score, the group, the channel, the
+certificate, whom the half names and the proposer's own signature over it
+([Signed halves](#signed-halves)). Each member checks the certificate against
+its own roster and the signature against the proposer's key, and pools the
+same half; the proposer skips its own bounce-back. This step looks
 redundant and is not. Without it, every peer would hold only its own halves.
 When peers A and B independently score the same task, A would hold only A's
 half and B only B's, and the bilateral check that contrite tit-for-tat performs
@@ -1343,7 +1345,9 @@ at least `(n + 1) // 2` members of the receiver's own view besides the scorer
 this scorer, on this channel, for this task. It does not prove the score is
 true. An acceptor never sees the task; it signs what the proposer tells it. So
 the lie a certificate leaves open is a scorer's about its own half, which is
-`R+D.md` §14.2's question (bilateral evidence), not this one's. What it buys is
+`R+D.md` §14.2's question (bilateral evidence), not this one's. Nor does it
+prove the scorer wrote the half at all; that is what [Signed
+halves](#signed-halves) adds. What it buys is
 round existence, non-equivocation (every node writes the score a quorum saw),
 an entry that can be checked offline, and a per-entry cost of a quorum's
 participation.
@@ -1417,6 +1421,91 @@ rather than the receiver's live view (under "Who is in the group").
 
 Pinned by the `commit-cert-*` scenarios below, `tests/a_unit/test_commit_certificates.py`
 and `src/c/test/rep_commit_cert_test.c`.
+
+## Signed halves
+
+A commit certificate is the acceptors' word that a round ran. It is not the
+scorer's word, and until 2026-10-22 nothing was. The live path binds a half to
+its transport sender, but placement and catch-up take the certificate as proof,
+and the scorer's own signature never counted toward it. So a majority of the
+roster could certify, and then place, a half "by" an honest member that the
+member never wrote. It could also pair that half with one of its own. That is
+the one forgery `R+D.md` §14.2 says a dishonest majority must not have: an
+entry about an honest node that the node never agreed to.
+
+**Every ordinary half is signed by its scorer.** The scorer signs its own half
+and nothing else:
+
+    "AT-HALF\0" task "|" scorer "|" counterparty "|" %.17g score "|" channel
+
+Lowercase uuids and the channel normalized, as `commit_designation`. Index and
+link are not covered, for the reason attestation gives: they differ per node
+until chains reconcile. The bytes are identical in both runtimes
+(`half_designation`) and pinned by a unit test on each side against the same
+literal.
+
+**A half names its counterparty, and the name is mandatory.** A producer that
+cannot say whom it scored gets no round: `forward_transaction` (C
+`_forward_transaction`) drops a half that names nobody, or names its own node,
+and logs why. The executor's half of a task names the requestor; the
+requestor's names the executor.
+
+**Two halves pair only when each names the other.** The pool used to fill a
+task's two slots first come, first served, and task ids travel in the clear
+inside `committed`, so a member that saw one half could commit its own for the
+same task first and close the entry as a transaction between the wrong pair.
+Now a half that the held half does not name, or that names somebody else, is
+refused (`record_half` returns `mismatch`). One case gives way instead of
+refusing: when the held half names the newcomer's scorer, and the newcomer's
+signed half names somebody else. The newcomer's signature proves the held half
+can never pair, so it is dropped and the newcomer takes its place. Without that
+rule a squatter that learned a task id early could block the real pair. A half
+with no name at all, held from before names existed, pairs as it always did.
+
+**Where the signature lives.** Outside the entry hash, like the certificates
+(the user's call, 2026-10-22), so a signed entry hashes exactly as an unsigned
+one did and no chain, checkpoint or pinned root moves:
+`Transaction.half_sigs` (`{scorer: signature}`) in Python, and
+`tx_history_t.half_sigs` with `pool_halves` (which also keeps a pooled half's
+name) in C. It travels as `half_sigs` on the catch-up wire and in the evidence
+document, as `p1_sig` / `p2_sig` on a placement entry, and as `names` and
+`sig` on a pooled half in `reputation-pool*.cfg.json`. A `committed` carries
+the name and the signature as elements seven and eight in Python, `"names"`
+and `"half_sig"` in C, beside the certificate.
+
+**Where it is checked.** On every path a half enters a chain:
+
+- **`committed`.** Refused without a name, or without a signature that
+  verifies over a half naming it.
+- **Placement, as acceptor and as learner.** The acceptor refuses a value with
+  an unsigned half. The learner refuses a decided placement with one, whatever
+  signed the placement: a placement certificate is the majority's word, and
+  so is every commit certificate in it.
+- **Catch-up.** A segment is refused if any ordinary entry new to this node
+  lacks either scorer's signature. Unlike certificates, **neither placement
+  cover nor checkpoint cover excuses a missing signature** (the user's call,
+  2026-10-22). The majority that could forge a half also signs the placement
+  and the checkpoint. The only exemption is an entry this node already holds
+  identically.
+
+**Whose key.** The identity this node holds for the scorer (itself, or a roster
+peer) when there is one. Otherwise, the rosters logged in this node's own chain
+that list the scorer, newest first, so a member who has since left is still
+checkable. A roster a segment brings with it is never used: it could list any
+key for any uuid.
+
+**What this does not do.** It does not make a score true; a scorer can still
+lie about its own half, and a certificate never could stop that. It does not
+stop a withheld half: a peer can still refuse to commit, and the other half
+then never pairs (R+D.md §14.2, question 4). It does not reach deep
+resolution: an answer's requestor holds no keys for the answering group's
+scorers, so it still trusts the anchored checkpoint signers. And it costs a
+node with no chain one thing: a window committed before signed halves cannot
+be adopted by catch-up until it slides out of the window (`MAX_CHAIN_LEN`). The
+node can still place new rounds meanwhile.
+
+Pinned by the `half-*` scenarios below, `tests/a_unit/test_bilateral_halves.py`
+and `src/c/test/rep_bilateral_test.c`.
 
 ## Asking others what they think
 
@@ -1893,6 +1982,20 @@ stands over is documented rather than papered over.
 | An unsigned acceptance is not counted | [`commit-cert-unsigned-acceptance-not-counted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-unsigned-acceptance-not-counted.yaml) |
 | Catch-up refuses an uncertified segment | [`commit-cert-catchup-uncertified-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-catchup-uncertified-refused.yaml) |
 | Catch-up accepts a certified segment and keeps its certificates | [`commit-cert-catchup-certified-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-catchup-certified-accepted.yaml) |
+| A signed half naming its counterparty is pooled | [`half-committed-signed-pooled.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-committed-signed-pooled.yaml) |
+| A certified half its scorer never signed is refused | [`half-committed-unsigned-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-committed-unsigned-refused.yaml) |
+| A half that names nobody is refused | [`half-committed-unnamed-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-committed-unnamed-refused.yaml) |
+| A half signed in its scorer's name by another is refused | [`half-committed-forged-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-committed-forged-refused.yaml) |
+| A signature over a half naming somebody else is refused | [`half-committed-signed-for-another-name-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-committed-signed-for-another-name-refused.yaml) |
+| Halves that do not name each other do not pair | [`half-committed-names-somebody-else-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-committed-names-somebody-else-refused.yaml) |
+| A squatted half gives way to the half it names | [`half-committed-squatted-half-gives-way.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-committed-squatted-half-gives-way.yaml) |
+| The proposer signs its own half | [`half-proposer-signs-its-half.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-proposer-signs-its-half.yaml) |
+| Catch-up adopts a signed segment and keeps the signatures | [`half-catchup-signed-chain-adopted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-catchup-signed-chain-adopted.yaml) |
+| Catch-up refuses an unsigned half | [`half-catchup-unsigned-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-catchup-unsigned-refused.yaml) |
+| Catch-up refuses a forged half | [`half-catchup-forged-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-catchup-forged-refused.yaml) |
+| Placement cover does not excuse an unsigned half | [`half-catchup-placed-unsigned-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-catchup-placed-unsigned-refused.yaml) |
+| An acceptor accepts a signed value, and refuses an unsigned one | [`half-place-signed-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-place-signed-accepted.yaml), [`half-place-unsigned-not-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-place-unsigned-not-accepted.yaml) |
+| A learner writes a signed placement, and refuses an unsigned one | [`half-placed-signed-written.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-placed-signed-written.yaml), [`half-placed-unsigned-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-placed-unsigned-refused.yaml) |
 | A member short of its tenure is held below tier 3 | [`tenure-young-member-held-below-tier-three.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/tenure-young-member-held-below-tier-three.yaml) |
 | A member past its tenure is scored as before | [`tenure-old-member-not-held.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/tenure-old-member-not-held.yaml) |
 | A replication from a verifier short of its tenure is declined | [`attest-propose-replication-young-verifier-declined.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/attest-propose-replication-young-verifier-declined.yaml) |

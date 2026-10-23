@@ -1,0 +1,49 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: half-committed-forged-refused
+byte_pinning: false
+description: |
+    Signed halves (R+D.md §14.2; doc/architecture/reputation.md, "Signed
+    halves"). A commit certificate is the acceptors' word that a round ran; a
+    half also carries its scorer's own signature over AT-HALF, which names the
+    counterparty, and two halves pair only when each names the other.
+
+    The certifiers' majority signs alice's half in her name: dave made the
+    signature. It does not verify against alice's key, so bob refuses it. This is
+    the forgery the signature exists to stop: a majority writing a half its
+    scorer never gave.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: proposer
+  - id: dave
+    role: member
+
+fixtures:
+  tx_history:
+    bob:
+      - task_id: t-1
+        p1: carol
+        p1_score: 0.9
+        names: alice
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: tx committed
+    payload:
+      task_id: t-1
+      score: 0.8
+      cosigners: [carol, dave]
+      half_forged_by: dave
+
+expected_state:
+  bob:
+    halves_held: 1
+    signed_halves: 0

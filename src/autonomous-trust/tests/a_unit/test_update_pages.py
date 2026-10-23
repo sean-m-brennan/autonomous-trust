@@ -38,6 +38,7 @@ from autonomous_trust.core.reputation.reputation import (
 from tests.a_unit.test_commit_certificates import _ident, _node, _sent
 from tests.a_unit.test_placement_acceptor import _roster_of
 from tests.a_unit.test_placement_reconcile import _signed
+from tests.a_unit.test_commit_certificates import _half
 
 ENTRIES = 20
 _IDS = {}
@@ -64,8 +65,11 @@ def _staged(me, other):
     rp, q = _node(me, [other])
     hist = TransactionHistory()
     for i in range(ENTRIES):
+        t, a, b = uuid4(), 0.3 + 0.01 * i, 0.9 - 0.01 * i
         hist.apply_placed(hist.next_index, [placement_entry(Transaction(
-            uuid4(), me.uuid, 0.3 + 0.01 * i, other.uuid, 0.9 - 0.01 * i))],
+            t, me.uuid, a, other.uuid, b,
+            half_sigs={str(me.uuid): _half(me, other, t, a),
+                       str(other.uuid): _half(other, me, t, b)}))],
             {'voter': 'sig'})
     rp.history = _signed(hist, [_id('ada', 1), _id('bob', 2), _id('cal', 3)])
     return rp, q

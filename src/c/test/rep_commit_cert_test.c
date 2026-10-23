@@ -272,6 +272,23 @@ typedef struct {
 /* bob, rostered with alice, carol and dave (a quorum of more than 3 // 2);
  * alice holds three bilateral entries
  * between herself and carol, none certified. */
+/* @p scorer's own signature over its half of @p task naming @p other, kept
+ * on @p h beside the entry (R+D.md §14.2). */
+static void _sign_half(tx_history_t *h, const uuid_t task, identity_t *scorer,
+                       identity_t *other, double score)
+{
+    uint8_t desig[HALF_DESIG_MAX];
+    size_t dlen = half_designation(task, scorer->uuid, other->uuid, score, NULL,
+                                   desig, sizeof(desig));
+    ck_assert(dlen > 0);
+    unsigned char sig[crypto_sign_BYTES];
+    ck_assert(crypto_sign_detached(sig, NULL, desig, dlen,
+                                   scorer->signature.private) == 0);
+    char hex[crypto_sign_BYTES * 2 + 1];
+    hexlify(sig, crypto_sign_BYTES, (unsigned char *)hex);
+    ck_assert_int_eq(tx_history_attach_half_sig(h, task, scorer->uuid, hex), 0);
+}
+
 static void _cohort(cohort_t *c)
 {
     reputation_reset_state(3);
@@ -289,6 +306,11 @@ static void _cohort(cohort_t *c)
         uuid_generate(c->tasks[i]);
         tx_history_update(&c->src, c->tasks[i], c->alice->uuid, 0.9, NULL);
         tx_history_update(&c->src, c->tasks[i], c->carol->uuid, 0.8, NULL);
+        /* Each scorer signs its own half (R+D.md §14.2): certificates are
+         * what these cases are about, and a checkpoint never excuses a
+         * missing scorer signature. */
+        _sign_half(&c->src, c->tasks[i], c->alice, c->carol, 0.9);
+        _sign_half(&c->src, c->tasks[i], c->carol, c->alice, 0.8);
     }
 }
 

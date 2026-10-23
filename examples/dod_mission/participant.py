@@ -65,7 +65,8 @@ from autonomous_trust.core.config.generate import (
     generate_identity, generate_worker_config,
 )
 from autonomous_trust.core.network import Message
-from autonomous_trust.core.reputation.reputation import TransactionScore
+from autonomous_trust.core.reputation.reputation import (TransactionScore,
+                                                         pair_task_id)
 from autonomous_trust.core.system import queue_cadence
 from autonomous_trust.services.data.server import (
     DataProcess, DataConfig, DataProtocol,
@@ -282,18 +283,27 @@ class DoDDataProcess(DataProcess, metaclass=ProcMeta,
                     if (batch_id is not None and self.clients
                             and _ts_keep(batch_id, denom)):
                         # Sender's "I delivered" score for this
-                        # batch.  Pinned to 0.9; pairs with the
+                        # batch.  Pinned to 0.9; one per subscribed
+                        # coordinator, naming it, under the batch's
+                        # pair id with it, which is the id that
                         # coordinator's verdict TS (0.8 clean / 0.3
-                        # anomalous) on the same task_id to form
-                        # the bilateral Transaction CTFT scores.
-                        # Tagged with dod.sensor-report so the
-                        # weighting math applies on both sides (see
-                        # examples/dod_mission/trust_ladder.yaml).
-                        ts = TransactionScore(task_id=batch_id, score=0.9,
-                                              capability_name="dod.sensor-report")
+                        # anomalous, naming us) carries: two halves
+                        # pair only when each names the other
+                        # (R+D.md §14.2). Tagged with dod.sensor-report
+                        # so the weighting math applies on both sides
+                        # (see examples/dod_mission/trust_ladder.yaml).
                         try:
-                            queues[CfgIds.reputation].put(
-                                ts, block=True, timeout=self.q_cadence)
+                            for _pn, peer in list(self.clients.values()):
+                                client = getattr(peer, 'uuid', None)
+                                if client is None:
+                                    continue
+                                ts = TransactionScore(
+                                    task_id=pair_task_id(batch_id, client),
+                                    score=0.9,
+                                    capability_name="dod.sensor-report",
+                                    subject_uuid=client)
+                                queues[CfgIds.reputation].put(
+                                    ts, block=True, timeout=self.q_cadence)
                             if not DoDDataProcess._logged_first_tx_submit:
                                 self.logger.info(
                                     "DoDDataProcess: first "

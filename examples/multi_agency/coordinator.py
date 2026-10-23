@@ -41,7 +41,8 @@ from autonomous_trust.core import AutonomousTrust, Configuration, LogLevel, CfgI
 from autonomous_trust.core.config.generate import generate_identity, generate_worker_config
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
-from autonomous_trust.core.reputation.reputation import TransactionScore
+from autonomous_trust.core.reputation.reputation import (TransactionScore,
+                                                         pair_task_id)
 from autonomous_trust.core.system import queue_cadence, now
 from autonomous_trust.inspector.transitive_trust import (
     TransitiveTrustMixin, PEER_PAIR_QUERY_SEC)
@@ -688,13 +689,15 @@ class MultiAgencyCoordinator(TransitiveTrustMixin, AutonomousTrust):
                         peer_name, entry)
                     continue
                 try:
-                    self.submit_reading_for_validation(reading, queues)
+                    self.submit_reading_for_validation(reading, queues,
+                                                       sender_uuid=uuid_str)
                 except Exception:
                     logger.exception(
                         "Validator/chart dispatch failed for %s",
                         peer_name)
 
-    def submit_reading_for_validation(self, reading, queues=None) -> None:
+    def submit_reading_for_validation(self, reading, queues=None,
+                                      sender_uuid=None) -> None:
         """Push a reading through validators + charts, and accumulate
         per-batch anomaly state so we can submit a TransactionScore
         for the batch as a whole once it has settled.
@@ -729,9 +732,11 @@ class MultiAgencyCoordinator(TransitiveTrustMixin, AutonomousTrust):
         if batch_id is not None:
             state = self._batch_state.get(batch_id)
             if state is None:
+                # The sender's uuid is whom our half names (R+D.md §14.2).
                 state = {"submitted": False, "anomalous": False,
                          "first_tick": self._tick_count,
-                         "peer_name": reading.peer_name}
+                         "peer_name": reading.peer_name,
+                         "sender_uuid": sender_uuid}
                 self._batch_state[batch_id] = state
                 if not MultiAgencyCoordinator._logged_first_batch_seen:
                     logger.info(
@@ -808,8 +813,19 @@ class MultiAgencyCoordinator(TransitiveTrustMixin, AutonomousTrust):
                 continue
             is_anomaly = bool(state["anomalous"])
             score = 0.3 if is_anomaly else 0.8
-            ts = TransactionScore(task_id=batch_id, score=score,
-                                  capability_name="multi.sensor-report")
+            # One pair per consumer: our half names the sender, under the
+            # batch's pair id with us, which is the id the sender's half for
+            # us carries (R+D.md §14.2). A batch whose sender we never saw
+            # has nobody to name, so it is not scored.
+            sender = state.get("sender_uuid")
+            me = getattr(getattr(self, 'identity', None), 'uuid', None)
+            if sender is None or me is None:
+                state["submitted"] = True
+                continue
+            ts = TransactionScore(task_id=pair_task_id(batch_id, me),
+                                  score=score,
+                                  capability_name="multi.sensor-report",
+                                  subject_uuid=sender)
             try:
                 queues[CfgIds.reputation].put(
                     ts, block=True, timeout=queue_cadence)

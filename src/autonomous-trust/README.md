@@ -1,4 +1,4 @@
-AutonomousTrust ===============
+# AutonomousTrust 
 
 **AutonomousTrust** (AT) is a framework for cooperative computing among machines
 that do not fully trust each other and cannot count on a central authority to
@@ -21,8 +21,7 @@ degraded, or partitioned. Although conventional Zero Trust addresses the same
 threat, it depends on reaching a central authority, so under those conditions it
 falls back to either failing open or failing closed.
 
-
-Quick start -----------
+---
 
 AutonomousTrust is developed against a **conda** environment and driven through
 the `./at` launcher at the repository root.
@@ -54,7 +53,7 @@ For the full multi-node demos, orchestrated over Docker, Tilt, and Minikube:
 Run `./at help` for the full command list.
 
 
-Documentation -------------
+### Documentation
 
 AutonomousTrust is Part II of a continuous narrative that runs from the physical
 mesh layer below it up through the polity and compact tiers above. The whole
@@ -88,37 +87,38 @@ application.
 Outstanding work is tracked in [`ISSUES.md`](ISSUES.md).
 
 
-Zero Trust integration ----------------------
+### Zero Trust integration
 
 AutonomousTrust complements Zero Trust Architecture (NIST SP 800-207) rather
 than replacing it. ZTA credentials gate admission, and AT behavioral reputation
 governs ongoing trust once a peer is in. The overlay provides five things.
 
-- A pluggable verifier interface, with a working X.509/OCSP backend and an OIDC
-  stub.
-- DDIL-aware fallback, admitting a peer at a capped reputation when verification
-  infrastructure is unreachable, so the cohort still forms while disconnected.
-- Revocation as a reputation event, applying a configurable penalty rather than a
-  binary disconnect.
-- Delegated verification, in which peers that can reach OCSP vouch for peers that
-  cannot, lifting the cap without every peer needing external connectivity.
-- A JSONL audit trail recording every verification, deferral, and resolution for
-  later review.
+## Quick start
 
 See [Zero Trust integration](doc/architecture/zta-integration.md) for the full
 reference. A standalone enrollment and OCSP demo lives in
 [`examples/zta/`](examples/zta) (`./run.sh`).
 
 
-Development setup -----------------
+## Development setup
 
 Dependencies are managed with **conda**, not pip or venv. Two environment files
 under `config/cfg/` are authoritative.
 
-- [`config/cfg/environment.yml`](config/cfg/environment.yml): runtime
-  dependencies (symlinked from the repo-root `environment.yml`).
-- [`config/cfg/devel_environ.yml`](config/cfg/devel_environ.yml): build and test
-  dependencies (compilers, `pytest`, conformance tooling).
+- A pluggable verifier interface, with a working X.509/OCSP backend and an OIDC
+  stub.
+
+- DDIL-aware fallback, admitting a peer at a capped reputation when verification
+  infrastructure is unreachable, so the cohort still forms while disconnected.
+
+- Revocation as a reputation event, applying a configurable penalty rather than a
+  binary disconnect.
+
+- Delegated verification, in which peers that can reach OCSP vouch for peers that
+  cannot, lifting the cap without every peer needing external connectivity.
+
+- A JSONL audit trail recording every verification, deferral, and resolution for
+  later review.
 
 Firstly, `./at setup-dev` runs the whole setup. To do it by hand:
 
@@ -140,6 +140,11 @@ Build the native library with `./at build-native`. See [the dual
 implementation](doc/architecture/native-ffi-dual-implementation.md).
 
 
-License -------
+## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
+- [`config/cfg/environment.yml`](config/cfg/environment.yml): runtime
+  dependencies (symlinked from the repo-root `environment.yml`).
+
+- [`config/cfg/devel_environ.yml`](config/cfg/devel_environ.yml): build and test
+  dependencies (compilers, `pytest`, conformance tooling).
