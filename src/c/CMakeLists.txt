@@ -523,12 +523,14 @@ set(libsrc
     autonomous_trust/config/trust_ladder.c
     autonomous_trust/identity/encryptor.c
     autonomous_trust/identity/group.c
+    autonomous_trust/identity/group_file.c
     autonomous_trust/identity/hexlify.c
     autonomous_trust/identity/history.c
     autonomous_trust/identity/identity.c
     autonomous_trust/identity/id_proc.c
     autonomous_trust/utilities/send_retry.c
     autonomous_trust/identity/id_ext.c
+    autonomous_trust/identity/join_policy.c
     autonomous_trust/identity/package_hash.c
     autonomous_trust/identity/peers.c
     autonomous_trust/identity/signature.c
@@ -1555,6 +1557,23 @@ add_executable(group_adopt_test test/group_adopt_test.c)
 set_source_files_properties(test/group_adopt_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(group_adopt_test PRIVATE ${AT_TEST_LIBS} m)
 add_test(NAME group_adopt_test COMMAND $<TARGET_FILE:group_adopt_test>)
+add_executable(join_selection_test test/join_selection_test.c)
+set_source_files_properties(test/join_selection_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(join_selection_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME join_selection_test COMMAND $<TARGET_FILE:join_selection_test>)
+
+add_executable(group_file_test test/group_file_test.c)
+set_source_files_properties(test/group_file_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(group_file_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME group_file_test COMMAND $<TARGET_FILE:group_file_test>)
+
+add_executable(join_policy_test test/join_policy_test.c)
+set_source_files_properties(test/join_policy_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(join_policy_test PRIVATE ${AT_TEST_LIBS})
+# Reads config/cfg/join_policy.example.json, the file the Python suite reads.
+target_compile_definitions(join_policy_test PRIVATE
+    AT_REPO_ROOT_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/../..")
+add_test(NAME join_policy_test COMMAND $<TARGET_FILE:join_policy_test>)
 
 add_executable(rescore_sweep_test test/rescore_sweep_test.c)
 set_source_files_properties(test/rescore_sweep_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1740,7 +1759,10 @@ set(CPACK_PACKAGE_NAME autonomous-trust-devel)
 set(CPACK_PACKAGE_VERSION ${AT_PACKAGE_VERSION})
 set(CPACK_PACKAGE_CONTACT "Sean M Brennan <sean.brennan@tekfive.com>")
 set(CPACK_PACKAGE_HOMEPAGE_URL https://github.com/sean-m-brennan/autonomous-trust)
-set(CPACK_RESOURCE_FILE_LICENSE ${top_src_dir}/LICENSE)
+# Container builds copy only src/c, so the repo-root LICENSE is absent there.
+if (EXISTS ${top_src_dir}/LICENSE)
+    set(CPACK_RESOURCE_FILE_LICENSE ${top_src_dir}/LICENSE)
+endif()
 set(CPACK_PACKAGING_INSTALL_PREFIX ${CMAKE_INSTALL_PREFIX})
 set(CPACK_DEB_COMPONENT_INSTALL ON)
 set(CPACK_RPM_COMPONENT_INSTALL ON)

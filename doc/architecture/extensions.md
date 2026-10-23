@@ -663,7 +663,21 @@ phrased so that no extension at all is a node with no such authority:
 
 `admission_gate` answers the most restrictive verdict (`ADMIT`,
 `ADMIT_CAPPED`, `REJECT`); ZTA's publishes its standing to reputation before
-the vote, as the core did. Python's `IdentityHooks` has the same five plus
+the vote, as the core did.
+
+**The anchor hook.** `anchor_classes` (both runtimes, RD_14.4 plan Phase 2)
+says which out-of-band anchor classes a public identity holds here, as
+`AT_ANCHOR_*` bits in C and class names in Python. First contact answers
+`verified_contact` and `unverified_contact` for a recorded contact or a device
+its operator vouched for, and `operator` for a sibling. ZTA answers `zta` for
+a credential that chains to one of our anchors and is bound to the identity,
+and `operator` for a verified operator-key binding naming this node's own
+operator key. Both match on keys, not the uuid alone. The core ORs the answers
+and intersects them with the classes the join policy (`$AT_JOIN_POLICY`,
+`identity/join_policy.{h,c}`, `core/_python/identity/join_policy.py`)
+declares: `identity_anchor_classes` in C, `IdentityProcess.anchor_classes` in
+Python. With no policy, nothing is an anchor. A declared class that no linked
+or installed extension can answer refuses the start. Python's `IdentityHooks` has the same five plus
 `on_tick(proc, queues, tick)`, which carries the background re-verification
 off the identity loop (C has its own `zta_verify` process for that).
 

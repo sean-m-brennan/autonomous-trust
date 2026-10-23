@@ -133,7 +133,20 @@ typedef struct {
      *  is the one route by which a contact joins the cohort. NULL is a node
      *  with no contacts. */
     bool (*is_contact)(const process_t *proc, const char *uuid_str);
+
+    /** Which out-of-band anchor classes (join_policy.h, AT_ANCHOR_* bits) the
+     *  public identity @p ident holds here: first contact for contacts and
+     *  siblings, ZTA for credentials and the operator key. Match on keys, not
+     *  the uuid alone, since a uuid is public. The core intersects the answers
+     *  with the join policy's declared classes (RD_14.4 plan, Phase 2). NULL
+     *  anchors nobody. */
+    uint32_t (*anchor_classes)(const process_t *proc, const public_identity_t *ident);
 } identity_ext_t;
+
+/** Whether two identities are the same keyholder: uuid, signing key and
+ *  encryption key (address and nickname aside). For an anchor_classes hook,
+ *  which must match on keys. NULL is never the same. */
+bool identity_same_keys(const public_identity_t *one, const public_identity_t *other);
 
 /** Register @p ext (static storage). @return 0; -1 NULL/unnamed/duplicate;
  *  -2 full. Refusals go to stderr (this runs before main). */
@@ -178,6 +191,8 @@ bool identity_ext_gateway_refused(const process_t *proc, const char *uuid_str);
 bool identity_ext_operator_credential(const process_t *proc, const public_identity_t *claim);
 bool identity_ext_credential_anchored(const process_t *proc, const public_identity_t *carried);
 bool identity_ext_is_contact(const process_t *proc, const char *uuid_str);
+/** The union of every extension's anchor_classes answer. */
+uint32_t identity_ext_anchor_classes(const process_t *proc, const public_identity_t *ident);
 
 /** Register @p ext at load time. */
 #define IDENTITY_EXT_REGISTER(tag, ext)                                        \

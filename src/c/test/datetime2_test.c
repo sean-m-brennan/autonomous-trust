@@ -70,6 +70,40 @@ DEFINE_TEST(test_datetime_isoformat_roundtrip)
 }
 END_TEST_DEFINITION()
 
+DEFINE_TEST(test_datetime_isoformat_offset)
+{
+    /* Python's isoformat writes "+HH:MM"; a parsed "+00:00" used to come
+     * back as "+0:0", and a -0:30 offset lost its sign. */
+    datetime_t dt;
+    memset(&dt, 0, sizeof(dt));
+    dt.tm_year = 126;
+    dt.tm_mon = 9;
+    dt.tm_mday = 23;
+    dt.tm_hour = 2;
+    dt.tm_min = 4;
+    dt.tm_sec = 43;
+    dt.tm_nsec = 67288000;
+
+    char buf[MAX_DT_STR] = {0};
+    datetime_t parsed;
+    ck_assert_ret_ok(datetime_from_isostring("2026-10-23T02:04:43.067288+00:00", &parsed));
+    ck_assert_ret_ok(datetime_to_isoformat(&parsed, buf, sizeof(buf)));
+    ck_assert_str_eq(buf, "2026-10-23T02:04:43.067288+00:00");
+
+    dt.tm_tz_offset = -0.5f;
+    ck_assert_ret_ok(datetime_to_isoformat(&dt, buf, sizeof(buf)));
+    ck_assert(strstr(buf, "-00:30") != NULL);
+
+    dt.tm_tz_offset = 5.75f;
+    ck_assert_ret_ok(datetime_to_isoformat(&dt, buf, sizeof(buf)));
+    ck_assert(strstr(buf, "+05:45") != NULL);
+
+    dt.tm_tz_offset = -10.0f;
+    ck_assert_ret_ok(datetime_to_isoformat(&dt, buf, sizeof(buf)));
+    ck_assert(strstr(buf, "-10:00") != NULL);
+}
+END_TEST_DEFINITION()
+
 DEFINE_TEST(test_datetime_from_time_local)
 {
     /* Test local time variant */
@@ -145,5 +179,6 @@ DEFINE_TEST(test_timedelta_large)
 END_TEST_DEFINITION()
 
 RUN_TESTS(DateTime2, test_datetime_strptime_basic, test_datetime_isoformat_roundtrip,
+          test_datetime_isoformat_offset,
           test_datetime_from_time_local, test_datetime_strftime_with_tz,
           test_timedelta_zero, test_timedelta_large)

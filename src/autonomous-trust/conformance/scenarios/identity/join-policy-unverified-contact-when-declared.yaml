@@ -1,0 +1,44 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: join-policy-unverified-contact-when-declared
+byte_pinning: false
+description: |
+    RD_14.4_HOSTILE_JOIN_PLAN.md Phase 2, D6: unverified_contact is a class a
+    declaration MAY name (the example file leaves it out). Named, carol counts
+    as one, and bob still counts as verified: the classes are reported as
+    they are, not collapsed.
+
+participants:
+  - id: joiner
+    role: new_node
+  - id: bob
+    role: border_guard
+  - id: carol
+    role: border_guard
+
+fixtures:
+  first_contact:
+    enabled: true
+  contacts:
+    bob:
+      verified: true
+    carol:
+      verified: false
+  join_policy:
+    version: 1
+    enabled: true
+    anchors: [verified_contact, unverified_contact]
+
+steps:
+  - id: 1
+    from: joiner
+    to: joiner
+    function: trigger_choose_group
+    description: No history is stashed; a scenario needs a step.
+
+expected_state:
+  joiner:
+    anchors:
+      bob: [verified_contact]
+      carol: [unverified_contact]

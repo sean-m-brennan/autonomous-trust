@@ -36,6 +36,7 @@ from ..extensions import (identity_hooks, load_extensions, reputation_hooks,
 from ..config import (Configuration, atomic_write, from_json_string,
                       to_json_string)
 from ..identity.protocol import IdentityProtocol
+from ..identity.join_policy import load_join_policy_env
 from ..identity.identity import (public_identity_to_canonical,
                                  public_identity_from_canonical)
 from ..identity.peer_standing import STANDING_PROVED, STANDING_FAILED
@@ -64,6 +65,11 @@ from .reputation import (TransactionHistory, ReconcileResult, Reputation, Reputa
 from ..system import CfgIds, now, encoding, proc_idle_floor
 from ..app_verbs import is_local_app_verb, refuse_remote_app_verb
 from .. import _probes
+
+#: Chain entries held only by catch-up under the join policy (RD_14.4, D2 (b)):
+#: ``<cfg>/reputation-catchup-marks.cfg.json``, chain key -> sorted indices
+#: ('' is the primary chain).
+CATCHUP_MARKS_FILE = 'reputation-catchup-marks'
 
 
 def _env_float(name, default):
@@ -805,6 +811,10 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         # Slash replay marks, before any message can be handled. Also resumes
         # our own slash epoch, so this has to precede the first forward_slash.
         self._load_slash_marks()
+        # The join policy (RD_14.4, D9) and, under it, which chain entries we
+        # hold only because catch-up told us (D2 (b)): chain key -> indices.
+        self.join_policy = load_join_policy_env()
+        self._catchup_marks: dict[str, set] = self._load_catchup_marks()
 
         # Verifiable warm start: adopt the persisted committed history if its
         # checkpoint verifies, and clamp every restored score the evidence
@@ -3089,6 +3099,79 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         if len(sigs or {}) > self._checkpoint_quorum(None):
             self._finalized = ckpt
 
+    def _mark_catchup(self, key, hist, res):
+        """Under the join policy, mark the entries a catch-up added that we
+        were not party to: told, not our own evidence (RD_14.4, D2 (b)). The
+        chain is adopted unchanged and the marks never leave the node. An
+        adoption's dropped entries lose their marks first, since their
+        indices are reused; marks below the resident window are pruned."""
+        if not self.join_policy.enabled:
+            return
+        marks = self._catchup_marks.get(key, set())
+        before = set(marks)
+        for tx in res.dropped:
+            marks.discard(tx.index)
+        me = str(self.identity.uuid)
+        for tx in res.added:
+            if tx.index is None:
+                continue
+            if me not in (str(tx.p1_id), str(tx.p2_id)):
+                marks.add(tx.index)
+            else:
+                marks.discard(tx.index)
+        first = getattr(hist, '_first_index', 0) or 0
+        marks = {i for i in marks if i >= first}
+        if marks == before:
+            return
+        if marks:
+            self._catchup_marks[key] = marks
+        else:
+            self._catchup_marks.pop(key, None)
+        self._persist_catchup_marks()
+
+    def is_told(self, index, key: str = '') -> bool:
+        """Whether chain ``key``'s entry at ``index`` arrived by catch-up
+        under the join policy and names us in neither slot."""
+        return index in self._catchup_marks.get(key, ())
+
+    def _catchup_marks_path(self):
+        return os.path.join(Configuration.get_cfg_dir(),
+                            CATCHUP_MARKS_FILE + Configuration.file_ext)
+
+    def _persist_catchup_marks(self):
+        """Write the catch-up marks, so a restart does not launder told
+        entries into our own. Swallowed on failure, as the slash marks are."""
+        try:
+            doc = {k: sorted(v) for k, v in self._catchup_marks.items()}
+            with atomic_write(self._catchup_marks_path()) as f:
+                json.dump(doc, f, indent=2, sort_keys=True)
+        except (OSError, IOError, ValueError, TypeError) as e:
+            self.logger.warning('Could not persist catch-up marks: %s', e)
+
+    def _load_catchup_marks(self) -> dict:
+        """Read the catch-up marks. Missing is the cold start; a corrupt file
+        is reported and left in place, and the marks start empty."""
+        path = self._catchup_marks_path()
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path) as f:
+                doc = json.load(f)
+            if not isinstance(doc, dict):
+                raise ValueError('not an object')
+            marks = {}
+            for k, v in doc.items():
+                if not isinstance(v, list) or not all(
+                        isinstance(i, int) and not isinstance(i, bool) for i in v):
+                    raise ValueError('chain %r: not a list of indices' % k)
+                if v:
+                    marks[str(k)] = set(v)
+            return marks
+        except (OSError, IOError, ValueError, TypeError) as e:
+            self.logger.error('Catch-up marks unreadable (%s); starting from '
+                              'none this boot', e)
+            return {}
+
     def _slash_marks_path(self):
         """The file holding the per-(target, slasher) slash high-water marks."""
         return os.path.join(Configuration.get_cfg_dir(),
@@ -3988,6 +4071,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             for peer in (tx.p1_id, tx.p2_id):
                 if peer is not None:
                     self._note_interaction(peer)
+        self._mark_catchup(key, hist, res)
         if res.status in (ReconcileResult.ADOPTED, ReconcileResult.EXTENDED):
             # Placements buffered ahead of the chain may now follow it.
             self._apply_ahead(key, hist, group)
