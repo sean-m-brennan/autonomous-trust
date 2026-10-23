@@ -22,9 +22,8 @@ name: Release Packages
 # packages already attached. A release created by another workflow using
 # GITHUB_TOKEN does not trigger `release` events; use the manual run then.
 
+# Automatic triggers are disabled for now; run by hand (Actions > Run workflow).
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
