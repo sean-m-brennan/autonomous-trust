@@ -1,0 +1,55 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: merge-to-mesh-anchor-beats-created
+byte_pinning: false
+description: |
+    _merge_to_mesh under the join policy (RD_14.4_HOSTILE_JOIN_PLAN.md Phase
+    3, D1, the user's call "anchors break, lone ties"). The newcomer minted a
+    group of its own when no history came (self_bootstrapped) and a second
+    member has joined it since, so its group is not a group of one. bob, a
+    verified contact, then offers a YOUNGER group. By `created` alone the
+    newcomer would keep its own; `created` is a claim a group makes about
+    itself, and under the policy an anchored offer beats an unanchored group
+    of ours, so the newcomer merges into bob's.
+
+    Both runtimes merge on delivery: receive_history sees the self-bootstrap
+    and runs the merge.
+
+participants:
+  - id: newcomer
+    role: new_node
+  - id: bob
+    role: border_guard
+
+fixtures:
+  first_contact:
+    enabled: true
+  contacts:
+    bob:
+      verified: true
+  join_policy:
+    version: 1
+    enabled: true
+    anchors: [verified_contact]
+  self_bootstrapped: [newcomer]
+  groups:
+    newcomer:
+      uuid: "c0000000-0000-4000-8000-0000000000a1"
+      size: 2
+      created: 100.0
+    bob:
+      uuid: "c0000000-0000-4000-8000-0000000000b1"
+      size: 1
+      created: 200.0
+
+steps:
+  - id: 1
+    from: bob
+    to: newcomer
+    function: full_history
+    description: The newcomer merges into bob's group.
+
+expected_state:
+  newcomer:
+    group_uuid: "c0000000-0000-4000-8000-0000000000b1"

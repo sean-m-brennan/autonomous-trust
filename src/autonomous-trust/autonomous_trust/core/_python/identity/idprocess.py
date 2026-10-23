@@ -37,6 +37,11 @@ from .group import Group, ChildGroupSet
 from .peer_standing import (PeerStanding, STANDINGS, STANDING_SOURCE_ZTA,
                             standing_source_or_default, standing_source_valid)
 from .history.history import IdentityHistory
+from .join_policy import load_join_policy_env
+
+#: Members learned only from a history adopted under the join policy
+#: (RD_14.4, D1 (d)): ``<cfg>/provisional_members.cfg.json``, a list of uuids.
+PROVISIONAL_FILE = 'provisional_members'
 from ..algorithms.agreement import AgreementProof
 from ..algorithms.impl import AgreementImpl
 from ..capabilities import PeerCapabilities
@@ -210,11 +215,22 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # (str) to the set of confirmer uuids (str) seen so far.
         self._admission_quorum = 1
         self._provisional_confirmations: dict[str, set] = {}
+        # The join policy (RD_14.4 plan, D9): inert unless $AT_JOIN_POLICY
+        # names one. The node checked it at start (check_join_policy), so a
+        # bad one does not get this far in a running node.
+        self.join_policy = load_join_policy_env()
         # 3-tuple: (group, history-steps, peer-identities). The peer
         # list rides along to seed self.peers with welcomer-known peers
         # whose admission confirm broadcasts predated our join. Older
         # sender versions send a 2-tuple; choose_group() tolerates both.
         self.histories: list[tuple] = []
+        # Who offered each stashed history, by position: the peer the network
+        # box-decrypted it from (None when unknown). Kept beside the wire tuple
+        # rather than in it. Read only under the join policy (RD_14.4, D1).
+        self.history_senders: list = []
+        # Members we learned only from an adopted history while the join
+        # policy was on, and could not anchor: told, not yet our own (D1 (d)).
+        self.provisional_members: set[str] = self._load_provisional_members()
         self.package_hash = self.configs[PackageHash.key]
         # ZTA's admission state (the gate's caches, the DDIL-capped set, the
         # re-verify stamps) is the ZTA extension's, set up when it registers
@@ -1712,70 +1728,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     elif (now() - history_seen_at).total_seconds() >= grace:
                         break
                 time.sleep(self.cadence)
-            # accepted is (group, steps) — group/steps come from the
-            # one chosen welcomer (longest history wins). Peer
-            # identities, however, are unioned across ALL received
-            # histories so we don't miss peers any one welcomer
-            # happens to be unaware of (each welcomer's peer view can
-            # be partial due to admit-time confirm propagation gaps).
-            accepted: tuple[Optional[Group], Optional[list[LinkedStep]]] = None, None
-            unioned_peers: dict = {}  # uuid_str -> Identity
-
-            self.logger.debug('%d histories', len(self.histories))
-            for hist_tpl in self.histories:
-                # Tolerate 2-tuple (legacy) and 3-tuple (group, steps,
-                # peer_idents) wire shapes.
-                if len(hist_tpl) >= 3:
-                    group, steps, peer_idents = hist_tpl[0], hist_tpl[1], hist_tpl[2]
-                else:
-                    group, steps = hist_tpl[0], hist_tpl[1]
-                    peer_idents = None
-                # Group rides the wire as the DRY canonical flat dict (shared
-                # byte-shape with C's group_to_json); reconstruct it. Tolerate
-                # a legacy Group object (in-process / pre-canonical path).
-                if isinstance(group, dict):
-                    group = Group.from_canonical(group)
-                # Merge peer identities from every history that arrived
-                # — even ones we won't pick for our group/DAG — so the
-                # peer set is the union of what all welcomers saw.
-                if peer_idents:
-                    for ident in peer_idents:
-                        # Slot-2 peers ride as DRY canonical public-identity
-                        # dicts (shared with C); reconstruct, tolerating a
-                        # legacy Identity object.
-                        if isinstance(ident, dict):
-                            ident = public_identity_from_canonical(ident)
-                        uuid = getattr(ident, 'uuid', None)
-                        if uuid is not None:
-                            unioned_peers.setdefault(str(uuid), ident)
-                if not steps:
-                    continue
-                if CfgIds.group in self.configs and self.configs[CfgIds.group] == group:
-                    accepted = group, steps
-                    break
-                else:
-                    if accepted == (None, None):
-                        accepted = group, steps
-                    elif len(steps) > len(accepted[1]):  # noqa
-                        accepted = group, steps
             try:
-                if accepted != (None, None):
-                    self.group, hist = accepted
-                    self.logger.debug('Updated group key')
-                    self._record_group(queues)
-                    self._populate_peers_from_history(
-                        queues, list(unioned_peers.values()))
-                    # Every other group that admitted us: tell its members
-                    # ours exists.
-                    for hist_tpl in list(self.histories):
-                        self._tell_bridged_group(queues, hist_tpl[0])
-                    existing = hist
-                    diff: list[LinkedStep] = self._history.catch_up(existing)
-                    msg_str = to_json_string(diff)  # to self.handle_history_diff()
-                    message = Message(self.name, IdentityProtocol.diff, msg_str, to_whom=self.group)
-                    self.logger.debug('Send history diff')
-                    queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
-                else:
+                if not self._adopt_from_histories(queues):
                     from_scratch = True
                     try:
                         filename = os.path.join(Configuration.get_cfg_dir(), 'group' + Configuration.file_ext)
@@ -1806,6 +1760,91 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         except Exception as err:
             self.report_exception(err, 'choose_group')
 
+    def _adopt_from_histories(self, queues) -> bool:
+        """
+        Adopt the best of the stashed histories: its group, its steps, and the
+        peers of every history. choose_group calls this when its wait ends; the
+        conformance harness calls it directly, as C's
+        identity_adopt_group_from_histories (RD_14.4 plan, Phase 1).
+        :param queues: Interprocess communication queues
+        :return: bool (a group was adopted)
+        """
+        # accepted is (group, steps) — group/steps come from the
+        # one chosen welcomer (longest history wins). Peer
+        # identities, however, are unioned across ALL received
+        # histories so we don't miss peers any one welcomer
+        # happens to be unaware of (each welcomer's peer view can
+        # be partial due to admit-time confirm propagation gaps).
+        accepted: tuple[Optional[Group], Optional[list[LinkedStep]]] = None, None
+        accepted_rank = None  # (offered by an anchor, steps)
+        unioned_peers: dict = {}  # uuid_str -> Identity
+
+        self.logger.debug('%d histories', len(self.histories))
+        for i, hist_tpl in enumerate(self.histories):
+            # Tolerate 2-tuple (legacy) and 3-tuple (group, steps,
+            # peer_idents) wire shapes.
+            if len(hist_tpl) >= 3:
+                group, steps, peer_idents = hist_tpl[0], hist_tpl[1], hist_tpl[2]
+            else:
+                group, steps = hist_tpl[0], hist_tpl[1]
+                peer_idents = None
+            # Group rides the wire as the DRY canonical flat dict (shared
+            # byte-shape with C's group_to_json); reconstruct it. Tolerate
+            # a legacy Group object (in-process / pre-canonical path).
+            if isinstance(group, dict):
+                group = Group.from_canonical(group)
+            # Merge peer identities from every history that arrived
+            # — even ones we won't pick for our group/DAG — so the
+            # peer set is the union of what all welcomers saw.
+            if peer_idents:
+                for ident in peer_idents:
+                    # Slot-2 peers ride as DRY canonical public-identity
+                    # dicts (shared with C); reconstruct, tolerating a
+                    # legacy Identity object.
+                    if isinstance(ident, dict):
+                        ident = public_identity_from_canonical(ident)
+                    uuid = getattr(ident, 'uuid', None)
+                    if uuid is not None:
+                        unioned_peers.setdefault(str(uuid), ident)
+            # A history with no steps (a lone node that minted its group
+            # moments ago) is eligible too: adopting it gives the two of
+            # us one key now instead of two groups merged later. Any
+            # longer history still beats it. Mirrors C
+            # _adopt_group_from_histories (the user's call, 2026-10-23,
+            # RD_14.4 plan D10).
+            steps = list(steps or [])
+            if CfgIds.group in self.configs and self.configs[CfgIds.group] == group:
+                # A returning node rejoins the group it persisted.
+                accepted = group, steps
+                break
+            # Under the join policy a history offered by an anchor beats any
+            # that is not, and length decides within each (RD_14.4, D1 (c)).
+            # Inert, every history ranks unanchored: longest wins, as before.
+            rank = (self._offered_by_anchor(i), len(steps))
+            if accepted_rank is None or rank > accepted_rank:
+                accepted, accepted_rank = (group, steps), rank
+        if accepted == (None, None):
+            return False
+        self.group, hist = accepted
+        self.logger.debug('Updated group key')
+        self._record_group(queues)
+        self._mark_provisional(self.group, unioned_peers)
+        self._populate_peers_from_history(
+            queues, list(unioned_peers.values()))
+        # Every other group that admitted us: tell its members
+        # ours exists.
+        for hist_tpl in list(self.histories):
+            self._tell_bridged_group(queues, hist_tpl[0])
+        # A zero-step history has nothing to merge (ingest_branch needs a step),
+        # and an empty diff tells the cohort nothing; C sends none either.
+        diff: list[LinkedStep] = self._history.catch_up(hist) if hist else []
+        if diff:
+            msg_str = to_json_string(diff)  # to self.handle_history_diff()
+            message = Message(self.name, IdentityProtocol.diff, msg_str, to_whom=self.group)
+            self.logger.debug('Send history diff')
+            queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
+        return True
+
     def receive_history(self, queues, message):
         """
         Receive a full history plus group key or timeout
@@ -1829,8 +1868,14 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             shape = ('3tuple' if isinstance(hist_tpl, (list, tuple))
                      and len(hist_tpl) >= 3 else '2tuple')
             _probes.counter('id.receive_history', 'arrived', shape)
+            # The sender is the network's word, not the envelope's: `history`
+            # is not a plaintext verb, so it reaches us only box-decrypted from
+            # a peer we hold (wire_verb_admitted refuses it on the stranger
+            # path). The box is what authenticates "offered by" (RD_14.4, D1).
+            sender = message.from_whom if isinstance(message.from_whom, Identity) else None
             with self.lock:
                 self.histories.append(hist_tpl)  # see choose_group
+                self._note_history_sender(sender)
                 should_merge = (self.self_bootstrapped
                                 and not self.merging
                                 and not self.choosing)
@@ -1905,8 +1950,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             with self.lock:
                 snapshot = list(self.histories)
             accepted: tuple[Optional[Group], Optional[list[LinkedStep]]] = None, None
+            accepted_rank = None  # (offered by an anchor, steps)
             unioned_peers: dict = {}
-            for hist_tpl in snapshot:
+            for i, hist_tpl in enumerate(snapshot):
                 if len(hist_tpl) >= 3:
                     group, steps, peer_idents = hist_tpl[0], hist_tpl[1], hist_tpl[2]
                 else:
@@ -1927,18 +1973,24 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                         uuid = getattr(ident, 'uuid', None)
                         if uuid is not None:
                             unioned_peers.setdefault(str(uuid), ident)
-                if not steps:
-                    continue
+                # A zero-step history (a lone node's freshly minted group) is
+                # eligible when nothing longer is offered, as in choose_group:
+                # two lone nodes converge here by created/uuid instead of
+                # waiting for partition recovery. Mirrors C (the user's call,
+                # 2026-10-23, RD_14.4 plan Phase 3).
+                steps = list(steps or [])
                 if formatless:
                     # Its peers still count; its group is not ours to take.
                     self.logger.warning('Skipping a history whose group names no '
                                         'format: our group speaks proto')
                     continue
-                if accepted == (None, None) or len(steps) > len(accepted[1]):  # noqa
-                    accepted = group, steps
+                rank = (self._offered_by_anchor(i), len(steps))
+                if accepted_rank is None or rank > accepted_rank:
+                    accepted, accepted_rank = (group, steps), rank
             if accepted == (None, None):
-                # All received histories were empty — nothing to merge to;
-                # leave self-bootstrap state alone and clear merging flag.
+                # No usable history (none parsed, or every group named no
+                # format) — nothing to merge to; leave self-bootstrap state
+                # alone and clear merging flag.
                 with self.lock:
                     self.merging = False
                 return
@@ -1954,8 +2006,20 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             cand_created = getattr(cand_group, 'created', 0.0) or 0.0
             mine_created = (getattr(mine, 'created', 0.0) or 0.0) if mine is not None else 0.0
             both_aged = cand_created > 0.0 and mine_created > 0.0
+            # Under the join policy anchors come before `created`, which is a
+            # claim the offering group makes about itself (RD_14.4, D1). Ours
+            # counts as anchored when it holds an anchor besides us, or when
+            # it is a group of one facing an anchored candidate: two mutual
+            # anchors that self-bootstrap at once must still converge on one
+            # group, not swap (the user's call, 2026-10-23).
+            cand_anchored = bool(accepted_rank and accepted_rank[0])
+            mine_anchored = mine is not None and (
+                self._group_holds_anchor(mine)
+                or (cand_anchored and self._group_is_lone(mine)))
             if mine is None:
                 adopt_cand = True
+            elif cand_anchored != mine_anchored:
+                adopt_cand = cand_anchored
             elif both_aged and cand_created < mine_created:
                 adopt_cand = True  # candidate older -> absorbs us
             elif both_aged and cand_created > mine_created:
@@ -1966,6 +2030,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 self.group, hist = cand_group, cand_hist
                 self.logger.info('Merging self-bootstrap into mesh group %s',
                                  getattr(self.group, 'nickname', '?'))
+                self._mark_provisional(self.group, unioned_peers)
             else:
                 hist = cand_hist
                 self.logger.info('Kept our group %s over merge candidate %s '
@@ -2437,6 +2502,124 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         contact). Without that extension nobody is."""
         return any(hook.is_contact(self, str(peer_uuid)) for hook in identity_hooks(self)
                    if hook.is_contact is not None)
+
+    def anchor_classes(self, ident) -> frozenset:
+        """The out-of-band anchor classes ``ident`` (a public identity) holds
+        here and the join policy counts: the extensions' answers
+        (``IdentityHooks.anchor_classes``) intersected with the declared
+        classes. Empty under an inert policy (RD_14.4 plan, Phase 2)."""
+        policy = self.join_policy
+        if not policy.enabled or not policy.anchors or ident is None:
+            return frozenset()
+        found = set()
+        for hook in identity_hooks(self):
+            if hook.anchor_classes is not None:
+                found.update(hook.anchor_classes(self, ident) or ())
+        return frozenset(found) & policy.anchors
+
+    def is_anchored(self, ident) -> bool:
+        """Whether the join policy counts ``ident`` as an anchor."""
+        return bool(self.anchor_classes(ident))
+
+    def _note_history_sender(self, sender):
+        """Record who offered the history just appended to ``histories``.
+        Caller holds ``self.lock``. A history stashed without a sender (a test,
+        an in-process path) is padded with None, so the positions line up."""
+        while len(self.history_senders) < len(self.histories) - 1:
+            self.history_senders.append(None)
+        self.history_senders.append(sender)
+
+    def _offered_by_anchor(self, i) -> bool:
+        """Whether stashed history ``i`` was offered by an anchor. Offered BY,
+        not containing: a cohort can list any public identity, a verified
+        contact's included, in its address map or peer bundle, so what a
+        history contains proves nothing (RD_14.4, Phase 2 note)."""
+        if not self.join_policy.enabled or i >= len(self.history_senders):
+            return False
+        return self.is_anchored(self.history_senders[i])
+
+    def _group_holds_anchor(self, group) -> bool:
+        """Whether OUR ``group`` lists an anchor other than us. Our own map is
+        our own record, so containment counts here, unlike in an offer."""
+        if not self.join_policy.enabled or group is None:
+            return False
+        me = str(self.identity.uuid)
+        for member in getattr(group, '_address_map', None) or {}:
+            if str(member) == me:
+                continue
+            peer = self.peers.find_by_uuid(member) if self.peers else None
+            if peer is not None and self.is_anchored(peer):
+                return True
+        return False
+
+    def _group_is_lone(self, group) -> bool:
+        """Whether ``group`` lists nobody but us."""
+        me = str(self.identity.uuid)
+        return all(str(m) == me for m in getattr(group, '_address_map', None) or {})
+
+    def _mark_provisional(self, group, unioned_peers):
+        """After adopting ``group`` under the join policy, record the members
+        it introduced as provisional: told to us by the cohort, not anchored,
+        and not peers we already held (RD_14.4, D1 (d)). Call before the
+        bundle is populated into our peers. Local state only: nothing leaves
+        the node, and nothing reads it until the told ceiling (Phase 4)."""
+        if not self.join_policy.enabled:
+            return
+        me = str(self.identity.uuid)
+        told = {str(u) for u in unioned_peers}
+        told.update(str(u) for u in getattr(group, '_address_map', None) or {})
+        # An identity to judge each by: the bundle's, else the sender's own (a
+        # welcomer is in its map, and need not be in any bundle).
+        known = dict(unioned_peers)
+        with self.lock:
+            for sender in self.history_senders:
+                if sender is not None:
+                    known.setdefault(str(sender.uuid), sender)
+        added = set()
+        for member in told - {me} - self.provisional_members:
+            held = self.peers.find_by_uuid(member) if self.peers else None
+            if held is not None:
+                continue
+            ident = known.get(member)
+            if ident is not None and self.is_anchored(ident):
+                continue
+            added.add(member)
+        if not added:
+            return
+        self.provisional_members |= added
+        self.logger.info('Join policy: %d member(s) of %s are provisional',
+                         len(added), getattr(group, 'nickname', '?'))
+        self._persist_provisional_members()
+
+    @staticmethod
+    def _provisional_path():
+        return os.path.join(Configuration.get_cfg_dir(),
+                            PROVISIONAL_FILE + Configuration.file_ext)
+
+    def _persist_provisional_members(self):
+        """Write the provisional set, so a restart does not launder it."""
+        try:
+            with atomic_write(self._provisional_path()) as f:
+                json.dump(sorted(self.provisional_members), f, indent=2)
+        except (OSError, IOError, ValueError, TypeError) as e:
+            self.logger.warning('Could not persist provisional members: %s', e)
+
+    def _load_provisional_members(self) -> set:
+        """Read the provisional set. Missing is the cold start; a corrupt
+        file is reported and left in place, and the set starts empty."""
+        path = self._provisional_path()
+        if not os.path.exists(path):
+            return set()
+        try:
+            with open(path) as f:
+                doc = json.load(f)
+            if not isinstance(doc, list) or not all(isinstance(u, str) for u in doc):
+                raise ValueError('not a list of uuids')
+            return set(doc)
+        except (OSError, IOError, ValueError) as e:
+            self.logger.error('Provisional members unreadable (%s); starting '
+                              'from none this boot', e)
+            return set()
 
     def _group_already_member(self, peer) -> bool:
         """True when ``peer`` is ALREADY a member of our group, i.e. its uuid is

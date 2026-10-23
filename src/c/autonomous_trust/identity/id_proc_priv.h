@@ -22,6 +22,7 @@
 
 #include "processes/processes.h"
 #include "identity/group.h"
+#include "identity/join_policy.h"
 #include "utilities/send_retry.h"
 #include "utilities/clock.h"    /* at_clock_sample_t (cohort clock skew) */
 
@@ -167,6 +168,17 @@ void identity_periodic_vote_collection(process_t *proc, directory_t *queues);
  *  meantime is not re-added. Invoked from identity_run's main loop each
  *  cadence tick; exposed for unit tests. */
 void identity_retry_sibling_handoffs(process_t *proc);
+
+/** Write group.cfg.json (Python's schema, identity/group_file.h) if the group
+ *  changed since the last write. Called once per identity-loop pass with no
+ *  lock held (RD_14.4 plan, D10). */
+void identity_persist_group_if_dirty(process_t *proc);
+
+/** Take @p g (with its tagged step_dag @p steps, borrowed) as the group this
+ *  node persisted, as identity_run does from group.cfg.json at boot; NULL
+ *  forgets it. Preferred among the histories offered at join, and restored
+ *  before minting when none is usable. Also a test hook. */
+void identity_set_configured_group(const group_t *g, json_t *steps);
 
 /** How many group_key_update frames identity holds while it is not yet in
  *  phase 3 (ISSUES §2.18); past it the oldest is dropped. */
@@ -417,6 +429,25 @@ void identity_set_border_guard_mode(process_t *proc, bool enabled);
  *  border-guards have confirmed the admission. Values < 1 clamp to 1. */
 void identity_set_admission_quorum(process_t *proc, int quorum);
 
+/** Load $AT_JOIN_POLICY into this node's identity state and refuse what it
+ *  cannot honour: a declaration that does not validate, or one naming an
+ *  anchor class no linked extension answers (RD_14.4 plan, D9). Logs an
+ *  ERROR per reason. @return 0, or -1 to refuse the start. */
+int identity_join_policy_check(logger_t *logger);
+
+/** Install @p policy (NULL: inert). Test hook as well as the loader's. */
+void identity_set_join_policy(const at_join_policy_t *policy);
+
+/** The out-of-band anchor classes (AT_ANCHOR_* bits) @p ident holds here and
+ *  the join policy counts: the extensions' answers (id_ext.h anchor_classes)
+ *  intersected with the declared classes; 0 under an inert policy. Mirrors
+ *  Python IdentityProcess.anchor_classes. Takes and releases id_state.lock;
+ *  calls the hooks with no lock held. */
+uint32_t identity_anchor_classes(const process_t *proc, const public_identity_t *ident);
+
+/** Whether the join policy counts @p ident as an anchor. */
+bool identity_is_anchored(const process_t *proc, const public_identity_t *ident);
+
 /** Wipe the entire identity singleton state (histories, peer_potentials,
  *  vote_collection, peer_caps_map, and conformance-only override maps),
  *  resetting choosing_group to false. Preserves synchronous_dispatch so
@@ -610,6 +641,29 @@ DECLARE_ERROR(EID_NOQ, "Required process queue missing");
 /** Stash one full_history payload as handle_receive_history does. The array
  *  takes ownership of @p history. Test hook. */
 void identity_stash_history(json_t *history);
+
+/** As identity_stash_history, naming who offered it (NULL: nobody known), as
+ *  handle_receive_history records the box-decrypted sender (RD_14.4 plan, D1).
+ *  Test hook. */
+void identity_stash_history_from(json_t *history, const public_identity_t *sender);
+
+/** The members marked provisional by an adoption under the join policy
+ *  (RD_14.4 plan, D1 (d)): a new JSON array of uuid strings the caller
+ *  decrefs. Mirrors Python IdentityProcess.provisional_members. */
+json_t *identity_provisional_members(void);
+
+/** Mark this node as having minted its own group when no history came, so a
+ *  history arriving now takes _merge_to_mesh rather than choose_group. Test
+ *  hook (the conformance self_bootstrapped fixture). */
+void identity_set_self_bootstrapped(bool on);
+
+/** Mark choose_group's wait as running, so a history arriving now is only
+ *  stashed for it. Test hook (the conformance choosing fixture). */
+void identity_set_choosing_group(bool on);
+
+/** Its file: <cfg>/provisional_members.cfg.json, a JSON array of uuids, shared
+ *  with Python (PROVISIONAL_FILE). */
+#define ID_PROVISIONAL_FILE "provisional_members"
 
 /** Run choose_group's history adoption over the stashed histories: adopt the
  *  mesh group and its key, and push it to the sibling processes as a GROUP

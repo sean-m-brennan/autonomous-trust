@@ -48,6 +48,7 @@
 #include "config/discover.h"        /* CFG_FILE_EXT */
 #include "reputation/rep_ext.h"   /* extensions' trust seeds */
 #include "reputation/rep_proc_priv.h"
+#include "identity/join_policy.h"
 
 #define EREP_PAXOS 253
 DEFINE_ERROR(EREP_PAXOS, "Paxos consensus error");
@@ -270,6 +271,11 @@ static void _persist_reputations(const process_t *proc);
  * above the persistence block that owns the file. */
 static void _persist_slash_marks(const process_t *proc);
 static void _load_slash_marks(const process_t *proc);
+static bool _mark_catchup_locked(const process_t *proc, const char *key,
+                                 const tx_history_t *hist, int start,
+                                 int drop_from);
+static void _persist_catchup_marks(const process_t *proc);
+static void _load_catchup_marks(const process_t *proc);
 static bool _slash_mark_advance_locked(const char *target_str,
                                        const char *slasher_str,
                                        int64_t epoch);
@@ -816,6 +822,13 @@ static struct {
      * the older majority vote runs instead (mirrors Python's
      * self.num_updates). */
     int num_updates;
+    /* The join policy (RD_14.4 plan, D9), read at start, and under it which
+     * chain entries we hold only because catch-up told us (D2 (b)): a JSON
+     * object, chain key ("" primary) -> array of absolute indices. Persisted
+     * to REP_CATCHUP_MARKS_FILE, never sent. Mirrors Python
+     * ReputationProcess.join_policy / _catchup_marks. */
+    at_join_policy_t join_policy;
+    json_t *catchup_marks;
 } rep_state;
 
 /* Is @p fn a frame that nothing re-sends if it is lost (ISSUES §2.28)?
@@ -3247,6 +3260,7 @@ static void _reconcile_into(const process_t *proc, const char *key, json_t *arr,
     pthread_mutex_lock(&rep_state.lock);
     tx_history_t *hist = _chain_for_key_locked(key);
     int before = tx_history_len(hist);
+    int next_before = hist->next_index;
     /* Never rewrite inside our finalized checkpoint (user decision, ISSUES.md
      * §2.15). Outvoted: a chain reproducing the quorum's checkpoint wins even
      * an equal-length tiebreak (§2.15, mod-2538837). */
@@ -3263,8 +3277,17 @@ static void _reconcile_into(const process_t *proc, const char *key, json_t *arr,
                                 n_cert, &res);
     int after = tx_history_len(hist);
     uuid_t *peers_after = primary ? _chain_peers_locked(&n_after) : NULL;
+    /* What the reconcile added: an adoption's entries from the fork on (ours
+     * from there were dropped), an extension's past our old end. */
+    bool marked = false;
+    if (res.status == TX_RECONCILE_ADOPTED)
+        marked = _mark_catchup_locked(proc, key, hist, res.fork, res.fork);
+    else if (res.status == TX_RECONCILE_EXTENDED)
+        marked = _mark_catchup_locked(proc, key, hist, next_before, -1);
     pthread_mutex_unlock(&rep_state.lock);
     free(cert);
+    if (marked)
+        _persist_catchup_marks(proc);
 
     if (res.status == TX_RECONCILE_ADOPTED)
         log_info(proc->logger,
@@ -8928,6 +8951,178 @@ static void _persist_history(const process_t *proc, const char *chain_key)
     json_decref(doc);
 }
 
+/* Under the join policy, mark the entries a catch-up added to chain @p key
+ * (absolute indices @p start up to the chain's end) that name us in neither
+ * slot: told, not our own evidence (RD_14.4 plan, D2 (b)). Marks from
+ * @p drop_from on are dropped first (an adoption reuses those indices; -1:
+ * none), and marks below the resident window are pruned. Returns whether the
+ * marks changed. Caller holds rep_state.lock. Mirrors Python _mark_catchup. */
+static bool _mark_catchup_locked(const process_t *proc, const char *key,
+                                 const tx_history_t *hist, int start,
+                                 int drop_from)
+{
+    if (!rep_state.join_policy.enabled || hist == NULL || start < 0)
+        return false;
+    uuid_t self_uuid;
+    bool have_self = _resolve_self_uuid(proc, self_uuid);
+    if (rep_state.catchup_marks == NULL)
+        rep_state.catchup_marks = json_object();
+    json_t *old = json_object_get(rep_state.catchup_marks, key);
+    json_t *marks = json_array();
+    size_t i;
+    json_t *v;
+    json_array_foreach(old, i, v)
+    {
+        int idx = (int)json_integer_value(v);
+        if (idx >= hist->first_index && (drop_from < 0 || idx < drop_from)
+            && idx < start)
+            json_array_append_new(marks, json_integer(idx));
+    }
+    for (int idx = start; idx < hist->next_index; idx++)
+    {
+        const transaction_t *tx = tx_history_committed_at(hist, idx);
+        if (tx == NULL || tx->index != idx)
+            continue;
+        bool party = have_self && (uuid_compare(tx->p1_uuid, self_uuid) == 0
+                                   || uuid_compare(tx->p2_uuid, self_uuid) == 0);
+        if (!party && idx >= hist->first_index)
+            json_array_append_new(marks, json_integer(idx));
+    }
+    json_t *none = json_array();
+    bool changed = !json_equal(old != NULL ? old : none, marks);
+    json_decref(none);
+    if (json_array_size(marks) > 0)
+        json_object_set_new(rep_state.catchup_marks, key, marks);
+    else
+    {
+        json_decref(marks);
+        json_object_del(rep_state.catchup_marks, key);
+    }
+    return changed;
+}
+
+bool reputation_is_told(const char *key, int index)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    json_t *marks = json_object_get(rep_state.catchup_marks, key != NULL ? key : "");
+    bool told = false;
+    size_t i;
+    json_t *v;
+    json_array_foreach(marks, i, v)
+        if ((int)json_integer_value(v) == index)
+            told = true;
+    pthread_mutex_unlock(&rep_state.lock);
+    return told;
+}
+
+json_t *reputation_catchup_marks(void)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    json_t *out = rep_state.catchup_marks != NULL
+        ? json_deep_copy(rep_state.catchup_marks) : json_object();
+    pthread_mutex_unlock(&rep_state.lock);
+    return out;
+}
+
+void reputation_set_join_policy(const at_join_policy_t *policy)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    if (policy != NULL)
+        rep_state.join_policy = *policy;
+    else
+        memset(&rep_state.join_policy, 0, sizeof(rep_state.join_policy));
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+static int _catchup_marks_path(char *out, size_t cap)
+{
+    char cfg_dir[CFG_PATH_LEN + 1] = {0};
+    if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) < 0)
+        return -1;
+    int n = snprintf(out, cap, "%s/%s%s", cfg_dir, REP_CATCHUP_MARKS_FILE,
+                     CFG_FILE_EXT);
+    return (n < 0 || (size_t)n >= cap) ? -1 : 0;
+}
+
+/* Write the catch-up marks, indices sorted, write-then-rename, so a restart
+ * does not launder told entries into our own. Swallowed on failure, as the
+ * slash marks are. Mirrors Python _persist_catchup_marks. */
+static void _persist_catchup_marks(const process_t *proc)
+{
+    char path[CFG_PATH_LEN + 64] = {0};
+    if (_catchup_marks_path(path, sizeof(path)) != 0)
+        return;
+    pthread_mutex_lock(&rep_state.lock);
+    json_t *doc = rep_state.catchup_marks != NULL
+        ? json_deep_copy(rep_state.catchup_marks) : json_object();
+    pthread_mutex_unlock(&rep_state.lock);
+    const char *k;
+    json_t *arr;
+    json_object_foreach(doc, k, arr)
+    {
+        size_t n = json_array_size(arr);
+        for (size_t i = 1; i < n; i++)          /* insertion sort */
+            for (size_t j = i; j > 0; j--)
+            {
+                json_int_t a = json_integer_value(json_array_get(arr, j - 1));
+                json_int_t b = json_integer_value(json_array_get(arr, j));
+                if (a <= b)
+                    break;
+                json_array_set_new(arr, j - 1, json_integer(b));
+                json_array_set_new(arr, j, json_integer(a));
+            }
+    }
+    char tmp[sizeof(path) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (doc == NULL || json_dump_file(doc, tmp, JSON_INDENT(2) | JSON_SORT_KEYS) != 0
+        || rename(tmp, path) != 0)
+    {
+        unlink(tmp);
+        log_warn(proc->logger,
+                 "Reputation: could not persist catch-up marks to %s\n", path);
+    }
+    json_decref(doc);
+}
+
+/* Read the catch-up marks. Missing is the cold start; a corrupt file is
+ * reported and left in place, and the marks start empty. Mirrors Python
+ * _load_catchup_marks. */
+static void _load_catchup_marks(const process_t *proc)
+{
+    char path[CFG_PATH_LEN + 64] = {0};
+    if (_catchup_marks_path(path, sizeof(path)) != 0 || access(path, F_OK) != 0)
+        return;
+    json_error_t err;
+    json_t *doc = json_load_file(path, 0, &err);
+    bool ok = json_is_object(doc);
+    const char *k;
+    json_t *arr;
+    json_object_foreach(doc, k, arr)
+    {
+        size_t i;
+        json_t *v;
+        if (!json_is_array(arr))
+            ok = false;
+        json_array_foreach(arr, i, v)
+            if (!json_is_integer(v))
+                ok = false;
+    }
+    if (!ok)
+    {
+        log_error(proc->logger, "Reputation: catch-up marks unreadable (%s); "
+                  "starting from none this boot\n", path);
+        json_decref(doc);
+        return;
+    }
+    pthread_mutex_lock(&rep_state.lock);
+    json_decref(rep_state.catchup_marks);
+    rep_state.catchup_marks = doc;
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
 /* Path of the slash replay-mark file. */
 static int _slash_marks_path(char *out, size_t cap)
 {
@@ -14229,6 +14424,9 @@ void reputation_reset_state(int num_peers)
     map_init(&rep_state.restore_clamped);
     memset(rep_state.parked_cosigns, 0, sizeof(rep_state.parked_cosigns));
     rep_state.num_updates = REP_CATCHUP_QUORUM;
+    memset(&rep_state.join_policy, 0, sizeof(rep_state.join_policy));
+    json_decref(rep_state.catchup_marks);
+    rep_state.catchup_marks = NULL;
     rep_state.num_peers = num_peers;
     paxos_init(&rep_state.paxos, num_peers, NULL);
     rep_state.synchronous_dispatch = was_sync;
@@ -15083,6 +15281,15 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
     /* Slash replay marks, before the loop can handle a slash_final. Also
      * resumes our own slash epoch, so it must precede the first origination. */
     _load_slash_marks(proc);
+    /* The join policy identity validated at start (identity_run refuses a bad
+     * one), and the marks it keeps. */
+    {
+        at_join_policy_t policy;
+        char jerr[256];
+        if (at_join_policy_load_env(&policy, jerr, sizeof(jerr)))
+            reputation_set_join_policy(&policy);
+        _load_catchup_marks(proc);
+    }
 
     while (keep_running(proc, &ctx.sig_q, logger))
     {

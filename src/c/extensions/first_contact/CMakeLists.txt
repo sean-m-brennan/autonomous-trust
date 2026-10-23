@@ -47,6 +47,7 @@ at_extension_library(first_contact
 )
 
 at_extension_tests(first_contact
+    first_contact_anchor_test
     contacts_device_test
     contacts_sync_test
     contacts_backup_test

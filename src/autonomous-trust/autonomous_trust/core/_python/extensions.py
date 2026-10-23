@@ -100,7 +100,15 @@ class IdentityHooks:
     recorded as a contact (first contact). Duplicate detection lets such a peer,
     presenting the keys it is known by, be voted on like any newcomer, which is
     the one route by which a contact joins the cohort. None is a node with no
-    contacts."""
+    contacts.
+
+    ``anchor_classes(proc, ident)`` says which out-of-band anchor classes
+    (``identity.join_policy.ANCHOR_CLASSES``) the public identity ``ident``
+    holds here, as an iterable of class names: first contact for contacts and
+    siblings, ZTA for credentials and the operator key. It must match on keys,
+    not on the uuid alone, since a uuid is public. The core intersects the
+    answers with the join policy's declared classes (RD_14.4 plan, Phase 2);
+    None anchors nobody."""
     on_start: Optional[Callable[[Any, Any], None]] = None
     on_peer_confirmed: Optional[Callable[[Any, Any, Any], None]] = None
     periodic_resync: Optional[Callable[[Any, Any], None]] = None
@@ -112,6 +120,7 @@ class IdentityHooks:
     credential_anchored: Optional[Callable[[Any, dict], bool]] = None
     on_tick: Optional[Callable[[Any, Any, Any], None]] = None
     is_contact: Optional[Callable[[Any, str], bool]] = None
+    anchor_classes: Optional[Callable[[Any, Any], Any]] = None
 
 
 @dataclass(frozen=True)

@@ -139,6 +139,10 @@ typedef struct {
     int     fork_index;
     char    fork_both[SCE_MAX_PARTICIPANTS][UUID_STRING_LEN + 1];
     int     fork_both_n;
+    /* Primary-chain indices marked told by catch-up under the join policy
+     * (RD_14.4 plan, D2 (b)). */
+    int     told[64];
+    int     told_n;
 } rp_snap_t;
 static rp_snap_t g_snaps[SCE_MAX_PARTICIPANTS];
 
@@ -712,6 +716,20 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
      * witness for each other (ISSUES §2.54). Scenario-level: every node holds
      * the same set, as every node holding one verified team roster does.
      * Mirrors the Python adapter's preset_attest_conflicts. */
+    /* join_policy: the declaration's own JSON (RD_14.4 plan, Phase 3), as the
+     * identity adapter installs it; reputation marks catch-up under it.
+     * reputation_reset_state above cleared the last one. */
+    json_t *jp = json_object_get(g_fixtures, "join_policy");
+    if (jp != NULL)
+    {
+        char *text = json_dumps(jp, JSON_COMPACT);
+        at_join_policy_t policy;
+        char perr[256] = {0};
+        if (text != NULL && at_join_policy_parse(text, &policy, perr, sizeof(perr)))
+            reputation_set_join_policy(&policy);
+        free(text);
+    }
+
     json_t *acs = json_object_get(g_fixtures, "attest_conflicts");
     if (json_is_array(acs))
     {
@@ -2537,6 +2555,15 @@ static int _dispatch(sce_run_ctx_t *ctx,
                              "%s", json_string_value(bv));
         }
         json_decref(forks);
+        json_t *marks = reputation_catchup_marks();
+        json_t *told = json_object_get(marks, "");
+        s->told_n = 0;
+        size_t ti;
+        json_t *tv;
+        json_array_foreach(told, ti, tv)
+            if (s->told_n < 64)
+                s->told[s->told_n++] = (int)json_integer_value(tv);
+        json_decref(marks);
         /* Record this dispatcher's view of every other participant's
          * reputation, so `expected_state[pid].reputation_of[other]`
          * can be checked after the next step resets rep_state. */
@@ -2769,6 +2796,30 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: checkpoint_root=%s, expected %s",
                              pid, snap->checkpoint_root, want ? want : "(null)");
+                    return -1;
+                }
+            }
+            else if (strcmp(key, "catchup_told") == 0)
+            {
+                /* [index, ...], order-free: the primary-chain entries marked
+                 * told by catch-up under the join policy (RD_14.4 plan,
+                 * D2 (b)). Mirrors the Python adapter. */
+                bool ok = json_is_array(val) && (int)json_array_size(val) == snap->told_n;
+                size_t wi;
+                json_t *wv;
+                json_array_foreach(val, wi, wv)
+                {
+                    bool found = false;
+                    for (int ri = 0; ri < snap->told_n; ri++)
+                        found = found || snap->told[ri] == (int)json_integer_value(wv);
+                    ok = ok && found;
+                }
+                if (!ok)
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: catchup_told has %d entr%s, expected %zu",
+                             pid, snap->told_n, snap->told_n == 1 ? "y" : "ies",
+                             json_array_size(val));
                     return -1;
                 }
             }

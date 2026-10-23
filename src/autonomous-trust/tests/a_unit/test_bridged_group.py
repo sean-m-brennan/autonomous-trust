@@ -29,6 +29,7 @@ from unittest.mock import MagicMock
 from autonomous_trust.core.identity import Group, Identity
 from autonomous_trust.core.identity.idprocess import IdentityProcess
 from autonomous_trust.core.identity.protocol import IdentityProtocol
+from autonomous_trust.core._python.identity.join_policy import INERT
 from autonomous_trust.core.system import CfgIds
 
 
@@ -50,6 +51,9 @@ def _node(me, peers):
     by_uuid = {str(p.uuid): p for p in peers}
     node.peers = SimpleNamespace(find_by_uuid=lambda u: by_uuid.get(str(u).lower()))
     node._history_payload = lambda: 'history'
+    node.join_policy = INERT
+    node.history_senders = []
+    node.provisional_members = set()
     return node
 
 

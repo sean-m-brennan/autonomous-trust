@@ -276,3 +276,12 @@ bool identity_ext_is_contact(const process_t *proc, const char *uuid_str)
             return true;
     return false;
 }
+
+uint32_t identity_ext_anchor_classes(const process_t *proc, const public_identity_t *ident)
+{
+    uint32_t found = 0;
+    for (size_t i = 0; i < _exts_len; i++)
+        if (_exts[i]->anchor_classes != NULL)
+            found |= _exts[i]->anchor_classes(proc, ident);
+    return found;
+}

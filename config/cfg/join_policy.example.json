@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "note": "The join policy (R+D.md §14.4, RD_14.4_HOSTILE_JOIN_PLAN.md). Named by $AT_JOIN_POLICY; absent is inert, and a file that does not validate stops the node at start. `anchors` chooses which out-of-band evidence makes an identity one this node trusts before the cohort it joins tells it anything: verified_contact (a first-contact contact whose safety number was compared, or a device its operator vouched for), zta (a credential chaining to one of our trust anchors and bound to the identity), operator (a node under THIS node's operator key: a verified operator-key binding, or a sibling device). unverified_contact is also accepted and deliberately left out here: a forwarded invitation link is enough to hold one. A class needs its extension (first_contact for contacts, zta for credentials, either for operator) or the node refuses to start.",
+  "enabled": true,
+  "anchors": ["verified_contact", "zta", "operator"]
+}

@@ -1,0 +1,72 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: choose-group-adopts-welcomer
+byte_pinning: false
+description: |
+    The join selection (RD_14.4_HOSTILE_JOIN_PLAN.md Phase 1, D10). bg admits
+    the newcomer as in new-node-admission, then the newcomer's choose_group
+    wait ends (trigger_choose_group stands in for its timer) and it adopts
+    from the one history it holds.
+
+    What it adopts is bg's group AFTER the admission rotated its key, so the
+    newcomer holds bg's uuid: the group cohort traffic will use from here on.
+
+    The two runtimes reach the adoption at different steps. Python's
+    receive_history starts choose_group itself when no choice is running, and
+    the harness runs it inline, so Python adopts on delivery (step 3) and the
+    trigger repeats it harmlessly; C chooses only from identity_run's phase-2
+    wait, which the trigger stands in for (step 4). Without step 4, C keeps no
+    group and the case fails there.
+
+    Steps are not compared. Python's bg hands over the steps its admission
+    recorded; C's harness rebuilds full_history with none, and C's identity
+    DAG records no admission steps of its own in any case. So whether a
+    history_diff follows differs by runtime, and nothing here asserts it.
+    The zero-step rule and the empty-diff guard are pinned by the unit tests
+    (test_choose_group.py, group_adopt_test.c).
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  groups:
+    bg:
+      uuid: "c0000000-0000-4000-8000-0000000000c1"
+      size: 1
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+
+  - id: 2
+    from: bg
+    to: newcomer
+    function: access_granted
+    in_response_to: 1
+
+  - id: 3
+    from: bg
+    to: newcomer
+    function: full_history
+    in_response_to: 1
+    description: |
+        Delivered: the newcomer stashes it for choose_group.
+
+  - id: 4
+    from: newcomer
+    to: newcomer
+    function: trigger_choose_group
+    description: |
+        The wait ends; the newcomer adopts bg's group and key.
+
+expected_state:
+  bg:
+    phase: 3
+  newcomer:
+    group_uuid: "c0000000-0000-4000-8000-0000000000c1"

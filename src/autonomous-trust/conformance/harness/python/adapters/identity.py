@@ -117,6 +117,11 @@ _TRIGGER_SUBTREE_ROSTER = 'trigger_subtree_roster'
 # asserted. Mirrors the C adapter's trigger_hierarchy.
 _TRIGGER_HIERARCHY = 'trigger_hierarchy'
 
+# Pseudo-function: end choose_group's wait now and adopt from the histories
+# stashed so far (RD_14.4 plan, Phase 1); the wait itself is a timer. Mirrors
+# the C adapter's trigger_choose_group.
+_TRIGGER_CHOOSE_GROUP = 'trigger_choose_group'
+
 # Pseudo-function: solicit membership in a cohort this participant is NOT in (runtime
 # cross-group join, doc/architecture/gateway-reputation-tree.md). The step's payload
 # names the target cohort (`group_uuid`), which the scenario pins via fixtures.groups so
@@ -723,6 +728,17 @@ class _Participant:
                         f'{self.id}: provisional_peer_count={actual}, '
                         f'expected {int(expected)}'
                     )
+            elif key == 'join_provisional_count':
+                # Members this participant marked provisional when it adopted
+                # a history under the join policy: introduced by the cohort,
+                # not anchored, not already held (RD_14.4 plan, D1 (d)). Not
+                # the admission hold above. C mirrors via
+                # identity_provisional_members.
+                actual = len(getattr(self.process, 'provisional_members', set()))
+                if actual != int(expected):
+                    raise AssertionError(
+                        f'{self.id}: join_provisional_count={actual}, '
+                        f'expected {int(expected)}')
             elif key == 'subtree_roster':
                 # The flattened membership roll of this gateway's cohort subtree
                 # (trigger_subtree_roster), as sorted participant ids — each
@@ -734,6 +750,18 @@ class _Participant:
                 if actual != want:
                     raise AssertionError(
                         f'{self.id}: subtree_roster={actual}, expected {want}')
+            elif key == 'anchors':
+                # The join-policy anchor classes this participant counts for
+                # each named participant's PUBLISHED identity, as
+                # {participant_id: [class, ...]}, order-free (RD_14.4 plan,
+                # Phase 2). C mirrors via identity_anchor_classes.
+                for pid, want in (expected or {}).items():
+                    self._uuid_for_pid(pid)
+                    target = self.peers_by_pid[pid].identity.publish()
+                    got = sorted(self.process.anchor_classes(target))
+                    if got != sorted(want or []):
+                        raise AssertionError(
+                            f'{self.id}: anchors[{pid}]={got}, expected {sorted(want or [])}')
             elif key == 'hierarchy_of':
                 # What this participant RECORDED from a peer's hierarchy claim
                 # (protocol step 7), as {participant_id: {rank, children}}.
@@ -936,7 +964,8 @@ def _uuid_of(ident) -> bytes:
 
 
 def _scenario_operator_binding(corpus_root: Path, ident: Identity,
-                               variant: str) -> tuple[bytes, bytes]:
+                               variant: str, key_of: Identity | None = None
+                               ) -> tuple[bytes, bytes]:
     """Mint an (operator_pubkey, binding) pair for a scenario participant.
 
     The operator key is derived deterministically from the participant's uuid
@@ -959,8 +988,10 @@ def _scenario_operator_binding(corpus_root: Path, ident: Identity,
     # Deterministic 32-byte "operator key": the uuid, domain-separated. Not a
     # real ed25519 secret — nothing in this path signs with it, and AT only ever
     # verifies the BINDING over it.
+    # ``key_of`` (variant ``valid:<pid>``) derives it from ANOTHER
+    # participant's uuid instead: two nodes under one operator.
     op_pub = hashlib.sha256(b'conformance-operator-key:'
-                            + _uuid_of(ident)).digest()
+                            + _uuid_of(key_of if key_of is not None else ident)).digest()
 
     bind_to = ident
     if variant == 'other-identity':
@@ -1370,6 +1401,8 @@ class IdentityAdapter:
         #   forged          signed by an unrelated key (impostor_leaf.key)
         #   other-identity  correctly signed, but over a pre-image naming a
         #                   DIFFERENT node — the harvested-credential case
+        #   valid:<pid>     as valid, under the operator key <pid> has: two
+        #                   nodes under one operator (RD_14.4 plan, Phase 2)
         #
         # A participant absent from the map advertises nothing, which is the
         # ordinary opted-out node and must stay indistinguishable from one built
@@ -1379,8 +1412,13 @@ class IdentityAdapter:
             if pid not in identities:
                 continue
             ident = identities[pid]
+            variant, _, key_pid = str(variant).partition(':')
+            if key_pid and key_pid not in identities:
+                raise AssertionError(
+                    f'fixtures.operator_bindings[{pid}] names unknown participant {key_pid!r}')
             op_pub, binding = _scenario_operator_binding(
-                self.corpus_root, ident, str(variant))
+                self.corpus_root, ident, variant,
+                key_of=identities[key_pid] if key_pid else None)
             ident.operator_pubkey = op_pub
             ident.operator_key_binding = binding
 
@@ -1589,6 +1627,35 @@ class IdentityAdapter:
         peers_by_pid = {pid: h.impl for pid, h in handles.items()}
         for h in handles.values():
             h.impl.peers_by_pid = peers_by_pid
+        # join_policy fixture: the declaration's own JSON, installed on every
+        # participant (RD_14.4 plan, Phase 2). Mirrors the C adapter, which
+        # holds one per node and so one per scenario.
+        jp_fix = (case.data.get('fixtures') or {}).get('join_policy')
+        if jp_fix is not None:
+            from autonomous_trust.core._python.identity.join_policy import parse_join_policy
+            policy = parse_join_policy(jp_fix)
+            for h in handles.values():
+                h.impl.process.join_policy = policy
+        # self_bootstrapped fixture: [pid, ...] that minted a group of their own
+        # when no history came, so a history arriving now takes the merge path
+        # (_merge_to_mesh) rather than choose_group. Mirrors the C adapter's
+        # identity_set_self_bootstrapped.
+        for pid in (case.data.get('fixtures') or {}).get('self_bootstrapped') or []:
+            h = handles.get(pid)
+            if h is None:
+                raise AssertionError(f'self_bootstrapped names unknown participant {pid!r}')
+            h.impl.process.self_bootstrapped = True
+        # choosing fixture: [pid, ...] whose choose_group wait is running, so
+        # every history delivered is stashed for it and the adoption happens
+        # at trigger_choose_group, as in a real wait that several histories
+        # reach. Without it the harness runs choose_group on the first
+        # delivery and the later ones meet a group already chosen. Mirrors the
+        # C adapter's identity_set_choosing_group.
+        for pid in (case.data.get('fixtures') or {}).get('choosing') or []:
+            h = handles.get(pid)
+            if h is None:
+                raise AssertionError(f'choosing names unknown participant {pid!r}')
+            h.impl.process.choosing = True
         # ranks fixture: {pid: int} — the topology rank each participant HAS,
         # applied both to its own identity and to every other node's view of it.
         # Rank is what the hierarchy derivation reads (protocol step 7), so a
@@ -1735,6 +1802,9 @@ class IdentityAdapter:
         grp = Group(group_uuid, {identity.uuid: identity.address},
                     f'grp-{pid}', enc, public_only,
                     _key_epoch=int(spec.get('key_epoch', 0)),
+                    # `created`: the group's claimed age, which _merge_to_mesh's
+                    # tiebreak reads (RD_14.4 plan, Phase 3). 0 = unknown.
+                    _created=float(spec.get('created', 0.0)),
                     _wire_format=spec.get('wire_format'))
         _FIXTURE_GROUP_PUB[pid] = enc.publish()
         ns = UUID('00000000-0000-0000-0000-000000000aaa')
@@ -1968,6 +2038,9 @@ class IdentityAdapter:
             if inbound.obj:
                 target = str(from_json_string(inbound.obj).get('group_uuid', ''))
             participant.process.request_cohort_join(participant.queues, target)
+            return participant.drain_outbox()
+        if inbound.function == _TRIGGER_CHOOSE_GROUP:
+            participant.process._adopt_from_histories(participant.queues)
             return participant.drain_outbox()
         if inbound.function == _TRIGGER_HIERARCHY:
             participant.process._refresh_hierarchy(participant.queues)
@@ -2552,7 +2625,7 @@ class IdentityAdapter:
 
         if function in (_TRIGGER_CAPS_RESYNC, _TRIGGER_SUBTREE_ROSTER,
                         _TRIGGER_ATTEST_PULL, _TRIGGER_ATTEST_REPLAY,
-                        _TRIGGER_HIERARCHY):
+                        _TRIGGER_HIERARCHY, _TRIGGER_CHOOSE_GROUP):
             # Pseudo-function: no wire payload; _dispatch invokes the sweep /
             # roster enumeration directly instead of a handler.
             obj = ''
