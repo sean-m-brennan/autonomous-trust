@@ -214,7 +214,8 @@ static void _round(cohort_t *c, uuid_t task, char *task_str)
     uuid_generate(task);
     uuid_unparse_lower(task, task_str);
     uuid_t subject;
-    uuid_clear(subject);
+    /* Our half names whom it scores (R+D.md §14.2). */
+    uuid_copy(subject, c->alice->uuid);
     _forward_transaction(c->proc, task, c->me->uuid, 0.9, "agora-post",
                          NULL, subject, 0.0);
     identity_t *voters[2] = { c->alice, c->bob };

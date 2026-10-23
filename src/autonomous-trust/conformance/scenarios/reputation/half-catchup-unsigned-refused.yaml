@@ -1,0 +1,40 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: half-catchup-unsigned-refused
+byte_pinning: false
+description: |
+    Signed halves (R+D.md §14.2; doc/architecture/reputation.md, "Signed
+    halves"). A commit certificate is the acceptors' word that a round ran; a
+    half also carries its scorer's own signature over AT-HALF, which names the
+    counterparty, and two halves pair only when each names the other.
+
+    The second entry is certified, but neither scorer signed its half. Catch-up
+    refuses the whole segment: a certificate is the majority's word, never the
+    scorer's.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: proposer
+  - id: dave
+    role: member
+
+fixtures: {}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: latest update
+    payload:
+      chain:
+        - {task: a, p1: 0.9, p2: 0.8, p1_id: alice, p2_id: carol, certified_by: [alice, carol, dave]}
+        - {task: b, p1: 0.7, p2: 0.6, p1_id: alice, p2_id: carol, certified_by: [alice, carol, dave], unsigned: true}
+
+expected_state:
+  bob:
+    committed_tx_count: 0

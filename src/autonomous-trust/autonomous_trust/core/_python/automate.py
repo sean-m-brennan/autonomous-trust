@@ -1344,9 +1344,14 @@ class AutonomousTrust(Protocol):
                     # Under the pair task id (ISSUES §2.50): pairs only with
                     # the requestor's half about THIS executor.
                     me = getattr(self.identity, 'uuid', None)
+                    # It names the requestor, whose half names us back: two
+                    # halves pair only when each names the other (R+D.md
+                    # §14.2).
                     tx = TransactionScore(
                         pair_task_id(tr.uuid, me) if me is not None else tr.uuid,
-                        0.9, capability_name=cap_name)
+                        0.9, capability_name=cap_name,
+                        subject_uuid=getattr(getattr(orig_task, 'requestor',
+                                                     None), 'uuid', None))
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
                 except KeyboardInterrupt:
                     pass

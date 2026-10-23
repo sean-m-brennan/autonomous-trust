@@ -48,6 +48,7 @@
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "network/net_message.h"
+#include "reputation/reputation.h"   /* tx_pair_task_uuid */
 #include "utilities/send_retry.h"   /* at_send: keep a refused frame */
 
 /* Protocol selectors (declared extern in the header) — writable arrays so they
@@ -289,7 +290,12 @@ void data_source_set_readings(const char *readings_json, size_t len)
  * participant.py's sender-side TS. Submitted at most once per unique batch, on
  * the same _ts_keep-decimated subset the coordinator uses. No-op for synthetic
  * batches (build_synthetic_readings emits no task_id). The reputation process
- * resolves the proposer (this node's own identity) and starts the Paxos round. */
+ * resolves the proposer (this node's own identity) and starts the Paxos round.
+ *
+ * One half per subscriber, naming it, under the batch's pair id with it
+ * (tx_pair_task_uuid(task_id, subscriber)), which is the id that coordinator's
+ * verdict half, naming us, carries: two halves pair only when each names the
+ * other (R+D.md §14.2). */
 static void _maybe_submit_producer_score(const process_t *proc, json_t *arr)
 {
     char task_id[UUID_STRING_LEN + 1];
@@ -314,21 +320,33 @@ static void _maybe_submit_producer_score(const process_t *proc, json_t *arr)
         return;
     }
 
-    generic_msg_t msg = {0};
-    msg.type = TRANSACTION_SCORE;
-    msg.size = sizeof(tx_score_msg_t);
-    uuid_copy(msg.info.tx_score.task_uuid, task_uuid);
-    /* peer_uuid left zero: reputation is the proposer and fills in this node's
-     * own identity (it owns the producer half of the bilateral transaction). */
-    msg.info.tx_score.score = 0.9;
-    snprintf(msg.info.tx_score.capability_name,
-             sizeof(msg.info.tx_score.capability_name), "dod.sensor-report");
-    /* last_ts_task is set before this, so a lost score is never sent again:
-     * kept on a full queue instead (ISSUES §2.14). */
-    (void)at_send(proc, "reputation", &msg, "a producer score", "reputation",
-                  0, NULL, NULL, 0);
+    uuid_t subs[DS_MAX_SUBS];
+    size_t n_subs = 0;
+    pthread_mutex_lock(&ds_state.lock);
+    for (size_t i = 0; i < DS_MAX_SUBS; i++)
+        if (ds_state.subs[i].used)
+            uuid_copy(subs[n_subs++], ds_state.subs[i].ident.uuid);
+    pthread_mutex_unlock(&ds_state.lock);
+    for (size_t i = 0; i < n_subs; i++) {
+        generic_msg_t msg = {0};
+        msg.type = TRANSACTION_SCORE;
+        msg.size = sizeof(tx_score_msg_t);
+        tx_pair_task_uuid(task_uuid, subs[i], msg.info.tx_score.task_uuid);
+        /* peer_uuid is the SUBJECT, the subscriber this half names; the
+         * reputation process fills in this node's own identity as the
+         * proposer (it owns the producer half of the bilateral transaction). */
+        uuid_copy(msg.info.tx_score.peer_uuid, subs[i]);
+        msg.info.tx_score.score = 0.9;
+        snprintf(msg.info.tx_score.capability_name,
+                 sizeof(msg.info.tx_score.capability_name), "dod.sensor-report");
+        /* last_ts_task is set before this, so a lost score is never sent
+         * again: kept on a full queue instead (ISSUES §2.14). */
+        (void)at_send(proc, "reputation", &msg, "a producer score", "reputation",
+                      0, NULL, NULL, 0);
+    }
     log_debug(proc->logger,
-              "data-source: submitted producer score 0.9 for batch %s\n", task_id);
+              "data-source: submitted producer score 0.9 for batch %s to %zu "
+              "subscriber(s)\n", task_id, n_subs);
 }
 
 /* Stream the current reading batch to every subscriber as a per-peer-encrypted
