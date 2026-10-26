@@ -955,6 +955,44 @@ class TestIdentityResync:
                                       self._id_response(member, signer=other))
         assert proc.peers.find_by_uuid(member.uuid) is None
 
+    def test_response_backfills_member_seeded_at_placeholder_address(self):
+        """The cohort seeder writes a hostname placeholder (here 'captain') into
+        the shared group map, while the member advertises its runtime IP. The
+        member is known by UUID, so its signed identity is backfilled and the
+        group entry is refreshed to the verified address."""
+        me = _new_identity('coord', '10.0.0.3')
+        member = _new_identity('captain', '10.0.0.10')
+        grp = Group.initialize({str(me.uuid): me.address,
+                                str(member.uuid): 'captain'}, 'coord-grp')
+        proc = _build_process(me, grp, Peers())
+        proc._record_peers = MagicMock()
+        proc._record_group = MagicMock()
+
+        proc.handle_identity_response(_build_queues(), self._id_response(member))
+
+        assert proc.peers.find_by_uuid(member.uuid) is not None
+        assert '10.0.0.10' in list(proc.group.addresses)
+        assert 'captain' not in list(proc.group.addresses)
+        proc._record_group.assert_called()
+
+    def test_response_rejects_unknown_uuid_at_unknown_address(self):
+        """UUID membership does not open the door to strangers: an identity
+        whose UUID is not a member and whose address is not in the group is
+        still refused."""
+        me = _new_identity('coord', '10.0.0.3')
+        member = _new_identity('captain', '10.0.0.10')
+        grp = Group.initialize({str(me.uuid): me.address,
+                                str(member.uuid): 'captain'}, 'coord-grp')
+        stranger = _new_identity('stranger', '10.0.0.99')
+        proc = _build_process(me, grp, Peers())
+        proc._record_peers = MagicMock()
+
+        proc.handle_identity_response(_build_queues(),
+                                      self._id_response(stranger))
+
+        assert proc.peers.find_by_uuid(stranger.uuid) is None
+        proc._record_peers.assert_not_called()
+
     def test_response_rejects_non_group_address(self):
         me = _new_identity('coord', '10.0.0.3')
         grp = _group_of_size(me, [])  # group is just us

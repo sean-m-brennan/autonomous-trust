@@ -1106,6 +1106,15 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
                        const uuid_t peer_uuid,
                        const map_t *task_weights);
 
+/** For a transaction between @p self_uuid and @p peer_uuid: the score this
+ *  node gave the peer and the score the peer gave this node, each read
+ *  through transaction_score_about. False for any other transaction. Mirrors
+ *  repprocess.py bilateral_scores. */
+bool reputation_bilateral_scores(const transaction_t *tx,
+                                 const uuid_t self_uuid,
+                                 const uuid_t peer_uuid,
+                                 double *ours_of_peer, double *peers_of_us);
+
 /*@
   requires \valid(hist);
   requires \valid(reps);
@@ -1114,6 +1123,22 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
 */
 double reputation_contrite_tft(const tx_history_t *hist, const reputations_t *reps,
                                const uuid_t self_uuid, const uuid_t peer_uuid);
+
+/** reputation_contrite_tft, with the cold-start prior skipping the chain
+ *  indices in @p told (the entries catch-up marked under the join policy,
+ *  RD_14.4 D4 (b)); NULL/0 skips none. */
+double reputation_contrite_tft_told(const tx_history_t *hist,
+                                    const reputations_t *reps,
+                                    const uuid_t self_uuid,
+                                    const uuid_t peer_uuid,
+                                    const int64_t *told, size_t n_told);
+
+/** Contrite tit-for-tat's blend: @p peer_last the last score this node gave
+ *  the peer, @p peer_standing the mean of them, @p my_standing the mean the
+ *  peer gave this node. Shared by the told and brought scores (RD_14.4
+ *  Phase 4). Mirrors repprocess.py contrite_tft_of. */
+double reputation_ctft_blend(double peer_last, double peer_standing,
+                             double my_standing);
 
 /*@
   requires \valid(hist);

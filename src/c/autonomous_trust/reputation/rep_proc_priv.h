@@ -445,6 +445,27 @@ void reputation_install_coop_mode(const uuid_t peer_uuid, bool in_coop);
  *  -1 if uninitialized or @p peer_uuid is absent. */
 int reputation_get_peer_reputation(const uuid_t peer_uuid, double *out);
 
+/** The brought score (RD_14.4 Phase 4) of @p peer_uuid: 0 and @p out, or -1
+ *  when this node holds none. */
+int reputation_get_brought(const uuid_t peer_uuid, double *out);
+
+/** What a decision about @p peer_uuid reads (bounded): 0 and @p out, or -1
+ *  when no told score is held. */
+int reputation_get_bounded(const uuid_t peer_uuid, double *out);
+
+/** Record identity's judgement that @p peer_uuid is (or is no longer) an
+ *  anchor, as a PEER_ANCHOR message does. Reset by reputation_reset_state. */
+void reputation_set_anchored(const uuid_t peer_uuid, bool anchored);
+
+/** Replace the primary chain's catch-up marks with @p indices (conformance). */
+void reputation_install_catchup_told(const int64_t *indices, size_t n);
+
+/** Offer one extension seed for @p who, as a provider would (FIRST_CONTACT
+ *  §10.5; under the join policy, RD_14.4 Phase 4). @p label names the
+ *  provider in the log. */
+void reputation_offer_seed(const process_t *proc, const char *label,
+                           const uuid_t who, double seed, const char *what);
+
 /** Deliver one peer standing exactly as the process loop would
  * (doc/architecture/zta-integration.md), so a test or conformance step can exercise the
  * DDIL cap and the retroactive unwind without standing up the identity process.

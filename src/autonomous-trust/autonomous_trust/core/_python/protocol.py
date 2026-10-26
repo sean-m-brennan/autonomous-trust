@@ -22,6 +22,7 @@ import icontract
 from .system import CfgIds, QueueType
 from .util import ClassEnumMeta
 from .identity import Group, ChildGroupSet, Peers, PeerStanding
+from .identity.join_policy import AnchoredSet
 from .identity.peer_standing import standing_source_valid
 from .network import Message
 from .network.presence import PeerPresence
@@ -50,6 +51,10 @@ class Protocol(object, metaclass=ClassEnumMeta):
         # stay on every roster and in every quorum; negotiation stops inviting
         # them.
         self.absent_peers = set()
+        # Peer uuids (str) the join policy counts as anchors, from
+        # IdentityProcess (AnchoredSet, RD_14.4 Phase 4). Empty while the
+        # policy is off.
+        self.anchored = frozenset()
         if configurations is not None:
             if CfgIds.peers in configurations:
                 self.peers = configurations[CfgIds.peers]
@@ -89,6 +94,9 @@ class Protocol(object, metaclass=ClassEnumMeta):
             return True
         if isinstance(message, ChildGroupSet):
             self.child_groups = message.groups
+            return True
+        if isinstance(message, AnchoredSet):
+            self.anchored = message.uuids
             return True
         if isinstance(message, PeerStanding):
             # Last writer wins WITHIN ONE AUTHORITY, deliberately: findings

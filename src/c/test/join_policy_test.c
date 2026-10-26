@@ -65,6 +65,36 @@ DEFINE_TEST(test_the_example_lists_the_recommended_three)
     ck_assert(p.enabled);
     ck_assert_uint_eq(p.anchors,
                       AT_ANCHOR_VERIFIED_CONTACT | AT_ANCHOR_ZTA | AT_ANCHOR_OPERATOR);
+    ck_assert_int_eq(p.told_tier, 1);
+    ck_assert_int_eq(p.own_evidence_min, 3);
+}
+END_TEST_DEFINITION()
+
+/* Phase 4's bounds: tier 1 and three own entries unless declared, and the
+ * same refusals as the Python suite. */
+DEFINE_TEST(test_the_phase_four_bounds)
+{
+    at_join_policy_t p;
+    char err[256] = {0};
+    ck_assert(at_join_policy_parse("{\"version\": 1}", &p, err, sizeof(err)));
+    ck_assert_int_eq(p.told_tier, AT_JOIN_TOLD_TIER_DEFAULT);
+    ck_assert_int_eq(p.own_evidence_min, AT_JOIN_OWN_EVIDENCE_MIN_DEFAULT);
+    ck_assert(at_join_policy_parse(
+        "{\"version\": 1, \"told_tier\": 0, \"own_evidence_min\": 7}",
+        &p, err, sizeof(err)));
+    ck_assert_int_eq(p.told_tier, 0);
+    ck_assert_int_eq(p.own_evidence_min, 7);
+    ck_assert(!_parses("{\"version\": 1, \"told_tier\": 5}"));
+    ck_assert(!_parses("{\"version\": 1, \"told_tier\": -1}"));
+    ck_assert(!_parses("{\"version\": 1, \"told_tier\": 1.5}"));
+    ck_assert(!_parses("{\"version\": 1, \"told_tier\": true}"));
+    ck_assert(!_parses("{\"version\": 1, \"own_evidence_min\": 0}"));
+    ck_assert(!_parses("{\"version\": 1, \"own_evidence_min\": \"3\"}"));
+    /* A refused declaration leaves the inert policy, defaults included. */
+    ck_assert(!at_join_policy_parse("{\"version\": 1, \"told_tier\": 9}", &p,
+                                    err, sizeof(err)));
+    ck_assert(!p.enabled);
+    ck_assert_int_eq(p.told_tier, AT_JOIN_TOLD_TIER_DEFAULT);
 }
 END_TEST_DEFINITION()
 
@@ -172,6 +202,7 @@ END_TEST_DEFINITION()
 RUN_TESTS(JoinPolicy,
           test_absent_is_inert,
           test_the_example_lists_the_recommended_three,
+          test_the_phase_four_bounds,
           test_malformed_is_refused,
           test_a_missing_or_malformed_file_refuses_the_start,
           test_a_class_no_extension_answers_refuses_the_start,

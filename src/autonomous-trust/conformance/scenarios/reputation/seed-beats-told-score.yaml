@@ -1,0 +1,68 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: seed-beats-told-score
+byte_pinning: false
+description: |
+    Under the join policy a told-only score no longer blocks a verified
+    contact's seed (RD_14.4_HOSTILE_JOIN_PLAN.md Phase 4, amending
+    FIRST_CONTACT_PLAN.md §10.5). bob holds 0.4 for subject and for earned.
+    bob has no evidence of his own about subject, so its 0.4 is what the
+    cohort told him; earned's rests on three transactions of bob's own.
+
+    A seed of 0.3 for each (as first contact offers for a verified contact)
+    replaces subject's told score and becomes its brought score; earned's
+    told score stands, since a seed never overrides an earned one. Without
+    the policy both told scores would stand. Pinned at install: the step
+    scores an unrelated peer.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: oracle
+  - id: subject
+    role: subject
+  - id: earned
+    role: member
+  - id: other
+    role: member
+
+fixtures:
+  join_policy:
+    version: 1
+    enabled: true
+    anchors: [verified_contact]
+  tx_history:
+    bob:
+      - {task_id: t-e1, p1: bob, p1_score: 0.4, p2: earned, p2_score: 0.9}
+      - {task_id: t-e2, p1: bob, p1_score: 0.4, p2: earned, p2_score: 0.9}
+      - {task_id: t-e3, p1: bob, p1_score: 0.4, p2: earned, p2_score: 0.9}
+  reputations:
+    bob:
+      subject: 0.4
+      earned: 0.4
+  seeds:
+    bob:
+      subject: 0.3
+      earned: 0.3
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: request reputation
+    payload:
+      target: other
+      proc: negotiation
+    description: |
+        bob scores other, about whom nothing is known.
+
+expected_state:
+  bob:
+    reputation_of:
+      subject: 0.3
+      earned: 0.4
+      other: 0.2
+    brought_of:
+      subject: 0.3

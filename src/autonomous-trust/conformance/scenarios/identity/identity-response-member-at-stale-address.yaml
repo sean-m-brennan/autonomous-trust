@@ -1,0 +1,48 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: identity-response-member-at-stale-address
+byte_pinning: false
+description: |
+    Identity-resync backfill when the group map holds a stale address for the
+    responding member. The cohort seeder writes a hostname placeholder into the
+    shared group map for a seeded member, and the member then advertises its
+    runtime address. The member is still in the group by UUID, and its response
+    is signed by that identity, so the asker backfills it (and refreshes the
+    map entry to the advertised address). Before, the gate compared addresses
+    only, so a seeded member's identity was never backfilled and every unicast
+    frame it sent the asker was dropped as undecryptable.
+
+    Twin of identity-resync-backfill, with member's map entry replaced by the
+    placeholder "member-host".
+
+participants:
+  - id: coord
+    role: group_member
+  - id: member
+    role: group_member
+
+fixtures:
+  shared_group:
+    uuid: "0c000000-0000-4000-8000-000000000003"
+    stale_addresses:
+      member: "member-host"
+
+steps:
+  - id: 1
+    from: coord
+    to: member
+    function: peer_identity_query
+    payload:
+      have: []
+
+  - id: 2
+    from: member
+    to: coord
+    function: peer_identity_response
+    in_response_to: 1
+    payload: {}
+
+expected_state:
+  coord:
+    peer_count: 1

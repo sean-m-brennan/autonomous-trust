@@ -378,43 +378,50 @@ class TestComputeReputation:
 
 
 class TestContriteTitForTatBranches:
+    # history.update(task, scorer, score) records `scorer`'s half: the score
+    # it GAVE the other side. In _contrite_tit_for_tat, peer_scores are the
+    # scores this node gave the peer and my_scores the scores the peer gave
+    # this node (RD_14.4 plan, Phase 4).
     def test_defected_low_standing(self):
         rp = _make_rep_process()
         peer = _make_mock_peer()
-        # In _contrite_tit_for_tat, when p1_id==peer.uuid:
-        #   peer_scores uses p2_score (identity's score), my_scores uses p1_score (peer's score)
-        # We want: peer_scores[-1] < 0.5 (defected) AND my_standing < 0.5
+        # We judged the peer to have defected (0.3) AND it rates us low (0.3).
         tid = uuid4()
-        rp.history.update(tid, peer.uuid, 0.3)       # p1_score=0.3 -> my_scores
-        rp.history.update(tid, rp.identity.uuid, 0.3) # p2_score=0.3 -> peer_scores
+        rp.history.update(tid, peer.uuid, 0.3)        # the peer's rating of us
+        rp.history.update(tid, rp.identity.uuid, 0.3)  # our rating of the peer
         result = rp._contrite_tit_for_tat(peer)
         assert result >= 0.51  # cooperate despite defection because my standing is low
 
     def test_defected_good_standing(self):
         rp = _make_rep_process()
         peer = _make_mock_peer()
-        # Need: peer's last score < 0.5 (peer defected) AND my own
-        # standing >= 0.5. Per _contrite_tit_for_tat:626-631, when
-        # peer fills p1 then peer_scores gets p1_score; when self
-        # fills p2 then my_scores gets p2_score. So peer must
-        # submit a low score (0.3) and self must submit a high one
-        # (0.8). The earlier revision of this test had the values
-        # swapped, asserting a punishment that never triggered.
+        # We judged the peer to have defected (0.3) while it rates us well
+        # (0.8): punish.
         tid = uuid4()
-        rp.history.update(tid, peer.uuid, 0.3)        # peer's score → peer_scores
-        rp.history.update(tid, rp.identity.uuid, 0.8) # self's score → my_scores
+        rp.history.update(tid, peer.uuid, 0.8)         # the peer's rating of us
+        rp.history.update(tid, rp.identity.uuid, 0.3)  # our rating of the peer
         result = rp._contrite_tit_for_tat(peer)
         assert result <= 0.49  # punish defection
+
+    def test_peer_rating_us_well_does_not_raise_it(self):
+        """A peer's own score of us is not its standing: one that rates us 1.0
+        while we rate it 0.3 is held at the defection pivot, not raised."""
+        rp = _make_rep_process()
+        peer = _make_mock_peer()
+        tid = uuid4()
+        rp.history.update(tid, peer.uuid, 1.0)
+        rp.history.update(tid, rp.identity.uuid, 0.3)
+        assert rp._contrite_tit_for_tat(peer) == pytest.approx(0.3)
 
     def test_cooperate(self):
         rp = _make_rep_process()
         peer = _make_mock_peer()
-        # peer_scores[-1] >= 0.5 (cooperated)
+        # Our last rating of the peer >= 0.5 (it cooperated).
         tid = uuid4()
-        rp.history.update(tid, peer.uuid, 0.6)       # p1_score -> my_scores
-        rp.history.update(tid, rp.identity.uuid, 0.7) # p2_score -> peer_scores (cooperated)
+        rp.history.update(tid, peer.uuid, 0.6)         # the peer's rating of us
+        rp.history.update(tid, rp.identity.uuid, 0.7)  # our rating of the peer
         result = rp._contrite_tit_for_tat(peer)
-        assert result >= 0.51
+        assert result == pytest.approx(0.7)
 
 
 class TestHandleOutdatedDeeper:
@@ -728,10 +735,9 @@ class TestContriteTitForTatBranches2:
         rp.history.update(tid, rp.identity.uuid, 0.7)
         rp.history.update(tid, peer.uuid, 0.8)
         result = rp._contrite_tit_for_tat(peer)
-        # tx.p2_id==peer.uuid, tx.p1_id==identity.uuid:
-        #   peer_scores.append(tx.p1_score=0.7), my_scores.append(tx.p2_score=0.8)
-        # peer_scores[-1]=0.7 >= 0.5 → cooperate: max(0.51, peer_standing=0.7) = 0.7
-        assert result >= 0.51
+        # Our rating of the peer is p1_score (0.7), its rating of us p2_score:
+        # cooperate, max(0.51, peer_standing=0.7) = 0.7
+        assert result == pytest.approx(0.7)
 
     def test_p1_is_peer_branch(self):
         """When tx.p1_id == peer.uuid and tx.p2_id == identity, uses p2/p1 scores."""
@@ -742,10 +748,9 @@ class TestContriteTitForTatBranches2:
         rp.history.update(tid, peer.uuid, 0.6)
         rp.history.update(tid, rp.identity.uuid, 0.7)
         result = rp._contrite_tit_for_tat(peer)
-        # tx.p1_id==peer.uuid, tx.p2_id==identity.uuid:
-        #   peer_scores.append(tx.p2_score=0.7), my_scores.append(tx.p1_score=0.6)
-        # peer_scores[-1]=0.7 >= 0.5 → cooperate: max(0.51, 0.7) = 0.7
-        assert result >= 0.51
+        # Our rating of the peer is p2_score (0.7), its rating of us p1_score:
+        # cooperate, max(0.51, 0.7) = 0.7
+        assert result == pytest.approx(0.7)
 
     def test_no_matching_transactions(self):
         """Transactions with neither peer being the target peer return the
