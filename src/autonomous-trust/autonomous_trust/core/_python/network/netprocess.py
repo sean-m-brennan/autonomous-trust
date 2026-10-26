@@ -1281,6 +1281,42 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         except Full:
             pass
 
+    def _send_to_group_members(self, msg, addresses):
+        """Send one encrypted group frame to each member address.
+
+        A member that cannot be reached costs only its own copy. In
+        particular an address that fails to resolve (a container hostname
+        whose container has not started yet raises socket.gaierror, an
+        OSError) must not stop the fan-out to the members after it."""
+        for addr in addresses:
+            if addr == self.myself.address:
+                continue
+            # Gateway boundary, invariant G: a group's
+            # traffic never reaches an address that also
+            # belongs to another group we hold.
+            if len(self._groups_containing(addr)) > 1:
+                self._boundary_refuse(
+                    'group_spans_gateway', addr,
+                    'target is a member of more than one '
+                    'group we hold')
+                continue
+            # Reputation cut-off: do not forward
+            # to/for an excluded member (a gateway
+            # thus stops relaying toward it).
+            if self.reject_message(addr):
+                _probes.counter('net.group', 'skip', 'excluded_target')
+                continue
+            try:
+                self.send_group(msg, addr)
+                self.track_send_stats(self.unknown_peer, len(msg))
+                member = self.peers.find_by_address(addr)
+                if member is not None:
+                    self._presence.sent(member.uuid, time.time())
+            except (TransmissionError, OSError) as err:
+                self.logger.error('Network: group send to %s failed: %s',
+                                  addr, err)
+                self.track_send_error(self.unknown_peer)
+
     def process(self, queues, signal):
         """
         Network processing main loop
@@ -1439,33 +1475,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                     msg = enc_grp.encrypt(wire, enc_grp)
                                 else:
                                     msg = wire
-                                for addr in message.to_whom.addresses:
-                                    if addr == self.myself.address:
-                                        continue
-                                    # Gateway boundary, invariant G: a group's
-                                    # traffic never reaches an address that also
-                                    # belongs to another group we hold.
-                                    if len(self._groups_containing(addr)) > 1:
-                                        self._boundary_refuse(
-                                            'group_spans_gateway', addr,
-                                            'target is a member of more than one '
-                                            'group we hold')
-                                        continue
-                                    # Reputation cut-off: do not forward
-                                    # to/for an excluded member (a gateway
-                                    # thus stops relaying toward it).
-                                    if self.reject_message(addr):
-                                        _probes.counter('net.group', 'skip', 'excluded_target')
-                                        continue
-                                    try:
-                                        self.send_group(msg, addr)
-                                        self.track_send_stats(self.unknown_peer, len(msg))
-                                        member = self.peers.find_by_address(addr)
-                                        if member is not None:
-                                            self._presence.sent(member.uuid, time.time())
-                                    except TransmissionError as err:
-                                        self.logger.error('Network: %s', err)
-                                        self.track_send_error(self.unknown_peer)
+                                self._send_to_group_members(msg, message.to_whom.addresses)
                             else:  # defaults to pseudo-multicast
                                 for who in message.to_whom:  # Message ensures this is list  # noqa
                                     address = strip_cidr(who.address)
