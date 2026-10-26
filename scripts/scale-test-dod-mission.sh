@@ -404,11 +404,14 @@ import sys, re, datetime as dt
 line = sys.stdin.read().strip()
 if not line:
     sys.exit(1)
-m = re.search(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)', line)
+# Logs use either ',' or '.' before the milliseconds, and containers log in
+# UTC, so parse as UTC to compare against the host's epoch t_start.
+m = re.search(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[,.]\d+)', line)
 if not m:
     sys.exit(1)
 t = dt.datetime.strptime(m.group(1).replace(',', '.'),
-                         '%Y-%m-%d %H:%M:%S.%f').timestamp()
+                         '%Y-%m-%d %H:%M:%S.%f').replace(
+                             tzinfo=dt.timezone.utc).timestamp()
 print(round(t - $t_start, 2))
 " 2>/dev/null
 }
@@ -641,14 +644,15 @@ print('%s %s %s %s %s' % (
     local t_start
     t_start=$($AT_PYTHON -c "
 import re, datetime as dt
-ts_re = re.compile(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)')
+ts_re = re.compile(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[,.]\d+)')
 with open('$coord_log') as f:
     for line in f:
         m = ts_re.search(line)
         if m:
             t = dt.datetime.strptime(
                 m.group(1).replace(',', '.'),
-                '%Y-%m-%d %H:%M:%S.%f').timestamp()
+                '%Y-%m-%d %H:%M:%S.%f').replace(
+                    tzinfo=dt.timezone.utc).timestamp()
             print(t)
             break
 " 2>/dev/null)

@@ -63,6 +63,36 @@ class TestConstants:
         assert isinstance(max_concurrency, int)
 
 
+class TestMaxConcurrency:
+    """The process pool opens all its workers up front, roughly 30 MiB each
+    under forkserver, so the size is capped rather than scaled with the host's
+    core count; AT_MAX_CONCURRENCY overrides it."""
+
+    def _size(self, monkeypatch, env=None, cpus=None):
+        from autonomous_trust.core._python import system as sysmod
+        if env is None:
+            monkeypatch.delenv('AT_MAX_CONCURRENCY', raising=False)
+        else:
+            monkeypatch.setenv('AT_MAX_CONCURRENCY', env)
+        if cpus is not None:
+            monkeypatch.setattr(sysmod.os, 'process_cpu_count',
+                                lambda: cpus, raising=False)
+        return sysmod._max_concurrency()
+
+    def test_default_is_capped_on_a_big_host(self, monkeypatch):
+        assert self._size(monkeypatch, cpus=32) == 8
+
+    def test_default_scales_on_a_small_host(self, monkeypatch):
+        assert self._size(monkeypatch, cpus=2) == 4
+
+    def test_env_override(self, monkeypatch):
+        assert self._size(monkeypatch, env='32', cpus=2) == 32
+
+    def test_bad_env_falls_back_to_default(self, monkeypatch):
+        assert self._size(monkeypatch, env='lots', cpus=32) == 8
+        assert self._size(monkeypatch, env='0', cpus=32) == 8
+
+
 def test_package_hash_onerror():
     from autonomous_trust.core.system import PackageHash
     ph = PackageHash()

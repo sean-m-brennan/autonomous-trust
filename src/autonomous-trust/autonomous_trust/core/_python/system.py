@@ -312,6 +312,31 @@ def _proc_idle_floor() -> float:
     return val if val >= 0 else 0.01
 
 
+
+def _max_concurrency() -> int:
+    """Size of the per-peer process pool, and the cap on concurrent jobs.
+
+    multiprocessing.Pool starts every worker up front, at roughly 30 MiB each
+    under forkserver, so scaling with the host's core count cost a container
+    on a 32-core host 64 workers and about 2 GiB before it did any work. The
+    default is twice the usable CPUs (respecting container CPU pinning),
+    capped at 8. The C core uses a fixed 4.
+
+    Tunable via AT_MAX_CONCURRENCY; a non-positive or unparseable value falls
+    back to the default.
+    """
+    cpus = getattr(os, 'process_cpu_count', os.cpu_count)() or 1
+    default = min(cpus * 2, 8)
+    raw = os.environ.get('AT_MAX_CONCURRENCY')
+    if raw is None:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        return default
+    return val if val > 0 else default
+
+
 proc_idle_floor = _proc_idle_floor()
 agreement_impl = AgreementImpl.POA.value
 dev_root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -320,7 +345,7 @@ core_system = {CfgIds.network: communications,
                CfgIds.negotiation: pkg + '.negotiation.NegotiationProcess',
                CfgIds.reputation: pkg + '.reputation.ReputationProcess',
                }
-max_concurrency = os.cpu_count() * 2
+max_concurrency = _max_concurrency()
 base_system_deps = core_system.keys()
 
 

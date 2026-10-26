@@ -319,6 +319,36 @@ class DoDDataProcess(DataProcess, metaclass=ProcMeta,
             self.sleep_until(self.cadence)
 
 
+class _ScenarioPoseProvider:
+    """Callable ``() -> (lat, lon) | None`` replaying one peer's scenario path.
+
+    A module-level class rather than a closure, because the demo's workers run
+    under the forkserver start method, which pickles each worker's state, and a
+    local function cannot be pickled."""
+
+    def __init__(self, scenario, peer_name, epoch):
+        self.scenario = scenario
+        self.peer_name = peer_name
+        self.epoch = epoch
+
+    def __call__(self):
+        # Replay the scenario movement model to this peer's live position.
+        # _update_positions is pure movement (no phase-event side effects),
+        # mutating scenario.peers[*].position in place; we read our own.
+        try:
+            t = timedelta(seconds=time.time() - self.epoch)
+            self.scenario._update_positions(t)
+            role = self.scenario.peers.get(self.peer_name)
+            pos = getattr(role, "position", None)
+            if pos is None:
+                return None
+            return (pos.lat, pos.lon)
+        except Exception:  # a flaky pose source must not crash the sensor
+            logger.debug("detection pose provider failed for %s",
+                         self.peer_name, exc_info=True)
+            return None
+
+
 class DoDMissionParticipant(AutonomousTrust):
     """A peer in the DoD squad infiltration scenario.
 
@@ -403,8 +433,9 @@ class DoDMissionParticipant(AutonomousTrust):
 
         1. An explicit ``self._pose_provider`` (e.g. a real simulator feed set
            on the instance) always wins.
-        2. **Microdrones** get live motion *on by default*: a closure that
-           replays this peer's own deterministic scenario path locally — no
+        2. **Microdrones** get live motion *on by default*: a callable
+           (``_ScenarioPoseProvider``) that replays this peer's own
+           deterministic scenario path locally — no
            simulator dependency — so its ~350 m forward FOV sweeps onto the
            target compound as it advances from the insertion LZ to the
            objective (T+1:00..T+7:00). The pose is read from this
@@ -425,28 +456,8 @@ class DoDMissionParticipant(AutonomousTrust):
         if os.environ.get("AT_DETECTION_LIVE_MOTION", "1") == "0":
             return None
 
-        scenario = self.scenario
-        peer_name = self.peer_name
-        epoch = self._t0_epoch
-
-        def _pose():
-            # Replay the scenario movement model to this peer's live position.
-            # _update_positions is pure movement (no phase-event side effects),
-            # mutating scenario.peers[*].position in place; we read our own.
-            try:
-                t = timedelta(seconds=time.time() - epoch)
-                scenario._update_positions(t)
-                role = scenario.peers.get(peer_name)
-                pos = getattr(role, "position", None)
-                if pos is None:
-                    return None
-                return (pos.lat, pos.lon)
-            except Exception:  # a flaky pose source must not crash the sensor
-                logger.debug("detection pose provider failed for %s",
-                             peer_name, exc_info=True)
-                return None
-
-        return _pose
+        return _ScenarioPoseProvider(self.scenario, self.peer_name,
+                                     self._t0_epoch)
 
     def _maybe_add_detection(self, bundle, kind, roster_latlon):
         """Attach a DetectionSource alongside a drone-role bundle.

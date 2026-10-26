@@ -139,6 +139,16 @@ int net_transport_ip_bind(const socket_cfg_t *cfg, const char *address,
 int net_transport_ip_bind_source(int sock, const char *address, int domain,
                                  bool stream, logger_t *logger);
 
+/** Resolve a peer address to a network-order IPv4 (@p ipv6 false, @p out a
+ *  struct in_addr) or IPv6 (@p ipv6 true, @p out a struct in6_addr) address.
+ *
+ *  Numeric addresses are parsed directly; anything else is looked up with
+ *  getaddrinfo, because a peer's address may be a hostname (the cohort seeder
+ *  writes container hostnames, which the Python runtime already resolves).
+ *  @return 0 on success, EINVAL when the address neither parses nor resolves.
+ */
+int net_transport_resolve_host(const char *host, bool ipv6, void *out);
+
 /** Join a multicast group on an already-bound socket. */
 int net_transport_ip_join_mcast(int sock, bool ipv6, const char *mcast_address,
                                 int port, logger_t *logger);

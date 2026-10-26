@@ -67,7 +67,7 @@ static int udp_send(int sock, const uint8_t *msg, size_t msg_len,
         struct sockaddr_in6 addr = {0};
         addr.sin6_family = AF_INET6;
         addr.sin6_port = htons(port);
-        if (inet_pton(AF_INET6, host, &addr.sin6_addr) <= 0)
+        if (net_transport_resolve_host(host, true, &addr.sin6_addr) != 0)
             return EXCEPTION(EINVAL);
         sent = at_sendto_eintr(sock, msg, send_len, 0,
                                (struct sockaddr *)&addr, sizeof(addr));
@@ -75,7 +75,7 @@ static int udp_send(int sock, const uint8_t *msg, size_t msg_len,
         struct sockaddr_in addr = {0};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(port);
-        if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0)
+        if (net_transport_resolve_host(host, false, &addr.sin_addr) != 0)
             return EXCEPTION(EINVAL);
         sent = at_sendto_eintr(sock, msg, send_len, 0,
                                (struct sockaddr *)&addr, sizeof(addr));

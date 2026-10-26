@@ -271,3 +271,28 @@ int net_transport_ip_join_mcast(int sock, bool ipv6, const char *mcast_address,
     }
     return 0;
 }
+
+/* Frama-C: skipped — [syscall] inet_pton + getaddrinfo stubs. */
+int net_transport_resolve_host(const char *host, bool ipv6, void *out)
+{
+    if (host == NULL || out == NULL)
+        return EXCEPTION(EINVAL);
+    int family = ipv6 ? AF_INET6 : AF_INET;
+    if (inet_pton(family, host, out) == 1)
+        return 0;
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = family;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL)
+        return EXCEPTION(EINVAL);
+    if (ipv6)
+        memcpy(out, &((struct sockaddr_in6 *)res->ai_addr)->sin6_addr,
+               sizeof(struct in6_addr));
+    else
+        memcpy(out, &((struct sockaddr_in *)res->ai_addr)->sin_addr,
+               sizeof(struct in_addr));
+    freeaddrinfo(res);
+    return 0;
+}
