@@ -340,7 +340,10 @@ build_images_once() {
 # given scale point. Mirrors what scripts/run-demo.sh does on `--compose`.
 regenerate_manifests() {
     local squad=$1 swarm=$2 sensor=$3 hacked=$4
-    AT_DEMO_T0_EPOCH=$(date +%s) $AT_PYTHON \
+    # The scenario clock starts at T0. A large point on slow storage can take
+    # longer to start than the scenario lasts, so AT_DEMO_T0_DELAY_SEC pushes
+    # T0 past start-up; producers emit nothing before T0.
+    AT_DEMO_T0_EPOCH=$(( $(date +%s) + ${AT_DEMO_T0_DELAY_SEC:-0} )) $AT_PYTHON \
         -m examples.dod_mission.deploy.generate_compose \
         "$COMPOSE_FILE" \
         --image "$DEMO_IMAGE_REF" \
