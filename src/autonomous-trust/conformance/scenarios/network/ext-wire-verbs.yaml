@@ -1,0 +1,40 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: ext-wire-verbs
+byte_pinning: false
+description: |
+    A network-process verb an extension declares (C net_ext_t.wire_verbs,
+    Python Extension.network_wire_verbs) is accepted from the wire on a
+    member's paths only: decrypted from a peer we hold, or group-encrypted.
+    Never from a stranger, a relayed stranger or the broadcast channel, and
+    an undeclared network verb stays refused. The adapters declare the
+    fixture's verbs through a test extension and ask the production policy.
+
+participants:
+  - id: node
+    role: receiver
+
+fixtures:
+  declared: [t_announce]
+  cases:
+    - {process: network, function: t_announce, path: peer, admitted: true}
+    - {process: network, function: t_announce, path: group, admitted: true}
+    - {process: network, function: t_announce, path: broadcast, admitted: false}
+    - {process: network, function: t_announce, path: stranger-plaintext, admitted: false}
+    - {process: network, function: t_announce, path: relayed-stranger, admitted: false}
+    - {process: network, function: t_other, path: peer, admitted: false}
+    - {process: network, function: stats_req, path: peer, admitted: true}
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: classify_wire_verbs
+    description: |
+        The adapter declares `declared`, asks the production policy about
+        every case, and records whether every answer matches.
+
+expected_state:
+  node:
+    all_cases_match: true

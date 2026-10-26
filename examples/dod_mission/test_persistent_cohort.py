@@ -434,3 +434,61 @@ def test_seed_cohort_evidence_supports_the_seeded_tier(tmp_path,
     for uuid, score in rp.reputations.current.items():
         assert rp._trust_tier(score) >= SEED_TIER, \
             f"{str(uuid)[:8]} restored at {score:.4f}, below tier {SEED_TIER}"
+
+
+# ------------------------------------------------- seeding the coordinator
+# At 100 peers the coordinator's cold admission reached only one member, so a
+# late joiner such as the MQ-800 never learned it and dropped every data
+# subscribe it sent as undecryptable. --seed-coordinator makes it a seeded
+# member from t=0; its capabilities are left for peers to learn at runtime.
+
+def _small(scenario_factory):
+    return scenario_factory(squad_size=2, swarm_size=2, sensor_count=2,
+                            hacked_sensors=1, include_command=False)
+
+
+def test_coordinator_not_seeded_by_default(tmp_path, scenario_factory):
+    from tools.seed_dod_cohort import seed_cohort
+    seeded = seed_cohort(tmp_path, _small(scenario_factory), force=True)
+    assert "coordinator" not in seeded
+    assert not (tmp_path / "coordinator").exists()
+
+
+def test_seed_coordinator_writes_full_state(tmp_path, scenario_factory):
+    from tools.seed_dod_cohort import seed_cohort
+    seeded = seed_cohort(tmp_path, _small(scenario_factory), force=True,
+                         seed_coordinator=True)
+    assert "coordinator" in seeded
+    d = tmp_path / "coordinator" / "etc" / "at"
+    for fn in ("identity.cfg.json", "group.cfg.json", "peers.cfg.json",
+               "reputation.cfg.json", "reputation-history.cfg.json",
+               "peer-capabilities.cfg.json"):
+        assert (d / fn).exists(), f"coordinator missing {fn}"
+
+
+def test_seeded_peers_recognise_coordinator(tmp_path, scenario_factory):
+    from tools.seed_dod_cohort import seed_cohort
+    seeded = seed_cohort(tmp_path, _small(scenario_factory), force=True,
+                         seed_coordinator=True)
+    for peer in seeded:
+        if peer == "coordinator":
+            continue
+        with (tmp_path / peer / "etc" / "at" / "peers.cfg.json").open() as f:
+            peers = json.load(f, object_hook=config_json_decoder)
+        assert "coordinator" in {p.petname for p in peers.all}, peer
+
+
+def test_coordinator_capabilities_not_seeded(tmp_path, scenario_factory):
+    from tools.seed_dod_cohort import seed_cohort
+    seeded = seed_cohort(tmp_path, _small(scenario_factory), force=True,
+                         seed_coordinator=True)
+    coord_dir = tmp_path / "coordinator" / "etc" / "at"
+    with (coord_dir / "identity.cfg.json").open() as f:
+        coord_uuid = str(json.load(f, object_hook=config_json_decoder).uuid)
+    for peer in seeded:
+        if peer == "coordinator":
+            continue
+        with (tmp_path / peer / "etc" / "at" / "peer-capabilities.cfg.json").open() as f:
+            pc = json.load(f, object_hook=config_json_decoder)
+        listed = {str(u) for caps in pc._listing.values() for u in caps}
+        assert coord_uuid not in listed, peer

@@ -13,14 +13,19 @@ description: |
     scenario seeded a transaction with the scorer as a party while in CTFT
     mode.
 
-    bob's history holds two transactions between bob and subject:
+    bob's history holds two transactions between bob and subject. Each
+    pX_score is the score pX GAVE the other side:
 
-        t-b1: subject is p1 (scored 0.8), bob is p2 (scored 0.9)
-        t-b2: bob is p1 (scored 0.9), subject is p2 (scored 0.7)
+        t-b1: subject is p1 (gave bob 0.8), bob is p2 (gave subject 0.9)
+        t-b2: bob is p1 (gave subject 0.9), subject is p2 (gave bob 0.7)
 
-    subject's side: [0.8, 0.7], last 0.7 >= 0.5 (cooperated), so
-    score = max(0.51, (0.8 + 0.7) / 2) = 0.75. With the scorer's uuid lost,
-    neither transaction is bilateral and the prior answers instead.
+    subject's standing is what bob gave it, [0.9, 0.9], last 0.9 >= 0.5
+    (cooperated), so score = max(0.51, 0.9) = 0.9. With the scorer's uuid
+    lost, neither transaction is bilateral and the prior answers instead.
+
+    Re-pinned 2026-10-26 (RD_14.4 plan, Phase 4): CTFT read the peer's OWN
+    submitted score as its standing ([0.8, 0.7], 0.75), so a peer's
+    reputation was how it rated the scorer.
 
 participants:
   - id: alice
@@ -68,4 +73,4 @@ steps:
 expected_state:
   bob:
     reputation_of:
-      subject: 0.75
+      subject: 0.9

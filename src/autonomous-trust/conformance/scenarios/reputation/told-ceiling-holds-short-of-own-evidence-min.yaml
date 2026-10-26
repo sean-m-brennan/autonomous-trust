@@ -1,0 +1,56 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: told-ceiling-holds-short-of-own-evidence-min
+byte_pinning: false
+description: |
+    Own evidence below own_evidence_min does not lift the told ceiling
+    (RD_14.4_HOSTILE_JOIN_PLAN.md Phase 4). bob has two transactions of his
+    own with subject, giving it 0.9 each time, and nothing else about it:
+    told and brought are both 0.9, but two entries are short of the three
+    the policy asks for, so bounded is told capped at the tier-1 ceiling,
+    just under 0.65.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: oracle
+  - id: subject
+    role: subject
+
+fixtures:
+  join_policy:
+    version: 1
+    enabled: true
+    anchors: [verified_contact]
+  tx_history:
+    bob:
+      - {task_id: t-b1, p1: bob, p1_score: 0.9, p2: subject, p2_score: 0.9}
+      - {task_id: t-b2, p1: subject, p1_score: 0.9, p2: bob, p2_score: 0.9}
+  reputations:
+    bob:
+      subject: 0.9
+  coop_mode:
+    bob:
+      subject: true
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: request reputation
+    payload:
+      target: subject
+      proc: negotiation
+    description: |
+        bob scores subject from his own two entries.
+
+expected_state:
+  bob:
+    reputation_of:
+      subject: 0.9
+    brought_of:
+      subject: 0.9
+    bounded_of:
+      subject: 0.65

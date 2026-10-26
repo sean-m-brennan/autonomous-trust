@@ -55,6 +55,15 @@ def test_the_example_lists_the_recommended_three():
     policy = load_join_policy(EXAMPLE)
     assert policy.enabled
     assert policy.anchors == {'verified_contact', 'zta', 'operator'}
+    assert (policy.told_tier, policy.own_evidence_min) == (1, 3)
+
+
+def test_the_phase_four_bounds():
+    """Tier 1 and three own entries unless declared (RD_14.4 Phase 4)."""
+    assert (INERT.told_tier, INERT.own_evidence_min) == (1, 3)
+    policy = parse_join_policy({'version': 1, 'told_tier': 0,
+                                'own_evidence_min': 7})
+    assert (policy.told_tier, policy.own_evidence_min) == (0, 7)
 
 
 @pytest.mark.parametrize('doc, why', [
@@ -68,6 +77,12 @@ def test_the_example_lists_the_recommended_three():
     ({'version': 1, 'anchors': ['friend']}, 'unknown class'),
     ({'version': 1, 'anchors': ['zta', 'zta']}, 'twice'),
     ({'version': 1, 'anchor': ['zta']}, 'unknown key'),
+    ({'version': 1, 'told_tier': 5}, 'told_tier'),
+    ({'version': 1, 'told_tier': -1}, 'told_tier'),
+    ({'version': 1, 'told_tier': 1.5}, 'told_tier'),
+    ({'version': 1, 'told_tier': True}, 'told_tier'),
+    ({'version': 1, 'own_evidence_min': 0}, 'own_evidence_min'),
+    ({'version': 1, 'own_evidence_min': '3'}, 'own_evidence_min'),
 ])
 def test_malformed_is_refused(doc, why):
     with pytest.raises(JoinPolicyError, match=why):

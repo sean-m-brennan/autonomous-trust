@@ -554,6 +554,7 @@ set(libsrc
     autonomous_trust/network/net_transport_registry.c
     autonomous_trust/network/net_filter.c
     autonomous_trust/network/net_presence.c
+    autonomous_trust/network/net_liveness.c
     autonomous_trust/network/net_ext.c
     autonomous_trust/network/network.c
     autonomous_trust/bootstrap/bootstrap_capabilities.c
@@ -993,6 +994,12 @@ target_link_libraries(amnesia_recognition_test PRIVATE ${AT_TEST_LIBS})
 add_executable(handoff_retry_test test/handoff_retry_test.c)
 set_source_files_properties(test/handoff_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(handoff_retry_test PRIVATE ${AT_TEST_LIBS})
+add_executable(net_liveness_test test/net_liveness_test.c)
+set_source_files_properties(test/net_liveness_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_liveness_test PRIVATE ${AT_TEST_LIBS})
+add_executable(net_ext_seams_test test/net_ext_seams_test.c)
+set_source_files_properties(test/net_ext_seams_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_ext_seams_test PRIVATE ${AT_TEST_LIBS})
 add_executable(net_presence_test test/net_presence_test.c)
 set_source_files_properties(test/net_presence_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(net_presence_test PRIVATE ${AT_TEST_LIBS})
@@ -1205,6 +1212,8 @@ add_test(NAME group_rotation_sibling_test COMMAND $<TARGET_FILE:group_rotation_s
 add_test(NAME bridged_group_test COMMAND $<TARGET_FILE:bridged_group_test>)
 add_test(NAME amnesia_recognition_test COMMAND $<TARGET_FILE:amnesia_recognition_test>)
 add_test(NAME handoff_retry_test COMMAND $<TARGET_FILE:handoff_retry_test>)
+add_test(NAME net_liveness_test COMMAND $<TARGET_FILE:net_liveness_test>)
+add_test(NAME net_ext_seams_test COMMAND $<TARGET_FILE:net_ext_seams_test>)
 add_test(NAME net_presence_test COMMAND $<TARGET_FILE:net_presence_test>)
 add_test(NAME send_retry_test COMMAND $<TARGET_FILE:send_retry_test>)
 add_test(NAME neg_send_keep_test COMMAND $<TARGET_FILE:neg_send_keep_test>)
@@ -1578,6 +1587,11 @@ target_link_libraries(join_policy_test PRIVATE ${AT_TEST_LIBS})
 target_compile_definitions(join_policy_test PRIVATE
     AT_REPO_ROOT_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/../..")
 add_test(NAME join_policy_test COMMAND $<TARGET_FILE:join_policy_test>)
+
+add_executable(rep_brought_test test/rep_brought_test.c)
+set_source_files_properties(test/rep_brought_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_brought_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rep_brought_test COMMAND $<TARGET_FILE:rep_brought_test>)
 
 add_executable(rescore_sweep_test test/rescore_sweep_test.c)
 set_source_files_properties(test/rescore_sweep_test.c PROPERTIES COMPILE_FLAGS "-Wall")

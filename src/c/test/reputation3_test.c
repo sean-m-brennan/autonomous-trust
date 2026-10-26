@@ -122,14 +122,15 @@ DEFINE_TEST(test_reputation_contrite_tft)
     ck_assert_double_eq_tol(score, 0.2, 0.001);
 
     /* Add a cooperative transaction (both peers, high scores) */
-    ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 0.9, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.8, NULL));
+    /* Each update records the score its scorer GAVE the other side. */
+    ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 0.8, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.9, NULL));
 
     score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
-    /* One cooperative direct interaction: peer_standing = 0.8,
-     * my_standing = 0.9, peer_last = 0.8 (not < 0.5). Falls into the
-     * cooperate/cooperate branch which returns max(0.51, peer_standing).
-     * Mirrors Python repprocess.py:384-385. */
+    /* One cooperative direct interaction: peer_standing = 0.8 (what we gave
+     * it), my_standing = 0.9 (what it gave us), peer_last = 0.8 (not < 0.5).
+     * Falls into the cooperate/cooperate branch which returns
+     * max(0.51, peer_standing). Mirrors Python _contrite_tit_for_tat. */
     ck_assert_double_eq_tol(score, 0.8, 0.001);
 
     tx_history_free(&hist);
@@ -157,8 +158,8 @@ DEFINE_TEST(test_reputation_contrite_tft_cooperative_self_p2)
     uuid_generate(peer_id);
     uuid_generate(task);
 
-    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.8, NULL));  /* peer → p1 */
-    ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 0.9, NULL));  /* self → p2 */
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.9, NULL));  /* peer → p1 */
+    ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 0.8, NULL));  /* self → p2 */
 
     double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
     ck_assert_double_eq_tol(score, 0.8, 0.001);
@@ -184,11 +185,11 @@ DEFINE_TEST(test_reputation_contrite_tft_retaliation)
     uuid_generate(t2);
 
     /* tx1: cooperate/cooperate. */
-    ck_assert_ret_ok(tx_history_update(&hist, t1, self_id, 0.9, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, t1, peer_id, 0.8, NULL));
-    /* tx2: self cooperates, peer defects. peer_last = 0.2. */
-    ck_assert_ret_ok(tx_history_update(&hist, t2, self_id, 0.9, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, t2, peer_id, 0.2, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t1, self_id, 0.8, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t1, peer_id, 0.9, NULL));
+    /* tx2: we judge the peer to have defected (0.2); it rates us 0.9. */
+    ck_assert_ret_ok(tx_history_update(&hist, t2, self_id, 0.2, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t2, peer_id, 0.9, NULL));
 
     double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
     /* peer_standing = (0.8 + 0.2)/2 = 0.5; my_standing = 0.9.
@@ -216,10 +217,10 @@ DEFINE_TEST(test_reputation_contrite_tft_contrition)
     uuid_generate(t2);
 
     /* Both defect, both times. */
-    ck_assert_ret_ok(tx_history_update(&hist, t1, self_id, 0.2, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, t1, peer_id, 0.3, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, t2, self_id, 0.2, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, t2, peer_id, 0.4, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t1, self_id, 0.3, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t1, peer_id, 0.2, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t2, self_id, 0.4, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t2, peer_id, 0.2, NULL));
 
     double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
     /* peer_standing = (0.3 + 0.4)/2 = 0.35; my_standing = 0.2.

@@ -198,6 +198,12 @@ try:
                 os.environ.get("AT_DATA_RESUBSCRIBE_TICKS", "6")))
             self._resub_tick = 0
             self._resub_logged: set = set()
+            # Per-peer backoff for those retries: the gap doubles from
+            # _resub_period up to this cap, so a producer that never answers
+            # stops costing a request every few ticks for the whole run.
+            self._resub_cap = max(self._resub_period, int(
+                os.environ.get("AT_DATA_RESUBSCRIBE_MAX_TICKS", "96")))
+            self._resub_schedule: dict = {}
             super().__init__(configurations, subsystems, log_queue,
                              dependencies, **kwargs)
 
@@ -281,19 +287,24 @@ try:
                 # (_received_data_uuids, set in handle_data), not on whether we
                 # once sent a request — until the stream is live.
                 #
-                # Fire on the FIRST pass (tick 0 % period == 0) and then every
-                # _resub_period passes — incrementing AFTER the check. The
-                # increment used to run first, so the first attempt waited a
-                # whole period (~10s): mq800, whose advert is lost and which
-                # thus depends entirely on this path, appeared ~10s late while
-                # cap-advertised producers (rq86) showed immediately. Firing
-                # immediately closes that mq800-specific lag.
-                if (self.data_producers
-                        and self._resub_tick % self._resub_period == 0):
+                # Each peer's first attempt fires on the pass where it first
+                # turns up pending, so mq800 (whose advert is lost and which
+                # depends entirely on this path) is not held back. Later retries
+                # back off per peer (_resub_due), doubling from _resub_period to
+                # _resub_cap: an unreachable producer used to be re-requested
+                # every _resub_period passes for the whole run, which at 100
+                # peers came to ~1.4M undecryptable requests.
+                if self.data_producers:
                     for p in self._pending_roster_subscriptions(
                             self.protocol.peers.all,
                             self._received_data_uuids,
                             self.data_producers):
+                        if not self._resub_due(
+                                self._resub_schedule,
+                                str(getattr(p, "uuid", "")),
+                                self._resub_tick, self._resub_period,
+                                self._resub_cap):
+                            continue
                         msg = _DQ_Message(
                             _DQ_DataProcess.name,
                             _DQ_DataProtocol.request,
@@ -357,6 +368,25 @@ try:
                 subscribed.add(uid)
                 pending.append(p)
             return pending
+
+        @staticmethod
+        def _resub_due(schedule, uid, tick, base, cap):
+            """True when peer ``uid`` is due another subscribe at ``tick``.
+
+            Pure backoff half of the retry path: the first attempt is
+            immediate, then the gap doubles from ``base`` ticks up to ``cap``.
+            ``schedule`` maps uid -> (next due tick, current gap) and is
+            updated in place whenever an attempt is due.
+            """
+            entry = schedule.get(uid)
+            if entry is None:
+                schedule[uid] = (tick + base, min(base * 2, cap))
+                return True
+            due_at, gap = entry
+            if tick < due_at:
+                return False
+            schedule[uid] = (tick + gap, min(gap * 2, cap))
+            return True
 
         def _resolve_identity(self, ref):
             """Accept Identity, UUID, or uuid-string; return Identity

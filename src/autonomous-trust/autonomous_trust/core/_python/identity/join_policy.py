@@ -21,7 +21,9 @@ Schema (version 1)::
     {
       "version": 1,
       "enabled": true,
-      "anchors": ["verified_contact", "zta", "operator"]
+      "anchors": ["verified_contact", "zta", "operator"],
+      "told_tier": 1,
+      "own_evidence_min": 3
     }
 
 **Opt-in** (the user's call, D9): named by ``$AT_JOIN_POLICY``, absent is
@@ -36,6 +38,12 @@ extension answers for each (first contact for contacts and siblings, ZTA for
 credentials and the operator key), and a class no extension answers anchors
 nobody. ``operator`` means the operator key of THIS node: its operator's
 other nodes.
+
+``told_tier`` and ``own_evidence_min`` bound what the cohort's word alone can
+do (Phase 4): a peer this node holds no own evidence about reads at most
+``told_tier`` (default 1, ``UNVERIFIED_RESTORE_TIER``) until it has at least
+``own_evidence_min`` entries of this node's own (default 3), when its brought
+score takes over. An anchored peer is not bounded.
 
 Unknown keys are refused, ``note`` aside: a misspelled key would otherwise
 turn part of a security declaration off without a word. The C twin is
@@ -77,7 +85,14 @@ ANCHOR_PROVIDERS = {
     ANCHOR_OPERATOR: ('zta', 'first_contact'),
 }
 
-_KEYS = frozenset({'version', 'enabled', 'anchors', 'note'})
+_KEYS = frozenset({'version', 'enabled', 'anchors', 'told_tier',
+                   'own_evidence_min', 'note'})
+
+#: Defaults for the Phase 4 bounds (the user's calls, 2026-10-26).
+TOLD_TIER_DEFAULT = 1
+OWN_EVIDENCE_MIN_DEFAULT = 3
+#: The highest trust tier (repprocess TIER_FLOORS).
+_TIER_MAX = 4
 
 
 class JoinPolicyError(ValueError):
@@ -90,6 +105,8 @@ class JoinPolicy:
 
     enabled: bool = False
     anchors: frozenset = field(default_factory=frozenset)
+    told_tier: int = TOLD_TIER_DEFAULT
+    own_evidence_min: int = OWN_EVIDENCE_MIN_DEFAULT
 
 
 INERT = JoinPolicy()
@@ -119,7 +136,44 @@ def parse_join_policy(doc) -> JoinPolicy:
         if name in anchors:
             raise JoinPolicyError(f'anchors: {name!r} listed twice')
         anchors.append(name)
-    return JoinPolicy(enabled=enabled, anchors=frozenset(anchors))
+    told_tier = _bounded_int(doc, 'told_tier', TOLD_TIER_DEFAULT, 0, _TIER_MAX)
+    own_min = _bounded_int(doc, 'own_evidence_min', OWN_EVIDENCE_MIN_DEFAULT,
+                           1, None)
+    return JoinPolicy(enabled=enabled, anchors=frozenset(anchors),
+                      told_tier=told_tier, own_evidence_min=own_min)
+
+
+def _bounded_int(doc, key, default, low, high):
+    """``doc[key]`` as an integer in [low, high] (no upper bound when high is
+    None), or ``default`` when absent."""
+    value = doc.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise JoinPolicyError(f'{key}: not an integer: {value!r}')
+    if value < low or (high is not None and value > high):
+        raise JoinPolicyError(f'{key}: {value} out of range')
+    return value
+
+
+class AnchoredSet(object):
+    """IPC carrier for the peers the join policy counts as anchors, from
+    identity (which judges anchors: the hooks need its ZTA verifiers and
+    contacts) to reputation (which leaves an anchored peer's told score
+    unbounded, Phase 4). The user's call, 2026-10-26: a local carrier, as
+    ``ChildGroupSet`` and ``PeerStanding`` are. Plain picklable object; it only
+    travels the local queues, never the network. Handled in
+    ``Protocol.run_message_handlers`` by setting ``Protocol.anchored``."""
+
+    def __init__(self, uuids=()):
+        self.uuids = frozenset(str(u) for u in uuids)
+
+    def __eq__(self, other):
+        return isinstance(other, AnchoredSet) and self.uuids == other.uuids
+
+    def __hash__(self):
+        return hash(self.uuids)
+
+    def __repr__(self):
+        return 'AnchoredSet(%d)' % len(self.uuids)
 
 
 def load_join_policy(path: str) -> JoinPolicy:

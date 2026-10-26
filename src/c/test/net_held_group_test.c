@@ -33,6 +33,8 @@
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
 #include "identity/group.h"
+#include "network/net_ext.h"
+#include "network/net_liveness.h"
 #include "network/net_message.h"
 #include "network/net_proc_priv.h"
 #include "structures/data.h"
@@ -42,6 +44,7 @@
 #include "utilities/allocation.h"
 
 static int g_delivered;      /* peer_dm frames routed to a process */
+static int g_partition;      /* partition_signal frames sent to identity */
 
 static int _hook(const char *key, const message_type_t type,
                  generic_msg_t *msg, bool blocking)
@@ -50,6 +53,9 @@ static int _hook(const char *key, const message_type_t type,
     if (type == NET_MESSAGE && msg->info.net_msg.function != NULL
         && strcmp(msg->info.net_msg.function, "peer_dm") == 0)
         g_delivered++;
+    if (type == NET_MESSAGE && msg->info.net_msg.function != NULL
+        && strcmp(msg->info.net_msg.function, "partition_signal") == 0)
+        g_partition++;
     return 0;
 }
 
@@ -121,7 +127,7 @@ static uint8_t *_frame(identity_t *from, const group_t *grp, size_t *out_len)
 static void _begin(void)
 {
     ck_assert(sodium_init() >= 0);
-    g_delivered = 0;
+    g_delivered = g_partition = 0;
     net_held_group_frames_reset();
     messaging_set_test_hook(_hook);
 }
@@ -225,8 +231,55 @@ DEFINE_TEST(test_the_hold_is_bounded_and_keeps_the_newest)
     _end();
 }
 
+/* A held frame an extension injected is still one when it is retried: opened,
+ * it does not stamp transport liveness; still shut, it raises no partition
+ * signal. */
+DEFINE_TEST(test_an_injected_frame_keeps_its_mark_when_retried)
+{
+    _begin();
+    identity_t *me = _mk("mate", "10.0.0.1"), *off = _mk("officer", "10.0.0.31");
+    process_t *proc = _mk_proc(off);
+    net_thread_ctx_t ctx = { .proc = proc, .myself = me };
+    char ustr[UUID_STR_LEN + 1];
+    uuid_unparse_lower(off->uuid, ustr);
+    group_t ours = proc->protocol.group, next, other;
+    _rotated(&ours, &next);
+    _rotated(&ours, &other);
+
+    size_t fl = 0;
+    uint8_t *f = _frame(off, &next, &fl);
+    handle_inbound_ext(&ctx, NET_CHAN_GROUP, f, fl, ustr);
+    free(f);
+    ck_assert_int_eq((int)net_held_group_frame_count(), 1);
+    net_liveness_reset(net_liveness_now() - 100.0);
+    proc->protocol.group = next;
+    ck_assert_int_eq((int)net_retry_held_group_frames(&ctx), 1);
+    ck_assert_int_eq(g_delivered, 1);
+    ck_assert(net_liveness_quiet_for(off->uuid, net_liveness_now()) >= 100.0);
+
+    /* Under some other key: it does not open on retry either. */
+    f = _frame(off, &other, &fl);
+    handle_inbound_ext(&ctx, NET_CHAN_GROUP, f, fl, ustr);
+    free(f);
+    ck_assert_int_eq((int)net_held_group_frame_count(), 1);
+    proc->protocol.group = ours;
+    ck_assert_int_eq((int)net_retry_held_group_frames(&ctx), 1);
+    ck_assert_int_eq(g_partition, 0);
+
+    /* The transport's own held frame does stamp once it opens. */
+    f = _frame(off, &next, &fl);
+    handle_inbound_group(&ctx, f, fl, off->address);
+    free(f);
+    net_liveness_reset(net_liveness_now() - 100.0);
+    proc->protocol.group = next;
+    ck_assert_int_eq((int)net_retry_held_group_frames(&ctx), 1);
+    ck_assert(net_liveness_quiet_for(off->uuid, net_liveness_now()) < 5.0);
+    _end();
+}
+
 RUN_TESTS(NetHeldGroup,
           test_a_frame_under_a_key_not_yet_installed_opens_once_it_is,
           test_a_frame_that_still_does_not_open_is_dropped,
           test_a_frame_under_our_key_is_not_held,
-          test_the_hold_is_bounded_and_keeps_the_newest)
+          test_the_hold_is_bounded_and_keeps_the_newest,
+          test_an_injected_frame_keeps_its_mark_when_retried)

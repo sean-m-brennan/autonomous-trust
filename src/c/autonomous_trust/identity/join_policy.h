@@ -17,7 +17,8 @@
 /** @file The join-policy declaration (R+D.md §14.4,
  *  RD_14.4_HOSTILE_JOIN_PLAN.md): how a joiner treats the cohort it joins.
  *
- *  `{"version": 1, "enabled": true, "anchors": ["verified_contact", ...]}`,
+ *  `{"version": 1, "enabled": true, "anchors": ["verified_contact", ...],
+ *  "told_tier": 1, "own_evidence_min": 3}`,
  *  named by $AT_JOIN_POLICY. Opt-in (the user's call, D9): absent is inert,
  *  and a declaration that does not validate stops the node at start. The
  *  declaration chooses which anchor classes count (D6); an identity extension
@@ -52,9 +53,17 @@
 #define AT_ANCHOR_OPERATOR           (1u << 3)
 #define AT_ANCHOR_ALL                (0xFu)
 
+/** Defaults for the Phase 4 bounds (the user's calls, 2026-10-26): a peer
+ *  this node holds no own evidence about reads at most tier 1
+ *  (UNVERIFIED_RESTORE_TIER) until it has 3 entries of this node's own. */
+#define AT_JOIN_TOLD_TIER_DEFAULT        1
+#define AT_JOIN_OWN_EVIDENCE_MIN_DEFAULT 3
+
 typedef struct {
     bool enabled;
     uint32_t anchors;   /* AT_ANCHOR_* bits declared */
+    int told_tier;          /* "told_tier", 0..4 */
+    int own_evidence_min;   /* "own_evidence_min", >= 1 */
 } at_join_policy_t;
 
 /** The class bit for @p name, or 0 when it names none. */

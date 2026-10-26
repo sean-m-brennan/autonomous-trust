@@ -1288,3 +1288,36 @@ class TestRosterKeysAreCanonical:
                               'video_slot': 1, 'data_slot': 2}})
         assert list(ui.peers) == [str(u)]
         assert u in ui.peers
+
+
+class _PicklableIdent:
+    """Module-level stand-in for an Identity (MagicMock cannot be pickled)."""
+    nickname = 'Test Peer'
+    petname = 'TP'
+
+
+class TestPeerDataAcqPickling:
+    """Workers start under the forkserver method, which pickles their state.
+    A coordinator that starts with a seeded cohort hands its data-sink worker
+    populated PeerDataAcq entries, and the threading.Event behind ``active``
+    used to make that pickle fail, killing the worker before it subscribed to
+    any data source."""
+
+    def _peer(self):
+        return PeerDataAcq('uuid-1', 0, _PicklableIdent(), NullPeerData(),
+                           None, None, None)
+
+    def test_roundtrip_keeps_active(self):
+        import pickle
+        p = self._peer()
+        p.active = True
+        q = pickle.loads(pickle.dumps(p))
+        assert q.active
+        assert q.wait_active(0) is True
+
+    def test_restored_event_still_tracks_active(self):
+        import pickle
+        q = pickle.loads(pickle.dumps(self._peer()))
+        assert q.wait_active(0) is False
+        q.active = True
+        assert q.wait_active(0) is True
