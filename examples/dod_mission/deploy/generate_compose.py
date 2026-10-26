@@ -354,12 +354,18 @@ def build_compose(scenario_kwargs: Optional[dict] = None,
     # user-owned /app/.
     coord_args = "--log-level debug"
     coord_volumes = None
+    # Seeded coordinator (tools/seed_dod_cohort.py --seed-coordinator): mount
+    # its whole config root, as for the peers below, so it starts as a trusted
+    # cohort member instead of cold-bootstrapping.
+    if os.environ.get("AT_COMPOSE_SEED_COORDINATOR") == "1":
+        coord_volumes = [f"{PERSIST_HOST_DIR}/coordinator:/app/config/coordinator"]
     if record_basename:
         # Recorder flushes on graceful shutdown (cleanup()); the bind mount
         # keeps the file after the container is removed. USER is root in this
         # image (Dockerfile), so the coordinator can write into the mount.
         coord_args += f" --record {RECORD_MOUNT}/{record_basename}"
-        coord_volumes = [f"{RECORD_HOST_DIR}:{RECORD_MOUNT}"]
+        coord_volumes = (coord_volumes or []) + [
+            f"{RECORD_HOST_DIR}:{RECORD_MOUNT}"]
     services["coordinator"] = _service_block(
         f"{sc.name}-coordinator",
         f"{SUBNET_BASE}.3",

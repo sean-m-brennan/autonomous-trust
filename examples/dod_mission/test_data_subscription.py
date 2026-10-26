@@ -99,3 +99,38 @@ def test_empty_producer_set_is_noop():
 def test_skips_peers_without_uuid():
     roster = [_Peer("", "mq800")]   # not yet a resolvable identity
     assert _pending(roster, [], PRODUCERS) == []
+
+
+# --- Per-peer retry backoff -------------------------------------------------
+# A producer that never answers used to be re-requested every few ticks for the
+# life of the run; at 100 peers that was ~1.4M undecryptable requests, each held
+# 30 s by its receiver. Retries now back off per peer, doubling to a cap.
+
+_due = coord.DiagDataRcvr._resub_due
+
+
+def _attempt_ticks(base, cap, ticks):
+    sched = {}
+    return [t for t in range(ticks) if _due(sched, "u1", t, base, cap)]
+
+
+def test_first_attempt_is_immediate():
+    assert _attempt_ticks(6, 96, 1) == [0]
+
+
+def test_retry_interval_doubles():
+    assert _attempt_ticks(6, 96, 100) == [0, 6, 18, 42, 90]
+
+
+def test_retry_interval_is_capped():
+    hits = _attempt_ticks(6, 24, 120)
+    gaps = [b - a for a, b in zip(hits, hits[1:])]
+    assert gaps[:3] == [6, 12, 24]
+    assert set(gaps[3:]) == {24}
+
+
+def test_backoff_is_per_peer():
+    sched = {}
+    assert _due(sched, "u1", 0, 6, 96)
+    assert _due(sched, "u2", 3, 6, 96)      # a new peer is not held back
+    assert not _due(sched, "u1", 3, 6, 96)

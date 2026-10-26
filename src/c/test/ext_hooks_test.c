@@ -178,8 +178,53 @@ DEFINE_TEST(test_seed_provider_registry)
     ck_assert_ptr_eq(out[n - 1], &P);
 }
 
+static const char *const T_WIRE_VERBS[] = {"t_announce", NULL};
+static int config_calls;
+static int config_answer;
+static int t_check_config(logger_t *logger)
+{
+    (void)logger;
+    config_calls++;
+    return config_answer;
+}
+static const net_ext_t T_DECL = {
+    .name = "t.decl",
+    .wire_verbs = T_WIRE_VERBS,
+    .check_config = t_check_config,
+};
+
+DEFINE_TEST(test_declared_network_verbs_are_admitted_on_member_paths_only)
+{
+    ck_assert(!net_wire_verb_admitted("network", "t_announce", NET_PATH_PEER, NULL));
+    ck_assert_int_eq(net_ext_register(&T_DECL), 0);
+    ck_assert(net_ext_wire_verb_declared("t_announce"));
+    ck_assert(!net_ext_wire_verb_declared("t_other"));
+    ck_assert(net_wire_verb_admitted("network", "t_announce", NET_PATH_PEER, NULL));
+    ck_assert(net_wire_verb_admitted("network", "t_announce", NET_PATH_GROUP, NULL));
+    ck_assert(!net_wire_verb_admitted("network", "t_announce", NET_PATH_BROADCAST, NULL));
+    ck_assert(!net_wire_verb_admitted("network", "t_announce", NET_PATH_STRANGER, NULL));
+    ck_assert(!net_wire_verb_admitted("network", "t_announce", NET_PATH_RELAY_STRANGER, NULL));
+    ck_assert(!net_wire_verb_admitted("network", "t_other", NET_PATH_PEER, NULL));
+    ck_assert(net_wire_verb_admitted("network", "stats_req", NET_PATH_PEER, NULL));
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_a_config_refusal_is_reported)
+{
+    config_calls = 0;
+    config_answer = 0;
+    ck_assert_int_eq(net_ext_check_config(NULL), 0);
+    ck_assert(config_calls >= 1);
+    config_answer = 1;
+    ck_assert_int_eq(net_ext_check_config(NULL), -1);
+    config_answer = 0;
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(ExtHooks,
           test_tier_caps_only_lower,
           test_network_hooks_dispatch,
           test_exclusions_by_uuid_and_key,
-          test_seed_provider_registry)
+          test_seed_provider_registry,
+          test_declared_network_verbs_are_admitted_on_member_paths_only,
+          test_a_config_refusal_is_reported)

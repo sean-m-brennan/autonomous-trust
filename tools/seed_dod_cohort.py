@@ -156,6 +156,13 @@ GROUP_NICKNAME = "odazone"
 # doc/architecture/gateway-reputation-tree.md.
 GATEWAY_PREFIXES = ("rq86-",)
 
+# The coordinator is not a scenario peer, so it is never seeded by prefix.
+# seed_cohort(seed_coordinator=True) adds it as an ordinary seeded member: at
+# 100 peers its cold admission reached only one member, so a late joiner such
+# as the MQ-800 never learned it and dropped every data subscribe it sent as
+# undecryptable. Its address is the compose service name.
+COORDINATOR_NAME = "coordinator"
+
 
 def is_seeded(peer_name: str) -> bool:
     """The pre-trusted set: squad-*, microdrone-*, jet-*."""
@@ -369,7 +376,8 @@ def _peer_view_of(ident: Identity) -> Identity:
 
 def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
                 force: bool = False,
-                c_nodes: frozenset[str] = frozenset()) -> list[str]:
+                c_nodes: frozenset[str] = frozenset(),
+                seed_coordinator: bool = False) -> list[str]:
     """Write seeded state under ``out_root``. Returns the list of seeded
     peer names (squad-*/microdrone-*/jet-*).
 
@@ -382,6 +390,8 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
     seeded = [name for name in scenario.peers.keys() if is_seeded(name)]
     if not seeded:
         return seeded
+    if seed_coordinator:
+        seeded.append(COORDINATOR_NAME)
     gateways = [name for name in scenario.peers.keys() if is_gateway(name)]
 
     if force and out_root.exists():
@@ -530,7 +540,7 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
         # the seeded capability list.
         pc = PeerCapabilities()
         for other in seeded:
-            if other == peer:
+            if other in (peer, COORDINATOR_NAME):
                 continue
             pc.register(identities[other].uuid, SEEDED_PEER_CAPABILITIES)
         _save_json(peer_cfg_dir / "peer-capabilities.cfg.json", pc)
@@ -564,6 +574,8 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
 
         pc = PeerCapabilities()
         for other in seeded:
+            if other == COORDINATOR_NAME:
+                continue
             pc.register(identities[other].uuid, SEEDED_PEER_CAPABILITIES)
         _save_json(gw_cfg_dir / "peer-capabilities.cfg.json", pc)
 
@@ -619,6 +631,11 @@ def main(argv=None) -> int:
     p.add_argument("--no-mq800", action="store_true")
     p.add_argument("--no-jet", action="store_true")
     p.add_argument("--no-command", action="store_true")
+    p.add_argument("--seed-coordinator", action="store_true",
+                   help="Also seed the coordinator as a trusted cohort member "
+                        "(pair with AT_COMPOSE_SEED_COORDINATOR=1 so compose "
+                        "mounts its state). Its capabilities are learned at "
+                        "runtime.")
     p.add_argument("--c-microdrones", metavar="SPEC", nargs="?",
                    const="all", default=None,
                    help="Seed microdrone-* peers as C at_demo nodes (C-format "
@@ -642,7 +659,8 @@ def main(argv=None) -> int:
         include_command=not args.no_command,
     )
     c_nodes = _resolve_c_microdrones(scenario, args.c_microdrones)
-    seeded = seed_cohort(args.out, scenario, force=args.force, c_nodes=c_nodes)
+    seeded = seed_cohort(args.out, scenario, force=args.force, c_nodes=c_nodes,
+                         seed_coordinator=args.seed_coordinator)
     n_skipped = len(scenario.peers) - len(seeded)
     print(f"Seeded {len(seeded)} peers under {args.out} "
           f"({n_skipped} peers left to cold-bootstrap)")

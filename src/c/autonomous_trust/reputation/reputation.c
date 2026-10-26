@@ -3981,10 +3981,20 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
  * capability task-weight (sparse during cold-start) so the two sides stay a
  * straight port. Kill switch: AT_PREREP_HEURISTIC=0 restores the flat value.
  */
+static bool _index_told(int64_t index, const int64_t *told, size_t n_told)
+{
+    for (size_t i = 0; i < n_told; i++)
+        if (told[i] == index)
+            return true;
+    return false;
+}
+
 static double reputation_prereputation_prior(const tx_history_t *hist,
                                              const reputations_t *reps,
                                              const uuid_t self_uuid,
-                                             const uuid_t peer_uuid)
+                                             const uuid_t peer_uuid,
+                                             const int64_t *told,
+                                             size_t n_told)
 {
     const char *kill = getenv("AT_PREREP_HEURISTIC");
     if (kill != NULL && strcmp(kill, "0") == 0)
@@ -4016,6 +4026,10 @@ static double reputation_prereputation_prior(const tx_history_t *hist,
             if (uuid_compare(seen[j], tx->task_uuid) == 0) { dup = true; break; }
         if (dup)
             continue;
+        /* Under the join policy, an entry catch-up told us about is not
+         * evidence for the prior (RD_14.4 D4 (b)). */
+        if (_index_told(tx->index, told, n_told))
+            continue;
         uuid_copy(seen[seen_count++], tx->task_uuid);
 
         double cp_rep = PREREP_NEUTRAL;  /* reputations_get leaves this if peer absent */
@@ -4039,12 +4053,34 @@ static double reputation_prereputation_prior(const tx_history_t *hist,
     return prior;
 }
 
+bool reputation_bilateral_scores(const transaction_t *tx,
+                                 const uuid_t self_uuid,
+                                 const uuid_t peer_uuid,
+                                 double *ours_of_peer, double *peers_of_us)
+{
+    if (!tx->p1_set || !tx->p2_set)
+        return false;
+    bool bilateral =
+        (uuid_compare(tx->p1_uuid, peer_uuid) == 0
+         && uuid_compare(tx->p2_uuid, self_uuid) == 0)
+        || (uuid_compare(tx->p2_uuid, peer_uuid) == 0
+            && uuid_compare(tx->p1_uuid, self_uuid) == 0);
+    if (!bilateral)
+        return false;
+    return transaction_score_about(tx, peer_uuid, ours_of_peer, NULL)
+           && transaction_score_about(tx, self_uuid, peers_of_us, NULL);
+}
+
 /**
- * Contrite tit-for-tat — ports repprocess.py:363-386.
+ * Contrite tit-for-tat — ports repprocess.py _contrite_tit_for_tat.
  *
  * Collects ALL direct peer↔self interactions, computes the peer's running
- * standing (mean of their scores) and our own standing (mean of our scores
- * in those same transactions), then blends them. The result is continuous
+ * standing (mean of the scores WE gave it) and our own standing (mean of the
+ * scores it gave us in those same transactions), then blends them. Each side
+ * is read through transaction_score_about: pX_score is what pX gave the
+ * other side. It used to take the peer's own submitted score as its
+ * standing, so a peer's reputation was how it rated us (RD_14.4 plan,
+ * Phase 4). The result is continuous
  * in [0.0, 1.0], not the binary 0.0/1.0 the previous implementation
  * returned from the last direct tx alone.
  *
@@ -4054,8 +4090,32 @@ static double reputation_prereputation_prior(const tx_history_t *hist,
  *   - peer defected last AND my standing is good  → min(0.49, peer_standing)
  *   - cooperative case                            → max(0.51, peer_standing)
  */
+double reputation_ctft_blend(double peer_last, double peer_standing,
+                             double my_standing)
+{
+    if (peer_last < 0.5 && my_standing < 0.5) {
+        /* Peer defected, but my standing is poor — be contrite. */
+        return (peer_standing > 0.51) ? peer_standing : 0.51;
+    } else if (peer_last < 0.5 && my_standing >= 0.5) {
+        /* Peer defected, my standing is fine — retaliate. */
+        return (peer_standing < 0.49) ? peer_standing : 0.49;
+    }
+    /* Cooperate/cooperate, possibly digging out of a hole. */
+    return (peer_standing > 0.51) ? peer_standing : 0.51;
+}
+
 double reputation_contrite_tft(const tx_history_t *hist, const reputations_t *reps,
                                const uuid_t self_uuid, const uuid_t peer_uuid)
+{
+    return reputation_contrite_tft_told(hist, reps, self_uuid, peer_uuid,
+                                        NULL, 0);
+}
+
+double reputation_contrite_tft_told(const tx_history_t *hist,
+                                    const reputations_t *reps,
+                                    const uuid_t self_uuid,
+                                    const uuid_t peer_uuid,
+                                    const int64_t *told, size_t n_told)
 {
     transaction_t txns[MAX_CHAIN_LEN];
     int count = 0;
@@ -4072,21 +4132,10 @@ double reputation_contrite_tft(const tx_history_t *hist, const reputations_t *re
         if (!tx->p1_set || !tx->p2_set)
             continue;
 
-        bool self_is_p1 = (uuid_compare(tx->p1_uuid, self_uuid) == 0);
-        bool self_is_p2 = (uuid_compare(tx->p2_uuid, self_uuid) == 0);
-        bool peer_is_p1 = (uuid_compare(tx->p1_uuid, peer_uuid) == 0);
-        bool peer_is_p2 = (uuid_compare(tx->p2_uuid, peer_uuid) == 0);
-
         double peer_score, my_score;
-        if (peer_is_p1 && self_is_p2) {
-            peer_score = tx->p1_score;
-            my_score   = tx->p2_score;
-        } else if (peer_is_p2 && self_is_p1) {
-            peer_score = tx->p2_score;
-            my_score   = tx->p1_score;
-        } else {
+        if (!reputation_bilateral_scores(tx, self_uuid, peer_uuid,
+                                         &peer_score, &my_score))
             continue;
-        }
         peer_sum += peer_score;
         my_sum   += my_score;
         peer_last = peer_score;  /* iteration is forward, so this ends as the most-recent */
@@ -4096,21 +4145,11 @@ double reputation_contrite_tft(const tx_history_t *hist, const reputations_t *re
     if (n < 1)
         /* Cold-start: no bilateral history WITH us. Fall back to a
          * transaction-memory prior rather than a flat neutral (doc/architecture/networking.md). */
-        return reputation_prereputation_prior(hist, reps, self_uuid, peer_uuid);
+        return reputation_prereputation_prior(hist, reps, self_uuid, peer_uuid,
+                                              told, n_told);
 
-    double peer_standing = peer_sum / (double)n;
-    double my_standing   = my_sum   / (double)n;
-
-    if (peer_last < 0.5 && my_standing < 0.5) {
-        /* Peer defected, but my standing is poor — be contrite. */
-        return (peer_standing > 0.51) ? peer_standing : 0.51;
-    } else if (peer_last < 0.5 && my_standing >= 0.5) {
-        /* Peer defected, my standing is fine — retaliate. */
-        return (peer_standing < 0.49) ? peer_standing : 0.49;
-    } else {
-        /* Cooperate/cooperate, possibly digging out of a hole. */
-        return (peer_standing > 0.51) ? peer_standing : 0.51;
-    }
+    return reputation_ctft_blend(peer_last, peer_sum / (double)n,
+                                 my_sum / (double)n);
 }
 
 /**

@@ -141,13 +141,23 @@ class NetworkHooks:
     uuid_str, excluded)`` runs after the core recorded that reputation cut a
     peer off or readmitted it (:meth:`NetworkProcess.is_excluded`). Local
     verbs addressed to the network process register through
-    ``Extension.register_handlers`` as any other handler."""
+    ``Extension.register_handlers`` as any other handler.
+
+    ``also_unicast(proc, peer_uuid, frame, process, function)`` sees every
+    unicast the transport is about to send (none an extension carried through
+    ``unicast``), already sealed for the peer. ``fanout(proc, channel, frame,
+    process, function, group)`` sees every frame the transport sent on the
+    'group' (sealed with the group key) or 'broadcast' (plaintext) channel.
+    Neither can stop or alter the transport send. Twins of C
+    ``net_ext_t.also_unicast`` / ``fanout``."""
     on_start: Optional[Callable[[Any, Any], None]] = None
     periodic: Optional[Callable[[Any, Any], None]] = None
     drain_inbound: Optional[Callable[[Any, Any, int], int]] = None
     reaches: Optional[Callable[[Any, Any], bool]] = None
     unicast: Optional[Callable[[Any, Any, bytes], None]] = None
     on_exclusion: Optional[Callable[[Any, str, bool], None]] = None
+    also_unicast: Optional[Callable[[Any, Any, bytes, str, str], None]] = None
+    fanout: Optional[Callable[[Any, str, bytes, str, str, Any], None]] = None
 
 
 @dataclass(frozen=True)
@@ -242,7 +252,16 @@ class Extension:
     ``process_aliases`` is ``((wire_name, local_process), ...)``: a process a
     C peer addresses that Python runs inside another one. ZTA's findings go to
     C's ``zta_verify`` process; Python's ZTA rides identity, so the network
-    process delivers them there (:func:`process_alias`)."""
+    process delivers them there (:func:`process_alias`).
+
+    ``network_wire_verbs`` are network-process functions this feature accepts
+    from the wire, admitted only on a member's paths (peer, group) and then
+    handled by a network-process handler it registers; the local outbound
+    form of the same verb reaches that handler first with no sender, and the
+    handler declines it so it is sent. Every inbound frame of a declared verb
+    (it carries a sender) must be consumed by that handler; one it declines
+    is treated as a local outbound message. Twin of C
+    ``net_ext_t.wire_verbs``."""
     name: str
     enabled: Callable[[], bool]
     register_handlers: Callable[[Any, str], None]
@@ -257,6 +276,7 @@ class Extension:
     plaintext_verbs: tuple = ()
     transports: tuple = ()
     process_aliases: tuple = ()
+    network_wire_verbs: tuple = ()
 
 
 def _builtin() -> list[Extension]:
@@ -401,6 +421,21 @@ def identity_hooks(proc) -> tuple:
 
 #: network_hooks' answers, keyed by the extension names a process loaded.
 _network_hooks_cache: dict = {}
+
+
+_network_wire_verbs_cache: Optional[frozenset] = None
+
+
+def network_wire_verbs() -> frozenset:
+    """Network-process functions the enabled extensions accept from the wire
+    (``Extension.network_wire_verbs``). Cached until ``reset_extensions()``;
+    each extension's ``enabled()`` is sampled once, when the cache fills."""
+    global _network_wire_verbs_cache
+    if _network_wire_verbs_cache is None:
+        _network_wire_verbs_cache = frozenset(
+            v for ext in all_extensions() if ext.enabled()
+            for v in ext.network_wire_verbs)
+    return _network_wire_verbs_cache
 
 
 def network_hooks(proc) -> tuple:
@@ -622,6 +657,8 @@ def configure_plaintext_verbs(cfg_dir=None, logger=None) -> frozenset:
 
 def reset_extensions() -> None:
     """Drop every extension's process-global state (conformance/tests)."""
+    global _network_wire_verbs_cache
+    _network_wire_verbs_cache = None
     _identity_hooks_cache.clear()
     _network_hooks_cache.clear()
     _present_hooks_cache.clear()

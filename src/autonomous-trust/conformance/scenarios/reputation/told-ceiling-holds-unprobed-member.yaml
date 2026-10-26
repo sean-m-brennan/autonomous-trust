@@ -1,0 +1,76 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: told-ceiling-holds-unprobed-member
+byte_pinning: false
+description: |
+    The told ceiling under the join policy (RD_14.4_HOSTILE_JOIN_PLAN.md
+    Phase 4, D3 (b)). bob holds only what others said of subject: carol and
+    dave each gave it 0.95, and bob has never transacted with it. Its told
+    score is the cooperation-mode mean, 0.95; bob holds no own evidence, so
+    it has no brought score, and what bob acts on (bounded) is told capped
+    at the tier-1 ceiling, just under 0.65.
+
+    friend's told score is the same 0.95, but identity counts friend as an
+    anchor (a verified contact), so its told score is read uncapped. friend
+    is staged, not stepped: its told score is the staged one in both
+    runtimes.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: oracle
+  - id: subject
+    role: subject
+  - id: friend
+    role: member
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  join_policy:
+    version: 1
+    enabled: true
+    anchors: [verified_contact]
+  anchored:
+    bob: [friend]
+  tx_history:
+    bob:
+      - {task_id: t-cs, p1: carol, p1_score: 0.95, p2: subject, p2_score: 0.9}
+      - {task_id: t-ds, p1: dave, p1_score: 0.95, p2: subject, p2_score: 0.9}
+  reputations:
+    bob:
+      subject: 0.95
+      friend: 0.95
+      carol: 0.8
+      dave: 0.8
+  coop_mode:
+    bob:
+      subject: true
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: request reputation
+    payload:
+      target: subject
+      proc: negotiation
+    description: |
+        bob scores subject: told 0.95 from carol and dave, nothing of its
+        own.
+
+expected_state:
+  bob:
+    reputation_of:
+      subject: 0.95
+      friend: 0.95
+    brought_of:
+      subject: null
+      friend: null
+    bounded_of:
+      subject: 0.65
+      friend: 0.95

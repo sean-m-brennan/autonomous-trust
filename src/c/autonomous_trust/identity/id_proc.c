@@ -645,6 +645,10 @@ static struct {
      * to provisional_members.cfg.json. Mirrors Python
      * IdentityProcess.provisional_members. */
     json_t *provisional_members;
+    /* The peers last told to reputation as anchors (PEER_ANCHOR), uuid-str ->
+     * integer_data(1), so only a change is sent (RD_14.4 Phase 4). Mirrors
+     * Python IdentityProcess._anchors_published. */
+    map_t anchors_published;
 } id_state;
 
 static void _ensure_id_init(void)
@@ -660,6 +664,7 @@ static void _ensure_id_init(void)
         /* Features that keep per-peer state (identity/id_ext.h). */
         identity_ext_init();
         map_init(&id_state.attest_sent);
+        map_init(&id_state.anchors_published);
         map_init(&id_state.attest_sent_clock);
         map_init(&id_state.peer_clock_samples);
         map_init(&id_state.peer_cap_descriptors_map);
@@ -1766,6 +1771,8 @@ static int _add_peer(process_t *proc, directory_t *queues,
      * from here on, so a consumer that models what we observe should see it.
      * Two-phase admission gates the GROUP KEY, not visibility. */
     identity_emit_peer_observed(proc, new_peer);
+    /* Under the join policy, whether the new peer is an anchor. */
+    identity_publish_anchors(proc);
 
     /* Two-phase admission (doc/architecture/identity-protocol.md): propagate the group key only for a
      * CONFIRMED peer. A provisional add records the peer above (visibility /
@@ -3924,6 +3931,81 @@ uint32_t identity_anchor_classes(const process_t *proc, const public_identity_t 
 bool identity_is_anchored(const process_t *proc, const public_identity_t *ident)
 {
     return identity_anchor_classes(proc, ident) != 0;
+}
+
+/* Record @p now as @p u's anchoring and, if that changed, tell reputation. */
+static void _note_anchor(const process_t *proc, const uuid_t u, bool now)
+{
+    char ks[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(u, ks);
+    data_t *d = NULL;
+    pthread_mutex_lock(&id_state.lock);
+    bool was = map_get(&id_state.anchors_published, (map_key_t)ks, &d) == 0;
+    if (now && !was)
+        map_set(&id_state.anchors_published, (map_key_t)ks, integer_data(1));
+    else if (!now && was)
+        map_remove(&id_state.anchors_published, (map_key_t)ks);
+    pthread_mutex_unlock(&id_state.lock);
+    if (now == was)
+        return;
+    generic_msg_t out;
+    memset(&out, 0, sizeof(out));
+    out.type = PEER_ANCHOR;
+    out.size = sizeof(peer_anchor_msg_t);
+    uuid_copy(out.info.peer_anchor.peer_uuid, u);
+    out.info.peer_anchor.anchored = now;
+    (void)identity_send_to(proc, "reputation", &out,
+                           now ? "an anchor" : "an anchor withdrawn", ks);
+}
+
+/* Tell reputation which peers are anchors, one PEER_ANCHOR per change
+ * (reputation leaves an anchored peer's told score unbounded, RD_14.4 Phase
+ * 4). Nothing is sent while the policy is off. Run when a peer is added and on
+ * the resync cadence, since a contact verified or a credential revoked changes
+ * the answer with no peer change. Mirrors Python _publish_anchors. */
+void identity_publish_anchors(const process_t *proc)
+{
+    _ensure_id_init();
+    pthread_mutex_lock(&id_state.lock);
+    bool on = id_state.join_policy.enabled;
+    pthread_mutex_unlock(&id_state.lock);
+    if (!on || proc == NULL)
+        return;
+    peers_read_lock(proc);
+    size_t n = proc->protocol.num_peers;
+    public_identity_t *peers = calloc(n > 0 ? n : 1, sizeof(*peers));
+    if (peers != NULL)
+        memcpy(peers, proc->protocol.peers, n * sizeof(*peers));
+    peers_read_unlock(proc);
+    if (peers == NULL)
+        return;
+    /* A peer no longer held is no longer an anchor. */
+    pthread_mutex_lock(&id_state.lock);
+    size_t n_gone = 0;
+    uuid_t *gone = calloc(map_size(&id_state.anchors_published) + 1, sizeof(uuid_t));
+    map_key_t key = NULL;
+    data_t *val = NULL;
+    map_entries_for_each(&id_state.anchors_published, key, val)
+    {
+        (void)val;
+        uuid_t u;
+        bool held = false;
+        if (gone == NULL || uuid_parse(key, u) != 0)
+            continue;
+        for (size_t i = 0; i < n && !held; i++)
+            held = uuid_compare(peers[i].uuid, u) == 0;
+        if (!held)
+            uuid_copy(gone[n_gone++], u);
+    }
+    map_end_for_each
+    pthread_mutex_unlock(&id_state.lock);
+    for (size_t g = 0; g < n_gone; g++)
+        _note_anchor(proc, gone[g], false);
+    /* Judged outside every lock: id_ext.h calls the hooks with none held. */
+    for (size_t i = 0; i < n; i++)
+        _note_anchor(proc, peers[i].uuid, identity_is_anchored(proc, &peers[i]));
+    free(gone);
+    free(peers);
 }
 
 /* Record who offered the history just appended to id_state.histories (NULL:
@@ -6934,8 +7016,19 @@ static bool handle_identity_response(const process_t *proc, directory_t *queues,
         ? parsed.address
         : json_string_value(json_object_get(payload, "from_address"));
 
-    /* Only backfill identities for actual group members. */
-    if (!_group_has_address(&((process_t *)proc)->protocol.group, addr)) {
+    /* Only backfill identities for actual group members. Membership is by
+     * UUID: the map is keyed by member uuid, and an entry can hold a stale
+     * address, e.g. the hostname placeholder the cohort seeder writes for a
+     * member that then advertises its runtime IP. The signature check above
+     * ties the identity to that uuid, so a stranger still cannot enter.
+     * Address membership is kept for a map keyed by address. Mirrors Python
+     * handle_identity_response. */
+    group_t *group = &((process_t *)proc)->protocol.group;
+    char member_key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(parsed.uuid, member_key);
+    data_t *entry = NULL;
+    bool is_member = map_get(&group->address_map, member_key, &entry) == 0;
+    if (!is_member && !_group_has_address(group, addr)) {
         probes_counter("peer.set", "identity_response_not_in_group", "1");
         json_decref(payload);
         return true;
@@ -6946,6 +7039,16 @@ static bool handle_identity_response(const process_t *proc, directory_t *queues,
     if (self != NULL && uuid_compare(parsed.uuid, self->uuid) == 0) {
         json_decref(payload);
         return true;
+    }
+
+    /* Refresh a stale map entry to the verified address (addr may point into
+     * payload, so before it is released; group_add_address copies it). */
+    bool refreshed = false;
+    if (is_member && addr != NULL && addr[0] != '\0') {
+        string_t cur = NULL;
+        if (data_string_ptr(entry, &cur) != 0 || cur == NULL
+            || strcmp(cur, addr) != 0)
+            refreshed = group_add_address(group, member_key, addr) == 0;
     }
     json_decref(payload);
 
@@ -6993,6 +7096,10 @@ static bool handle_identity_response(const process_t *proc, directory_t *queues,
     } else {
         probes_counter("peer.set", "identity_response_redundant", "1");
     }
+    /* Push the refreshed map to the local processes (Python: _record_group),
+     * after the backfill so a failure here cannot cost it. */
+    if (refreshed)
+        _update_group(proc, queues);
     return true;
 }
 
@@ -9667,6 +9774,9 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
              * converged leaf. */
             identity_request_hierarchy(proc);
             identity_refresh_hierarchy(proc);
+            /* Anchors change with no peer change too (a contact verified, a
+             * credential revoked). */
+            identity_publish_anchors(proc);
         }
 
         /* TAKE EVERYTHING WAITING, not one per tick. The periodic work above

@@ -96,6 +96,7 @@ bool at_send_retry_supported(long type)
     case PEER_REPUTATION:
     case PEER_REMOVED:
     case PEER_PRESENCE:
+    case PEER_ANCHOR:
         return true;
     default:
         break;

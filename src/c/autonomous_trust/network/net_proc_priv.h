@@ -94,6 +94,15 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
 void handle_inbound_relayed(net_thread_ctx_t *ctx, const uint8_t *buf,
                             size_t nbytes, const char *from_uuid);
 
+/** @brief Deliver a frame an extension received some other way (a radio) on
+ *  channel @p ch, attributed to the peer @p from_uuid we hold. PEER takes the
+ *  relayed path; GROUP and BROADCAST the transport's handlers, keyed on the
+ *  peer's address. The frame does not stamp transport liveness, and a group
+ *  frame that fails to open is counted (net.ext/group_decrypt_fail), never a
+ *  partition signal. An unknown uuid is dropped. The caller keeps @p buf. */
+void handle_inbound_ext(net_thread_ctx_t *ctx, net_channel_t ch,
+                        const uint8_t *buf, size_t nbytes, const char *from_uuid);
+
 /** @brief Process one inbound BROADCAST-channel frame. See @ref handle_inbound_peer. */
 void handle_inbound_broadcast(net_thread_ctx_t *ctx,
                               uint8_t *buf, size_t nbytes,
@@ -228,6 +237,16 @@ bool net_wire_verb_admitted(const char *process, const char *function,
  *         API. */
 int net_proc_test_route_on_path(const net_wire_msg_t *wmsg, process_t *proc,
                                 logger_t *logger, net_route_path_t path);
+
+/** @brief net_encrypt_and_send, exposed for tests (the send path's hooks). */
+int net_proc_test_encrypt_and_send(const identity_t *myself, const group_t *grp,
+                                   const net_wire_msg_t *msg,
+                                   const net_transport_t *transport,
+                                   net_transport_ctx_t *ctx, int port,
+                                   net_wire_format_t fmt, logger_t *logger);
+
+/** @brief Mark this thread as routing extension-delivered frames (tests). */
+void net_proc_test_set_ext_inbound(bool on);
 
 /* ---- ping_at refusal (divergence: C implements no PingAT) ----
  * The outbound drain answers the `ping_at` selector with an explicit refusal

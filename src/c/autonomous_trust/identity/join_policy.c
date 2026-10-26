@@ -17,6 +17,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 
 #include <jansson.h>
@@ -47,6 +48,37 @@ static void _fail(char *err, size_t err_len, const char *fmt, ...)
     va_end(ap);
 }
 
+/* The highest trust tier (reputation TIER_FLOORS). */
+#define AT_JOIN_TIER_MAX 4
+
+static void _inert(at_join_policy_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->told_tier = AT_JOIN_TOLD_TIER_DEFAULT;
+    out->own_evidence_min = AT_JOIN_OWN_EVIDENCE_MIN_DEFAULT;
+}
+
+/* @p key of @p root as an integer in [low, high] into @p out, left alone when
+ * absent. */
+static bool _bounded_int(json_t *root, const char *key, int low, int high,
+                         int *out, char *err, size_t err_len)
+{
+    json_t *val = json_object_get(root, key);
+    if (val == NULL)
+        return true;
+    if (!json_is_integer(val)) {
+        _fail(err, err_len, "%s: not an integer", key);
+        return false;
+    }
+    json_int_t v = json_integer_value(val);
+    if (v < low || v > high) {
+        _fail(err, err_len, "%s: %lld out of range", key, (long long)v);
+        return false;
+    }
+    *out = (int)v;
+    return true;
+}
+
 uint32_t at_join_policy_class(const char *name)
 {
     if (name == NULL)
@@ -70,7 +102,7 @@ bool at_join_policy_parse(const char *text, at_join_policy_t *out,
 {
     if (out == NULL)
         return false;
-    memset(out, 0, sizeof(*out));
+    _inert(out);
     if (text == NULL)
         return true;
     json_error_t jerr;
@@ -88,7 +120,9 @@ bool at_join_policy_parse(const char *text, at_join_policy_t *out,
     json_t *val;
     json_object_foreach(root, key, val) {
         if (strcmp(key, "version") != 0 && strcmp(key, "enabled") != 0
-            && strcmp(key, "anchors") != 0 && strcmp(key, "note") != 0) {
+            && strcmp(key, "anchors") != 0 && strcmp(key, "note") != 0
+            && strcmp(key, "told_tier") != 0
+            && strcmp(key, "own_evidence_min") != 0) {
             _fail(err, err_len, "unknown key(s) %s", key);
             goto done;
         }
@@ -125,13 +159,22 @@ bool at_join_policy_parse(const char *text, at_join_policy_t *out,
         }
         bits |= bit;
     }
+    int told_tier = AT_JOIN_TOLD_TIER_DEFAULT;
+    int own_min = AT_JOIN_OWN_EVIDENCE_MIN_DEFAULT;
+    if (!_bounded_int(root, "told_tier", 0, AT_JOIN_TIER_MAX, &told_tier,
+                      err, err_len)
+        || !_bounded_int(root, "own_evidence_min", 1, INT_MAX, &own_min,
+                         err, err_len))
+        goto done;
     out->enabled = json_is_true(enabled);
     out->anchors = bits;
+    out->told_tier = told_tier;
+    out->own_evidence_min = own_min;
     ok = true;
 done:
     json_decref(root);
     if (!ok)
-        memset(out, 0, sizeof(*out));
+        _inert(out);
     return ok;
 }
 
@@ -140,7 +183,7 @@ bool at_join_policy_load(const char *path, at_join_policy_t *out,
 {
     if (path == NULL || out == NULL)
         return false;
-    memset(out, 0, sizeof(*out));
+    _inert(out);
     FILE *fp = fopen(path, "rb");
     if (fp == NULL) {
         _fail(err, err_len, "cannot open %s", path);

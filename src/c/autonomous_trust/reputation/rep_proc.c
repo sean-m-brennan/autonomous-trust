@@ -260,6 +260,11 @@ static void _handle_peer_standing(const process_t *proc,
  * standing handler sits above it and must tell the app when a ceiling moves. */
 static void _publish_reputation_change(const uuid_t peer_uuid, double score);
 static double _score_peer_locked(const process_t *proc, const uuid_t peer_uuid);
+/* Brought and told (RD_14.4 Phase 4): defined beside _score_peer_locked.
+ * Callers hold rep_state.lock. */
+static double _bounded_locked(const uuid_t peer_uuid, double told);
+static bool _exclusion_score_locked(const uuid_t peer_uuid, double told,
+                                    double *out);
 static void _publish_standing_change(const process_t *proc,
                                      const uuid_t peer_uuid);
 /* Both defined further down, beside the code that owns them; this block
@@ -829,7 +834,56 @@ static struct {
      * ReputationProcess.join_policy / _catchup_marks. */
     at_join_policy_t join_policy;
     json_t *catchup_marks;
+    /* Brought and told (RD_14.4 Phase 4, D3 (b)). Under the join policy a
+     * second score per peer, from this node's OWN evidence alone, beside the
+     * told one in `reputations`; see _score_brought_locked. Mirrors Python
+     * Reputations.brought / _coop_brought / _warm_started /
+     * _restore_clamped_brought / Protocol.anchored.
+     *   brought:          the brought scores (persisted as "brought");
+     *   coop_brought:     its CTFT/pure latch, uuid-str -> integer_data(0|1);
+     *   warm_started:     peers the snapshot carried, whose told score is
+     *                     therefore not told-only (seeds);
+     *   restore_clamped_brought: the brought twin of restore_clamped;
+     *   anchored:         peers identity counts as anchors (PEER_ANCHOR),
+     *                     uuid-str -> integer_data(1). */
+    reputations_t brought;
+    /* This node's uuid, cached by _resolve_self_uuid for the readers that
+     * have no process to hand (the app carrier). */
+    uuid_t self_uuid;
+    bool have_self;
+    map_t coop_brought;
+    map_t warm_started;
+    map_t restore_clamped_brought;
+    map_t anchored;
 } rep_state;
+
+/* The brought map's accessors. Kept at DOUBLE precision, unlike the told
+ * scores reputations_t stores as floats: the bounded reader returns it as is,
+ * and 0.9 stored as a float reads back below the tier-4 floor, which the told
+ * path never meets because it publishes the score it just computed. Callers
+ * hold rep_state.lock. */
+static int _brought_get(const uuid_t peer_uuid, double *out)
+{
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, key);
+    data_t *d = NULL;
+    if (map_get(&rep_state.brought.scores, (map_key_t)key, &d) != 0 || d == NULL)
+        return -1;
+    return data_floating_pt_dbl(d, out) == 0 ? 0 : -1;
+}
+
+static bool _brought_has(const uuid_t peer_uuid)
+{
+    double unused = 0.0;
+    return _brought_get(peer_uuid, &unused) == 0;
+}
+
+static void _brought_set(const uuid_t peer_uuid, double score)
+{
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, key);
+    map_set(&rep_state.brought.scores, (map_key_t)key, floating_pt_dbl_data(score));
+}
 
 /* Is @p fn a frame that nothing re-sends if it is lost (ISSUES §2.28)?
  *
@@ -953,6 +1007,11 @@ static void _ensure_init(void)
         rep_state.rescore_swept = false;
         map_init(&rep_state.child_evidence_tried);
         map_init(&rep_state.restore_clamped);
+        reputations_init(&rep_state.brought);
+        map_init(&rep_state.coop_brought);
+        map_init(&rep_state.warm_started);
+        map_init(&rep_state.restore_clamped_brought);
+        map_init(&rep_state.anchored);
         map_init(&rep_state.peer_ceilings);
         map_init(&rep_state.peer_proved_index);
         map_init(&rep_state.peer_acted);
@@ -1566,11 +1625,16 @@ static const char *_task_channel_locked(const char *task_uuid_str)
 static void _publish_tier_change(const process_t *proc,
                                  const uuid_t peer_uuid, double score)
 {
-    int new_tier = _trust_tier(score);
     char uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(peer_uuid, uuid_str);
 
     pthread_mutex_lock(&rep_state.lock);
+    /* Under the join policy exclusion reads brought + slash and the tier reads
+     * bounded (RD_14.4 Phase 4); @p score is the told one. */
+    double excl = score;
+    bool have_excl = _exclusion_score_locked(peer_uuid, score, &excl);
+    score = _bounded_locked(peer_uuid, score);
+    int new_tier = _trust_tier(score);
 
     /* Communication cut-off crossing. Checked BEFORE the tier dedup
      * early-return because COMM_CUTOFF (0.1) lies WITHIN tier 0 ([0,0.5)):
@@ -1579,7 +1643,7 @@ static void _publish_tier_change(const process_t *proc,
      * the network process is notified only on an actual crossing. Mirrors
      * Python repprocess._publish_tier_change. */
     int exclusion_action = 0;  /* +1 exclude, -1 readmit, 0 unchanged */
-    bool now_excluded = (score < COMM_CUTOFF);
+    bool now_excluded = have_excl && excl < COMM_CUTOFF;
     data_t *ex_dat = NULL;
     bool was_excluded =
         (map_get(&rep_state.excluded, uuid_str, &ex_dat) == 0);
@@ -1991,6 +2055,14 @@ static void _handle_peer_standing(const process_t *proc,
      * from the punished regime instead of snapping back into cooperation --
      * the same reasoning as the slash override. */
     map_set(&rep_state.coop_mode, (map_key_t)key, integer_data(0));
+    /* Both maps (RD_14.4 Phase 4). */
+    double held = 0.0;
+    if (_brought_get(st->peer_uuid, &held) == 0
+        && held > unwound)
+    {
+        _brought_set(st->peer_uuid, unwound);
+        map_set(&rep_state.coop_brought, (map_key_t)key, integer_data(0));
+    }
     pthread_mutex_unlock(&rep_state.lock);
 
     log_warn(proc->logger,
@@ -2026,6 +2098,13 @@ static int _publish_reputation(const uuid_t peer_uuid, double score, bool rated)
     msg.type = PEER_REPUTATION;
     msg.size = sizeof(peer_reputation_msg_t);
     uuid_copy(msg.info.peer_reputation.peer_uuid, peer_uuid);
+    /* @p score is the told one; the carrier reads bounded (RD_14.4 Phase 4),
+     * with no change to the flat ABI. */
+    if (rated) {
+        pthread_mutex_lock(&rep_state.lock);
+        score = _bounded_locked(peer_uuid, score);
+        pthread_mutex_unlock(&rep_state.lock);
+    }
     msg.info.peer_reputation.score = rated ? score : 0.0;
     msg.info.peer_reputation.rated = rated;
     /* The tier and the bound behind it (Phase 4 P4.1). A consumer can derive a
@@ -4171,6 +4250,221 @@ static double _tenure_apply_locked(const process_t *proc, const uuid_t peer_uuid
     return score;
 }
 
+/* ---- Brought and told (RD_14.4 Phase 4, D3 (b)) --------------------------
+ *
+ * Under the join policy this node keeps two scores per peer. TOLD is the
+ * stored score (rep_state.reputations), unchanged: every entry on the chain,
+ * whoever wrote it. BROUGHT (rep_state.brought) is scored by the same regimes
+ * over this node's OWN evidence alone: its halves of bilateral transactions,
+ * physics and calibration findings among them, probes excluded until Phase 5.
+ * A peer with no own evidence has no brought score (a seed or a slash aside);
+ * it does not fall back to the prior. Each reader names the one it reads (the
+ * plan's reader table): decisions read BOUNDED (_bounded_locked), exclusion
+ * reads brought + slash (_exclusion_score_locked), the scoring weights read
+ * told. With the policy off there is no brought map and every reader reads
+ * told. Mirrors Python repprocess.py. */
+
+typedef struct {
+    int    n;            /* own entries */
+    double peer_sum;     /* sum of the scores we gave the peer */
+    double my_sum;       /* sum of the scores the peer gave us */
+    double peer_last;    /* the newest score we gave it */
+    double w_sum;        /* sum of task weights */
+    double w_score;      /* sum of (our score x task weight) */
+} rep_own_evidence_t;
+
+/* The task weight cached for @p task (1 when none). Caller holds the lock. */
+static int _task_weight_of_locked(const uuid_t task)
+{
+    char tk[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(task, tk);
+    data_t *w_dat = NULL;
+    int wv = 0;
+    if (map_get(&rep_state.task_weights, tk, &w_dat) == 0 && w_dat != NULL
+        && data_integer(w_dat, &wv) == 0 && wv > 0)
+        return wv;
+    return 1;
+}
+
+/* Fold this node's own entries about @p peer_uuid, oldest first: the
+ * bilateral transactions whose half of ours is not a probe. Caller holds
+ * rep_state.lock. Mirrors Python _own_evidence. */
+static void _own_evidence_locked(const uuid_t peer_uuid, rep_own_evidence_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!rep_state.have_self)
+        return;
+    transaction_t *txns = malloc(sizeof(transaction_t) * MAX_CHAIN_LEN);
+    uuid_t *seen = malloc(sizeof(uuid_t) * MAX_CHAIN_LEN);
+    if (txns == NULL || seen == NULL) {
+        free(txns);
+        free(seen);
+        return;
+    }
+    int count = 0;
+    int n_seen = 0;
+    tx_history_by_peer(&rep_state.history, peer_uuid, txns, &count,
+                       MAX_CHAIN_LEN);
+    for (int i = 0; i < count; i++)
+    {
+        const transaction_t *tx = &txns[i];
+        double ours = 0.0, theirs = 0.0;
+        if (tx->attested
+            || !reputation_bilateral_scores(tx, rep_state.self_uuid, peer_uuid,
+                                            &ours, &theirs))
+            continue;
+        const char *mine = uuid_compare(tx->p1_uuid, rep_state.self_uuid) == 0
+                           ? tx->p1_channel : tx->p2_channel;
+        if (strcmp(mine, TX_CHANNEL_PROBE) == 0)
+            continue;
+        bool dup = false;
+        for (int j = 0; j < n_seen && !dup; j++)
+            dup = uuid_compare(seen[j], tx->task_uuid) == 0;
+        if (dup)
+            continue;
+        uuid_copy(seen[n_seen++], tx->task_uuid);
+        int w = _task_weight_of_locked(tx->task_uuid);
+        out->n++;
+        out->peer_sum += ours;
+        out->my_sum += theirs;
+        out->peer_last = ours;
+        out->w_sum += (double)w;
+        out->w_score += ours * (double)w;
+    }
+    free(txns);
+    free(seen);
+}
+
+/* Score and store @p peer_uuid's brought score, bounded as the told one is
+ * (standing, tenure). A slashed peer keeps the floor _apply_slash_locked wrote
+ * to both maps. With no own evidence the stored value is left alone: absent
+ * stays absent, a seed stays a seed. Caller holds rep_state.lock. Mirrors
+ * Python _score_brought. */
+static void _score_brought_locked(const uuid_t peer_uuid)
+{
+    if (!rep_state.join_policy.enabled)
+        return;
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, key);
+    data_t *d = NULL;
+    if (map_get(&rep_state.slashed, (map_key_t)key, &d) == 0) {
+        map_set(&rep_state.coop_brought, (map_key_t)key, integer_data(0));
+        return;
+    }
+    rep_own_evidence_t own;
+    _own_evidence_locked(peer_uuid, &own);
+    if (own.n == 0)
+        return;
+    double ctft = reputation_ctft_blend(own.peer_last,
+                                        own.peer_sum / (double)own.n,
+                                        own.my_sum / (double)own.n);
+    double previous = 0.0;
+    if (_brought_get(peer_uuid, &previous) != 0)
+        previous = ctft;
+    int in_coop = 0;
+    if (map_get(&rep_state.coop_brought, (map_key_t)key, &d) == 0 && d != NULL)
+        data_integer(d, &in_coop);
+    bool use_pure = in_coop ? previous > COOP_EXIT : previous > COOP_ENTER;
+    map_set(&rep_state.coop_brought, (map_key_t)key,
+            integer_data(use_pure ? 1 : 0));
+    /* Cooperation mode over own entries: each is weighted by its author's
+     * reputation in the told regime; the author is always us, whose weight is
+     * the neutral, so it cancels and the task weight remains. */
+    double score = !use_pure ? ctft
+                   : own.w_sum > 0.0 ? own.w_score / own.w_sum
+                   : PREREP_NEUTRAL;
+    double ceiling = _standing_ceiling_of(peer_uuid);
+    if (ceiling >= 0.0 && score > ceiling)
+        score = ceiling;
+    score = _tenure_bound_locked(peer_uuid, score);
+    _brought_set(peer_uuid, score);
+}
+
+static bool _is_anchored_locked(const uuid_t peer_uuid)
+{
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, key);
+    data_t *d = NULL;
+    return map_get(&rep_state.anchored, (map_key_t)key, &d) == 0;
+}
+
+/* What a decision about @p peer_uuid reads, given its told score: the brought
+ * score once the peer has own_evidence_min own entries, otherwise told capped
+ * at the told_tier ceiling. An anchored peer reads told uncapped; with the
+ * policy off every reader reads told. Caller holds rep_state.lock. Mirrors
+ * Python _bounded. */
+static double _bounded_locked(const uuid_t peer_uuid, double told)
+{
+    if (!rep_state.join_policy.enabled || _is_anchored_locked(peer_uuid))
+        return told;
+    double brought = 0.0;
+    if (_brought_get(peer_uuid, &brought) == 0) {
+        rep_own_evidence_t own;
+        _own_evidence_locked(peer_uuid, &own);
+        if (own.n >= rep_state.join_policy.own_evidence_min) {
+            /* A ceiling that landed since the score was written bounds it. */
+            double ceiling = _standing_ceiling_of(peer_uuid);
+            return (ceiling >= 0.0 && brought > ceiling) ? ceiling : brought;
+        }
+    }
+    double cap = _tier_ceiling(rep_state.join_policy.told_tier);
+    return told < cap ? told : cap;
+}
+
+/* The score exclusion reads, into @p out: told with the policy off; under it
+ * the brought score, or told when the peer is slashed, so the cohort's word
+ * alone never excludes anyone (exclusion is sticky). False when there is none,
+ * which excludes nobody. Caller holds rep_state.lock. Mirrors Python
+ * _exclusion_score. */
+static bool _exclusion_score_locked(const uuid_t peer_uuid, double told,
+                                    double *out)
+{
+    *out = told;
+    if (!rep_state.join_policy.enabled)
+        return true;
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, key);
+    data_t *d = NULL;
+    if (map_get(&rep_state.slashed, (map_key_t)key, &d) == 0)
+        return true;
+    return _brought_get(peer_uuid, out) == 0;
+}
+
+/* Whether a told score exists only because of told evidence: not slashed, not
+ * warm-started, and no own entry behind it. A seed may replace such a score
+ * under the policy. Caller holds rep_state.lock. Mirrors Python _told_only. */
+static bool _told_only_locked(const uuid_t peer_uuid)
+{
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, key);
+    data_t *d = NULL;
+    if (map_get(&rep_state.slashed, (map_key_t)key, &d) == 0
+        || map_get(&rep_state.warm_started, (map_key_t)key, &d) == 0)
+        return false;
+    rep_own_evidence_t own;
+    _own_evidence_locked(peer_uuid, &own);
+    return own.n == 0;
+}
+
+/* Contrite TFT for the told score: under the join policy the cold-start prior
+ * skips the primary-chain entries catch-up marked as told (D4 (b)). Caller
+ * holds rep_state.lock. */
+static double _contrite_tft_locked(const uuid_t self_uuid, const uuid_t peer_uuid)
+{
+    int64_t told[MAX_CHAIN_LEN];
+    size_t n_told = 0;
+    json_t *marks = rep_state.join_policy.enabled && rep_state.catchup_marks
+                    ? json_object_get(rep_state.catchup_marks, "") : NULL;
+    size_t i;
+    json_t *v;
+    json_array_foreach(marks, i, v)
+        if (n_told < MAX_CHAIN_LEN && json_is_integer(v))
+            told[n_told++] = (int64_t)json_integer_value(v);
+    return reputation_contrite_tft_told(&rep_state.history,
+                                        &rep_state.reputations, self_uuid,
+                                        peer_uuid, told, n_told);
+}
+
 /* Score @p peer_uuid by the ordinary algebra, bound it by any standing, and
  * STORE it. The one place a score is computed: handle_rep_request answers with
  * it and _rescore_peers publishes it, so the two cannot drift apart. Returns
@@ -4205,9 +4499,7 @@ static double _score_peer_locked(const process_t *proc, const uuid_t peer_uuid)
          * to the pure mean and RAISED it. The first score's regime follows
          * what this node would assign it now (ISSUES §2.64). Mirrors Python's
          * _compute_reputation. */
-        current_score = reputation_contrite_tft(&rep_state.history,
-                                                &rep_state.reputations,
-                                                self_uuid, peer_uuid);
+        current_score = _contrite_tft_locked(self_uuid, peer_uuid);
     }
 
     char coop_key[UUID_STRING_LEN + 1];
@@ -4229,9 +4521,7 @@ static double _score_peer_locked(const process_t *proc, const uuid_t peer_uuid)
                                 &rep_state.reputations, peer_uuid,
                                 &rep_state.task_weights);
     } else {
-        score = reputation_contrite_tft(&rep_state.history,
-                                        &rep_state.reputations,
-                                        self_uuid, peer_uuid);
+        score = _contrite_tft_locked(self_uuid, peer_uuid);
     }
     /* doc/architecture/zta-integration.md: an authority's finding bounds how far this peer may
      * rise, whichever regime produced the score above. Applied where the
@@ -4239,6 +4529,8 @@ static double _score_peer_locked(const process_t *proc, const uuid_t peer_uuid)
     score = _standing_apply_ceiling(peer_uuid, score);
     score = _tenure_apply_locked(proc, peer_uuid, score);
     reputations_update(&rep_state.reputations, peer_uuid, score);
+    /* Under the join policy, the score from our own evidence alone. */
+    _score_brought_locked(peer_uuid);
     return score;
 }
 
@@ -4311,7 +4603,14 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
         probes_counter("rep.compute", "queued", NULL);
     }
 
-    /* Pack the response as a Reputation, the form both runtimes read. */
+    /* Pack the response as a Reputation, the form both runtimes read. It
+     * answers with what this node acts on (bounded), not the cohort's view
+     * under its name (RD_14.4 Phase 4). */
+    if (have_uuid) {
+        pthread_mutex_lock(&rep_state.lock);
+        score = _bounded_locked(peer_uuid, score);
+        pthread_mutex_unlock(&rep_state.lock);
+    }
     json_t *resp_json = _reputation_json(peer_uuid_str, score);
     if (resp_json == NULL) {
         log_error(proc->logger, "Reputation: json_pack OOM (rep_resp)\n");
@@ -4415,6 +4714,8 @@ static bool handle_local_rep_query(const process_t *proc, directory_t *queues, g
         if (reputations_contains(&rep_state.reputations, peer_uuid))
         {
             reputations_get(&rep_state.reputations, peer_uuid, &score);
+            /* A local decision (ZTA delegation's bar): bounded. */
+            score = _bounded_locked(peer_uuid, score);
             found = true;
         }
         pthread_mutex_unlock(&rep_state.lock);
@@ -4922,6 +5223,12 @@ static void _apply_slash_locked(const char *target_str,
     if (map_get(&rep_state.slashed, (map_key_t)target_str, &seen) == 0)
         return;  /* already slashed */
     reputations_update(&rep_state.reputations, target_uuid, floor);
+    /* A quorum verdict floors both maps (RD_14.4 Phase 4). */
+    if (rep_state.join_policy.enabled)
+    {
+        _brought_set(target_uuid, floor);
+        map_set(&rep_state.coop_brought, (map_key_t)target_str, integer_data(0));
+    }
     map_set(&rep_state.slashed, (map_key_t)target_str,
             integer_data((int)epoch));
 }
@@ -6325,6 +6632,8 @@ static bool _attest_admissible(const process_t *proc, const rep_attest_t *a,
     data_t *d = NULL;
     double rep = PREREP_NEUTRAL;
     reputations_get(&rep_state.reputations, vu, &rep);
+    /* A co-sign is a decision: bounded under the join policy. */
+    rep = _bounded_locked(vu, rep);
     double ceiling = _standing_ceiling_of(vu);
     if (ceiling >= 0.0 && rep > ceiling)
         rep = ceiling;
@@ -7297,6 +7606,14 @@ static bool handle_slash_final(const process_t *proc, directory_t *queues, gener
             map_remove(&rep_state.slashed, (map_key_t)target_str);
             reputations_update(&rep_state.reputations, target_uuid,
                                PREREP_NEUTRAL);
+            /* Both maps (RD_14.4 Phase 4): a brought score is lifted too. */
+            if (_brought_has(target_uuid))
+            {
+                _brought_set(target_uuid,
+                                   PREREP_NEUTRAL);
+                map_set(&rep_state.coop_brought, (map_key_t)target_str,
+                        integer_data(0));
+            }
         }
         pthread_mutex_unlock(&rep_state.lock);
         if (!fresh)
@@ -8790,8 +9107,26 @@ static void _load_reputations(const process_t *proc)
             pthread_mutex_lock(&rep_state.lock);
             reputations_update(&rep_state.reputations, u,
                                json_number_value(val));
+            /* A warm-started told score is not told-only (seeds). */
+            map_set(&rep_state.warm_started, (map_key_t)key, integer_data(1));
             pthread_mutex_unlock(&rep_state.lock);
             loaded++;
+        }
+    }
+    /* The brought map (RD_14.4 Phase 4), absent when the policy was off. */
+    json_t *brought = json_object_get(doc, "brought");
+    if (json_is_object(brought))
+    {
+        const char *key;
+        json_t *val;
+        json_object_foreach(brought, key, val)
+        {
+            uuid_t u;
+            if (!json_is_number(val) || uuid_parse(key, u) != 0)
+                continue;
+            pthread_mutex_lock(&rep_state.lock);
+            _brought_set(u, json_number_value(val));
+            pthread_mutex_unlock(&rep_state.lock);
         }
     }
     json_decref(doc);
@@ -8809,8 +9144,13 @@ static void _persist_reputations(const process_t *proc)
     if (_snapshot_path(path, sizeof(path)) != 0)
         return;
     json_t *current = json_object();
-    if (current == NULL)
+    json_t *brought = json_object();
+    if (current == NULL || brought == NULL)
+    {
+        json_decref(current);
+        json_decref(brought);
         return;
+    }
     double threshold = REP_PERSIST_THRESHOLD;
     pthread_mutex_lock(&rep_state.lock);
     map_key_t key = NULL;
@@ -8825,14 +9165,28 @@ static void _persist_reputations(const process_t *proc)
         json_object_set_new(current, key, json_real(score));
     }
     map_end_for_each
+    /* The brought map under the same filter (RD_14.4 Phase 4), written only
+     * when it holds something, so a policy-off snapshot is unchanged. */
+    map_entries_for_each(&rep_state.brought.scores, key, val)
+    {
+        double score = 0.0;
+        if (data_floating_pt_dbl(val, &score) == 0 && score > threshold)
+            json_object_set_new(brought, key, json_real(score));
+    }
+    map_end_for_each
     pthread_mutex_unlock(&rep_state.lock);
     json_t *doc = json_pack("{s:s, s:o}", "__type__", REP_SNAPSHOT_TYPE,
                             "current", current);
     if (doc == NULL)
     {
         json_decref(current);
+        json_decref(brought);
         return;
     }
+    if (json_object_size(brought) > 0)
+        json_object_set_new(doc, "brought", brought);
+    else
+        json_decref(brought);
     /* Rewritten after every score, so write-then-rename: a reader (or a
      * restart after a crash mid-write) sees the old snapshot or the new one,
      * never a truncated file that would cold-start the node. */
@@ -9724,6 +10078,24 @@ static void _grade_restored_reputations(const process_t *proc, map_t *ceilings,
         clamped++;
     }
     map_end_for_each
+    /* Both maps (RD_14.4 Phase 4). */
+    map_entries_for_each(&rep_state.brought.scores, key, val)
+    {
+        double score = 0.0;
+        if ((self_uuid_str != NULL && strcmp(key, self_uuid_str) == 0)
+            || data_floating_pt_dbl(val, &score) != 0)
+            continue;
+        double ceiling = unverified;
+        data_t *cd = NULL;
+        if (ceilings != NULL && map_get(ceilings, key, &cd) == 0 && cd != NULL)
+            data_floating_pt_dbl(cd, &ceiling);
+        if (score <= ceiling)
+            continue;
+        map_set(&rep_state.brought.scores, key, floating_pt_dbl_data(ceiling));
+        map_set(&rep_state.restore_clamped_brought, key,
+                floating_pt_dbl_data(score));
+    }
+    map_end_for_each
     pthread_mutex_unlock(&rep_state.lock);
     if (clamped > 0)
         log_info(proc->logger,
@@ -9735,23 +10107,56 @@ static void _grade_restored_reputations(const process_t *proc, map_t *ceilings,
  * this node has NO reputation for the peer at all, so it can never overwrite an
  * earned value, a warm-started one, or a slashed one. Refused, not clamped,
  * outside (0, 1]. */
-static void _offer_seed(void *arg, const uuid_t who, double seed, const char *what)
+void reputation_offer_seed(const process_t *proc, const char *label,
+                           const uuid_t who, double seed, const char *what)
 {
-    const rep_seed_provider_t *p = ((const void **)arg)[0];
-    const process_t *proc = ((const void **)arg)[1];
     char uuid_s[UUID_STRING_LEN + 1] = {0};
     uuid_unparse_lower(who, uuid_s);
     if (!(seed > 0.0 && seed <= 1.0)) {
         log_warn(proc->logger,
                  "Reputation: %s: refusing seed %g for %s (outside (0, 1])\n",
-                 p->name, seed, uuid_s);
+                 label, seed, uuid_s);
         return;
     }
-    if (reputations_contains(&rep_state.reputations, who))
+    what = what != NULL ? what : "peer";
+    uuid_t self_uuid;
+    (void)_resolve_self_uuid(proc, self_uuid);   /* for _told_only_locked */
+    pthread_mutex_lock(&rep_state.lock);
+    bool held = reputations_contains(&rep_state.reputations, who);
+    if (rep_state.join_policy.enabled)
+    {
+        /* Out-of-band key confirmation is own evidence: the seed is written to
+         * brought where there is none, and replaces a told score that is
+         * told-only (RD_14.4 Phase 4; amends FIRST_CONTACT_PLAN §10.5).
+         * Earned, warm-started and slashed scores still win. */
+        data_t *d = NULL;
+        if (!_brought_has(who)
+            && map_get(&rep_state.slashed, (map_key_t)uuid_s, &d) != 0)
+        {
+            _brought_set(who, seed);
+            log_info(proc->logger, "Reputation: %s: seeded %s %s at %.2f "
+                     "(brought)\n", label, what, uuid_s, seed);
+        }
+        if (held && !_told_only_locked(who)) {
+            pthread_mutex_unlock(&rep_state.lock);
+            return;
+        }
+    }
+    else if (held) {
+        pthread_mutex_unlock(&rep_state.lock);
         return;     /* already known here; earned beats seeded */
+    }
     reputations_update(&rep_state.reputations, who, seed);
+    pthread_mutex_unlock(&rep_state.lock);
     log_info(proc->logger, "Reputation: %s: seeded %s %s at %.2f\n",
-             p->name, what != NULL ? what : "peer", uuid_s, seed);
+             label, what, uuid_s, seed);
+}
+
+static void _offer_seed(void *arg, const uuid_t who, double seed, const char *what)
+{
+    const rep_seed_provider_t *p = ((const void **)arg)[0];
+    const process_t *proc = ((const void **)arg)[1];
+    reputation_offer_seed(proc, p->name, who, seed, what);
 }
 
 /* Ask every seed provider for priors that are new since its last answer. First
@@ -9808,6 +10213,20 @@ static void _seed_idle_from_snapshot(const process_t *proc,
                     floating_pt_dbl_data(decayed));
             faded++;
         }
+    }
+    map_end_for_each
+    /* Both maps (RD_14.4 Phase 4). */
+    map_entries_for_each(&rep_state.brought.scores, key, val)
+    {
+        double score = 0.0;
+        if ((self_uuid_str != NULL && strcmp(key, self_uuid_str) == 0)
+            || data_floating_pt_dbl(val, &score) != 0)
+            continue;
+        data_t *ld = NULL;
+        if (map_get(&rep_state.last_interaction, key, &ld) != 0)
+            map_set(&rep_state.last_interaction, key, floating_pt_dbl_data(mtime));
+        map_set(&rep_state.brought.scores, key,
+                floating_pt_dbl_data(reputation_decayed_score(score, idle)));
     }
     map_end_for_each
     pthread_mutex_unlock(&rep_state.lock);
@@ -9872,6 +10291,32 @@ static void _decay_reputations(const process_t *proc, double present)
             strncpy(changed[n_changed], key, UUID_STRING_LEN);
             changed[n_changed][UUID_STRING_LEN] = '\0';
             changed_score[n_changed] = decayed;
+            n_changed++;
+        }
+    }
+    map_end_for_each
+    /* Both maps (RD_14.4 Phase 4); the tier reads bounded, so a brought
+     * change republishes it from the told score. */
+    map_entries_for_each(&rep_state.brought.scores, key, val)
+    {
+        double score = 0.0, last = 0.0, told = 0.0;
+        data_t *sl = NULL, *ld = NULL;
+        if (data_floating_pt_dbl(val, &score) != 0
+            || map_get(&rep_state.slashed, key, &sl) == 0
+            || map_get(&rep_state.last_interaction, key, &ld) != 0 || ld == NULL
+            || data_floating_pt_dbl(ld, &last) != 0)
+            continue;
+        double decayed = reputation_decayed_score(score, present - last);
+        if (fabs(decayed - score) < 1e-12)
+            continue;
+        map_set(&rep_state.brought.scores, key, floating_pt_dbl_data(decayed));
+        uuid_t u;
+        if (n_changed < MAX_CHAIN_LEN && uuid_parse(key, u) == 0
+            && reputations_get(&rep_state.reputations, u, &told) == 0)
+        {
+            strncpy(changed[n_changed], key, UUID_STRING_LEN);
+            changed[n_changed][UUID_STRING_LEN] = '\0';
+            changed_score[n_changed] = told;
             n_changed++;
         }
     }
@@ -10476,6 +10921,23 @@ static void _restore_child_evidence(const process_t *proc,
                 bool lift = have && bound > current;
                 if (lift)
                     reputations_update(&rep_state.reputations, peer, bound);
+                /* Both maps (RD_14.4 Phase 4), the brought one by its own
+                 * clamped value. */
+                double held = 0.0;
+                if (_brought_get(peer, &held) == 0)
+                {
+                    double raised = ceiling;
+                    double persisted = 0.0;
+                    if (map_get(&rep_state.restore_clamped_brought, pkey, &cd) == 0
+                        && cd != NULL && data_floating_pt_dbl(cd, &persisted) == 0
+                        && persisted < raised)
+                        raised = persisted;
+                    if (map_get(&rep_state.restore_clamped_brought, pkey, &cd) != 0
+                        && held < raised)
+                        raised = held;
+                    if (raised > held)
+                        _brought_set(peer, raised);
+                }
                 pthread_mutex_unlock(&rep_state.lock);
                 if (lift)
                 {
@@ -14427,6 +14889,22 @@ void reputation_reset_state(int num_peers)
     memset(&rep_state.join_policy, 0, sizeof(rep_state.join_policy));
     json_decref(rep_state.catchup_marks);
     rep_state.catchup_marks = NULL;
+    /* The told scores too, as this function's contract says: left in place,
+     * one case's peer (same pid, same uuid5) carried its score into the next
+     * case and chose that case's regime. */
+    reputations_free(&rep_state.reputations);
+    reputations_init(&rep_state.reputations);
+    reputations_free(&rep_state.brought);
+    reputations_init(&rep_state.brought);
+    map_free(&rep_state.coop_brought);
+    map_init(&rep_state.coop_brought);
+    map_free(&rep_state.warm_started);
+    map_init(&rep_state.warm_started);
+    map_free(&rep_state.restore_clamped_brought);
+    map_init(&rep_state.restore_clamped_brought);
+    map_free(&rep_state.anchored);
+    map_init(&rep_state.anchored);
+    rep_state.have_self = false;
     rep_state.num_peers = num_peers;
     paxos_init(&rep_state.paxos, num_peers, NULL);
     rep_state.synchronous_dispatch = was_sync;
@@ -15112,6 +15590,58 @@ int reputation_get_peer_reputation(const uuid_t peer_uuid, double *out)
     return rc == 0 ? 0 : -1;
 }
 
+int reputation_get_brought(const uuid_t peer_uuid, double *out)
+{
+    if (!rep_state.initialized || out == NULL) return -1;
+    pthread_mutex_lock(&rep_state.lock);
+    int rc = _brought_get(peer_uuid, out);
+    pthread_mutex_unlock(&rep_state.lock);
+    return rc == 0 ? 0 : -1;
+}
+
+int reputation_get_bounded(const uuid_t peer_uuid, double *out)
+{
+    if (!rep_state.initialized || out == NULL) return -1;
+    double told = 0.0;
+    pthread_mutex_lock(&rep_state.lock);
+    int rc = reputations_get(&rep_state.reputations, peer_uuid, &told);
+    if (rc == 0)
+        *out = _bounded_locked(peer_uuid, told);
+    pthread_mutex_unlock(&rep_state.lock);
+    return rc == 0 ? 0 : -1;
+}
+
+void reputation_set_anchored(const uuid_t peer_uuid, bool anchored)
+{
+    _ensure_init();
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, key);
+    pthread_mutex_lock(&rep_state.lock);
+    data_t *d = NULL;
+    bool was = map_get(&rep_state.anchored, (map_key_t)key, &d) == 0;
+    if (anchored && !was)
+        map_set(&rep_state.anchored, (map_key_t)key, integer_data(1));
+    else if (!anchored && was)
+        map_remove(&rep_state.anchored, (map_key_t)key);
+    /* Its bounded score changed: rescore it, so the tier is republished. */
+    if (anchored != was)
+        map_set(&rep_state.rescore_due, (map_key_t)key, integer_data(1));
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+void reputation_install_catchup_told(const int64_t *indices, size_t n)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    json_decref(rep_state.catchup_marks);
+    rep_state.catchup_marks = json_object();
+    json_t *arr = json_array();
+    for (size_t i = 0; i < n; i++)
+        json_array_append_new(arr, json_integer((json_int_t)indices[i]));
+    json_object_set_new(rep_state.catchup_marks, "", arr);
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
 /* Frama-C: skipped — [solver-timeout] state-cascade through paxos_init +
  * process_register_handler stubs prevents WP from discharging
  * valid_rw(proc) and valid_rd(signal) at downstream call sites */
@@ -15123,6 +15653,8 @@ static bool _resolve_self_uuid(const process_t *proc, uuid_t out_uuid)
     if (self == NULL)
         return false;
     uuid_copy(out_uuid, self->uuid);
+    uuid_copy(rep_state.self_uuid, self->uuid);
+    rep_state.have_self = true;
     return true;
 }
 
@@ -15265,6 +15797,16 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
      * contact, then adopt the persisted history if its checkpoint verifies and
      * clamp every score the evidence does not bear out. See doc/architecture/reputation.md and
      * doc/architecture/reputation.md. */
+    /* The join policy identity validated at start (identity_run refuses a bad
+     * one), and the marks it keeps; before anything below scores, seeds or
+     * clamps a peer, since under it a brought score is kept too. */
+    {
+        at_join_policy_t policy;
+        char jerr[256];
+        if (at_join_policy_load_env(&policy, jerr, sizeof(jerr)))
+            reputation_set_join_policy(&policy);
+        _load_catchup_marks(proc);
+    }
     _load_reputations(proc);
     /* Extensions' trust seeds (first contact's verified contacts), after the
      * snapshot so a persisted value always wins, and before the idle fade so a
@@ -15281,15 +15823,6 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
     /* Slash replay marks, before the loop can handle a slash_final. Also
      * resumes our own slash epoch, so it must precede the first origination. */
     _load_slash_marks(proc);
-    /* The join policy identity validated at start (identity_run refuses a bad
-     * one), and the marks it keeps. */
-    {
-        at_join_policy_t policy;
-        char jerr[256];
-        if (at_join_policy_load_env(&policy, jerr, sizeof(jerr)))
-            reputation_set_join_policy(&policy);
-        _load_catchup_marks(proc);
-    }
 
     while (keep_running(proc, &ctx.sig_q, logger))
     {
@@ -15352,7 +15885,14 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
             if (rerr == -1 || rerr == ENOMSG)
                 break;
 
-            if (buf.type == PEER_STANDING)
+            if (buf.type == PEER_ANCHOR)
+            {
+                /* Identity's judgement of one peer under the join policy
+                 * (RD_14.4 Phase 4): an anchored peer reads told uncapped. */
+                reputation_set_anchored(buf.info.peer_anchor.peer_uuid,
+                                        buf.info.peer_anchor.anchored);
+            }
+            else if (buf.type == PEER_STANDING)
             {
                 /* An authority's finding about a peer (doc/architecture/zta-integration.md). Handled
                  * here rather than via run_message_handlers for the same reason

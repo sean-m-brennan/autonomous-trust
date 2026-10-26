@@ -1490,12 +1490,19 @@ class IdentityAdapter:
                 guuid = UUID(shared_fix['uuid'])
             else:
                 guuid = identities[seed_id].uuid
+            # stale_addresses: {pid: address} puts that address in the map
+            # instead of the member's own, as the cohort seeder does with a
+            # hostname placeholder.
+            stale = (shared_fix.get('stale_addresses') or {}) \
+                if isinstance(shared_fix, dict) else {}
             shared_group_obj = Group(
-                guuid, {identities[seed_id].uuid: identities[seed_id].address},
+                guuid, {identities[seed_id].uuid:
+                        stale.get(seed_id, identities[seed_id].address)},
                 'shared-grp', Encryptor.generate(), False)
             for pid in pids_all[1:]:
-                shared_group_obj.add_address(identities[pid].uuid,
-                                             identities[pid].address)
+                shared_group_obj.add_address(
+                    identities[pid].uuid,
+                    stale.get(pid, identities[pid].address))
 
         # All participants except the newcomer share the same group key in
         # Phase C scenarios. Newcomer is detected as the participant with role

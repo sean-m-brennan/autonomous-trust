@@ -2918,13 +2918,22 @@ class PeerReputation(Configuration):
 
 
 class Reputations(Configuration):
-    def __init__(self, current: dict[UUID, float] = None):
+    """This node's stored reputations. ``current`` is the TOLD score: every
+    entry on the chain, whoever wrote it. ``brought`` is the score built from
+    this node's own evidence alone (RD_14.4 Phase 4), kept only under the join
+    policy; persisted as ``brought`` when non-empty, and absent reads as empty,
+    so a file written with the policy off is unchanged. Keys are uuid strings.
+    """
+
+    def __init__(self, current: dict[UUID, float] = None,
+                 brought: dict[str, float] = None):
         if current is None:
             self.current = {}
         else:
             # Convert string keys back to UUIDs (from JSON deserialization)
             self.current = {UUID(k) if isinstance(k, str) else k: v
                             for k, v in current.items()}
+        self.brought = {str(k): float(v) for k, v in (brought or {}).items()}
 
     def __getitem__(self, key):
         return self.current[key]
@@ -2933,11 +2942,16 @@ class Reputations(Configuration):
         return item in self.current
 
     def to_dict(self):
-        return {'current': {str(k): v for k, v in self.current.items()}}
+        doc = {'current': {str(k): v for k, v in self.current.items()}}
+        if self.brought:
+            doc['brought'] = dict(self.brought)
+        return doc
 
     def update(self, peer_id: UUID, score: float):
         self.current[peer_id] = score
 
-    def filtered_for_persist(self, keep_uuids):
+    def filtered_for_persist(self, keep_uuids, keep_brought=()):
         keep = {UUID(str(u)) if not isinstance(u, UUID) else u for u in keep_uuids}
-        return Reputations(current={u: r for u, r in self.current.items() if u in keep})
+        kept = {str(u) for u in keep_brought}
+        return Reputations(current={u: r for u, r in self.current.items() if u in keep},
+                           brought={u: r for u, r in self.brought.items() if u in kept})

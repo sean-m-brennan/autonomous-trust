@@ -31,6 +31,8 @@
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
 #include "network/network.h"
+#include "network/net_ext.h"
+#include "network/net_liveness.h"
 #include "network/net_message.h"
 #include "network/net_proc_priv.h"
 #ifdef AT_RENDEZVOUS_ENABLED   /* libat_rendezvous is built */
@@ -2741,6 +2743,89 @@ static int run_wire_verb_policy(const at_case_t *c, char *err, size_t err_len) {
     return expect_flag(c, "node", "all_cases_match", all, err, err_len) != 0 ? -1 : 0;
 }
 
+/* Extension-declared network verbs (scenario `ext-wire-verbs`). The registry
+ * is filled once and never emptied, so the test extension's list is a
+ * static array this case fills, then clears. Mirrors Python
+ * _run_ext_wire_verbs. */
+static const char *_conf_wire_verbs[9];
+static const net_ext_t _conf_wire_ext = {
+    .name = "conformance.wire_verbs",
+    .wire_verbs = _conf_wire_verbs,
+};
+
+static int run_ext_wire_verbs(const at_case_t *c, char *err, size_t err_len) {
+    static bool registered;
+    if (!registered) {
+        if (net_ext_register(&_conf_wire_ext) != 0) {
+            snprintf(err, err_len, "could not register the test extension");
+            return -1;
+        }
+        registered = true;
+    }
+    json_t *fx = json_object_get(c->data, "fixtures");
+    json_t *declared = json_object_get(fx, "declared");
+    size_t i;
+    json_t *one;
+    memset(_conf_wire_verbs, 0, sizeof(_conf_wire_verbs));
+    if (json_array_size(declared) > 8) {
+        snprintf(err, err_len, "scenario: more than 8 declared verbs");
+        return -1;
+    }
+    json_array_foreach(declared, i, one)
+        _conf_wire_verbs[i] = json_string_value(one);
+    int rc = run_wire_verb_policy(c, err, err_len);
+    memset(_conf_wire_verbs, 0, sizeof(_conf_wire_verbs));
+    return rc;
+}
+
+/* Transport liveness (scenario `transport-liveness`): replay the events into
+ * net_liveness and ask every check. Mirrors Python _run_transport_liveness. */
+static int _liveness_peer(json_t *peers, const char *name, uuid_t out)
+{
+    const char *s = json_string_value(json_object_get(peers, name ? name : ""));
+    return (s != NULL && uuid_parse(s, out) == 0) ? 0 : -1;
+}
+
+static int run_transport_liveness(const at_case_t *c, char *err, size_t err_len)
+{
+    json_t *fx = json_object_get(c->data, "fixtures");
+    json_t *peers = json_object_get(fx, "peers");
+    json_t *events = json_object_get(fx, "events");
+    json_t *checks = json_object_get(fx, "checks");
+    if (!json_is_number(json_object_get(fx, "start")) || !json_is_object(peers)
+        || !json_is_array(checks) || json_array_size(checks) == 0) {
+        snprintf(err, err_len, "scenario: fixtures.start, peers or checks missing");
+        return -1;
+    }
+    net_liveness_reset(json_number_value(json_object_get(fx, "start")));
+    size_t i;
+    json_t *one;
+    json_array_foreach(events, i, one) {
+        uuid_t u;
+        if (_liveness_peer(peers, json_string_value(json_object_get(one, "heard")), u) != 0) {
+            snprintf(err, err_len, "scenario: event %zu names an unknown peer", i);
+            return -1;
+        }
+        net_liveness_heard(u, json_number_value(json_object_get(one, "at")));
+    }
+    bool all = true;
+    json_array_foreach(checks, i, one) {
+        uuid_t u;
+        if (_liveness_peer(peers, json_string_value(json_object_get(one, "peer")), u) != 0) {
+            snprintf(err, err_len, "scenario: check %zu names an unknown peer", i);
+            return -1;
+        }
+        double got = net_liveness_quiet_for(u, json_number_value(json_object_get(one, "at")));
+        double want = json_number_value(json_object_get(one, "quiet_for"));
+        if (got - want > 1e-9 || want - got > 1e-9) {
+            fprintf(stderr, "transport-liveness mismatch: check %zu got %f want %f\n",
+                    i, got, want);
+            all = false;
+        }
+    }
+    return expect_flag(c, "node", "all_checks_match", all, err, err_len) != 0 ? -1 : 0;
+}
+
 /* The plaintext allowlist (scenario `unencrypted-verbs`).
  *
  * Pins the membership AND the size of the set a receiver accepts unencrypted
@@ -3312,6 +3397,10 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
     if (strcmp(c->name, "wire-verb-policy") == 0) {
         return run_wire_verb_policy(c, err, err_len);
     }
+    if (strcmp(c->name, "ext-wire-verbs") == 0)
+        return run_ext_wire_verbs(c, err, err_len);
+    if (strcmp(c->name, "transport-liveness") == 0)
+        return run_transport_liveness(c, err, err_len);
     if (strcmp(c->name, "unencrypted-verbs") == 0) {
         return run_unencrypted_verbs(c, err, err_len);
     }

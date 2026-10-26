@@ -37,7 +37,7 @@ from .group import Group, ChildGroupSet
 from .peer_standing import (PeerStanding, STANDINGS, STANDING_SOURCE_ZTA,
                             standing_source_or_default, standing_source_valid)
 from .history.history import IdentityHistory
-from .join_policy import load_join_policy_env
+from .join_policy import AnchoredSet, load_join_policy_env
 
 #: Members learned only from a history adopted under the join policy
 #: (RD_14.4, D1 (d)): ``<cfg>/provisional_members.cfg.json``, a list of uuids.
@@ -1379,6 +1379,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.logger.debug('Add peers')
         self._remember_activity(queues, CfgIds.peers, self.peers)
         self._remember_activity(queues, CfgIds.capabilities, self.peer_capabilities)
+        self._publish_anchors(queues)
         # Reliable re-put of self.peers to the main proc. _remember_activity's
         # update() fan-put uses the q_cadence (10 ms) timeout, which silently
         # DROPS under main-proc queue contention — e.g. the dod_mission
@@ -2521,6 +2522,26 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         """Whether the join policy counts ``ident`` as an anchor."""
         return bool(self.anchor_classes(ident))
 
+    def _publish_anchors(self, queues):
+        """Tell the other processes which peers are anchors, when that has
+        changed (AnchoredSet; reputation leaves their told scores unbounded,
+        RD_14.4 Phase 4). Nothing is sent while the policy is off. Run on every
+        peer-list change and on the resync cadence, since a contact verified
+        or a credential revoked changes the answer with no peer change.
+        Mirrors C _publish_anchors."""
+        if not getattr(getattr(self, 'join_policy', None), 'enabled', False):
+            return
+        anchored = AnchoredSet(str(peer.uuid) for peer in list(self.peers.all)
+                               if self.is_anchored(peer))
+        if anchored == getattr(self, '_anchors_published', None):
+            return
+        self._anchors_published = anchored
+        self.protocol.anchored = anchored.uuids
+        try:
+            self.update(anchored, queues)
+        except Exception as err:
+            self.logger.warning('Could not propagate anchors: %s', err)
+
     def _note_history_sender(self, sender):
         """Record who offered the history just appended to ``histories``.
         Caller holds ``self.lock``. A history stashed without a sender (a test,
@@ -3617,9 +3638,24 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 return True
             addr = (getattr(ident, 'address', None)
                     or payload.get('from_address'))
-            if addr is None or addr not in list(self.group.addresses):
+            # Membership is by UUID: the group map is keyed by member uuid, and
+            # an entry can hold a stale address, e.g. the hostname placeholder
+            # the cohort seeder writes for a member that then advertises its
+            # runtime IP. The signature check above ties the identity to that
+            # uuid, so a stranger still cannot enter. Address membership is
+            # kept for a map keyed by address.
+            member_key = next((k for k in self.group._address_map
+                               if str(k) == str(ident.uuid)), None)
+            if member_key is None and (
+                    addr is None or addr not in list(self.group.addresses)):
                 # Only backfill identities for actual group members.
                 _probes.counter('peer.set', 'identity_response_not_in_group')
+                self.logger.debug(
+                    'Identity resync: ignoring response for %s at %r: not an '
+                    'address in our group (%d addresses, e.g. %s)',
+                    getattr(ident, 'nickname', str(ident.uuid)), addr,
+                    len(list(self.group.addresses)),
+                    sorted(map(str, self.group.addresses))[:3])
                 return True
             if str(ident.uuid) == str(self.identity.uuid):
                 return True
@@ -3635,6 +3671,12 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     '%s', getattr(ident, 'nickname', str(ident.uuid)))
             else:
                 _probes.counter('peer.set', 'identity_response_redundant')
+            # Refresh a stale map entry to the verified address, after the
+            # backfill so a failure to persist the group cannot cost it.
+            if member_key is not None and addr is not None \
+                    and self.group._address_map.get(member_key) != addr:
+                self.group.add_address(member_key, addr)
+                self._record_group(queues)
         except Exception as err:
             _probes.counter('peer.set', 'identity_response_exc')
             self.report_exception(err, 'handle_identity_response')
@@ -4380,6 +4422,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     # are quiet no-ops on a converged leaf.
                     self._request_hierarchy(queues)
                     self._refresh_hierarchy(queues)
+                    # Anchors change with no peer change too (a contact
+                    # verified, a credential revoked).
+                    self._publish_anchors(queues)
 
                 # Features that pace work of their own off this loop (ZTA's
                 # background re-verification, on its policy's interval).

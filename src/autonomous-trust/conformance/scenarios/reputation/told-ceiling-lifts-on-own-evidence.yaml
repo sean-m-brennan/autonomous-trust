@@ -1,0 +1,69 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: told-ceiling-lifts-on-own-evidence
+byte_pinning: false
+description: |
+    The told ceiling lifts on own evidence (RD_14.4_HOSTILE_JOIN_PLAN.md
+    Phase 4). bob has three transactions of his own with subject, giving it
+    0.9 each time, and carol has said 0.3 of it three times.
+
+    told is the cooperation-mode mean over all six, each weighted by its
+    author's reputation (bob, unrated by himself, at the 0.2 neutral; carol
+    at 0.5): (3 x 0.9 x 0.2 + 3 x 0.3 x 0.5) / (3 x 0.2 + 3 x 0.5) = 0.4714.
+    brought reads bob's own three alone: contrite tit-for-tat first (0.9,
+    above the cooperation threshold), so the mean of bob's scores, 0.9.
+    Three own entries meet own_evidence_min, so bounded is brought.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: oracle
+  - id: subject
+    role: subject
+  - id: carol
+    role: member
+
+fixtures:
+  join_policy:
+    version: 1
+    enabled: true
+    anchors: [verified_contact]
+    own_evidence_min: 3
+  tx_history:
+    bob:
+      - {task_id: t-b1, p1: bob, p1_score: 0.9, p2: subject, p2_score: 0.9}
+      - {task_id: t-b2, p1: subject, p1_score: 0.9, p2: bob, p2_score: 0.9}
+      - {task_id: t-b3, p1: bob, p1_score: 0.9, p2: subject, p2_score: 0.9}
+      - {task_id: t-c1, p1: carol, p1_score: 0.3, p2: subject, p2_score: 0.9}
+      - {task_id: t-c2, p1: carol, p1_score: 0.3, p2: subject, p2_score: 0.9}
+      - {task_id: t-c3, p1: carol, p1_score: 0.3, p2: subject, p2_score: 0.9}
+  reputations:
+    bob:
+      subject: 0.9
+      carol: 0.5
+  coop_mode:
+    bob:
+      subject: true
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: request reputation
+    payload:
+      target: subject
+      proc: negotiation
+    description: |
+        bob scores subject from all six entries (told) and from his own
+        three (brought).
+
+expected_state:
+  bob:
+    reputation_of:
+      subject: 0.4714
+    brought_of:
+      subject: 0.9
+    bounded_of:
+      subject: 0.9

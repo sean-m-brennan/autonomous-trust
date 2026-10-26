@@ -75,6 +75,8 @@ size_t message_size(message_type_t type)
         return sizeof(peer_removed_msg_t);
     case PEER_PRESENCE:
         return sizeof(peer_presence_msg_t);
+    case PEER_ANCHOR:
+        return sizeof(peer_anchor_msg_t);
     case MSG_TYPE_RETIRED_10:   /* fleet's old slots: never sent (Phase 8) */
     case MSG_TYPE_RETIRED_11:
     case MSG_TYPE_RETIRED_12:
@@ -131,6 +133,8 @@ char *message_type_to_string(message_type_t type)
         return (char*)"PEER_REMOVED";
     case PEER_PRESENCE:
         return (char*)"PEER_PRESENCE";
+    case PEER_ANCHOR:
+        return (char*)"PEER_ANCHOR";
     case MSG_TYPE_RETIRED_10:   /* fleet's old slots: never sent (Phase 8) */
     case MSG_TYPE_RETIRED_11:
     case MSG_TYPE_RETIRED_12:
@@ -193,6 +197,8 @@ message_type_t message_type_core_by_name(const char *str)
         return PEER_REMOVED;
     if (strcmp(str, "PEER_PRESENCE") == 0)
         return PEER_PRESENCE;
+    if (strcmp(str, "PEER_ANCHOR") == 0)
+        return PEER_ANCHOR;
     return -1;  // No matching message type found (all valid types are > 0)
 }
 
@@ -505,6 +511,14 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         memcpy(subdata, &msg->info.peer_presence, subdata_len);
         break;
     }
+    case PEER_ANCHOR:
+    {
+        subdata_len = sizeof(peer_anchor_msg_t);
+        subdata = malloc(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.peer_anchor, subdata_len);
+        break;
+    }
     case MSG_TYPE_RETIRED_10:   /* fleet's old slots: never sent (Phase 8) */
     case MSG_TYPE_RETIRED_11:
     case MSG_TYPE_RETIRED_12:
@@ -803,6 +817,9 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
         break;
     case PEER_PRESENCE:
         COPY_FIXED_PAYLOAD(peer_presence, peer_presence_msg_t);
+        break;
+    case PEER_ANCHOR:
+        COPY_FIXED_PAYLOAD(peer_anchor, peer_anchor_msg_t);
         break;
     case MSG_TYPE_RETIRED_10:   /* fleet's old slots: never sent (Phase 8) */
     case MSG_TYPE_RETIRED_11:

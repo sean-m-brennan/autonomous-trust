@@ -467,6 +467,12 @@ class NetworkAdapter:
         if case.name == 'wire-verb-policy':
             self._run_wire_verb_policy(case)
             return
+        if case.name == 'ext-wire-verbs':
+            self._run_ext_wire_verbs(case)
+            return
+        if case.name == 'transport-liveness':
+            self._run_transport_liveness(case)
+            return
         if case.name == 'unencrypted-verbs':
             self._run_unencrypted_verbs(case)
             return
@@ -749,6 +755,52 @@ class NetworkAdapter:
             print('wire-verb-policy mismatches:', mismatched)
         _assert_expected_flags(case, 'node', {
             'all_cases_match': bool(cases) and not mismatched})
+
+    def _run_ext_wire_verbs(self, case: Case) -> None:
+        """Extension-declared network verbs (scenario `ext-wire-verbs`):
+        declare them through a test extension, then ask
+        netprocess.wire_verb_admitted. Mirrors C run_ext_wire_verbs."""
+        from autonomous_trust.core._python import extensions as _ext
+        from autonomous_trust.core._python.network.netprocess import \
+            wire_verb_admitted
+        fx = case.data.get('fixtures') or {}
+        test_ext = _ext.Extension(
+            name='conformance_wire_verbs', enabled=lambda: True,
+            register_handlers=lambda proc, name: None,
+            network_wire_verbs=tuple(fx.get('declared') or ()))
+        saved = (_ext._builtin, _ext._installed, _ext._source_tree)
+        _ext._builtin, _ext._installed, _ext._source_tree = \
+            (lambda: [test_ext]), (lambda: []), (lambda: [])
+        _ext.reset_extensions()
+        try:
+            cases = fx.get('cases') or []
+            mismatched = [c for c in cases
+                          if wire_verb_admitted(c['process'], c['function'],
+                                                c['path'])[0] != bool(c['admitted'])]
+        finally:
+            _ext._builtin, _ext._installed, _ext._source_tree = saved
+            _ext.reset_extensions()
+        if mismatched:
+            print('ext-wire-verbs mismatches:', mismatched)
+        _assert_expected_flags(case, 'node', {
+            'all_cases_match': bool(cases) and not mismatched})
+
+    def _run_transport_liveness(self, case: Case) -> None:
+        """Transport liveness (C net_liveness, Python TransportLiveness):
+        replay the events, ask every check. Mirrors C run_transport_liveness."""
+        from autonomous_trust.core._python.network.liveness import TransportLiveness
+        fx = case.data.get('fixtures') or {}
+        peers = fx.get('peers') or {}
+        lv = TransportLiveness(float(fx['start']))
+        for ev in fx.get('events') or []:
+            lv.heard(peers[ev['heard']], float(ev['at']))
+        checks = fx.get('checks') or []
+        bad = [c for c in checks
+               if abs(lv.quiet_for(peers[c['peer']], float(c['at']))
+                      - float(c['quiet_for'])) > 1e-9]
+        if bad:
+            print('transport-liveness mismatches:', bad)
+        _assert_expected_flags(case, 'node', {'all_checks_match': bool(checks) and not bad})
 
     def _run_unencrypted_verbs(self, case: Case) -> None:
         """The plaintext allowlist: which verbs a receiver accepts unencrypted

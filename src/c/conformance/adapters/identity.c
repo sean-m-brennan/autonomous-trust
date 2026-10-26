@@ -1036,13 +1036,21 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
                 group_init(&guuid, gaddr, &impl->proc->protocol.group);
             else
                 group_init(NULL, gaddr, &impl->proc->protocol.group);
+            /* stale_addresses: { "<participant>": "<address>" } puts that
+             * address in the map instead of the member's own, as the cohort
+             * seeder does with a hostname placeholder. */
+            json_t *stale = json_object_get(shared, "stale_addresses");
             for (size_t j = 0; j < ctx->participant_count; j++) {
                 ic_impl_t *other = (ic_impl_t *)ctx->participants[j].impl;
                 if (other == NULL || other->pub == NULL) continue;
                 char u[UUID_STRING_LEN + 1];
                 uuid_unparse_lower(other->pub->uuid, u);
+                const char *over = json_is_object(stale)
+                    ? json_string_value(json_object_get(
+                          stale, ctx->participants[j].id))
+                    : NULL;
                 group_add_address(&impl->proc->protocol.group, u,
-                                  other->pub->address);
+                                  over != NULL ? over : other->pub->address);
             }
         }
     }

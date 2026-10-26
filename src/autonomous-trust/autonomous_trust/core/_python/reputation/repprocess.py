@@ -36,7 +36,7 @@ from ..extensions import (identity_hooks, load_extensions, reputation_hooks,
 from ..config import (Configuration, atomic_write, from_json_string,
                       to_json_string)
 from ..identity.protocol import IdentityProtocol
-from ..identity.join_policy import load_join_policy_env
+from ..identity.join_policy import INERT as JOIN_POLICY_INERT, load_join_policy_env
 from ..identity.identity import (public_identity_to_canonical,
                                  public_identity_from_canonical)
 from ..identity.peer_standing import STANDING_PROVED, STANDING_FAILED
@@ -57,7 +57,8 @@ from .reputation import (TransactionHistory, ReconcileResult, Reputation, Reputa
                          resolve_query_to_dict, resolve_query_from_dict,
                          resolved_to_dict, resolved_from_dict, verify_resolved,
                          consensus_score_from_window, tx_channel_weight,
-                         TX_CHANNEL_REPLICATION,
+                         TX_CHANNEL_REPLICATION, TX_CHANNEL_PROBE,
+                         TX_CHANNEL_DEFAULT,
                          # The one shared rounding rule for a composed EMA
                          # weight (R+D.md §12.5), `floor(x + 0.5)` as the C
                          # twin's at_tx_weight_round.
@@ -140,6 +141,53 @@ REP_CATCHUP_QUORUM = 1
 UPDATE_PAGE_BYTES = 24000
 UPDATE_PAGES_MAX = 64
 UPDATE_PAGE_BUFS = 8
+
+
+def _policy_on(proc) -> bool:
+    """Whether the join policy is enabled on ``proc`` (RD_14.4). A process
+    built without one (a test double) is inert."""
+    return getattr(proc, 'join_policy', JOIN_POLICY_INERT).enabled
+
+
+def _as_uuid(value):
+    """``value`` as a UUID, or None."""
+    try:
+        return value if isinstance(value, UUID) else UUID(str(value))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _brought_of(proc) -> dict:
+    """``proc``'s brought map (uuid str -> score), empty when it keeps none."""
+    reps = getattr(proc, 'reputations', None)
+    brought = getattr(reps, 'brought', None)
+    return brought if brought is not None else {}
+
+
+def contrite_tft_of(peer_scores, my_scores):
+    """Contrite tit-for-tat over non-empty, aligned lists: the scores this
+    node gave the peer and the scores the peer gave this node, oldest first.
+    Shared by the told score and the brought one (RD_14.4 Phase 4)."""
+    peer_standing = sum(peer_scores) / len(peer_scores)
+    my_standing = sum(my_scores) / len(my_scores)
+    if peer_scores[-1] < 0.5 and my_standing < 0.5:  # peer defected, but my standing sucks
+        return max(0.51, peer_standing)
+    if peer_scores[-1] < 0.5 and my_standing >= 0.5:  # peer defected, my standing is ok
+        return min(0.49, peer_standing)
+    return max(0.51, peer_standing)  # cooperate/cooperate (but digging out of a hole)
+
+
+def bilateral_scores(tx, peer_uuid, me):
+    """``(ours of the peer, the peer's of us)`` for a transaction between
+    ``me`` and ``peer_uuid``, read through Tx.about, else None."""
+    if not ((tx.p1_id == peer_uuid and tx.p2_id == me)
+            or (tx.p2_id == peer_uuid and tx.p1_id == me)):
+        return None
+    theirs = tx.about(peer_uuid)
+    ours = tx.about(me)
+    if theirs is None or ours is None:
+        return None
+    return theirs[0], ours[0]
 
 
 class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
@@ -544,6 +592,18 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         self.reputations = (loaded_reps
                             if isinstance(loaded_reps, Reputations)
                             else Reputations())
+        # The join policy (RD_14.4, D9), read before anything below scores,
+        # seeds or excludes a peer: under it a second, BROUGHT score is kept
+        # beside the told one (Phase 4).
+        self.join_policy = load_join_policy_env()
+        # Peers the snapshot carried: a warm-started told score is not
+        # told-only, so a seed never overrides it (Phase 4).
+        self._warm_started = {str(k) for k in self.reputations.current}
+        # The brought score's CTFT/pure latch, beside _coop_mode (str keys).
+        self._coop_brought: dict[str, bool] = {}
+        # The anchored set last acted on (Protocol.anchored), so a change
+        # rescores the peers it moved.
+        self._anchored_seen = frozenset()
         # Idle-decay bookkeeping. _last_interaction maps peer-uuid-str ->
         # epoch seconds of our most recent committed transaction with that
         # peer; the staleness sweep relaxes idle peers toward almost-
@@ -783,6 +843,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         # instead of inventing it.
         self._child_evidence_tried: set[str] = set()
         self._restore_clamped: dict[str, float] = {}
+        self._restore_clamped_brought: dict[str, float] = {}
 
         # --- Deep resolution: one peer, on demand
         # (doc/architecture/gateway-reputation-tree.md) --------
@@ -813,7 +874,6 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         self._load_slash_marks()
         # The join policy (RD_14.4, D9) and, under it, which chain entries we
         # hold only because catch-up told us (D2 (b)): chain key -> indices.
-        self.join_policy = load_join_policy_env()
         self._catchup_marks: dict[str, set] = self._load_catchup_marks()
 
         # Verifiable warm start: adopt the persisted committed history if its
@@ -2102,6 +2162,10 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             except Exception:
                 self.logger.debug('apply_slash: reputations.update (rehab) '
                                   'failed', exc_info=True)
+            # Both maps (RD_14.4 Phase 4): a brought score is lifted too.
+            if target in _brought_of(self):
+                _brought_of(self)[target] = pending_score
+                self._coop_brought[target] = False
         else:
             floor = float(attestation.floor_score)
             pending_score = floor
@@ -2119,6 +2183,10 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             except Exception:
                 self.logger.debug('apply_slash: reputations.update failed',
                                   exc_info=True)
+            # A quorum verdict floors both maps (RD_14.4 Phase 4).
+            if _policy_on(self):
+                _brought_of(self)[target] = floor
+                self._coop_brought[target] = False
         self._slashed_seen[key] = None
         while len(self._slashed_seen) > self.COMMITTED_ROUNDS_CAP:
             self._slashed_seen.popitem(last=False)
@@ -2522,6 +2590,9 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                     break
             except (TypeError, ValueError):
                 continue
+        # A co-sign is a decision: bounded under the join policy.
+        if _policy_on(self):
+            rep = self._bounded(att.verifier_uuid, rep)
         ceiling = self._standing_ceiling(att.verifier_uuid)
         if ceiling is not None and rep > ceiling:
             rep = ceiling
@@ -3105,7 +3176,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         chain is adopted unchanged and the marks never leave the node. An
         adoption's dropped entries lose their marks first, since their
         indices are reused; marks below the resident window are pruned."""
-        if not self.join_policy.enabled:
+        if not _policy_on(self):
             return
         marks = self._catchup_marks.get(key, set())
         before = set(marks)
@@ -3409,6 +3480,17 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 # past what ZTA proved about the peer holding it. Evidence that
                 # a peer behaved well is not evidence it is who it claims.
                 lift = self._apply_standing_ceiling(peer_uuid, lift)
+                # Both maps (RD_14.4 Phase 4), the brought one by its own
+                # clamped value.
+                held = _brought_of(self).get(peer)
+                if held is not None:
+                    raised = min(self._restore_clamped_brought.get(peer, held),
+                                 ceiling)
+                    sc = self._standing_ceiling(peer_uuid)
+                    if sc is not None:
+                        raised = min(raised, sc)
+                    if raised > held:
+                        _brought_of(self)[peer] = raised
                 if lift <= current:
                     continue
                 self.reputations.current[peer_uuid] = lift
@@ -3663,6 +3745,15 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             self.reputations.current[peer_uuid] = ceiling
             self._restore_clamped[key] = score
             clamped.append((key, score, ceiling))
+        # Both maps (RD_14.4 Phase 4).
+        brought = _brought_of(self)
+        for key in list(brought):
+            if key == self_uuid:
+                continue
+            ceiling = ceilings.get(key, unattested)
+            if brought[key] > ceiling:
+                self._restore_clamped_brought[key] = brought[key]
+                brought[key] = ceiling
         if clamped:
             self.logger.info(
                 'Warm start: clamped %d peer score(s) to what the evidence '
@@ -4531,13 +4622,14 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         return total / total_weight
 
     def _contrite_tit_for_tat(self, peer):
-        # peer_score is the score the PEER submitted in a bilateral
-        # transaction; my_score is the score WE submitted. p1_score
-        # belongs to whoever is p1, p2_score to p2 — so the side that
-        # matches `peer.uuid` is the one whose score is "peer_score".
-        # An earlier revision had these indices swapped relative to
-        # the C twin (reputation.c:499-507), inverting the
-        # peer-defected vs. self-defected branches.
+        # peer_score is the score WE gave the peer in a bilateral transaction
+        # (its standing with us); my_score is the score the PEER gave us. Both
+        # are read through Tx.about, which takes each side from its scorer:
+        # pX_score is what pX gave the other side (half_designation). An
+        # earlier revision took the peer's own submitted score as peer_score,
+        # so a peer's reputation was how it rated US, and a member that rated
+        # its victims 1.0 earned 1.0 (RD_14.4 plan, Phase 4). Mirrors C
+        # reputation_contrite_tft.
         # `peer` may be a Peer object, a UUID, or a uuid string
         # (see _pure_reputation comment).
         peer_uuid = peer if isinstance(peer, (UUID, str)) else peer.uuid
@@ -4545,27 +4637,17 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         my_scores = []
         try:
             for tx in self.history.by_peer(peer_uuid):
-                if tx.p1_id == peer_uuid and tx.p2_id == self.identity.uuid:
-                    peer_scores.append(tx.p1_score)
-                    my_scores.append(tx.p2_score)
-                elif tx.p2_id == peer_uuid and tx.p1_id == self.identity.uuid:
-                    peer_scores.append(tx.p2_score)
-                    my_scores.append(tx.p1_score)
+                rated = bilateral_scores(tx, peer_uuid, self.identity.uuid)
+                if rated is not None:
+                    peer_scores.append(rated[0])
+                    my_scores.append(rated[1])
         except KeyError:
             self.logger.debug('No transaction history for peer %s', peer_uuid)
         if len(peer_scores) < 1 or len(my_scores) < 1:  # no bilateral w/ us
             # Cold-start: before any bilateral history WITH us exists, fall
             # back to a transaction-memory prior rather than a flat neutral.
             return self._prereputation_prior(peer_uuid)
-        peer_standing = sum(peer_scores) / len(peer_scores)
-        my_standing = sum(my_scores) / len(my_scores)
-        if peer_scores[-1] < 0.5 and my_standing < 0.5:  # peer defected, but my standing sucks
-            rep_score = max(0.51, peer_standing)
-        elif peer_scores[-1] < 0.5 and my_standing >= 0.5:  # peer defected, my standing is ok
-            rep_score = min(0.49, peer_standing)
-        else:  # cooperate/cooperate (but digging out of a hole)
-            rep_score = max(0.51, peer_standing)
-        return rep_score
+        return contrite_tft_of(peer_scores, my_scores)
 
     def _prereputation_prior(self, peer_uuid):
         """Transaction-memory prior for the CTFT cold-start window.
@@ -4594,6 +4676,11 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         except (KeyError, AttributeError):
             return neutral
         self_uuid = getattr(self.identity, 'uuid', None)
+        # Under the join policy, entries catch-up told us about are not
+        # evidence for the prior (RD_14.4 D4 (b)): an unprobed member of the
+        # cohort we joined reads exactly the neutral. Mirrors C.
+        told = (getattr(self, '_catchup_marks', {}).get('', ())
+                if _policy_on(self) else ())
         total = 0.0
         total_weight = 0.0
         count = 0
@@ -4601,6 +4688,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         #               one transaction is one observation for the prior.
         for tx in txs:
             if tx.task_id in seen:
+                continue
+            if tx.index in told:
                 continue
             about = tx.about(peer_uuid)
             if about is None:
@@ -4629,6 +4718,154 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         k = self.PREREP_SHRINKAGE_K
         prior = (n * observed + k * neutral) / (n + k)
         return min(1.0, max(0.0, prior))
+
+    # --- Brought and told (RD_14.4 Phase 4, D3 (b)) ------------------------
+    # Under the join policy this node keeps two scores per peer. TOLD is the
+    # stored score (reputations.current), unchanged: every entry on the chain,
+    # whoever wrote it. BROUGHT (reputations.brought) is scored by the same
+    # regimes over this node's OWN evidence alone: its halves of bilateral
+    # transactions, physics and calibration findings among them, probes
+    # excluded until Phase 5. A peer with no own evidence has no brought score
+    # (a seed or a slash aside); it does not fall back to the prior. Each
+    # reader names the one it reads (the plan's reader table): decisions read
+    # BOUNDED (_bounded), exclusion reads brought + slash (_exclusion_score),
+    # the scoring weights read told. With the policy off there is no brought
+    # map and every reader reads told.
+
+    def _own_evidence(self, peer_uuid):
+        """``[(ours of the peer, the peer's of us, tx)]``, oldest first: the
+        bilateral transactions with ``peer_uuid`` whose half of ours is not a
+        probe. Mirrors C _own_evidence_locked."""
+        me = self.identity.uuid
+        # The chain is keyed by whichever form its entries carry (a uuid
+        # string in production); accept either.
+        for key in (peer_uuid, str(peer_uuid), _as_uuid(peer_uuid)):
+            try:
+                txs = list(self.history.by_peer(key))
+            except (KeyError, AttributeError, TypeError):
+                continue
+            peer_uuid = key
+            break
+        else:
+            return []
+        own = []
+        seen = set()
+        for tx in txs:
+            if tx.task_id in seen or getattr(tx, 'attested', False):
+                continue
+            rated = bilateral_scores(tx, peer_uuid, me)
+            if rated is None:
+                continue
+            mine = tx.p1_channel if tx.p1_id == me else tx.p2_channel
+            if (mine or TX_CHANNEL_DEFAULT) == TX_CHANNEL_PROBE:
+                continue
+            seen.add(tx.task_id)
+            own.append((rated[0], rated[1], tx))
+        return own
+
+    def _own_count(self, peer_uuid) -> int:
+        """How many own entries this node holds about ``peer_uuid``."""
+        return len(self._own_evidence(peer_uuid))
+
+    def _brought_pure(self, own):
+        """Cooperation mode over own entries: the task-weighted mean of this
+        node's scores of the peer. Each is weighted by its author's
+        reputation in the told regime; the author is always us, whose weight
+        is the neutral, so it cancels. Mirrors C _brought_pure."""
+        total = 0.0
+        weight = 0.0
+        for ours, _theirs, tx in own:
+            w = self.task_weights.get(str(tx.task_id), 1)
+            total += ours * w
+            weight += w
+        return total / weight if weight > 0 else self.PREREP_NEUTRAL
+
+    def _score_brought(self, peer_uuid):
+        """Score and store ``peer_uuid``'s brought score, bounded as the told
+        one is (ZTA standing, tenure); return it, or None when it has none.
+        A slashed peer is floored in both maps. With no own evidence the
+        stored value is left alone: absent stays absent, a seed stays a seed.
+        Mirrors C _score_brought_locked."""
+        if not _policy_on(self):
+            return None
+        key = str(peer_uuid)
+        brought = _brought_of(self)
+        slashed = self._slashed.get(key)
+        if slashed is not None:
+            brought[key] = float(slashed[0])
+            self._coop_brought[key] = False
+            return brought[key]
+        own = self._own_evidence(peer_uuid)
+        if not own:
+            return brought.get(key)
+        peer_scores = [o[0] for o in own]
+        my_scores = [o[1] for o in own]
+        previous = brought.get(key)
+        if previous is None:
+            previous = contrite_tft_of(peer_scores, my_scores)
+        in_coop = self._coop_brought.get(key, False)
+        use_pure = previous > (self.COOP_EXIT if in_coop else self.COOP_ENTER)
+        self._coop_brought[key] = use_pure
+        score = (self._brought_pure(own) if use_pure
+                 else contrite_tft_of(peer_scores, my_scores))
+        ceiling = self._standing_ceiling(peer_uuid)
+        if ceiling is not None and score > ceiling:
+            score = ceiling
+        score = self._tenure_bound(peer_uuid, score)
+        brought[key] = score
+        return score
+
+    def _is_anchored(self, peer_uuid) -> bool:
+        """Whether identity counts ``peer_uuid`` as an anchor (AnchoredSet)."""
+        return str(peer_uuid) in getattr(self.protocol, 'anchored', ())
+
+    def _bounded(self, peer_uuid, told):
+        """What a decision about ``peer_uuid`` reads, given its told score:
+        the brought score once the peer has ``own_evidence_min`` own entries,
+        otherwise told capped at the ``told_tier`` ceiling. An anchored peer
+        reads told uncapped; with the policy off every reader reads told.
+        Mirrors C _bounded_locked."""
+        policy = getattr(self, 'join_policy', JOIN_POLICY_INERT)
+        if told is None or not policy.enabled or self._is_anchored(peer_uuid):
+            return told
+        brought = _brought_of(self).get(str(peer_uuid))
+        if brought is not None and \
+                self._own_count(peer_uuid) >= policy.own_evidence_min:
+            # A ceiling that landed since the score was written bounds it too.
+            ceiling = self._standing_ceiling(peer_uuid)
+            return brought if ceiling is None or brought <= ceiling else ceiling
+        return min(told, self._tier_ceiling(policy.told_tier))
+
+    def _exclusion_score(self, peer_uuid, told):
+        """The score exclusion reads: told with the policy off; under it the
+        brought score, or told when the peer is slashed, so the cohort's word
+        alone never excludes anyone (exclusion is sticky). None excludes
+        nobody. Mirrors C _exclusion_score_locked."""
+        if not _policy_on(self):
+            return told
+        key = str(peer_uuid)
+        if key in self._slashed:
+            return told
+        return _brought_of(self).get(key)
+
+    def _told_only(self, peer_uuid) -> bool:
+        """Whether a told score exists only because of told evidence: not
+        slashed, not warm-started, and no own entry behind it. A seed may
+        replace such a score under the policy (Phase 4, amending
+        FIRST_CONTACT_PLAN §10.5)."""
+        key = str(peer_uuid)
+        return (key not in getattr(self, '_slashed', {})
+                and key not in self._warm_started
+                and self._own_count(peer_uuid) == 0)
+
+    def _note_anchors(self):
+        """Rescore every peer whose anchoring changed since the last pass, so
+        its bounded tier is republished."""
+        anchored = frozenset(getattr(self.protocol, 'anchored', ()) or ())
+        if anchored == self._anchored_seen:
+            return
+        self._rescore_due.update(anchored ^ self._anchored_seen)
+        self._anchored_seen = anchored
 
     @classmethod
     def _trust_tier(cls, score: float) -> int:
@@ -4808,27 +5045,52 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         reader without a second mechanism. A seed outside (0, 1] is refused,
         not clamped: reputation lives in [0, 1], and a provider's source may
         be a hand-editable file.
+
+        Under the join policy (RD_14.4 Phase 4) a told-only score no longer
+        blocks a seed, and the seed is written to the brought score too.
         """
         for hooks in reputation_hooks():
             if hooks.trust_seeds is None:
                 continue
             for peer_uuid, seed, what in hooks.trust_seeds(self):
-                try:
-                    peer_uuid = UUID(str(peer_uuid))
-                    seed = float(seed)
-                except (ValueError, TypeError, AttributeError):
-                    continue
-                if not 0.0 < seed <= 1.0:
-                    self.logger.warning('%s: refusing seed %r for %s (outside '
-                                        '(0, 1])', hooks.label, seed,
-                                        str(peer_uuid)[:8])
-                    continue
-                current = self.reputations.current
-                if peer_uuid in current or str(peer_uuid) in current:
-                    continue     # already known here; earned beats seeded
-                self.reputations.update(peer_uuid, seed)
-                self.logger.info('%s: seeded %s %s at %.2f', hooks.label, what,
-                                 str(peer_uuid)[:8], seed)
+                self._offer_seed(hooks.label, peer_uuid, seed, what)
+
+    def _offer_seed(self, label, peer_uuid, seed, what):
+        """Apply one extension's seed for ``peer_uuid`` (see _apply_seeds).
+        Mirrors C _offer_seed."""
+        try:
+            peer_uuid = UUID(str(peer_uuid))
+            seed = float(seed)
+        except (ValueError, TypeError, AttributeError):
+            return
+        if not 0.0 < seed <= 1.0:
+            self.logger.warning('%s: refusing seed %r for %s (outside '
+                                '(0, 1])', label, seed, str(peer_uuid)[:8])
+            return
+        current = self.reputations.current
+        held = peer_uuid in current or str(peer_uuid) in current
+        if held:
+            # Rewrite the key the score is held under, never a second one.
+            peer_uuid = next(k for k in current if str(k) == str(peer_uuid))
+        if _policy_on(self):
+            # Out-of-band key confirmation is own evidence: the seed is
+            # written to brought where there is none, and replaces a told
+            # score that is told-only (RD_14.4 Phase 4; amends
+            # FIRST_CONTACT_PLAN §10.5). Earned, warm-started and slashed
+            # scores still win.
+            key = str(peer_uuid)
+            brought = _brought_of(self)
+            if key not in brought and key not in getattr(self, '_slashed', {}):
+                brought[key] = seed
+                self.logger.info('%s: seeded %s %s at %.2f (brought)', label,
+                                 what, key[:8], seed)
+            if held and not self._told_only(peer_uuid):
+                return
+        elif held:
+            return     # already known here; earned beats seeded
+        self.reputations.update(peer_uuid, seed)
+        self.logger.info('%s: seeded %s %s at %.2f', label, what,
+                         str(peer_uuid)[:8], seed)
 
     def _seed_idle_from_snapshot(self):
         """At start-up, treat the persisted reputation snapshot's mtime as
@@ -4855,6 +5117,13 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             decayed = self._decayed_score(score, idle)
             if decayed is not None:
                 self.reputations.current[u] = decayed
+        # Both maps (RD_14.4 Phase 4).
+        brought = _brought_of(self)
+        for key in list(brought):
+            if key == self_uuid:
+                continue
+            self._last_interaction.setdefault(key, mtime)
+            brought[key] = self._decayed_score(brought[key], idle)
 
     def _seed_exclusions_from_snapshot(self):
         """Re-establish the exclusion set at start-up from the persisted
@@ -4869,7 +5138,11 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         by the first outbound/inbound gate and republished on the first live
         tier change."""
         self_uuid = str(self.identity.uuid)
-        for u, score in self.reputations.current.items():
+        # Under the join policy exclusion reads the brought score, which a
+        # slash floors too (RD_14.4 Phase 4).
+        scores = (_brought_of(self).items() if _policy_on(self)
+                  else self.reputations.current.items())
+        for u, score in scores:
             if str(u) == self_uuid:
                 continue
             if self._is_excluded(score):
@@ -4906,6 +5179,28 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             self._publish_tier_change(queues, u, decayed)
             self._publish_reputation_change(queues, u, decayed)
             changed = True
+        # Both maps (RD_14.4 Phase 4); the tier reads bounded, so a brought
+        # change republishes it from the told score.
+        brought = _brought_of(self)
+        for key in list(brought):
+            score = brought[key]
+            if key == self_uuid or key in self._slashed or \
+                    score <= self.REPUTATION_DECAY_ASYMPTOTE:
+                continue
+            idle = max(0.0, present - self._last_interaction.get(key, present))
+            decayed = self._decayed_score(score, idle)
+            if abs(decayed - score) <= 1e-9:
+                continue
+            brought[key] = decayed
+            told = None
+            for u in self.reputations.current:
+                if str(u) == key:
+                    told = self.reputations.current[u]
+                    break
+            if told is not None:
+                self._publish_tier_change(queues, key, told)
+                self._publish_reputation_change(queues, key, told)
+            changed = True
         if changed:
             try:
                 self._persist_reputations()
@@ -4935,7 +5230,13 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 continue
             if score > REPUTATION_PERSIST_THRESHOLD or self._is_excluded(score):
                 keep_uuids.add(u)
-        snapshot = self.reputations.filtered_for_persist(keep_uuids)
+        # The brought map under the same filter (RD_14.4 Phase 4).
+        keep_brought = {u for u, score in _brought_of(self).items()
+                        if score > REPUTATION_PERSIST_THRESHOLD
+                        or self._is_excluded(score)}
+        snapshot = (self.reputations.filtered_for_persist(keep_uuids, keep_brought)
+                    if keep_brought else
+                    self.reputations.filtered_for_persist(keep_uuids))
         snapshot.to_file(os.path.join(Configuration.get_cfg_dir(),
                                       CfgIds.reputation + Configuration.file_ext))
 
@@ -4948,7 +5249,12 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         because an unrated peer reads as PREREP_NEUTRAL, which is also a score a
         peer can genuinely earn; `PeerReputation` zeroes the score when unrated so
         a consumer ignoring the flag cannot read a plausible number.
+
+        `score` is the told one; the carrier reads bounded (RD_14.4 Phase 4),
+        as effective_tier does, with no change to the flat ABI.
         """
+        if rated and _policy_on(self):
+            score = self._bounded(peer_uuid, score)
         try:
             queues[CfgIds.main].put(
                 PeerReputation(str(peer_uuid), score, rated),
@@ -5021,7 +5327,14 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             # tier-0 -> tier-0 no-op for the tier logic, yet it must
             # exclude the peer. Exclusion state is the authority; the
             # network process is notified only on an actual crossing.
-            now_excluded = self._is_excluded(score)
+            # Under the join policy exclusion reads brought + slash and the
+            # tier reads bounded (RD_14.4 Phase 4); `score` is the told one.
+            if _policy_on(self):
+                excl, score = (self._exclusion_score(peer_uuid, score),
+                               self._bounded(peer_uuid, score))
+            else:
+                excl = score
+            now_excluded = self._is_excluded(excl)
             was_excluded = key in self._excluded
             if now_excluded and not was_excluded:
                 self._excluded.add(key)
@@ -5276,6 +5589,11 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         # trust from the punished regime instead of snapping back into
         # cooperation -- the same reasoning as the slash override.
         self._coop_mode[peer_uuid] = False
+        # Both maps (RD_14.4 Phase 4).
+        key_peer = str(peer_uuid)
+        if _brought_of(self).get(key_peer, -1.0) > unwound:
+            _brought_of(self)[key_peer] = unwound
+            self._coop_brought[key_peer] = False
         self.logger.warning(
             'Standing[%s]: %s FAILED (%s); unwound %.3f -> %.3f (anchor %s)',
             found.source, found.peer_uuid[:8], found.reason,
@@ -5450,6 +5768,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 rep_score = float(slashed[0])
                 self._coop_mode[peer_uuid] = False
                 self.reputations.update(peer_uuid, rep_score)
+                if _policy_on(self):
+                    self._score_brought(peer_uuid)
                 try:
                     self._persist_reputations()
                 except (OSError, IOError) as e:
@@ -5457,7 +5777,9 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 self.pending_tiers.append((peer_uuid, rep_score))
                 if respond:
                     self.requested_reps.append(
-                        (Reputation(peer_uuid, rep_score), req_proc, requestor))
+                        (Reputation(peer_uuid, rep_score if not _policy_on(self)
+                                    else self._bounded(peer_uuid, rep_score)),
+                         req_proc, requestor))
                 _probes.counter('rep.compute', 'slashed')
                 return
             # A peer scored for the first time has no stored score, and an
@@ -5505,6 +5827,9 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             rep_score = self._apply_standing_ceiling(peer_uuid, rep_score)
             rep_score = self._apply_tenure_ceiling(peer_uuid, rep_score)
             self.reputations.update(peer_uuid, rep_score)
+            # Under the join policy, the score from our own evidence alone.
+            if _policy_on(self):
+                self._score_brought(peer_uuid)
             try:
                 self._persist_reputations()
             except (OSError, IOError) as e:
@@ -5515,7 +5840,12 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             # so it can't put directly.
             self.pending_tiers.append((peer_uuid, rep_score))
             if respond:
-                self.requested_reps.append((Reputation(peer_uuid, rep_score), req_proc, requestor))
+                # A rep_resp answers with what this node acts on (bounded),
+                # not the cohort's view under its name (RD_14.4 Phase 4).
+                self.requested_reps.append(
+                    (Reputation(peer_uuid, rep_score if not _policy_on(self)
+                                    else self._bounded(peer_uuid, rep_score)),
+                     req_proc, requestor))
             _probes.counter('rep.compute', 'queued')
         except Exception as e:
             _probes.counter('rep.compute', 'exception', type(e).__name__)
@@ -6327,7 +6657,11 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         try:
             key = UUID(peer_uuid_str)
             if key in self.reputations:
-                score, found = float(self.reputations[key]), True
+                # A local decision (ZTA delegation's bar): bounded.
+                score = float(self.reputations[key])
+                if _policy_on(self):
+                    score = float(self._bounded(key, score))
+                found = True
         except (ValueError, TypeError):
             pass
         if return_proc not in queues:
@@ -6597,6 +6931,10 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                                     self.logger.error('Unhandled message of type %s', message.__class__.__name__)  # noqa
                 _probes.counter('proc.reputation', 'iter_drained', str(drained))
                 self.forward_reputation(queues)
+                # A peer whose anchoring changed reads a different bounded
+                # score (RD_14.4 Phase 4).
+                if _policy_on(self):
+                    self._note_anchors()
                 # Score whoever the chain moved for (see _rescore_sweep), so
                 # the drain below publishes them this same iteration.
                 self._rescore_sweep(now().timestamp())

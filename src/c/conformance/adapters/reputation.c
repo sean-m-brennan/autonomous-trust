@@ -89,6 +89,9 @@ typedef struct {
     /* Checkpoint proposals parked for a later co-sign (ISSUES §2.29). */
     int cosigns_parked;
     rp_peer_rep_t peer_reps[SCE_MAX_PARTICIPANTS];
+    /* Brought and bounded scores per participant (RD_14.4 Phase 4). */
+    rp_peer_rep_t brought[SCE_MAX_PARTICIPANTS];
+    rp_peer_rep_t bounded[SCE_MAX_PARTICIPANTS];
     /* Verifiable warm start (doc/architecture/reputation.md). The evidence document is the one
      * artifact BOTH runtimes read, so its shape is worth pinning here; the
      * ceilings are the arithmetic that decides how much standing a restored
@@ -1214,6 +1217,53 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
             if (root != NULL)
                 reputation_install_checkpoint_window(root, epoch, ck_first,
                                                      ck_count);
+        }
+    }
+
+    /* Phase 4 (RD_14.4): `catchup_told` {pid: [index, ...]} pre-marks
+     * primary-chain entries as told; `anchored` {pid: [other, ...]} is what
+     * PEER_ANCHOR would have said; `seeds` {pid: {other: seed}} offers each
+     * seed as an extension would, after the reputations above. Mirrors the
+     * Python adapter. */
+    json_t *ct = json_object_get(json_object_get(g_fixtures, "catchup_told"),
+                                 target_id);
+    if (json_is_array(ct))
+    {
+        int64_t idx[MAX_CHAIN_LEN];
+        size_t n = 0, i;
+        json_t *v;
+        json_array_foreach(ct, i, v)
+            if (n < MAX_CHAIN_LEN && json_is_integer(v))
+                idx[n++] = (int64_t)json_integer_value(v);
+        reputation_install_catchup_told(idx, n);
+    }
+    json_t *an = json_object_get(json_object_get(g_fixtures, "anchored"),
+                                 target_id);
+    {
+        size_t i;
+        json_t *v;
+        json_array_foreach(an, i, v)
+        {
+            const uuid_t *u = _uuid_of(ctx, json_string_value(v));
+            if (u != NULL)
+                reputation_set_anchored(*u, true);
+        }
+    }
+    json_t *sd = json_object_get(json_object_get(g_fixtures, "seeds"), target_id);
+    if (json_is_object(sd))
+    {
+        const process_t *proc = NULL;
+        for (size_t i = 0; i < ctx->participant_count; i++)
+            if (strcmp(ctx->participants[i].id, target_id) == 0)
+                proc = ((rp_impl_t *)ctx->participants[i].impl)->proc;
+        const char *other_id;
+        json_t *v;
+        json_object_foreach(sd, other_id, v)
+        {
+            const uuid_t *u = _uuid_of(ctx, other_id);
+            if (u != NULL && proc != NULL && json_is_number(v))
+                reputation_offer_seed(proc, "fixture", *u, json_number_value(v),
+                                      "seed");
         }
     }
 }
@@ -2580,6 +2630,12 @@ static int _dispatch(sce_run_ctx_t *ctx,
                 s->peer_reps[i].has_value = true;
                 s->peer_reps[i].value = v;
             }
+            snprintf(s->brought[i].id, SCE_ID_LEN, "%s", other_id);
+            s->brought[i].has_value = reputation_get_brought(*u, &v) == 0;
+            s->brought[i].value = v;
+            snprintf(s->bounded[i].id, SCE_ID_LEN, "%s", other_id);
+            s->bounded[i].has_value = reputation_get_bounded(*u, &v) == 0;
+            s->bounded[i].value = v;
             snprintf(s->evidence_ceilings[i].id, SCE_ID_LEN, "%s", other_id);
             s->evidence_ceilings[i].has_value = false;
             double c = 0.0;
@@ -3149,6 +3205,48 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                         snprintf(ctx->err, sizeof(ctx->err),
                                  "%s.reputation_of[%s]=%.4f, expected %.4f",
                                  pid, other, pr->value, want);
+                        return -1;
+                    }
+                }
+            }
+            else if (strcmp(key, "brought_of") == 0
+                     || strcmp(key, "bounded_of") == 0)
+            {
+                /* { "<other_pid>": float | null }: the brought score (null:
+                 * none held) or what a decision reads (RD_14.4 Phase 4).
+                 * Mirrors the Python adapter. */
+                if (!json_is_object(val)) continue;
+                rp_peer_rep_t *table = strcmp(key, "brought_of") == 0
+                                       ? snap->brought : snap->bounded;
+                const char *other;
+                json_t *want_j;
+                json_object_foreach(val, other, want_j)
+                {
+                    rp_peer_rep_t *pr = NULL;
+                    for (size_t i = 0; i < SCE_MAX_PARTICIPANTS && pr == NULL; i++)
+                        if (strcmp(table[i].id, other) == 0)
+                            pr = &table[i];
+                    bool have = pr != NULL && pr->has_value;
+                    if (json_is_null(want_j) || !have)
+                    {
+                        if (json_is_null(want_j) != !have)
+                        {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s.%s[%s]=%s, expected %s", pid, key,
+                                     other, have ? "a score" : "None",
+                                     json_is_null(want_j) ? "None" : "a score");
+                            return -1;
+                        }
+                        continue;
+                    }
+                    double want = json_number_value(want_j);
+                    double diff = pr->value - want;
+                    if (diff < 0) diff = -diff;
+                    if (diff > 1e-3)
+                    {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s.%s[%s]=%.4f, expected %.4f",
+                                 pid, key, other, pr->value, want);
                         return -1;
                     }
                 }

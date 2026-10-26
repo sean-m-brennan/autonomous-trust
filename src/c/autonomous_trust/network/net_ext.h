@@ -47,7 +47,7 @@
 #include "network/net_proc_priv.h"
 
 /** Most network extensions. */
-#define NET_EXT_MAX 4
+#define NET_EXT_MAX 8
 
 /** One feature's view of the network process. */
 typedef struct {
@@ -71,6 +71,28 @@ typedef struct {
     /** Reputation cut @p uuid (lower-case) off, or readmitted it; the core
      *  has already recorded it (@ref net_is_excluded). */
     void (*exclusion)(const char *uuid, bool excluded);
+    /** Network-process functions this feature accepts from the wire,
+     *  NULL-terminated; NULL for none. Admitted only on a member's paths
+     *  (decrypted peer, group), never from a stranger or the broadcast
+     *  channel. The frame then reaches local_verb with its sender set. Every
+     *  inbound frame of a declared verb (it carries a sender) must be
+     *  consumed by this extension's local_verb; one it declines is treated
+     *  as a local outbound message. */
+    const char *const *wire_verbs;
+    /** network_run, after the filters and plaintext verbs are checked: a
+     *  non-zero return refuses to start the network process (the feature's
+     *  configuration cannot be honoured). */
+    int (*check_config)(logger_t *logger);
+    /** A unicast the transport is about to send (no extension carried it
+     *  through `unicast`): the frame as sealed for @p peer, with its verb.
+     *  Cannot stop or alter the transport send. */
+    void (*also_unicast)(const uuid_t peer, const char *process,
+                         const char *function, const uint8_t *buf, size_t len);
+    /** A GROUP (sealed with @p grp's key) or BROADCAST (plaintext) frame the
+     *  transport just sent, with its verb and the node's group (may be NULL).
+     *  Cannot stop or alter the transport send. */
+    void (*fanout)(net_channel_t ch, const char *process, const char *function,
+                   const group_t *grp, const uint8_t *buf, size_t len);
 } net_ext_t;
 
 /** Register @p ext (static storage). @return 0; -1 NULL, unnamed, duplicate or
@@ -89,6 +111,14 @@ bool net_ext_local_verb(net_thread_ctx_t *ctx, net_msg_t *nmsg);
 bool net_ext_reachable(const uuid_t peer);
 /** The first answer that is not 1 (not mine), else 1. */
 int net_ext_unicast(const uuid_t peer, const uint8_t *buf, size_t len);
+/** True iff an extension declared @p function in its wire_verbs. */
+bool net_ext_wire_verb_declared(const char *function);
+/** Ask every extension's check_config. @return 0, or -1 if any refused. */
+int net_ext_check_config(logger_t *logger);
+void net_ext_also_unicast(const uuid_t peer, const char *process,
+                          const char *function, const uint8_t *buf, size_t len);
+void net_ext_fanout(net_channel_t ch, const char *process, const char *function,
+                    const group_t *grp, const uint8_t *buf, size_t len);
 
 /* Who reputation cut off (C4). The network process records each exclusion
  * by uuid and by the signing key it holds for that peer, so a distrusted peer

@@ -49,6 +49,7 @@
 #include "network/net_proc_priv.h"
 #include "network/net_filter.h"
 #include "network/net_ext.h"
+#include "network/net_liveness.h"
 #include "network/net_presence.h"
 #include "utilities/send_retry.h"
 #include "identity/identity.h"
@@ -1026,7 +1027,9 @@ bool net_wire_verb_admitted(const char *process, const char *function,
     else if (strncmp(function, "app_", 4) == 0)
         reason = "app verbs are the local app's and never travel";
     else if (strcmp(process, "network") == 0
-             && strcmp(function, NET_FN_STATS_REQ) != 0)
+             && strcmp(function, NET_FN_STATS_REQ) != 0
+             && !((path == NET_PATH_PEER || path == NET_PATH_GROUP)
+                  && net_ext_wire_verb_declared(function)))
         reason = "the network process takes only stats_req from the wire";
     else if ((path == NET_PATH_STRANGER || path == NET_PATH_RELAY_STRANGER)
              && !identity_verb_is_unencrypted(function))
@@ -1041,6 +1044,16 @@ bool net_wire_verb_admitted(const char *process, const char *function,
 /* Refusals logged at INFO, the first 20 and then every 100th, so a missed
  * legitimate verb shows in the first cohort log and a flood cannot fill it. */
 static unsigned long _route_refusals;
+
+/* True while this thread routes a frame an extension delivered (a relay, a
+ * radio): such a frame is evidence the peer is alive, but not that the
+ * transport path to it works, so it does not stamp net_liveness. */
+static __thread bool _net_ext_inbound;
+
+void net_proc_test_set_ext_inbound(bool on)
+{
+    _net_ext_inbound = on;
+}
 
 static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
                             directory_t *queues, logger_t *logger,
@@ -1057,8 +1070,14 @@ static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
     /* Every frame from the wire is routed here, so this is where a peer is
      * heard (doc/architecture/peer-presence.md). A uuid not on the roster is
      * ignored by the tracker. A presence frame has said everything it carries
-     * by arriving: consumed here, never routed. */
+     * by arriving: consumed here, never routed. Transport liveness is stamped
+     * only on the paths where the sender is a peer we hold: a stranger or the
+     * broadcast channel names any uuid it likes. */
     net_presence_heard(wmsg->from_whom.uuid, (double)time(NULL));
+    if (!_net_ext_inbound
+        && (path == NET_PATH_PEER || path == NET_PATH_GROUP
+            || path == NET_PATH_PLAIN_KNOWN))
+        net_liveness_heard(wmsg->from_whom.uuid, net_liveness_now());
     if (wmsg->function != NULL
         && strcmp(wmsg->process, NET_PRESENCE_PROCESS) == 0
         && strcmp(wmsg->function, NET_PRESENCE_FUNCTION) == 0) {
@@ -1291,12 +1310,14 @@ static int handle_outbound_stats_req(const net_msg_t *nmsg,
  * sealed for the peer either way. */
 static int _peer_unicast(const net_transport_t *transport,
                          net_transport_ctx_t *ctx, const uuid_t peer,
+                         const char *process, const char *function,
                          const uint8_t *buf, size_t len, const char *host,
                          int port)
 {
     int rc = net_ext_unicast(peer, buf, len);
     if (rc != 1)
         return rc;
+    net_ext_also_unicast(peer, process, function, buf, len);
     return transport->send_unicast(ctx, buf, len, host, port);
 }
 
@@ -1332,6 +1353,8 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
         }
         int ret = transport->send_broadcast(ctx, NET_CHAN_BROADCAST,
                                             send_buf, send_len, port);
+        net_ext_fanout(NET_CHAN_BROADCAST, msg->process, msg->function, grp,
+                       send_buf, send_len);
         if (ret == 0) {
             track_send(msg->to_whom.target.peer.address, send_len);
         } else if (ret == -1) {
@@ -1414,6 +1437,8 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
         }
         int ret = transport->send_broadcast(ctx, NET_CHAN_GROUP,
                                             send_buf, send_len, port);
+        net_ext_fanout(NET_CHAN_GROUP, msg->process, msg->function, grp,
+                       send_buf, send_len);
         if (ret == -1)
             log_debug(logger, "Network: transport lacks group multicast; skipping\n");
         if (send_buf != frame)
@@ -1467,6 +1492,7 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
         }
         const char *host = msg->to_whom.target.peer.address;
         int ret = _peer_unicast(transport, ctx, msg->to_whom.target.peer.uuid,
+                                msg->process, msg->function,
                                 send_buf, send_len, host, port);
         if (ret == 0) track_send(host, send_len);
         else          track_send_error(host);
@@ -1486,6 +1512,7 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
     }
     const char *host = msg->to_whom.target.peer.address;
     int ret = _peer_unicast(transport, ctx, msg->to_whom.target.peer.uuid,
+                            msg->process, msg->function,
                             send_buf, send_len, host, port);
     if (ret == 0) track_send(host, send_len);
     else          track_send_error(host);
@@ -1493,6 +1520,15 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
         free((void *)send_buf);
     free(wire);
     return ret;
+}
+
+int net_proc_test_encrypt_and_send(const identity_t *myself, const group_t *grp,
+                                   const net_wire_msg_t *msg,
+                                   const net_transport_t *transport,
+                                   net_transport_ctx_t *ctx, int port,
+                                   net_wire_format_t fmt, logger_t *logger)
+{
+    return net_encrypt_and_send(myself, grp, msg, transport, ctx, port, fmt, logger);
 }
 
 /****************************
@@ -1905,6 +1941,8 @@ void handle_inbound_relayed(net_thread_ctx_t *ctx, const uint8_t *buf,
     if (ctx == NULL || buf == NULL || from_uuid == NULL
         || uuid_parse(from_uuid, u) != 0)
         return;
+    bool was = _net_ext_inbound;
+    _net_ext_inbound = true;
     const public_identity_t *peer = net_find_peer_by_uuid(ctx->proc, u);
     if (peer != NULL) {
         /* A known peer: the ordinary path, keyed on its own address so the
@@ -1912,7 +1950,7 @@ void handle_inbound_relayed(net_thread_ctx_t *ctx, const uint8_t *buf,
         char addr[ADDR_LEN + 1];
         at_strlcpy(addr, peer->address, sizeof(addr));
         handle_inbound_peer(ctx, (uint8_t *)buf, nbytes, addr);
-        return;
+        goto out;
     }
     /* A sender we do not know yet: only plaintext can be read (the
      * first-contact hello), and its envelope must name the sender the relay
@@ -1921,7 +1959,7 @@ void handle_inbound_relayed(net_thread_ctx_t *ctx, const uint8_t *buf,
     if (net_message_from_wire_fmt(buf, nbytes, NULL, NET_WIRE_JSON, &wmsg) != 0) {
         log_debug(ctx->logger, "Network: unreadable relayed frame from %.8s\n",
                   from_uuid);
-        return;
+        goto out;
     }
     if (uuid_compare(wmsg.from_whom.uuid, u) != 0) {
         char claimed[UUID_STR_LEN + 1];
@@ -1929,11 +1967,53 @@ void handle_inbound_relayed(net_thread_ctx_t *ctx, const uint8_t *buf,
         log_warn(ctx->logger, "Network: relayed frame from %.8s claims to be "
                  "%.8s; dropped\n", from_uuid, claimed);
         net_wire_msg_free(&wmsg);
-        return;
+        goto out;
     }
     route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger,
                      NET_PATH_RELAY_STRANGER);
     net_wire_msg_free(&wmsg);
+out:
+    _net_ext_inbound = was;
+}
+
+void handle_inbound_ext(net_thread_ctx_t *ctx, net_channel_t ch,
+                        const uint8_t *buf, size_t nbytes, const char *from_uuid)
+{
+    uuid_t u;
+    if (ctx == NULL || buf == NULL || nbytes == 0 || from_uuid == NULL
+        || uuid_parse(from_uuid, u) != 0)
+        return;
+    const public_identity_t *peer = net_find_peer_by_uuid(ctx->proc, u);
+    if (peer == NULL) {
+        probes_counter("net.ext", "drop", "unknown_peer");
+        return;
+    }
+    char ustr[UUID_STR_LEN + 1];
+    uuid_unparse_lower(u, ustr);
+    if (reject_message(peer->address) || net_is_excluded(ustr, NULL)) {
+        probes_counter("net.ext", "drop", "excluded");
+        return;
+    }
+    /* The handlers may rewrite the buffer in place; give them a copy. */
+    uint8_t *copy = malloc(nbytes);
+    if (copy == NULL)
+        return;
+    memcpy(copy, buf, nbytes);
+    if (ch == NET_CHAN_PEER) {
+        handle_inbound_relayed(ctx, copy, nbytes, from_uuid);
+        free(copy);
+        return;
+    }
+    char addr[ADDR_LEN + 1];
+    at_strlcpy(addr, peer->address, sizeof(addr));
+    bool was = _net_ext_inbound;
+    _net_ext_inbound = true;
+    if (ch == NET_CHAN_GROUP)
+        handle_inbound_group(ctx, copy, nbytes, addr);
+    else if (ch == NET_CHAN_BROADCAST)
+        handle_inbound_broadcast(ctx, copy, nbytes, addr);
+    _net_ext_inbound = was;
+    free(copy);
 }
 
 static void *peer_receiver_thread(void *arg)
@@ -2113,6 +2193,7 @@ typedef struct {
     int64_t held_at_s;                                /* CLOCK_MONOTONIC */
     int64_t key_epoch;                                /* the key it failed under */
     unsigned char key_public[crypto_box_PUBLICKEYBYTES];
+    bool via_ext;                                     /* an extension injected it */
     uint8_t data[];
 } held_group_frame_t;
 static held_group_frame_t *held_group_frames[NET_HELD_GROUP_FRAMES];
@@ -2140,6 +2221,7 @@ static void _hold_group_frame(net_thread_ctx_t *ctx, const uint8_t *buf,
     h->held_at_s = _deferred_now_s();
     h->key_epoch = grp->key_epoch;
     memcpy(h->key_public, grp->encryptor.public, sizeof(h->key_public));
+    h->via_ext = _net_ext_inbound;
     memcpy(h->data, buf, nbytes);
     pthread_mutex_lock(&held_group_lock);
     if (held_group_count == NET_HELD_GROUP_FRAMES) {
@@ -2187,10 +2269,15 @@ size_t net_retry_held_group_frames(net_thread_ctx_t *ctx)
                  "under the new key %s… epoch %lld\n", n_due, kfp,
                  (long long)grp->key_epoch);
     }
+    bool was = _net_ext_inbound;
     for (size_t i = 0; i < n_due; i++) {
+        /* An injected frame stays injected: no liveness stamp and no
+         * partition signal on its retry either. */
+        _net_ext_inbound = due[i]->via_ext;
         _inbound_group(ctx, due[i]->data, due[i]->len, due[i]->from_addr, true);
         free(due[i]);
     }
+    _net_ext_inbound = was;
     return n_due;
 }
 
@@ -2334,7 +2421,12 @@ static void _inbound_group(net_thread_ctx_t *ctx, uint8_t *buf, size_t nbytes,
          * `partition_probe` and, on a response, initiate a normal
          * request_access to absorb the foreign group. See
          * doc/architecture/partition-recovery.md §5.1. */
-        _net_signal_partition(ctx, from_addr);
+        if (_net_ext_inbound)
+            /* Heard some other way (a radio): a foreign cohort's frame on the
+             * air must not start partition recovery. */
+            probes_counter("net.ext", "group_decrypt_fail", NULL);
+        else
+            _net_signal_partition(ctx, from_addr);
     }
     free(plain);
 }
@@ -2672,7 +2764,17 @@ static int network_run(const net_transport_t *transport,
     /* The optional half of the plaintext receive policy (identity_run checked
      * it too, but this is the process that consults it). */
     net_presence_init();
+    net_liveness_reset(net_liveness_now());
     if (plaintext_verbs_configure(NULL, logger) != 0) {
+        transport->close(tctx);
+        if (my_public != NULL) smrt_deref(my_public);
+        return -1;
+    }
+    /* An extension whose configuration cannot be honoured refuses the start,
+     * as the filters and plaintext verbs above do. */
+    if (net_ext_check_config(logger) != 0) {
+        log_error(logger, "Network: an extension refused its configuration; "
+                  "not starting\n");
         transport->close(tctx);
         if (my_public != NULL) smrt_deref(my_public);
         return -1;

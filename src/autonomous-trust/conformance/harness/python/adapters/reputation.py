@@ -463,6 +463,31 @@ class _Participant:
                             f'{self.id}.reputation_of[{other_pid}]={got:.4f}, '
                             f'expected {float(want):.4f}'
                         )
+            elif key in ('brought_of', 'bounded_of'):
+                # { "<other_pid>": float | null }: the brought score (null:
+                # none held) or what a decision reads (RD_14.4 Phase 4).
+                # Mirrors the C adapter.
+                for other_pid, want in expected.items():
+                    other = participants.get(other_pid)
+                    if other is None:
+                        raise AssertionError(
+                            f'{self.id}.{key}: unknown participant {other_pid!r}')
+                    other_uuid = other.identity.uuid
+                    if key == 'brought_of':
+                        got = self.process.reputations.brought.get(str(other_uuid))
+                    else:
+                        told = (self.process.reputations[other_uuid]
+                                if other_uuid in self.process.reputations else None)
+                        got = self.process._bounded(other_uuid, told)
+                    if want is None or got is None:
+                        if want is not got:
+                            raise AssertionError(
+                                f'{self.id}.{key}[{other_pid}]={got!r}, '
+                                f'expected {want!r}')
+                    elif abs(got - float(want)) > 1e-3:
+                        raise AssertionError(
+                            f'{self.id}.{key}[{other_pid}]={got:.4f}, '
+                            f'expected {float(want):.4f}')
             elif key == 'unrated':
                 # `expected` is [ "<pid>", ... ] -- participants this one
                 # holds NO stored score for (the negation reputation_of cannot
@@ -1054,6 +1079,26 @@ class ReputationAdapter:
                 parse_join_policy(fixtures['join_policy'])
                 if fixtures.get('join_policy') is not None else INERT_JOIN_POLICY)
             participant.process._catchup_marks = {}
+            # Phase 4 (RD_14.4): `catchup_told` {pid: [index, ...]} pre-marks
+            # primary-chain entries as told; `anchored` {pid: [other, ...]}
+            # is the AnchoredSet identity would have sent; `seeds`
+            # {pid: {other: seed}} offers each seed as an extension would,
+            # after the reputations above. Mirrors the C adapter.
+            # Staged scores are not a warm start; nothing a case's config dir
+            # held is either.
+            participant.process._warm_started = set()
+            told = (fixtures.get('catchup_told') or {}).get(pid)
+            if told:
+                participant.process._catchup_marks = {'': {int(i) for i in told}}
+            participant.process.protocol.anchored = frozenset(
+                str(identities[o].uuid)
+                for o in (fixtures.get('anchored') or {}).get(pid) or ()
+                if o in identities)
+            for other_pid, seed in ((fixtures.get('seeds') or {}).get(pid)
+                                    or {}).items():
+                if other_pid in identities:
+                    participant.process._offer_seed(
+                        'fixture', identities[other_pid].uuid, seed, 'seed')
             if preset_peer_standing.get(pid):
                 # ACT on them, not merely record them: the C adapter's
                 # reputation_apply_peer_standing does the unwind at install time,

@@ -1066,13 +1066,17 @@ class TestContriteTitForTat:
         peer = SimpleNamespace(uuid=peer_id)
         assert ReputationProcess._contrite_tit_for_tat(stub, peer) == 0.2
 
+    # history.update(task, scorer, score) records the score `scorer` GAVE the
+    # other side; CTFT's peer standing is what WE gave the peer, and our own
+    # standing what the peer gave us (RD_14.4 plan, Phase 4).
+
     def test_cooperative_self_p1(self):
         """Self enters as p1, peer as p2, both cooperate. Falls into
         the cooperate branch → max(0.51, peer_standing) = 0.8."""
         self_id, peer_id, task = uuid4(), uuid4(), uuid4()
         stub = _stub_proc(self_id)
-        stub.history.update(task, self_id, 0.9)  # self → p1
-        stub.history.update(task, peer_id, 0.8)  # peer → p2
+        stub.history.update(task, self_id, 0.8)  # self → p1, our rating of peer
+        stub.history.update(task, peer_id, 0.9)  # peer → p2, its rating of us
         score = ReputationProcess._contrite_tit_for_tat(
             stub, SimpleNamespace(uuid=peer_id))
         assert score == pytest.approx(0.8, abs=0.001)
@@ -1084,23 +1088,34 @@ class TestContriteTitForTat:
         regressed."""
         self_id, peer_id, task = uuid4(), uuid4(), uuid4()
         stub = _stub_proc(self_id)
-        stub.history.update(task, peer_id, 0.8)  # peer → p1
-        stub.history.update(task, self_id, 0.9)  # self → p2
+        stub.history.update(task, peer_id, 0.9)  # peer → p1, its rating of us
+        stub.history.update(task, self_id, 0.8)  # self → p2, our rating of peer
         score = ReputationProcess._contrite_tit_for_tat(
             stub, SimpleNamespace(uuid=peer_id))
         assert score == pytest.approx(0.8, abs=0.001)
 
+    def test_peer_rating_of_us_is_not_its_standing(self):
+        """The same two scores the other way round: the peer rates us 0.8,
+        we rate it 0.9, and its standing is ours of it, 0.9."""
+        self_id, peer_id, task = uuid4(), uuid4(), uuid4()
+        stub = _stub_proc(self_id)
+        stub.history.update(task, self_id, 0.9)
+        stub.history.update(task, peer_id, 0.8)
+        score = ReputationProcess._contrite_tit_for_tat(
+            stub, SimpleNamespace(uuid=peer_id))
+        assert score == pytest.approx(0.9, abs=0.001)
+
     def test_retaliation_branch(self):
-        """Peer defected on last tx (0.2) and self's standing is good
-        (mean 0.9) → retaliation branch → min(0.49, peer_standing) =
-        0.2."""
+        """We judged the peer to have defected on the last tx (0.2) and its
+        rating of us is good (mean 0.9) → retaliation branch →
+        min(0.49, peer_standing)."""
         self_id, peer_id = uuid4(), uuid4()
         stub = _stub_proc(self_id)
         t1, t2 = uuid4(), uuid4()
-        stub.history.update(t1, self_id, 0.9)
-        stub.history.update(t1, peer_id, 0.8)  # peer cooperated once
-        stub.history.update(t2, self_id, 0.9)
-        stub.history.update(t2, peer_id, 0.2)  # peer defects, peer_last
+        stub.history.update(t1, self_id, 0.8)  # peer cooperated once
+        stub.history.update(t1, peer_id, 0.9)
+        stub.history.update(t2, self_id, 0.2)  # peer defects, peer_last
+        stub.history.update(t2, peer_id, 0.9)
         score = ReputationProcess._contrite_tit_for_tat(
             stub, SimpleNamespace(uuid=peer_id))
         # peer_standing = (0.8 + 0.2) / 2 = 0.5; my_standing = 0.9.
@@ -1113,10 +1128,10 @@ class TestContriteTitForTat:
         self_id, peer_id = uuid4(), uuid4()
         stub = _stub_proc(self_id)
         t1, t2 = uuid4(), uuid4()
-        stub.history.update(t1, self_id, 0.2)   # self defected too
-        stub.history.update(t1, peer_id, 0.3)
-        stub.history.update(t2, self_id, 0.2)
-        stub.history.update(t2, peer_id, 0.4)   # peer_last < 0.5
+        stub.history.update(t1, self_id, 0.3)
+        stub.history.update(t1, peer_id, 0.2)   # the peer rates us low too
+        stub.history.update(t2, self_id, 0.4)   # peer_last < 0.5
+        stub.history.update(t2, peer_id, 0.2)
         score = ReputationProcess._contrite_tit_for_tat(
             stub, SimpleNamespace(uuid=peer_id))
         # peer_standing = (0.3 + 0.4) / 2 = 0.35; my_standing = 0.2

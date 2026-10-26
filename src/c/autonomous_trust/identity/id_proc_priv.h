@@ -448,6 +448,11 @@ uint32_t identity_anchor_classes(const process_t *proc, const public_identity_t 
 /** Whether the join policy counts @p ident as an anchor. */
 bool identity_is_anchored(const process_t *proc, const public_identity_t *ident);
 
+/** Send reputation a PEER_ANCHOR for every peer whose anchoring changed since
+ *  the last call (RD_14.4 Phase 4); nothing while the join policy is off.
+ *  Mirrors Python IdentityProcess._publish_anchors. */
+void identity_publish_anchors(const process_t *proc);
+
 /** Wipe the entire identity singleton state (histories, peer_potentials,
  *  vote_collection, peer_caps_map, and conformance-only override maps),
  *  resetting choosing_group to false. Preserves synchronous_dispatch so

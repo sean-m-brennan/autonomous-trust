@@ -89,6 +89,7 @@ def _rep_stub():
         info=lambda *a, **k: None, warning=lambda *a, **k: None))
     stub.reputations = types.SimpleNamespace(current={}, update=None)
     stub.reputations.update = lambda u, v: stub.reputations.current.__setitem__(u, v)
+    stub._offer_seed = lambda *a: ReputationProcess._offer_seed(stub, *a)
     return stub
 
 
