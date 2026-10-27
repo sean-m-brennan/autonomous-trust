@@ -180,7 +180,7 @@ DEFINE_TEST(test_fanout_sees_group_and_broadcast_sends)
 {
     _reset();
     identity_t *me = _mk("me", "10.0.0.1");
-    group_t grp;
+    group_t grp = {0};
     char gaddr[] = "group-addr";
     ck_assert_int_eq(group_init(NULL, gaddr, &grp), 0);
 
@@ -205,6 +205,8 @@ DEFINE_TEST(test_fanout_sees_group_and_broadcast_sends)
     ck_assert_int_eq(t_broadcasts, 2);
     free(w.function);
     free(w.data);
+    /* A group on the stack: its address map is all group_init allocated. */
+    map_free(&grp.address_map);
 }
 END_TEST_DEFINITION()
 
@@ -235,6 +237,13 @@ static process_t *_proc_holding(identity_t *peer)
     smrt_deref(pub);
     proc->protocol.num_peers = 1;
     return proc;
+}
+
+static void _proc_release(process_t *proc)
+{
+    map_free(&proc->protocol.group.address_map);
+    pthread_rwlock_destroy(&proc->protocol.peers_rwlock);
+    smrt_deref(proc);
 }
 
 /* A plaintext JSON broadcast envelope from @p from. */
@@ -269,6 +278,7 @@ DEFINE_TEST(test_injected_broadcast_is_routed_and_does_not_stamp_liveness)
     ck_assert_int_eq(g_routed, 1);
     ck_assert(net_liveness_quiet_for(peer->uuid, net_liveness_now()) >= 100.0);
     free(frame);
+    _proc_release(proc);
     messaging_set_test_hook(NULL);
 }
 END_TEST_DEFINITION()
@@ -292,6 +302,7 @@ DEFINE_TEST(test_injected_group_frame_that_fails_raises_no_partition_signal)
     handle_inbound_group(&ctx, junk, sizeof(junk), peer->address);
     ck_assert_int_eq(g_partition, 1);
     net_held_group_frames_reset();
+    _proc_release(proc);
     messaging_set_test_hook(NULL);
 }
 END_TEST_DEFINITION()
@@ -309,6 +320,7 @@ DEFINE_TEST(test_injection_from_an_unknown_uuid_is_dropped)
                        "00000000-0000-4000-8000-0000000000ff");
     ck_assert_int_eq(g_routed, 0);
     free(frame);
+    _proc_release(proc);
     messaging_set_test_hook(NULL);
 }
 END_TEST_DEFINITION()
@@ -341,6 +353,7 @@ DEFINE_TEST(test_injection_from_an_excluded_peer_is_dropped)
     handle_inbound_ext(&ctx, NET_CHAN_BROADCAST, frame, len, uuid_str);
     ck_assert_int_eq(g_routed, 1);
     free(frame);
+    _proc_release(proc);
     messaging_set_test_hook(NULL);
 }
 END_TEST_DEFINITION()
@@ -385,6 +398,7 @@ DEFINE_TEST(test_injected_peer_frame_takes_the_peer_path_unstamped)
     handle_inbound_ext(&ctx, NET_CHAN_PEER, sealed, len, uuid_str);
     ck_assert_int_eq(g_routed, 1);
     net_note_exclusion(uuid_str, NULL, false);
+    _proc_release(proc);
     messaging_set_test_hook(NULL);
 }
 END_TEST_DEFINITION()

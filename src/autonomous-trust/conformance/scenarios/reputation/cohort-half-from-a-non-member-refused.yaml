@@ -1,0 +1,75 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: cohort-half-from-a-non-member-refused
+byte_pinning: false
+description: |
+    The anchored cohort's acceptor check (RD_14.4_HOSTILE_JOIN_PLAN.md
+    Phase 6, D8 (b); doc/architecture/hostile-join.md). Under the join
+    policy, a half that names the anchored cohort is accepted only from a
+    member. Otherwise any peer of the primary group could write to the
+    chain the cohort's scorers read.
+
+    ally holds the anchored cohort {alice, ally}. other, a primary-group
+    peer but not a member, proposes a half naming the cohort, and ally
+    sends no acceptance. The same peer's half naming the primary group is
+    accepted, so the refusal is about the cohort and not about other.
+
+participants:
+  - id: alice
+    role: member
+  - id: ally
+    role: acceptor
+  - id: other
+    role: proposer
+
+fixtures:
+  join_policy:
+    version: 1
+    enabled: true
+    anchors: [verified_contact]
+  anchored_cohort:
+    alice: [alice, ally]
+    ally: [alice, ally]
+
+steps:
+  - id: 1
+    from: other
+    to: ally
+    function: transaction
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: other
+      task_id: t-1
+      score: 0.9
+      group: cohort
+    description: other names the cohort it is not in.
+
+  - id: 2
+    from: ally
+    to: other
+    function: tx accepted
+    in_response_to: 1
+    expect_none: true
+    description: Refused, silently.
+
+  - id: 3
+    from: other
+    to: ally
+    function: transaction
+    payload:
+      id1: 2000
+      id2: 1
+      proposer: other
+      task_id: t-2
+      score: 0.9
+    description: other's half on the primary group.
+
+  - id: 4
+    from: ally
+    to: other
+    function: tx accepted
+    in_response_to: 3
+    no_propagate: true
+    description: Accepted, as before.

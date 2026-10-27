@@ -217,6 +217,30 @@ def test_seed_cohort_mutual_recognition(tmp_path, scenario_factory):
     assert len(group_uuids) == 1, "every seeded peer must share one group UUID"
 
 
+def test_seed_cohort_group_history_loads_as_a_node_loads_it(tmp_path, scenario_factory):
+    """Each seeded peer's group.cfg.json carries a history that peer can
+    populate, the way IdentityProcess.choose_group reads it. An empty {}
+    raised KeyError 'blacklist' there, and the node fell back to minting a
+    group of its own, so the seeded cohort never formed."""
+    import queue
+    from autonomous_trust.core._python.identity.history.history import IdentityHistory
+    from tools.seed_dod_cohort import seed_cohort
+
+    sc = scenario_factory(squad_size=2, swarm_size=2, sensor_count=2,
+                          hacked_sensors=1, include_command=False)
+    seeded = seed_cohort(tmp_path, sc, force=True)
+
+    for peer in seeded:
+        d = tmp_path / peer / "etc" / "at"
+        with (d / "identity.cfg.json").open() as f:
+            identity = json.load(f, object_hook=config_json_decoder)
+        with (d / "peers.cfg.json").open() as f:
+            peers = json.load(f, object_hook=config_json_decoder)
+        with (d / "group.cfg.json").open() as f:
+            _group, hist_dict = json.load(f, object_hook=config_json_decoder)
+        IdentityHistory(identity, peers, queue.Queue()).populate(hist_dict)
+
+
 def test_seed_cohort_reputation_above_threshold(tmp_path, scenario_factory):
     """Every seeded peer's reputation snapshot has every OTHER seeded
     peer at >0.5 so they would all survive the rep-persist filter."""
@@ -373,6 +397,54 @@ def test_seed_cohort_evidence_signatures_verify(tmp_path, scenario_factory):
     assert verified > len(roster.all) // 2, "short of a reader's quorum"
 
 
+def test_seed_cohort_evidence_is_founded_by_a_roster(tmp_path, scenario_factory):
+    """The seeded window opens with the field group's genesis roster, listing
+    every seeded member and gateway with its signing key, and every placement
+    in it carries a certificate those keys verify. A chain with entries and no
+    roster is reset at boot, whatever its checkpoint says."""
+    from tools.seed_dod_cohort import seed_cohort
+    from nacl.encoding import HexEncoder
+    from nacl.signing import VerifyKey
+    from autonomous_trust.core._python.reputation.reputation import (
+        TransactionHistory, place_designation, place_value_digest,
+        placement_entry,
+    )
+
+    sc = scenario_factory(squad_size=3, swarm_size=2, sensor_count=2,
+                          hacked_sensors=1, include_command=False)
+    seeded = seed_cohort(tmp_path, sc, force=True)
+    peer = sorted(seeded)[0]
+    chain, _signed = _seeded_evidence(tmp_path / peer)
+    genesis = chain[0]
+    assert genesis.index == 0 and genesis.roster_op == 'genesis'
+    assert TransactionHistory(_chain=chain).latest_roster() is not None
+
+    peers_file = tmp_path / peer / "etc" / "at" / "peers.cfg.json"
+    with peers_file.open() as f:
+        others = json.load(f, object_hook=config_json_decoder)
+    with (tmp_path / peer / "etc" / "at" / "identity.cfg.json").open() as f:
+        me = json.load(f, object_hook=config_json_decoder)
+    expected = {str(p.uuid).lower() for p in others.all} | {str(me.uuid).lower()}
+    keys = dict(map(tuple, genesis.roster_members))
+    assert set(keys) == expected
+
+    by_index = {tx.index: tx for tx in chain}
+    certified = 0
+    for tx in chain:
+        if not tx.place_sigs:
+            continue
+        entries = [placement_entry(by_index[i])
+                   for i in range(tx.place_from, tx.index + 1)]
+        desig = place_designation(tx.place_from,
+                                  by_index[tx.place_from].prev_hash,
+                                  place_value_digest(entries, tx.place_from))
+        for voter, sig in tx.place_sigs.items():
+            VerifyKey(keys[voter].encode('ascii'), encoder=HexEncoder).verify(
+                desig, HexEncoder.decode(sig.encode('ascii')))
+        certified += tx.index - tx.place_from + 1
+    assert certified == len(chain), "every entry is in a certified placement"
+
+
 def test_seed_cohort_evidence_supports_the_seeded_tier(tmp_path,
                                                       scenario_factory):
     """The point of the whole exercise: a real ReputationProcess booting on
@@ -429,7 +501,78 @@ def test_seed_cohort_evidence_supports_the_seeded_tier(tmp_path,
     # The evidence verified, so the attested history came up with it.
     assert rp._checkpoint is not None  # noqa: SLF001
     assert len(rp.history) == rp._checkpoint.count  # noqa: SLF001
+    # It came up with its roster, so boot did not reset it as pre-roster.
+    assert rp.history.latest_roster() is not None
     # ...and every seeded peer holds its seeded tier.
+    assert rp.reputations.current
+    for uuid, score in rp.reputations.current.items():
+        assert rp._trust_tier(score) >= SEED_TIER, \
+            f"{str(uuid)[:8]} restored at {score:.4f}, below tier {SEED_TIER}"
+
+
+def test_seed_cohort_gateway_restores_field_evidence_as_its_child_chain(
+        tmp_path, scenario_factory):
+    """A gateway holds the field window as the CHILD chain it is, restored
+    once its child group set arrives, with the field roster in force. Its
+    primary chain stays empty for the command cohort it cold-bootstraps: a
+    field-founded primary would give the field roster that cohort's
+    decisions."""
+    import queue
+    from unittest.mock import MagicMock
+    from autonomous_trust.core.processes import ProcessTracker
+    from autonomous_trust.core.system import CfgIds
+    from autonomous_trust.core._python.config import Configuration
+    from autonomous_trust.core._python.reputation.repprocess import (
+        ReputationProcess,
+    )
+    from tools.seed_dod_cohort import GROUP_NICKNAME, is_gateway, seed_cohort
+    from examples.dod_mission.reputation_warmstart import SEED_TIER
+
+    sc = scenario_factory(squad_size=3, swarm_size=2, sensor_count=2,
+                          hacked_sensors=1, include_command=False)
+    seed_cohort(tmp_path, sc, force=True)
+    gws = sorted(n for n in sc.peers if is_gateway(n))
+    assert gws, "the scenario has no gateway to check"
+    root = tmp_path / gws[0]
+    cfg = root / "etc" / "at"
+
+    def load(name):
+        with (cfg / name).open() as f:
+            return json.load(f, object_hook=config_json_decoder)
+
+    field = load("group_child_%s.cfg.json" % GROUP_NICKNAME)
+    procs = []
+    for nm in (CfgIds.network, CfgIds.identity, CfgIds.negotiation,
+               CfgIds.reputation):
+        p = MagicMock()
+        p.name = nm
+        procs.append(p)
+    configs = {
+        'processes': procs,
+        CfgIds.identity: load("identity.cfg.json"),
+        CfgIds.peers: load("peers.cfg.json"),
+        CfgIds.reputation: load("reputation.cfg.json"),
+    }
+    prior = os.environ.get(Configuration.ROOT_VARIABLE_NAME)
+    os.environ[Configuration.ROOT_VARIABLE_NAME] = str(root)
+    try:
+        rp = ReputationProcess(configs, ProcessTracker(), queue.Queue(),
+                               suppress_log=True)
+        assert len(rp.history) == 0
+        rp.protocol.child_groups = {str(field.uuid): field}
+        rp._restore_child_evidence({CfgIds.identity: queue.Queue(),  # noqa: SLF001
+                                    CfgIds.negotiation: queue.Queue(),
+                                    CfgIds.main: queue.Queue(),
+                                    CfgIds.network: queue.Queue()})
+    finally:
+        if prior is None:
+            del os.environ[Configuration.ROOT_VARIABLE_NAME]
+        else:
+            os.environ[Configuration.ROOT_VARIABLE_NAME] = prior
+    child = rp._chain_for_group(str(field.uuid))  # noqa: SLF001
+    assert len(child) == rp._checkpoints[str(field.uuid)].count  # noqa: SLF001
+    assert child.latest_roster() is not None
+    assert len(rp.history) == 0
     assert rp.reputations.current
     for uuid, score in rp.reputations.current.items():
         assert rp._trust_tier(score) >= SEED_TIER, \

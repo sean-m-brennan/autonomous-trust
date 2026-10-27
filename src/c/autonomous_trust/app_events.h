@@ -184,7 +184,7 @@ typedef struct {
 typedef struct {
     uint8_t peer_uuid[AT_APP_UUID_LEN];
     /** False once nothing has been heard from the peer for
-     *  AT_PRESENCE_ABSENT_SEC (default 90 s). AT keeps the peer as a member
+     *  AT_PRESENCE_ABSENT_SEC (default 150 s). AT keeps the peer as a member
      *  and only stops asking it to do work, so read this as "quiet", not
      *  "gone". */
     bool    present;

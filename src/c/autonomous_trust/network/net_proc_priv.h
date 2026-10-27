@@ -307,6 +307,11 @@ int net_proc_test_encrypt_and_send(const identity_t *myself, const group_t *grp,
 /** @brief Mark this thread as routing extension-delivered frames (tests). */
 void net_proc_test_set_ext_inbound(bool on);
 
+/** @brief The checks network_run makes before its receivers start (the
+ *  filters, the plaintext verbs, each extension's check_config), exposed for
+ *  tests. @return 0, or -1 when the start is refused. */
+int net_proc_test_start_checks(const network_config_t *net_cfg, logger_t *logger);
+
 /* ---- ping_at refusal (divergence: C implements no PingAT) ----
  * The outbound drain answers the `ping_at` selector with an explicit refusal
  * instead of performing one. Exposed here (not in network.h) so a test can

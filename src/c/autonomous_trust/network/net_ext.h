@@ -88,9 +88,10 @@ typedef struct {
      *  Cannot stop or alter the transport send. */
     void (*also_unicast)(const uuid_t peer, const char *process,
                          const char *function, const uint8_t *buf, size_t len);
-    /** A GROUP (sealed with @p grp's key) or BROADCAST (plaintext) frame the
-     *  transport just sent, with its verb and the node's group (may be NULL).
-     *  Cannot stop or alter the transport send. */
+    /** A GROUP (sealed with @p grp's key) or BROADCAST (plaintext) frame,
+     *  after the transport was asked to send it, whether or not that
+     *  succeeded (a fallback radio still carries it), with its verb and the
+     *  node's group (may be NULL). Cannot stop or alter the transport send. */
     void (*fanout)(net_channel_t ch, const char *process, const char *function,
                    const group_t *grp, const uint8_t *buf, size_t len);
 } net_ext_t;
@@ -115,8 +116,11 @@ int net_ext_unicast(const uuid_t peer, const uint8_t *buf, size_t len);
 bool net_ext_wire_verb_declared(const char *function);
 /** Ask every extension's check_config. @return 0, or -1 if any refused. */
 int net_ext_check_config(logger_t *logger);
+/** Hand a unicast the transport is about to send to every also_unicast. */
 void net_ext_also_unicast(const uuid_t peer, const char *process,
                           const char *function, const uint8_t *buf, size_t len);
+/** Hand a GROUP or BROADCAST frame the transport was asked to send to every
+ *  fanout. */
 void net_ext_fanout(net_channel_t ch, const char *process, const char *function,
                     const group_t *grp, const uint8_t *buf, size_t len);
 

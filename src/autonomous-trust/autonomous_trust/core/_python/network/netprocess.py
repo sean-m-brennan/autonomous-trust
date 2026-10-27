@@ -212,9 +212,12 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self.unknown_messages = deque()
         # Transport liveness holds a lock and this instance is pickled across
         # the fork, so the tracker is created in process(). _via_ext marks a
-        # frame an extension injected, which never stamps it.
+        # frame an extension injected, which never stamps it. It is per
+        # thread (the receivers and mystery_handler route frames while the
+        # main loop injects), held in a threading.local that also cannot be
+        # pickled, so it too is created in process().
         self._liveness = None
-        self._via_ext = False
+        self._via_ext_tls = None
         self.acceptance = acceptance_func
         self.pests = {}
         self.protocol = Protocol(self.name, self.logger, configurations)
@@ -763,6 +766,21 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             self._tell_exclusion(uuid, True)
         return True
 
+    @property
+    def _via_ext(self) -> bool:
+        """Whether the frame this thread is routing was injected by an
+        extension. Twin of C's thread-local _net_ext_inbound."""
+        tls = self.__dict__.get('_via_ext_tls')
+        return bool(getattr(tls, 'on', False))
+
+    @_via_ext.setter
+    def _via_ext(self, value) -> None:
+        tls = self.__dict__.get('_via_ext_tls')
+        if tls is None:
+            # Only a stand-in that never ran process() gets here.
+            tls = self.__dict__['_via_ext_tls'] = threading.local()
+        tls.on = bool(value)
+
     def _note_transport_heard(self, peer_uuid, rcvd_by=None) -> None:
         """Stamp transport liveness, unless this frame was injected by an
         extension (``_via_ext``) or relayed by a rendezvous (``rcvd_by`` is
@@ -816,7 +834,10 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
 
     def _fanout(self, channel, process, function, group, frame) -> None:
         """Every extension that watches group/broadcast sends sees this one,
-        after the transport sent it. A hook that raises is logged and ignored."""
+        after the transport was asked to send it, whether or not that
+        succeeded: a fallback radio is for when the transport fails. A
+        broadcast whose send raises BrokenPipeError never gets here. A hook
+        that raises is logged and ignored."""
         for hooks in network_hooks(self):
             if hooks.fanout is None:
                 continue
@@ -842,6 +863,9 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         if self.reject_message(peer.address) or self.is_excluded(peer.uuid):
             _probes.counter('net.ext', 'drop', 'excluded')
             return False
+        # Restored, not cleared: a hook may inject while this thread is
+        # already routing an injected frame.
+        was = self._via_ext
         self._via_ext = True
         try:
             if channel == 'peer':
@@ -865,7 +889,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 return True
             raise ValueError('unknown channel %r' % (channel,))
         finally:
-            self._via_ext = False
+            self._via_ext = was
 
     def handle_readmit(self, queues, message):
         """Reverse an exclusion (explicit rehabilitation). Local IPC."""
@@ -1567,6 +1591,59 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                   addr, err)
                 self.track_send_error(self.unknown_peer)
 
+    def _send_broadcast_message(self, message):
+        """Send one outbound broadcast Message, then show it to the fanout
+        hooks whether or not the transport send succeeded. A BrokenPipeError
+        propagates to the caller and skips the hooks."""
+        # Broadcast is discovery: it goes to nodes we
+        # cannot place in any group, so JSON
+        # unconditionally (doc/architecture/network-wire-format.md). `bytes(message)` IS
+        # the JSON form.
+        msg = bytes(message)
+        try:
+            self.send_any(msg)
+            self.track_send_stats(self.unknown_peer, len(msg))
+            self._presence.sent(None, time.time())
+        except TransmissionError as err:
+            self.logger.error('Network: %s', err)
+            self.track_send_error(self.unknown_peer)
+        self._fanout('broadcast', message.process, message.function,
+                     self.group, msg)
+
+    def _send_group_message(self, message):
+        """Seal one outbound group Message, send it to each member, then show
+        it to the fanout hooks with the group whose key sealed it."""
+        # Encrypt with the TARGET group's key when
+        # we hold its private half (e.g. a gateway
+        # addressing one of its child cohorts);
+        # otherwise fall back to the primary group,
+        # which is the historical single-group
+        # behaviour for a leaf node.
+        enc_grp = self.group
+        tgt = message.to_whom
+        try:
+            if (not getattr(tgt, '_public_only', True)
+                    and getattr(tgt.encryptor, 'private', None) is not None):
+                enc_grp = tgt
+        except Exception:
+            enc_grp = self.group
+        # Format follows the ADDRESSED group, which
+        # for a gateway is the child cohort, not our
+        # own (doc/architecture/network-wire-format.md). Note this is a different question
+        # from which key encrypts it (enc_grp above):
+        # the key is about what we HOLD, the format
+        # about what the recipients SPEAK.
+        tgt_fmt = getattr(tgt, 'wire_format', None) or \
+            self._wire_format_for_group(self.group)
+        wire = message.to_wire(tgt_fmt)
+        if message.encrypt and enc_grp is not None:
+            msg = enc_grp.encrypt(wire, enc_grp)
+        else:
+            msg = wire
+        self._send_to_group_members(msg, message.to_whom.addresses)
+        self._fanout('group', message.process, message.function,
+                     enc_grp, msg)
+
     def process(self, queues, signal):
         """
         Network processing main loop
@@ -1595,6 +1672,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         # across the fork and the tracker holds a lock.
         self._presence = PresenceTracker()
         self._liveness = TransportLiveness(time.monotonic())
+        self._via_ext_tls = threading.local()
         self._presence_last_step = 0
         self.start_receivers(queues)
         for hooks in network_hooks(self):
@@ -1687,51 +1765,9 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                         target.address, message.obj,
                                         queues[message.return_to], target)
                             elif message.to_whom == Network.broadcast:
-                                # Broadcast is discovery: it goes to nodes we
-                                # cannot place in any group, so JSON
-                                # unconditionally (doc/architecture/network-wire-format.md). `bytes(message)` IS
-                                # the JSON form.
-                                msg = bytes(message)
-                                try:
-                                    self.send_any(msg)
-                                    self.track_send_stats(self.unknown_peer, len(msg))
-                                    self._presence.sent(None, time.time())
-                                except TransmissionError as err:
-                                    self.logger.error('Network: %s', err)
-                                    self.track_send_error(self.unknown_peer)
-                                self._fanout('broadcast', message.process, message.function,
-                                             self.group, msg)
+                                self._send_broadcast_message(message)
                             elif isinstance(message.to_whom, Group):
-                                # Encrypt with the TARGET group's key when
-                                # we hold its private half (e.g. a gateway
-                                # addressing one of its child cohorts);
-                                # otherwise fall back to the primary group,
-                                # which is the historical single-group
-                                # behaviour for a leaf node.
-                                enc_grp = self.group
-                                tgt = message.to_whom
-                                try:
-                                    if (not getattr(tgt, '_public_only', True)
-                                            and getattr(tgt.encryptor, 'private', None) is not None):
-                                        enc_grp = tgt
-                                except Exception:
-                                    enc_grp = self.group
-                                # Format follows the ADDRESSED group, which
-                                # for a gateway is the child cohort, not our
-                                # own (doc/architecture/network-wire-format.md). Note this is a different question
-                                # from which key encrypts it (enc_grp above):
-                                # the key is about what we HOLD, the format
-                                # about what the recipients SPEAK.
-                                tgt_fmt = getattr(tgt, 'wire_format', None) or \
-                                    self._wire_format_for_group(self.group)
-                                wire = message.to_wire(tgt_fmt)
-                                if message.encrypt and enc_grp is not None:
-                                    msg = enc_grp.encrypt(wire, enc_grp)
-                                else:
-                                    msg = wire
-                                self._send_to_group_members(msg, message.to_whom.addresses)
-                                self._fanout('group', message.process, message.function,
-                                             enc_grp, msg)
+                                self._send_group_message(message)
                             else:  # defaults to pseudo-multicast
                                 for who in message.to_whom:  # Message ensures this is list  # noqa
                                     self._unicast(message, who)

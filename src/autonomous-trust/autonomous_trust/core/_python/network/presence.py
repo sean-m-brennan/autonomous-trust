@@ -26,7 +26,7 @@ Two thresholds, both wall-clock seconds:
 * ``AT_PRESENCE_HEARTBEAT_SEC`` (default 30): a node that has sent nothing to
   some peer for this long sends one group presence frame, so an idle cohort
   still hears from everyone. A busy node never sends one.
-* ``AT_PRESENCE_ABSENT_SEC`` (default 90): a peer heard from nothing for this
+* ``AT_PRESENCE_ABSENT_SEC`` (default 150): a peer heard from nothing for this
   long is absent. A peer is never absent before it has been on the roster this
   long.
 
@@ -49,7 +49,7 @@ PRESENCE_PROCESS = 'identity'
 PRESENCE_FUNCTION = 'presence'
 
 HEARTBEAT_DEFAULT_SEC = 30.0
-ABSENT_DEFAULT_SEC = 90.0
+ABSENT_DEFAULT_SEC = 150.0
 
 
 @dataclass

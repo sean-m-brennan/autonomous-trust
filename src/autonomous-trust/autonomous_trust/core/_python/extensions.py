@@ -146,9 +146,13 @@ class NetworkHooks:
     ``also_unicast(proc, peer_uuid, frame, process, function)`` sees every
     unicast the transport is about to send (none an extension carried through
     ``unicast``), already sealed for the peer. ``fanout(proc, channel, frame,
-    process, function, group)`` sees every frame the transport sent on the
-    'group' (sealed with the group key) or 'broadcast' (plaintext) channel.
-    Neither can stop or alter the transport send. Twins of C
+    process, function, group)`` sees every frame on the 'group' (sealed with
+    ``group``'s key) or 'broadcast' (plaintext) channel after the transport
+    was asked to send it, whether or not that succeeded. ``group`` is the
+    group whose key sealed the frame: the node's own, or the child cohort on
+    a gateway's send to a child (C always passes the node's own). A
+    broadcast whose send raises BrokenPipeError skips it. Neither can stop or
+    alter the transport send. Twins of C
     ``net_ext_t.also_unicast`` / ``fanout``."""
     on_start: Optional[Callable[[Any, Any], None]] = None
     periodic: Optional[Callable[[Any, Any], None]] = None

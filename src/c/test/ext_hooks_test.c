@@ -25,11 +25,15 @@
 #define DEBUG_TESTS 1
 #include "test_setup.h"
 
+#include <errno.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <uuid/uuid.h>
 
 #include "negotiation/neg_ext.h"
 #include "network/net_ext.h"
+#include "network/net_proc_priv.h"
 #include "reputation/rep_ext.h"
 
 static int to_two(const process_t *proc, const unsigned char *peer, int tier)
@@ -211,6 +215,10 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_a_config_refusal_is_reported)
 {
+    /* Its own registration, so it does not lean on the test before it; a
+     * second registration of the same extension returns -1 and changes
+     * nothing. */
+    (void)net_ext_register(&T_DECL);
     config_calls = 0;
     config_answer = 0;
     ck_assert_int_eq(net_ext_check_config(NULL), 0);
@@ -221,10 +229,85 @@ DEFINE_TEST(test_a_config_refusal_is_reported)
 }
 END_TEST_DEFINITION()
 
+/* The checks network_run makes before any receiver starts: an extension
+ * that refuses its configuration refuses the start. */
+DEFINE_TEST(test_start_checks_refuse_on_a_config_refusal)
+{
+    (void)net_ext_register(&T_DECL);
+    config_answer = 0;
+    ck_assert_int_eq(net_proc_test_start_checks(NULL, NULL), 0);
+    config_answer = 1;
+    ck_assert_int_eq(net_proc_test_start_checks(NULL, NULL), -1);
+    config_answer = 0;
+}
+END_TEST_DEFINITION()
+
+/* A transport that records what network_run asks of it and never delivers. */
+static int t_opens, t_closes, t_recvs;
+static int t_open(net_transport_ctx_t **out, const net_transport_params_t *params)
+{
+    (void)params;
+    t_opens++;
+    *out = (net_transport_ctx_t *)&t_opens;     /* opaque; never dereferenced */
+    return 0;
+}
+static int t_recv(net_transport_ctx_t *ctx, net_channel_t channel, uint8_t **out_buf,
+                  size_t *out_len, char *from, size_t from_len, int timeout_ms)
+{
+    (void)ctx; (void)channel; (void)out_buf; (void)out_len; (void)from; (void)from_len;
+    __atomic_add_fetch(&t_recvs, 1, __ATOMIC_SEQ_CST);
+    usleep((useconds_t)timeout_ms * 1000);
+    return ENOMSG;
+}
+static void t_close(net_transport_ctx_t *ctx)
+{
+    (void)ctx;
+    t_closes++;
+}
+static const net_transport_t T_RECORDING = {
+    .name = "t_recording",
+    .open = t_open,
+    .recv = t_recv,
+    .close = t_close,
+};
+
+/* network_run itself, in-process so process_setup does not fork: a refused
+ * extension config closes the opened transport and returns -1 before any
+ * receiver thread reads from it. */
+DEFINE_TEST(test_network_run_refuses_to_start_on_a_config_refusal)
+{
+    setenv("AT_IN_PROCESS", "1", 1);
+    ck_assert(messaging_in_process());          /* else process_setup would fork */
+    (void)net_ext_register(&T_DECL);
+    ck_assert_int_eq(net_transport_register(&T_RECORDING), 0);
+    network_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    process_t *proc = smrt_create(sizeof(process_t));
+    ck_assert_ptr_nonnull(proc);
+    strncpy(proc->name, "network", PROC_NAME_LEN);
+    proc->conf.data_struct = &cfg;
+    ck_assert_ret_ok(map_create(&proc->configs));
+    config_answer = 1;
+    config_calls = 0;
+    t_opens = t_closes = t_recvs = 0;
+    char signal[] = "t_signal";
+    ck_assert_int_eq(network_run_by_name("t_recording", proc, NULL, signal, NULL), -1);
+    config_answer = 0;
+    ck_assert_int_eq(config_calls, 1);          /* refused by the extension's check */
+    ck_assert_int_eq(t_opens, 1);
+    ck_assert_int_eq(t_closes, 1);
+    ck_assert_int_eq(__atomic_load_n(&t_recvs, __ATOMIC_SEQ_CST), 0);
+    map_free(proc->configs);
+    smrt_deref(proc);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(ExtHooks,
           test_tier_caps_only_lower,
           test_network_hooks_dispatch,
           test_exclusions_by_uuid_and_key,
           test_seed_provider_registry,
           test_declared_network_verbs_are_admitted_on_member_paths_only,
-          test_a_config_refusal_is_reported)
+          test_a_config_refusal_is_reported,
+          test_start_checks_refuse_on_a_config_refusal,
+          test_network_run_refuses_to_start_on_a_config_refusal)

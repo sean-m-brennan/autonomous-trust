@@ -15,11 +15,31 @@
 # ******************
 """When a peer was last heard through the node's own transport, kept apart
 from frames an extension delivered some other way."""
+import time
 import types
 import uuid as uuid_mod
 
+import pytest
+
+from autonomous_trust.core._python.network import netprocess
 from autonomous_trust.core._python.network.liveness import TransportLiveness
 from autonomous_trust.core._python.network.netprocess import NetworkProcess
+
+#: The network process's monotonic clock, pinned by the ``clock`` fixture.
+NOW = 100.0
+
+
+class _PinnedClock:
+    """The time module, with monotonic() pinned to NOW."""
+    monotonic = staticmethod(lambda: NOW)
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    monkeypatch.setattr(netprocess, 'time', _PinnedClock())
 
 
 def test_never_heard_counts_from_start():
@@ -55,14 +75,14 @@ def test_full_table_forgets_the_longest_quiet():
     assert lv.quiet_for(first, 5000.0) == 5000.0
 
 
-def test_transport_frames_stamp_and_extension_frames_do_not():
+def test_transport_frames_stamp_and_extension_frames_do_not(clock):
     stub = types.SimpleNamespace(_liveness=TransportLiveness(0.0), _via_ext=False)
     a, b = uuid_mod.uuid4(), uuid_mod.uuid4()
     NetworkProcess._note_transport_heard(stub, a)
     stub._via_ext = True
     NetworkProcess._note_transport_heard(stub, b)
-    assert str(a).lower() in stub._liveness._last
-    assert str(b).lower() not in stub._liveness._last
+    assert NetworkProcess.transport_quiet_for(stub, a) == 0.0
+    assert NetworkProcess.transport_quiet_for(stub, b) == NOW
 
 
 def test_quiet_before_the_process_runs_is_zero():
@@ -84,12 +104,12 @@ def _routing_proc():
     proc._via_ext = False
     proc._foreign_format_counts = {}
     proc._crosses_gateway.return_value = False
-    for name in ('_msg_to_queue', '_note_transport_heard'):
+    for name in ('_msg_to_queue', '_note_transport_heard', 'transport_quiet_for'):
         setattr(proc, name, getattr(NetworkProcess, name).__get__(proc))
     return proc
 
 
-def test_only_member_paths_stamp_a_claimed_uuid():
+def test_only_member_paths_stamp_a_claimed_uuid(clock):
     """A stranger, a relayed stranger or the broadcast channel can claim a
     member's uuid in its envelope; only a frame from a peer we hold (the peer
     and group paths) says the transport reaches that peer."""
@@ -104,9 +124,9 @@ def test_only_member_paths_stamp_a_claimed_uuid():
         proc = _routing_proc()
         proc._msg_to_queue(wire, frm, {'identity': queue.Queue()}, rcvd_by,
                            validate=False)
-        assert key not in proc._liveness._last, rcvd_by
+        assert proc.transport_quiet_for(key) == NOW, rcvd_by
     for rcvd_by in ('point-to-point', 'group'):
         proc = _routing_proc()
         proc._msg_to_queue(bytes(Message('identity', 'peer_dm', '{}', from_whom=bob)),
                            bob, {'identity': queue.Queue()}, rcvd_by, validate=False)
-        assert key in proc._liveness._last, rcvd_by
+        assert proc.transport_quiet_for(key) == 0.0, rcvd_by

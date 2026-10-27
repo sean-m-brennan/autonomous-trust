@@ -37,7 +37,7 @@ Output layout::
         peers_template.json             # all seeded peers
       squad-captain/etc/at/
         identity.cfg.json               # this peer's own identity (keys)
-        group.cfg.json                  # copy of _shared/group.cfg.json
+        group.cfg.json                  # the _shared group + this peer's own history
         peers.cfg.json                  # the OTHER seeded peers' Identities
         reputation.cfg.json             # rep = 0.7 for each OTHER peer
         reputation-history.cfg.json     # the EVIDENCE behind that 0.7
@@ -60,7 +60,10 @@ until the cohort re-earned them. This seeder therefore writes
 ``reputation-history.cfg.json`` as well: a hash-linked committed window plus a
 checkpoint over it, co-signed with the cohort's own keys (which this script
 holds, because it generated them). The demo warm-starts through the real
-verification path rather than around it.
+verification path rather than around it. The window opens with the field
+group's genesis roster and is written in certified placements, as a placing
+group writes its chain; a node resets a chain that has entries and no roster,
+so evidence without one would verify at boot and then be discarded.
 
 Those transactions are SEEDED, not observed, and there are enough of them to
 matter: restoration bounds a peer's score by its shrunk mean attested score, so
@@ -84,10 +87,13 @@ import copy
 import json
 import os
 import math
+import queue
 import shutil
 import sys
 from pathlib import Path
 from uuid import NAMESPACE_URL, UUID, uuid5
+
+from nacl.encoding import HexEncoder
 
 # Repo-relative imports — works when invoked via
 # ``python -m tools.seed_dod_cohort`` from the repo root (PYTHONPATH
@@ -106,8 +112,10 @@ from autonomous_trust.core._python.reputation.repprocess import (  # noqa: E402
     ReputationProcess,
 )
 from autonomous_trust.core._python.reputation.reputation import (  # noqa: E402
-    Checkpoint, EVIDENCE_FILE, Reputations, SignedCheckpoint,
-    TransactionHistory, evidence_to_dict,
+    Checkpoint, EVIDENCE_FILE, PLACE_BATCH_MAX, Reputations, SignedCheckpoint,
+    Transaction, TransactionHistory, evidence_to_dict, place_designation,
+    place_value_digest, placement_entry, roster_digest, roster_members_norm,
+    roster_task_id,
 )
 from autonomous_trust.core._python.capabilities import PeerCapabilities  # noqa: E402
 from autonomous_trust.core._python.system import CfgIds  # noqa: E402
@@ -282,7 +290,9 @@ def _seed_evidence_rounds(n_members: int, cap: int) -> tuple[int, int]:
     side), and each rotation costs ``n_members`` chain entries.
 
     Bounded by the resident chain cap, because evidence that evicts is
-    evidence that cannot be attested. When the cap binds, the caller reports
+    evidence that cannot be attested. The roster entries take a few slots of
+    that cap too; the caller sheds rotations until the built chain evicts
+    nothing. When the cap binds, the caller reports
     the tier the shortened window actually supports rather than letting the
     demo come up quietly clamped.
     """
@@ -303,11 +313,53 @@ def _seed_evidence_rounds(n_members: int, cap: int) -> tuple[int, int]:
     return rounds, rounds * 2
 
 
+def _seed_roster_members(roster: list[str],
+                         identities: dict[str, Identity]) -> list[list[str]]:
+    """The roster member list the group's genesis records: ``[uuid, signing
+    key hex]`` for each name in ``roster``, sorted by uuid, as a node's
+    ``_live_roster`` builds it. Public-only C-node views have the key too, so
+    they are listed like everyone else."""
+    return [list(m) for m in roster_members_norm(
+        [[str(UUID(str(identities[m].uuid))),
+          identities[m].signature.public.encode(encoder=HexEncoder).decode('ascii')]
+         for m in roster])]
+
+
+def _seed_place(history: TransactionHistory, entries: list[Transaction],
+                signers: list[Identity]) -> None:
+    """Write ``entries`` at the chain's next index as one decided placement,
+    certified by every signer over its ``place_designation``: what a placement
+    round leaves in the chain, the certificate on its last entry."""
+    k = history.next_index
+    desig = place_designation(k, history.head_hash,
+                              place_value_digest(entries, k))
+    sigs = {str(s.uuid).lower(): s.sign(desig).signature.decode('ascii')
+            for s in signers}
+    history.apply_placed(k, entries, sigs)
+
+
 def _seed_evidence_chain(members: list[str], identities: dict[str, Identity],
-                         rounds: int) -> TransactionHistory:
+                         rounds: int, roster: list[str],
+                         signers: list[Identity]) -> TransactionHistory:
     """A hash-linked committed window in which every seeded member appears as a
     counterparty, ``rounds`` rotations of a RING (member i with member i+1,
-    wrapping).
+    wrapping), laid down the way a placing group lays down its chain.
+
+    Index 0 is the genesis roster listing ``roster`` (every member of the
+    field group, gateways included), placed alone. The ring entries follow in
+    placements of up to PLACE_BATCH_MAX, task ids sorted within each as
+    ``ready_items`` sorts them, halves ordered by scorer uuid as
+    ``placement_entry`` orders them. Before each placement the roster is
+    restated once it is half a window old, as ``_roster_item`` does, so the
+    roster in force never leaves the resident window. A chain with entries and
+    no roster is one a node resets at boot (``_reset_pre_roster_chain``), so
+    without the genesis the evidence would verify and then be thrown away.
+
+    Every placement is certified by all of ``signers``: the genesis wants every
+    member it lists and later placements a majority of the roster, so a cohort
+    with C-node members (no private key here) leaves the genesis certificate
+    short of the full roster. Warm start does not read placement certificates;
+    a peer catching up from a seeded node does.
 
     A ring rather than every pair: a ring gives every member the same number of
     attested transactions in ``n`` entries per rotation, where all-pairs costs
@@ -318,26 +370,49 @@ def _seed_evidence_chain(members: list[str], identities: dict[str, Identity],
     here would hash to a root the runtime could not reproduce.
     """
     history = TransactionHistory()
-    uuids = [str(UUID(str(identities[m].uuid))) for m in members]
+    uuids = [UUID(str(identities[m].uuid)) for m in members]
     n = len(uuids)
     if n < 2:
         return history  # nothing bilateral is possible
+    listed = _seed_roster_members(roster, identities)
+    digest = roster_digest(listed)
+    _seed_place(history, [Transaction(
+        roster_task_id(None, 'genesis', None, digest), roster_op='genesis',
+        roster_digest=digest, roster_members=listed)], signers)
+    ring = []
     for rnd in range(rounds):
         for i in range(n):
             nxt = (i + 1) % n
             task_id = uuid5(NAMESPACE_URL, 'at-dod-seed-tx/%d/%s/%s'
                             % (rnd, members[i], members[nxt]))
-            history.update(task_id, uuids[i], SEED_TX_SCORE)
-            history.update(task_id, uuids[nxt], SEED_TX_SCORE)
+            ring.append(placement_entry(Transaction(
+                task_id, p1_id=uuids[i], p1_score=SEED_TX_SCORE,
+                p2_id=uuids[nxt], p2_score=SEED_TX_SCORE)))
+    for at in range(0, len(ring), PLACE_BATCH_MAX):
+        in_force = history.latest_roster()
+        if history.next_index - in_force.index >= history.max_chain_len // 2:
+            _seed_place(history, [Transaction(
+                roster_task_id(in_force.task_id, 'restate', None, digest),
+                roster_op='restate', roster_digest=digest,
+                roster_members=listed)], signers)
+        batch = sorted(ring[at:at + PLACE_BATCH_MAX],
+                       key=lambda tx: str(tx.task_id).lower())
+        _seed_place(history, batch, signers)
     return history
 
 
 def _write_seed_evidence(cfg_dir: Path, viewer: Identity,
                          history: TransactionHistory,
-                         signers: list[Identity]) -> bool:
+                         signers: list[Identity], group_uuid: str = '') -> bool:
     """Write ``viewer``'s ``reputation-history.cfg.json``: the shared committed
     window plus a checkpoint over it that ``viewer`` proposes and ``signers``
     co-sign.
+
+    With ``group_uuid`` the window is a CHILD chain of ``viewer`` (a gateway
+    holding the field group as a child): the file is the child chain's,
+    ``reputation-history-<group uuid>.cfg.json``, and the checkpoint names the
+    group, which puts it in the signed designation. A gateway restores it once
+    its child group set arrives, as it restores any subtree chain.
 
     Every member holds the same window -- which is the honest shape, since
     co-signing a checkpoint means precisely "my own window produces this root"
@@ -353,10 +428,11 @@ def _write_seed_evidence(cfg_dir: Path, viewer: Identity,
         return False
     ckpt = Checkpoint(proposer_uuid=viewer.uuid, root=history.window_root(),
                       epoch=SEED_EVIDENCE_EPOCH, first_index=window[0].index,
-                      count=len(window))
+                      count=len(window), group_uuid=group_uuid)
     sigs = {str(s.uuid): s.sign(ckpt.designation).signature.decode('ascii')
             for s in signers}
-    _save_json(cfg_dir / (EVIDENCE_FILE + Configuration.file_ext),
+    name = EVIDENCE_FILE + ('-' + group_uuid if group_uuid else '')
+    _save_json(cfg_dir / (name + Configuration.file_ext),
                evidence_to_dict(history, SignedCheckpoint(ckpt, sigs)))
     return True
 
@@ -450,7 +526,8 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
     if shared_grp_file.exists() and not force:
         with shared_grp_file.open("r") as f:
             grp_payload = json.load(f, object_hook=config_json_decoder)
-            group, hist_dict = grp_payload
+        # A bare Group; a (Group, history) pair from an earlier version.
+        group = grp_payload[0] if isinstance(grp_payload, (list, tuple)) else grp_payload
         # Re-run: make sure the gateways are present in the loaded map.
         for gw in gateways:
             group.add_address(identities[gw].uuid, identities[gw].address)
@@ -458,12 +535,9 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
         address_map = {ident.uuid: ident.address
                        for ident in identities.values()}  # seeded + gateways
         group = Group.initialize(address_map, GROUP_NICKNAME)
-        # Empty IdentityHistory for v1 — the bootstrap flow's
-        # ``self_bootstrapped=True`` branch in idprocess.choose_group()
-        # tolerates a fresh history; peers will start exchanging
-        # diffs from the empty baseline.
-        hist_dict = {}
-        _save_json(shared_grp_file, (group, hist_dict))
+        # The group alone: the history in a group.cfg.json is its node's own
+        # (see Phase 3a), so the shared copy has none to carry.
+        _save_json(shared_grp_file, group)
 
     # Phase 3a: field members — primary group + mutual peers/rep/caps.
     # Each field member's peer view includes the OTHER field members AND
@@ -474,9 +548,18 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
     # member proposes the checkpoint over it.
     seed_cap = TransactionHistory().max_chain_len
     seed_rounds, seed_per_peer = _seed_evidence_rounds(len(seeded), seed_cap)
-    seed_history = _seed_evidence_chain(seeded, identities, seed_rounds)
     seed_signers = [identities[m] for m in field_and_gw
                     if _can_sign(identities[m])]
+    seed_history = _seed_evidence_chain(seeded, identities, seed_rounds,
+                                        field_and_gw, seed_signers)
+    # The roster entries share the cap with the ring, so a window sized to the
+    # cap by rotations alone would evict its oldest rotation. Shed rotations
+    # until nothing has been evicted.
+    while seed_rounds > 1 and seed_history.next_index > len(seed_history):
+        seed_rounds -= 1
+        seed_per_peer = seed_rounds * 2
+        seed_history = _seed_evidence_chain(seeded, identities, seed_rounds,
+                                            field_and_gw, seed_signers)
     supported = ((seed_per_peer * SEED_TX_SCORE
                   + ReputationProcess.RESTORE_SHRINKAGE_K
                   * ReputationProcess.PREREP_NEUTRAL)
@@ -511,11 +594,6 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
             continue
         peer_cfg_dir = out_root / peer / "etc" / "at"
 
-        # Group: shared content, one file per peer (each container
-        # bind-mounts only its own peer dir, so the file must be there).
-        peer_group_file = peer_cfg_dir / "group.cfg.json"
-        _save_json(peer_group_file, (group, hist_dict))
-
         # Peers: the OTHER field members + gateways, each tier-bumped.
         peers = Peers()
         for other in field_and_gw:
@@ -523,6 +601,15 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
                 continue
             peers.add(_peer_view_of(identities[other]))
         _save_json(peer_cfg_dir / "peers.cfg.json", peers)
+
+        # Group: shared content, one file per peer (each container
+        # bind-mounts only its own peer dir, so the file must be there),
+        # paired with this peer's own starting history, as choose_group
+        # reads it. IdentityHistory.populate rejects {} (no 'blacklist'),
+        # and a node whose group file fails to load mints a group of its
+        # own instead of joining the seeded cohort.
+        history = IdentityHistory(identities[peer], peers, queue.Queue()).to_dict()
+        _save_json(peer_cfg_dir / "group.cfg.json", (group, history))
 
         # Reputation: rep = SEED_REPUTATION for each OTHER field member.
         # Self is implicit (the rep engine seeds self at first compute).
@@ -553,7 +640,8 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
     for gw in gateways:
         gw_cfg_dir = out_root / gw / "etc" / "at"
         child_file = gw_cfg_dir / ("group_child_%s.cfg.json" % GROUP_NICKNAME)
-        _save_json(child_file, (group, hist_dict))
+        # A bare Group: _load_child_groups takes no history from it.
+        _save_json(child_file, group)
 
         peers = Peers()
         for other in seeded:
@@ -569,9 +657,12 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
                     for other in seeded}
         _save_json(gw_cfg_dir / "reputation.cfg.json",
                    Reputations(current=rep_dict))
+        # The field window is the gateway's child chain, not its primary: its
+        # primary chain belongs to the command cohort it cold-bootstraps, and
+        # a field-founded primary would hand the field roster that cohort's
+        # decisions.
         _write_seed_evidence(gw_cfg_dir, identities[gw], seed_history,
-                             seed_signers)
-
+                             seed_signers, group_uuid=str(group.uuid))
         pc = PeerCapabilities()
         for other in seeded:
             if other == COORDINATOR_NAME:

@@ -150,6 +150,12 @@ void reputation_set_update_page_bytes(size_t bytes);
 void reputation_install_proposal(int64_t id1, int64_t id2, double score,
                                  const uuid_t task_uuid, const char *channel,
                                  const uuid_t subject);
+/** Bind our staged round (@p id1, @p id2) to @p group_uuid, as
+ *  _forward_transaction does (the anchored cohort's for a half about a
+ *  member, RD_14.4 Phase 6). Unbound, handle_accepted reads it as our
+ *  primary group. The conformance `proposals` fixture's `group`. */
+void reputation_install_round_group(int64_t id1, int64_t id2,
+                                    const char *group_uuid);
 
 /** Keep placement state under @p dir rather than the config directory, or
  *  NULL for the config directory. Test and conformance seam: every
@@ -260,6 +266,10 @@ void reputation_get_commit_cert_counts(int *halves_held, int *certified_halves);
  *  §14.2), for the `signed_halves` expected_state assertion. Mirrors the
  *  Python adapter's reading of Transaction.half_sigs. */
 int reputation_get_signed_half_count(void);
+/** The ordinary halves the anchored cohort's chain holds, chain and pool (0
+ *  when no cohort is held or nothing has committed to it), for the
+ *  `cohort_halves_held` expected_state assertion (RD_14.4 Phase 6). */
+int reputation_get_cohort_half_count(void);
 
 /** Write the RFC 6962 ordered Merkle root over the resident committed window
  *  (transaction_window_root) into `out` (must hold TX_HASH_HEX_LEN + 1 bytes)

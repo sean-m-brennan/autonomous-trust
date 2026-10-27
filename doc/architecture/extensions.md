@@ -610,10 +610,15 @@ what the extension is. With no extension registered, each changes nothing.
 **Also-unicast and fan-out.** `also_unicast` sees each unicast the transport
 is about to send, already sealed for the peer, with its process and function. A
 unicast an extension carried itself through `unicast` does not reach it.
-`fanout` sees each GROUP frame (sealed with the node's group key) and each
-BROADCAST frame (plaintext) after the transport sent it, with the node's group.
-Neither can stop or alter a transport send. In Python a hook that raises is
-logged and ignored.
+`fanout` sees each GROUP frame (sealed with a group key) and each
+BROADCAST frame (plaintext) after the transport was asked to send it, whether
+or not that succeeded, with the group whose key sealed it. In C that is
+always the node's own group. In Python a gateway's send to a child cohort
+passes the child. A radio that backs up the
+transport needs exactly the frames the transport failed to send. In Python a
+broadcast whose send raises `BrokenPipeError` skips the hook. Neither hook can
+stop or alter a transport send. In Python a hook that raises is logged and
+ignored.
 
 **Transport liveness.** The core records when it last heard each peer through
 the transport, and answers how long a peer has been quiet (seconds since the
