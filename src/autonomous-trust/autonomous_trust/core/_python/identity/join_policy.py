@@ -23,7 +23,11 @@ Schema (version 1)::
       "enabled": true,
       "anchors": ["verified_contact", "zta", "operator"],
       "told_tier": 1,
-      "own_evidence_min": 3
+      "own_evidence_min": 3,
+      "burst_k": 3,
+      "burst_interval_sec": 5,
+      "burst_budget_factor": 4,
+      "anchored_cohort_min": 1
     }
 
 **Opt-in** (the user's call, D9): named by ``$AT_JOIN_POLICY``, absent is
@@ -44,6 +48,17 @@ do (Phase 4): a peer this node holds no own evidence about reads at most
 ``told_tier`` (default 1, ``UNVERIFIED_RESTORE_TIER``) until it has at least
 ``own_evidence_min`` entries of this node's own (default 3), when its brought
 score takes over. An anchored peer is not bounded.
+
+``burst_k``, ``burst_interval_sec`` and ``burst_budget_factor`` shape the join
+burst (Phase 5, D5 (b)): the bootstrap worker probes each bounded peer until it
+holds ``burst_k`` probe verdicts (default ``own_evidence_min``, so the burst
+just reaches graduation), one probe per ``burst_interval_sec`` (default 5),
+spending at most ``burst_budget_factor``·N·k probes over N targets (default 4).
+
+``anchored_cohort_min`` is how many of the cohort's members a joiner must
+count as anchors before it forms an anchored cohort with them (Phase 6, D8
+(b), default 1): a second group of its own, beside the cohort, holding the
+reputation evidence among its members.
 
 Unknown keys are refused, ``note`` aside: a misspelled key would otherwise
 turn part of a security declaration off without a word. The C twin is
@@ -86,11 +101,18 @@ ANCHOR_PROVIDERS = {
 }
 
 _KEYS = frozenset({'version', 'enabled', 'anchors', 'told_tier',
-                   'own_evidence_min', 'note'})
+                   'own_evidence_min', 'burst_k', 'burst_interval_sec',
+                   'burst_budget_factor', 'anchored_cohort_min', 'note'})
 
 #: Defaults for the Phase 4 bounds (the user's calls, 2026-10-26).
 TOLD_TIER_DEFAULT = 1
 OWN_EVIDENCE_MIN_DEFAULT = 3
+#: Defaults for the Phase 5 join burst (the user's calls, 2026-10-27). burst_k
+#: has none of its own: absent, it is own_evidence_min.
+BURST_INTERVAL_SEC_DEFAULT = 5.0
+BURST_BUDGET_FACTOR_DEFAULT = 4
+#: Default for the Phase 6 anchored cohort (the user's call, 2026-10-27).
+ANCHORED_COHORT_MIN_DEFAULT = 1
 #: The highest trust tier (repprocess TIER_FLOORS).
 _TIER_MAX = 4
 
@@ -107,6 +129,10 @@ class JoinPolicy:
     anchors: frozenset = field(default_factory=frozenset)
     told_tier: int = TOLD_TIER_DEFAULT
     own_evidence_min: int = OWN_EVIDENCE_MIN_DEFAULT
+    burst_k: int = OWN_EVIDENCE_MIN_DEFAULT
+    burst_interval_sec: float = BURST_INTERVAL_SEC_DEFAULT
+    burst_budget_factor: int = BURST_BUDGET_FACTOR_DEFAULT
+    anchored_cohort_min: int = ANCHORED_COHORT_MIN_DEFAULT
 
 
 INERT = JoinPolicy()
@@ -139,8 +165,21 @@ def parse_join_policy(doc) -> JoinPolicy:
     told_tier = _bounded_int(doc, 'told_tier', TOLD_TIER_DEFAULT, 0, _TIER_MAX)
     own_min = _bounded_int(doc, 'own_evidence_min', OWN_EVIDENCE_MIN_DEFAULT,
                            1, None)
+    burst_k = _bounded_int(doc, 'burst_k', own_min, 1, None)
+    interval = doc.get('burst_interval_sec', BURST_INTERVAL_SEC_DEFAULT)
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)) \
+            or not interval > 0 or interval == float('inf'):
+        raise JoinPolicyError(f'burst_interval_sec: not a positive number: '
+                              f'{interval!r}')
+    factor = _bounded_int(doc, 'burst_budget_factor',
+                          BURST_BUDGET_FACTOR_DEFAULT, 1, None)
+    cohort_min = _bounded_int(doc, 'anchored_cohort_min',
+                              ANCHORED_COHORT_MIN_DEFAULT, 1, None)
     return JoinPolicy(enabled=enabled, anchors=frozenset(anchors),
-                      told_tier=told_tier, own_evidence_min=own_min)
+                      told_tier=told_tier, own_evidence_min=own_min,
+                      burst_k=burst_k, burst_interval_sec=float(interval),
+                      burst_budget_factor=factor,
+                      anchored_cohort_min=cohort_min)
 
 
 def _bounded_int(doc, key, default, low, high):
@@ -174,6 +213,44 @@ class AnchoredSet(object):
 
     def __repr__(self):
         return 'AnchoredSet(%d)' % len(self.uuids)
+
+
+class ProbeCounts(object):
+    """IPC carrier for the join burst (Phase 5, D5 (b)), from reputation to
+    the bootstrap worker: each peer reputation reads under the told ceiling
+    (not anchored, not slashed, short of ``own_evidence_min`` own entries) and
+    how many probe verdicts this node holds about it. A peer absent from the
+    map has left the set. The user's call, 2026-10-27: reputation reports the
+    counts, so the burst and the ceiling read one source. Plain picklable
+    object; it only travels the local queues, never the network. The C twin
+    is PEER_PROBE_COUNT, one message per changed peer."""
+
+    def __init__(self, counts=None):
+        self.counts = {str(k): int(v) for k, v in (counts or {}).items()}
+
+    def __eq__(self, other):
+        return isinstance(other, ProbeCounts) and self.counts == other.counts
+
+    def __hash__(self):
+        return hash(frozenset(self.counts.items()))
+
+    def __repr__(self):
+        return 'ProbeCounts(%d)' % len(self.counts)
+
+
+class AnchoredCohort(object):
+    """IPC carrier for the anchored cohort this node holds (None: none), from
+    identity to the sibling processes; reputation routes and scores by it.
+    Plain picklable object; it only travels the local queues. Handled in
+    ``Protocol.run_message_handlers`` by setting ``Protocol.anchored_cohort``.
+    The C twin is the local ANCHORED_COHORT message."""
+
+    def __init__(self, group=None):
+        self.group = group
+
+    def __repr__(self):
+        return 'AnchoredCohort(%s)' % (
+            str(self.group.uuid)[:8] if self.group is not None else None)
 
 
 def load_join_policy(path: str) -> JoinPolicy:

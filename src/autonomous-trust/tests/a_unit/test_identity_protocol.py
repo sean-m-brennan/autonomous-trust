@@ -48,6 +48,7 @@ class TestIdentityProtocol:
           session round trip it needs
           (operator_state_req, operator_state_resp)
         - runtime hierarchy roots (hierarchy, hierarchy_req)
+        - the anchored cohort (cohort_invite, cohort_reply), RD_14.4 Phase 6
         First contact's verbs left with it (FEATURE_SPLIT_PLAN Phase 7, C6):
         they are ``FirstContactProtocol``, pinned in that distribution's
         test_first_contact_plaintext.py.
@@ -62,7 +63,7 @@ class TestIdentityProtocol:
         to ``IdentityProtocol``.
         """
         values = list(IdentityProtocol)
-        assert len(values) == 26
+        assert len(values) == 28
         assert 'announce' in values
         assert 'hello' not in values
         assert 'report' not in values

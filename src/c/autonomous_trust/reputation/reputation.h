@@ -1106,6 +1106,12 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
                        const uuid_t peer_uuid,
                        const map_t *task_weights);
 
+/** reputation_pure over @p hist and then @p extra (NULL: none): the anchored
+ *  cohort's chain beside the primary one (RD_14.4 Phase 6). */
+double reputation_pure_with(const tx_history_t *hist, const tx_history_t *extra,
+                            const reputations_t *reps, const uuid_t peer_uuid,
+                            const map_t *task_weights);
+
 /** For a transaction between @p self_uuid and @p peer_uuid: the score this
  *  node gave the peer and the score the peer gave this node, each read
  *  through transaction_score_about. False for any other transaction. Mirrors
@@ -1132,6 +1138,16 @@ double reputation_contrite_tft_told(const tx_history_t *hist,
                                     const uuid_t self_uuid,
                                     const uuid_t peer_uuid,
                                     const int64_t *told, size_t n_told);
+
+/** reputation_contrite_tft_told over @p hist and then @p extra (NULL: none):
+ *  the anchored cohort's chain beside the primary one (RD_14.4 Phase 6). The
+ *  @p told indices are @p hist's; @p extra's entries are never told. */
+double reputation_contrite_tft_told_with(const tx_history_t *hist,
+                                         const tx_history_t *extra,
+                                         const reputations_t *reps,
+                                         const uuid_t self_uuid,
+                                         const uuid_t peer_uuid,
+                                         const int64_t *told, size_t n_told);
 
 /** Contrite tit-for-tat's blend: @p peer_last the last score this node gave
  *  the peer, @p peer_standing the mean of them, @p my_standing the mean the

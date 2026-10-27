@@ -11,6 +11,7 @@ Technical architecture documentation for the AutonomousTrust cooperative computi
 - [Network wire format](network-wire-format.md): The JSON and protobuf envelopes, the group-carried format choice, and why detection stays unbuilt
 - [Native/FFI dual implementation](native-ffi-dual-implementation.md): C runtime, CFFI bridge, Python↔C interoperability, and embedded/microdrone nodes
 - [Identity protocol](identity-protocol.md): Peer discovery, voting, and group formation
+- [Joining a hostile cohort](hostile-join.md): The opt-in join policy: anchor-first selection, brought and told scores, the join burst, and the anchored cohort
 - [First contact](first-contact.md): Adding a specific person you already know: the 1:1 introduction, signed invitations, and safety-number verification
 - [Rendezvous](rendezvous.md): Reaching a node across NAT: relays, failover, relay proofs, reachability records, the seed list and community rosters
 - [Task negotiation](negotiation.md): Distributed task lifecycle

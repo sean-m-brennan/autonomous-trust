@@ -46,6 +46,13 @@ recipient. Admission hand-offs and history transfers travel here.
 
 The protocol runs in numbered phases, and a node walks them in order.
 
+A node joining a cohort it does not trust can declare a **join policy**
+(`$AT_JOIN_POLICY`). Under it the wait for histories prefers one offered by an
+anchor (a verified contact, a proved credential, a node under its own
+operator key) over the longest, marks the members it learned only from the
+adopted history provisional, and forms an anchored cohort with the anchors it
+finds there. See [Joining a hostile cohort](hostile-join.md).
+
 *Phase 0, acquire capabilities.* The identity process waits, up to ten seconds,
 for other local processes to register what services this node can offer. This
 determines what the node will advertise, and it happens before anything touches

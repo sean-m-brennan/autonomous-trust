@@ -1,0 +1,87 @@
+schema_version: "1"
+kind: scenario
+protocol: bootstrap
+name: join-burst-probes-provisional-members
+byte_pinning: false
+description: |
+    Under the join policy, the bootstrap worker probes the peers reputation
+    reads under the told ceiling until each holds k probe verdicts, then
+    stops (RD_14.4_HOSTILE_JOIN_PLAN.md Phase 5, D5 (b)).
+
+    Why this matters: a joiner that adopts a cohort's history holds every
+    member's score on the cohort's word alone, and the told ceiling holds
+    those members at tier 1 until this node has evidence of its own. At one
+    continuous probe a minute, a joiner facing forty members needs forty
+    minutes to probe each once. The burst spends a bounded number of probes,
+    at its own rate, on exactly the peers the ceiling holds; a probe verdict
+    is own evidence, so with the defaults a peer's k-th verdict both ends its
+    burst and graduates it.
+
+    Shape: one host, three peers. Continuous probing is off and the window
+    holds one pair, so every probe counted is a burst probe (a burst probe
+    takes its tick ahead of the window); the burst's interval is 0 so a fixed
+    tick count gives a fixed probe count.
+    Reputation's counts are scripted (`probe_counts`): before tick 1 it lists
+    peer_a and peer_b with no verdicts, and peer_c, a peer it does not read
+    under the ceiling (anchored, or graduated), not at all. Ticks 1-4 issue
+    four probes, fewest burst probes first, so a and b get two each. Before
+    tick 5 it lists peer_a with 2 verdicts (k reached) and drops peer_b (it
+    graduated); tick 5 finds no target short and ends the burst.
+
+    Observables:
+      - `burst_probes_issued: 4` — k each for the two listed peers, and no
+        more after they are done.
+      - `burst_peers_probed: 2` — peer_c, which the ceiling does not hold,
+        is never probed by the burst.
+      - `burst_done: true` — the burst ended on the counts, not the budget
+        (4 of 16).
+
+    With the policy off the worker runs no burst (all three read 0 / false),
+    so this scenario fails against a runtime without Phase 5.
+
+    Cross-language: the burst is deterministic in both twins (fewest burst
+    probes, then lowest uuid; no PRNG). The assertions are aggregate because
+    the two order peers differently.
+
+participants:
+  - id: self
+    role: new_node
+  - id: peer_a
+    role: border_guard
+  - id: peer_b
+    role: border_guard
+  - id: peer_c
+    role: border_guard
+
+fixtures:
+  bootstrap:
+    seed: 12345
+    ticks: 8
+    pairs_target: 1
+    duration_sec: 999
+    continuous: false
+    join_burst:
+      enabled: true
+      k: 2
+      interval_sec: 0
+      budget_factor: 4
+    probe_counts:
+      - tick: 1
+        counts: {peer_a: 0, peer_b: 0}
+      - tick: 5
+        counts: {peer_a: 2}
+
+steps:
+  - id: 1
+    from: self
+    to: self
+    function: run_bootstrap_window
+    description: |
+        Trigger. Reputation's counts reach the worker's queue before ticks 1
+        and 5; each tick drains the queue and issues at most one burst probe.
+
+expected_state:
+  self:
+    burst_probes_issued: 4
+    burst_peers_probed: 2
+    burst_done: true

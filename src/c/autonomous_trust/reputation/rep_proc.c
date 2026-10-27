@@ -146,6 +146,11 @@ static double _tier_ceiling(int tier)
 #define REP_RESCORE_INTERVAL_DEFAULT 60.0
 #define REP_RESCORE_INTERVAL \
     (reputation_env_double("AT_REP_RESCORE_SEC", REP_RESCORE_INTERVAL_DEFAULT))
+/* Seconds between passes of the join burst's count publisher
+ * (_publish_probe_counts, RD_14.4 Phase 5). Short against the burst's 5 s
+ * default, unlike the rescore sweep: a count that lags is a probe the burst
+ * spends on a peer already done. Mirrors Python PROBE_COUNTS_INTERVAL. */
+#define REP_PROBE_COUNTS_INTERVAL 1.0
 /* Seconds a member must have been in this node's peer list before it may hold
  * a tier above REP_TENURE_TIER (doc/architecture/reputation.md, "Tenure"). 0,
  * the default, turns the gate off. Mirrors Python MIN_TENURE /
@@ -855,6 +860,16 @@ static struct {
     map_t warm_started;
     map_t restore_clamped_brought;
     map_t anchored;
+    /* The join burst's counts (RD_14.4 Phase 5); see _publish_probe_counts.
+     *   counts_due:       peers whose count may have moved, uuid-str -> 1;
+     *   counts_roster:    the roster the last pass saw, uuid-str -> 1;
+     *   counts_published: what negotiation was last told, uuid-str ->
+     *                     integer_data(verdicts), for the bounded peers. */
+    map_t counts_due;
+    map_t counts_roster;
+    map_t counts_published;
+    double last_counts_pass;
+    bool counts_passed;
 } rep_state;
 
 /* The brought map's accessors. Kept at DOUBLE precision, unlike the told
@@ -1012,6 +1027,9 @@ static void _ensure_init(void)
         map_init(&rep_state.warm_started);
         map_init(&rep_state.restore_clamped_brought);
         map_init(&rep_state.anchored);
+        map_init(&rep_state.counts_due);
+        map_init(&rep_state.counts_roster);
+        map_init(&rep_state.counts_published);
         map_init(&rep_state.peer_ceilings);
         map_init(&rep_state.peer_proved_index);
         map_init(&rep_state.peer_acted);
@@ -1037,6 +1055,96 @@ static void _ensure_init(void)
  * that group's chain, created on first use. Mirrors Python
  * ReputationProcess._chain_for_group / _chain_key.
  */
+
+/****************************
+ * The anchored cohort (RD_14.4 Phase 6, D8 (b))
+ *
+ * A second group a node holds beside its cohort, formed by identity with the
+ * cohort's members it counts as anchors (identity/anchored_cohort.c), which
+ * tells this process over ANCHORED_COHORT. A half whose counterparty is a
+ * member names it, goes only to its members, and commits to its own chain
+ * with its own quorum; the scorers read that chain beside the primary one.
+ * Inert with the policy off. Kept under its own lock, so the helpers below
+ * are safe with rep_state.lock held or not. Mirrors Python repprocess.py.
+ ****************************/
+
+static struct {
+    pthread_mutex_t lock;
+    bool held;
+    char key[UUID_STRING_LEN + 1];
+    uint32_t n;
+    char members[AT_COHORT_MAX_MEMBERS][UUID_STRING_LEN + 1];
+} rep_cohort = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
+/* The cohort's uuid string into @p out when one is held under the policy. */
+static bool _cohort_key(char *out)
+{
+    out[0] = '\0';
+    if (!rep_state.join_policy.enabled)
+        return false;
+    pthread_mutex_lock(&rep_cohort.lock);
+    bool held = rep_cohort.held;
+    if (held)
+        memcpy(out, rep_cohort.key, UUID_STRING_LEN + 1);
+    pthread_mutex_unlock(&rep_cohort.lock);
+    return held;
+}
+
+/* Whether @p uuid_str is a member of the cohort held. */
+static bool _cohort_member(const char *uuid_str)
+{
+    if (uuid_str == NULL || !rep_state.join_policy.enabled)
+        return false;
+    bool found = false;
+    pthread_mutex_lock(&rep_cohort.lock);
+    for (uint32_t i = 0; rep_cohort.held && i < rep_cohort.n && !found; i++)
+        found = strcmp(rep_cohort.members[i], uuid_str) == 0;
+    pthread_mutex_unlock(&rep_cohort.lock);
+    return found;
+}
+
+static bool _cohort_member_uuid(const uuid_t u)
+{
+    char k[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(u, k);
+    return _cohort_member(k);
+}
+
+/* Whether @p group_uuid names the cohort held. */
+static bool _is_cohort(const char *group_uuid)
+{
+    char ck[UUID_STRING_LEN + 1];
+    return group_uuid != NULL && _cohort_key(ck) && strcmp(group_uuid, ck) == 0;
+}
+
+/* The cohort's chain, or NULL when none is held or nothing has committed to
+ * it yet. Caller holds rep_state.lock. */
+static tx_history_t *_cohort_chain_locked(void)
+{
+    char ck[UUID_STRING_LEN + 1];
+    if (!_cohort_key(ck))
+        return NULL;
+    data_t *d = NULL;
+    void *hp = NULL;
+    if (map_get(&rep_state.child_hist, (map_key_t)ck, &d) == 0 && d != NULL
+        && data_object_ptr(d, &hp) == 0)
+        return (tx_history_t *)hp;
+    return NULL;
+}
+
+void reputation_set_anchored_cohort(const anchored_cohort_msg_t *m)
+{
+    pthread_mutex_lock(&rep_cohort.lock);
+    rep_cohort.held = m != NULL && m->held;
+    rep_cohort.n = 0;
+    rep_cohort.key[0] = '\0';
+    if (rep_cohort.held) {
+        uuid_unparse_lower(m->group_uuid, rep_cohort.key);
+        for (uint32_t i = 0; i < m->n_members && i < AT_COHORT_MAX_MEMBERS; i++)
+            uuid_unparse_lower(m->members[i], rep_cohort.members[rep_cohort.n++]);
+    }
+    pthread_mutex_unlock(&rep_cohort.lock);
+}
 
 /* True if `key` names a cohort this node gateways. */
 static bool _is_child_group(const process_t *proc, const char *key)
@@ -1066,7 +1174,7 @@ static void _chain_key(const process_t *proc, const char *group_uuid,
         uuid_unparse_lower(proc->protocol.group.uuid, primary);
     if (strncmp(group_uuid, primary, UUID_STRING_LEN + 1) == 0)
         return;
-    if (!_is_child_group(proc, group_uuid))
+    if (!_is_child_group(proc, group_uuid) && !_is_cohort(group_uuid))
         return;
     snprintf(out, cap, "%s", group_uuid);
 }
@@ -1225,6 +1333,13 @@ static size_t _ckpt_roster_for_group(const process_t *proc, const char *group_uu
 {
     if (proc == NULL)
         return 0;
+    if (_is_cohort(group_uuid)) {
+        size_t n = 0;
+        for (size_t i = 0; i < proc->protocol.num_peers; i++)
+            if (_cohort_member_uuid(proc->protocol.peers[i].uuid))
+                n++;
+        return n;
+    }
     return (proc->protocol.child_groups == NULL
             || map_size(proc->protocol.child_groups) == 0
             || group_uuid == NULL || group_uuid[0] == '\0')
@@ -2438,6 +2553,10 @@ static void _propose_half(const process_t *proc, int64_t id1, int64_t id2,
      * groups and routes the entry to that subtree's chain (doc/architecture/gateway-reputation-tree.md). */
     char own_group[UUID_STRING_LEN + 1];
     uuid_unparse_lower(proc->protocol.group.uuid, own_group);
+    /* A half about an anchored cohort member goes to the cohort (RD_14.4
+     * Phase 6): it names it, and only its members are asked. */
+    bool to_cohort = _cohort_member_uuid(subject_local)
+                     && _cohort_key(own_group);
     _set_round_group_locked(round_key, own_group);
     pthread_mutex_unlock(&rep_state.lock);
 
@@ -2476,6 +2595,8 @@ static void _propose_half(const process_t *proc, int64_t id1, int64_t id2,
     peers_read_lock(proc);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
+        if (to_cohort && !_cohort_member_uuid(proc->protocol.peers[i].uuid))
+            continue;
         generic_msg_t tx_msg = {0};
         tx_msg.type = NET_MESSAGE;
         strncpy(tx_msg.info.net_msg.process, "reputation", PROC_NAME_LEN);
@@ -2654,6 +2775,29 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
         log_debug(proc->logger, "Reputation: dropping a proposal that names no "
                   "group (a half-round build)\n");
         return true;
+    }
+    /* RD_14.4 Phase 6: a half naming the anchored cohort must come from a
+     * member; under the policy a half naming a group this node does not hold
+     * is refused, so one meant for a cohort it left cannot land on its primary
+     * chain, where the cohort reads it. Mirrors Python _refuse_placing_group. */
+    if (rep_state.join_policy.enabled && placing_group[0] != '\0')
+    {
+        char primary[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(proc->protocol.group.uuid, primary);
+        const char *why = NULL;
+        if (_is_cohort(placing_group)) {
+            if (!_cohort_member_uuid(nmsg->from_whom.uuid))
+                why = "it names the anchored cohort and is not a member";
+        } else if (strcmp(placing_group, primary) != 0
+                   && !_is_child_group(proc, placing_group)) {
+            why = "it names a group this node does not hold";
+        }
+        if (why != NULL) {
+            log_warn(proc->logger, "Reputation: refusing a proposal from %s: %s\n",
+                     nmsg->from_whom.nickname, why);
+            json_decref(payload);
+            return true;
+        }
     }
 
     /* Record the grant (score) in the paxos proposals for later acceptance tracking */
@@ -3110,9 +3254,13 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
             net_msg_pack_json(&bcast.info.net_msg, commit_json);
             json_decref(commit_json);
 
+            /* A cohort chain's commit goes only to its members (Phase 6). */
+            bool to_cohort = _is_cohort(round_group);
             peers_read_lock(proc);
             for (size_t i = 0; i < proc->protocol.num_peers; i++)
             {
+                if (to_cohort && !_cohort_member_uuid(proc->protocol.peers[i].uuid))
+                    continue;
                 generic_msg_t per = bcast;  /* shallow copy */
                 memcpy(&per.info.net_msg.to_whom,
                        &proc->protocol.peers[i],
@@ -4271,6 +4419,7 @@ typedef struct {
     double peer_last;    /* the newest score we gave it */
     double w_sum;        /* sum of task weights */
     double w_score;      /* sum of (our score x task weight) */
+    int    probes;       /* of n, probes of ours (Phase 5: probe verdicts) */
 } rep_own_evidence_t;
 
 /* The task weight cached for @p task (1 when none). Caller holds the lock. */
@@ -4287,8 +4436,9 @@ static int _task_weight_of_locked(const uuid_t task)
 }
 
 /* Fold this node's own entries about @p peer_uuid, oldest first: the
- * bilateral transactions whose half of ours is not a probe. Caller holds
- * rep_state.lock. Mirrors Python _own_evidence. */
+ * bilateral transactions with it. A probe of ours counts under the join policy
+ * (Phase 5: the user's call, 2026-10-27, a verdict is full own evidence) and
+ * not otherwise. Caller holds rep_state.lock. Mirrors Python _own_evidence. */
 static void _own_evidence_locked(const uuid_t peer_uuid, rep_own_evidence_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -4305,6 +4455,14 @@ static void _own_evidence_locked(const uuid_t peer_uuid, rep_own_evidence_t *out
     int n_seen = 0;
     tx_history_by_peer(&rep_state.history, peer_uuid, txns, &count,
                        MAX_CHAIN_LEN);
+    /* The anchored cohort's chain too (RD_14.4 Phase 6). */
+    tx_history_t *cohort = _cohort_chain_locked();
+    if (cohort != NULL && count < MAX_CHAIN_LEN) {
+        int more = 0;
+        tx_history_by_peer(cohort, peer_uuid, txns + count, &more,
+                           MAX_CHAIN_LEN - count);
+        count += more;
+    }
     for (int i = 0; i < count; i++)
     {
         const transaction_t *tx = &txns[i];
@@ -4315,7 +4473,8 @@ static void _own_evidence_locked(const uuid_t peer_uuid, rep_own_evidence_t *out
             continue;
         const char *mine = uuid_compare(tx->p1_uuid, rep_state.self_uuid) == 0
                            ? tx->p1_channel : tx->p2_channel;
-        if (strcmp(mine, TX_CHANNEL_PROBE) == 0)
+        bool probe = strcmp(mine, TX_CHANNEL_PROBE) == 0;
+        if (probe && !rep_state.join_policy.enabled)
             continue;
         bool dup = false;
         for (int j = 0; j < n_seen && !dup; j++)
@@ -4330,6 +4489,8 @@ static void _own_evidence_locked(const uuid_t peer_uuid, rep_own_evidence_t *out
         out->peer_last = ours;
         out->w_sum += (double)w;
         out->w_score += ours * (double)w;
+        if (probe)
+            out->probes++;
     }
     free(txns);
     free(seen);
@@ -4411,6 +4572,174 @@ static double _bounded_locked(const uuid_t peer_uuid, double told)
     return told < cap ? told : cap;
 }
 
+/****************************
+ * The join burst's counts (RD_14.4 Phase 5, D5 (b))
+ *
+ * Reputation tells the bootstrap worker (in negotiation) which peers it reads
+ * under the told ceiling and how many probe verdicts it holds about each, so
+ * the burst probes exactly the peers the ceiling holds and stops when they
+ * graduate: one source of truth with the ceiling (the user's call,
+ * 2026-10-27). One PEER_PROBE_COUNT per changed peer. Mirrors Python
+ * _burst_count / _publish_probe_counts.
+ ****************************/
+
+/* Whether @p peer_uuid is a burst target (read under the told ceiling: not
+ * anchored, not slashed, short of own_evidence_min own entries), and if so
+ * the probe verdicts held about it, into @p verdicts. Caller holds
+ * rep_state.lock. */
+static bool _burst_count_locked(const uuid_t peer_uuid, int *verdicts)
+{
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, key);
+    data_t *d = NULL;
+    if (_is_anchored_locked(peer_uuid)
+        || map_get(&rep_state.slashed, (map_key_t)key, &d) == 0)
+        return false;
+    rep_own_evidence_t own;
+    _own_evidence_locked(peer_uuid, &own);
+    if (own.n >= rep_state.join_policy.own_evidence_min)
+        return false;
+    *verdicts = own.probes;
+    return true;
+}
+
+/* Recount the peers whose chain moved, whose anchoring changed, or who joined
+ * or left the roster since the last pass, and return what changed (at most
+ * @p max; the rest stay due), recording it as told. Takes the peers read-lock
+ * and then rep_state.lock, never both at once. */
+static size_t _probe_count_changes(const process_t *proc,
+                                   peer_probe_count_msg_t *out, size_t max)
+{
+    char (*roster)[UUID_STRING_LEN + 1] =
+        calloc(DEFAULT_MAX_PEERS, sizeof(*roster));
+    if (roster == NULL)
+        return 0;
+    size_t n_roster = 0;
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers && i < DEFAULT_MAX_PEERS; i++)
+        uuid_unparse_lower(proc->protocol.peers[i].uuid, roster[n_roster++]);
+    peers_read_unlock(proc);
+
+    size_t k = 0;
+    pthread_mutex_lock(&rep_state.lock);
+    if (!rep_state.join_policy.enabled) {
+        pthread_mutex_unlock(&rep_state.lock);
+        free(roster);
+        return 0;
+    }
+    char self[UUID_STRING_LEN + 1] = {0};
+    if (rep_state.have_self)
+        uuid_unparse_lower(rep_state.self_uuid, self);
+    /* due = counts_due, plus the roster's symmetric difference with the last
+     * pass's. */
+    map_t due;
+    map_init(&due);
+    map_key_t key;
+    data_t *val;
+    map_entries_for_each(&rep_state.counts_due, key, val)
+    {
+        (void)val;
+        map_set(&due, key, integer_data(1));
+    }
+    map_end_for_each
+    map_t now_roster;
+    map_init(&now_roster);
+    data_t *d = NULL;
+    for (size_t i = 0; i < n_roster; i++) {
+        if (strcmp(roster[i], self) == 0)
+            continue;
+        map_set(&now_roster, (map_key_t)roster[i], integer_data(1));
+        if (map_get(&rep_state.counts_roster, (map_key_t)roster[i], &d) != 0)
+            map_set(&due, (map_key_t)roster[i], integer_data(1));
+    }
+    map_entries_for_each(&rep_state.counts_roster, key, val)
+    {
+        (void)val;
+        if (map_get(&now_roster, key, &d) != 0)
+            map_set(&due, key, integer_data(1));
+    }
+    map_end_for_each
+    map_free(&rep_state.counts_due);
+    map_init(&rep_state.counts_due);
+    map_free(&rep_state.counts_roster);
+    rep_state.counts_roster = now_roster;
+
+    map_entries_for_each(&due, key, val)
+    {
+        (void)val;
+        uuid_t u;
+        if (uuid_parse(key, u) != 0)
+            continue;
+        int n = 0;
+        bool bounded = map_get(&rep_state.counts_roster, key, &d) == 0
+                       && _burst_count_locked(u, &n);
+        int was_n = 0;
+        bool was = map_get(&rep_state.counts_published, key, &d) == 0;
+        if (was && d != NULL)
+            data_integer(d, &was_n);
+        if (bounded == was && (!bounded || n == was_n))
+            continue;
+        if (k >= max) {
+            map_set(&rep_state.counts_due, key, integer_data(1));
+            continue;
+        }
+        uuid_copy(out[k].peer_uuid, u);
+        out[k].bounded = bounded;
+        out[k].verdicts = (int32_t)n;
+        k++;
+        if (bounded)
+            map_set(&rep_state.counts_published, key, integer_data(n));
+        else
+            map_remove(&rep_state.counts_published, key);
+    }
+    map_end_for_each
+    map_free(&due);
+    pthread_mutex_unlock(&rep_state.lock);
+    free(roster);
+    return k;
+}
+
+/* Send negotiation's bootstrap worker the burst targets whose count changed
+ * (PEER_PROBE_COUNT), throttled to REP_PROBE_COUNTS_INTERVAL. A send the queue
+ * refuses is undone and retried on the next pass. Nothing is sent while the
+ * policy is off. Mirrors Python _publish_probe_counts. */
+static void _publish_probe_counts(const process_t *proc, double present)
+{
+    pthread_mutex_lock(&rep_state.lock);
+    bool on = rep_state.join_policy.enabled;
+    bool due = !rep_state.counts_passed
+               || present - rep_state.last_counts_pass >= REP_PROBE_COUNTS_INTERVAL;
+    if (on && due) {
+        rep_state.counts_passed = true;
+        rep_state.last_counts_pass = present;
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    if (!on || !due || proc == NULL)
+        return;
+    peer_probe_count_msg_t changes[DEFAULT_MAX_PEERS];
+    size_t n = _probe_count_changes(proc, changes, DEFAULT_MAX_PEERS);
+    for (size_t i = 0; i < n; i++) {
+        generic_msg_t out;
+        memset(&out, 0, sizeof(out));
+        out.type = PEER_PROBE_COUNT;
+        out.size = sizeof(peer_probe_count_msg_t);
+        out.info.peer_probe_count = changes[i];
+        if (messaging_send("negotiation", PEER_PROBE_COUNT, &out, false) == 0)
+            continue;
+        /* Undone, so the next pass sees the change again: a target is
+         * forgotten, a departure is remembered as still bounded. */
+        char key[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(changes[i].peer_uuid, key);
+        pthread_mutex_lock(&rep_state.lock);
+        if (changes[i].bounded)
+            map_remove(&rep_state.counts_published, (map_key_t)key);
+        else
+            map_set(&rep_state.counts_published, (map_key_t)key, integer_data(-1));
+        map_set(&rep_state.counts_due, (map_key_t)key, integer_data(1));
+        pthread_mutex_unlock(&rep_state.lock);
+    }
+}
+
 /* The score exclusion reads, into @p out: told with the policy off; under it
  * the brought score, or told when the peer is slashed, so the cohort's word
  * alone never excludes anyone (exclusion is sticky). False when there is none,
@@ -4460,9 +4789,10 @@ static double _contrite_tft_locked(const uuid_t self_uuid, const uuid_t peer_uui
     json_array_foreach(marks, i, v)
         if (n_told < MAX_CHAIN_LEN && json_is_integer(v))
             told[n_told++] = (int64_t)json_integer_value(v);
-    return reputation_contrite_tft_told(&rep_state.history,
-                                        &rep_state.reputations, self_uuid,
-                                        peer_uuid, told, n_told);
+    return reputation_contrite_tft_told_with(&rep_state.history,
+                                             _cohort_chain_locked(),
+                                             &rep_state.reputations, self_uuid,
+                                             peer_uuid, told, n_told);
 }
 
 /* Score @p peer_uuid by the ordinary algebra, bound it by any standing, and
@@ -4517,9 +4847,10 @@ static double _score_peer_locked(const process_t *proc, const uuid_t peer_uuid)
             integer_data(use_pure ? 1 : 0));
 
     if (use_pure) {
-        score = reputation_pure(&rep_state.history,
-                                &rep_state.reputations, peer_uuid,
-                                &rep_state.task_weights);
+        score = reputation_pure_with(&rep_state.history,
+                                     _cohort_chain_locked(),
+                                     &rep_state.reputations, peer_uuid,
+                                     &rep_state.task_weights);
     } else {
         score = _contrite_tft_locked(self_uuid, peer_uuid);
     }
@@ -5231,6 +5562,8 @@ static void _apply_slash_locked(const char *target_str,
     }
     map_set(&rep_state.slashed, (map_key_t)target_str,
             integer_data((int)epoch));
+    /* No longer a join-burst target (Phase 5). */
+    map_set(&rep_state.counts_due, (map_key_t)target_str, integer_data(1));
 }
 
 /* Phase 3: gate a slash on Merkle evidence. Mirrors Python
@@ -7604,6 +7937,8 @@ static bool handle_slash_final(const process_t *proc, directory_t *queues, gener
         if (fresh)
         {
             map_remove(&rep_state.slashed, (map_key_t)target_str);
+            map_set(&rep_state.counts_due, (map_key_t)target_str,
+                    integer_data(1));
             reputations_update(&rep_state.reputations, target_uuid,
                                PREREP_NEUTRAL);
             /* Both maps (RD_14.4 Phase 4): a brought score is lifted too. */
@@ -10364,6 +10699,7 @@ static void _note_interaction(const uuid_t peer_uuid)
     map_set(&rep_state.last_interaction, (map_key_t)key,
             floating_pt_dbl_data((double)time(NULL)));
     map_set(&rep_state.rescore_due, (map_key_t)key, integer_data(1));
+    map_set(&rep_state.counts_due, (map_key_t)key, integer_data(1));
     pthread_mutex_unlock(&rep_state.lock);
 }
 
@@ -14904,6 +15240,15 @@ void reputation_reset_state(int num_peers)
     map_init(&rep_state.restore_clamped_brought);
     map_free(&rep_state.anchored);
     map_init(&rep_state.anchored);
+    map_free(&rep_state.counts_due);
+    map_init(&rep_state.counts_due);
+    map_free(&rep_state.counts_roster);
+    map_init(&rep_state.counts_roster);
+    map_free(&rep_state.counts_published);
+    map_init(&rep_state.counts_published);
+    rep_state.counts_passed = false;
+    rep_state.last_counts_pass = 0.0;
+    reputation_set_anchored_cohort(NULL);
     rep_state.have_self = false;
     rep_state.num_peers = num_peers;
     paxos_init(&rep_state.paxos, num_peers, NULL);
@@ -15446,6 +15791,21 @@ void reputation_install_tx_pair_tagged(const uuid_t task_uuid,
     pthread_mutex_unlock(&rep_state.lock);
 }
 
+void reputation_install_tx_pair_in(const char *group_uuid,
+                                   const uuid_t task_uuid,
+                                   const uuid_t p1_uuid, double p1_score,
+                                   const uuid_t p2_uuid, double p2_score)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    char key[UUID_STRING_LEN + 1];
+    _chain_key(NULL, group_uuid, key, sizeof(key));
+    tx_history_t *chain = _chain_for_key_locked(key);
+    tx_history_update(chain, task_uuid, p1_uuid, p1_score, NULL);
+    tx_history_update(chain, task_uuid, p2_uuid, p2_score, NULL);
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
 int reputation_install_tx_attested(const uuid_t verifier_uuid, double score,
                                    const char *channel,
                                    const uuid_t subject_uuid,
@@ -15611,6 +15971,22 @@ int reputation_get_bounded(const uuid_t peer_uuid, double *out)
     return rc == 0 ? 0 : -1;
 }
 
+bool reputation_burst_count(const uuid_t peer_uuid, int *verdicts)
+{
+    if (!rep_state.initialized || verdicts == NULL) return false;
+    pthread_mutex_lock(&rep_state.lock);
+    bool bounded = rep_state.join_policy.enabled
+                   && _burst_count_locked(peer_uuid, verdicts);
+    pthread_mutex_unlock(&rep_state.lock);
+    return bounded;
+}
+
+void reputation_publish_probe_counts(const process_t *proc, double present)
+{
+    _ensure_init();
+    _publish_probe_counts(proc, present);
+}
+
 void reputation_set_anchored(const uuid_t peer_uuid, bool anchored)
 {
     _ensure_init();
@@ -15624,8 +16000,10 @@ void reputation_set_anchored(const uuid_t peer_uuid, bool anchored)
     else if (!anchored && was)
         map_remove(&rep_state.anchored, (map_key_t)key);
     /* Its bounded score changed: rescore it, so the tier is republished. */
-    if (anchored != was)
+    if (anchored != was) {
         map_set(&rep_state.rescore_due, (map_key_t)key, integer_data(1));
+        map_set(&rep_state.counts_due, (map_key_t)key, integer_data(1));
+    }
     pthread_mutex_unlock(&rep_state.lock);
 }
 
@@ -15850,6 +16228,8 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
         /* Score whoever the chain moved for; see _rescore_peers for why this
          * is the only thing that rates a peer in a running node. */
         _rescore_peers(proc, present, have_self ? self_uuid : NULL);
+        /* The join burst's targets and their counts (RD_14.4 Phase 5). */
+        _publish_probe_counts(proc, present);
         _maybe_checkpoint(proc, present, have_self ? self_str : NULL);
         /* Our halves that went out and never came back (ISSUES §2.24). */
         _retry_uncommitted_halves(proc, present);
@@ -15885,7 +16265,12 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
             if (rerr == -1 || rerr == ENOMSG)
                 break;
 
-            if (buf.type == PEER_ANCHOR)
+            if (buf.type == ANCHORED_COHORT)
+            {
+                /* Identity's anchored cohort (RD_14.4 Phase 6). */
+                reputation_set_anchored_cohort(&buf.info.anchored_cohort);
+            }
+            else if (buf.type == PEER_ANCHOR)
             {
                 /* Identity's judgement of one peer under the join policy
                  * (RD_14.4 Phase 4): an anchored peer reads told uncapped. */

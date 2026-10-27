@@ -200,6 +200,11 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self.myself = configurations[CfgIds.identity]
         self.peer_messages = deque()
         self.encrypted_messages = deque()
+        # Admissions this node is partway through as the JOINER: admitter
+        # address -> monotonic deadline, set when its access_granted arrives,
+        # and the outbound frames held for it meanwhile (_hold_for_admission).
+        self._admission_pending = {}
+        self._held_for_admission = deque()
         self.group_messages = deque()
         # Group frames that did not open, kept for a key change
         # (_hold_group_frame).
@@ -1126,9 +1131,10 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                         self.logger.debug(
                             'Deferred message from %s still does not decrypt '
                             '(%s); retaining until it ages out', from_addr, err)
-                if decrypt_msg is not None:
-                    self._msg_to_queue(decrypt_msg, peer, queues, 'point-to-point',
-                                       wire_format=self._wire_format_for_addr(from_addr))
+                # Not routed: a known peer we still cannot place, whose frame
+                # is in a format we cannot read yet (_route_decrypted).
+                if decrypt_msg is not None and self._route_decrypted(
+                        decrypt_msg, peer, from_addr, queues):
                     _probes.counter('net.mystery', 'resolved')
                     _probes.emit('net.mystery', 'resolved',
                                  from_addr=from_addr,
@@ -1155,6 +1161,87 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                         remaining.append((raw_msg, from_addr, deferred_at))
             self.encrypted_messages.extend(remaining)
             time.sleep(self.cadence + self.q_cadence)  # curiously, does not sleep if exactly cadence
+
+    def _route_decrypted(self, plain, peer, from_addr, queues) -> bool:
+        """Route a point-to-point frame that decrypted from a known *peer*.
+        Returns False, having routed nothing, when the caller should defer it.
+
+        A peer we can place in a group we hold speaks that group's format, and
+        a refusal there is a foreign-format drop like any other. A peer we
+        cannot place yet is read as JSON, and the one legitimate sender of
+        anything else is our admitter: the moment it admits us it is talking
+        its cohort's format, while we learn that format only when our group
+        arrives a beat later. So on that path a refusal defers the frame, to
+        be read in the group's format once the sender can be placed, or
+        reclaimed by the out-of-order queue's age bound if it never can. The
+        foreign parser is still never run over the bytes: deferral re-reads
+        them only after a group says which format they are in.
+        """
+        if self._group_for_sender(from_addr) is not None:
+            self._msg_to_queue(plain, peer, queues, 'point-to-point',
+                               wire_format=self._wire_format_for_addr(from_addr))
+            return True
+        try:
+            self._msg_to_queue(plain, peer, queues, 'point-to-point', opaque=True)
+        except WireFormatMismatch:
+            _probes.counter('net.wire', 'defer', 'unplaced_peer')
+            return False
+        return True
+
+    def _note_admission(self, message, from_addr):
+        """An access_granted from a sender we cannot place: we are being
+        admitted, and until our group arrives we cannot know the format the
+        admitter now expects from us. Point-to-point traffic to it is held
+        (_hold_for_admission) until it can be placed, or until the
+        out-of-order age bound passes, after which it goes as the lookup says."""
+        if (message.process != CfgIds.identity
+                or message.function != IdentityProtocol.accept):
+            return
+        addr = strip_cidr(str(from_addr))
+        if self._group_for_sender(addr) is None:
+            self._admission_pending[addr] = time.monotonic() + self.mystery_max_age_s
+
+    def _admission_settled(self, addr) -> bool:
+        """True once a pending admission from *addr* is over: the admitter can
+        be placed in a group we hold, or the wait has run out."""
+        deadline = self._admission_pending.get(addr)
+        if deadline is None:
+            return True
+        if self._group_for_sender(addr) is not None or time.monotonic() >= deadline:
+            self._admission_pending.pop(addr, None)
+            return True
+        return False
+
+    def _hold_for_admission(self, message, who, address) -> bool:
+        """Hold a non-bootstrap frame to an admitter whose admission of us is
+        still settling. Sent now it would be JSON, and the admitter, which
+        already counts us as a member of its cohort, expects that cohort's
+        format. Bootstrap is JSON by rule and is never held."""
+        if message.function in BOOTSTRAP_VERBS or self._admission_settled(address):
+            return False
+        _probes.counter('net.ptp', 'hold', 'admission_pending')
+        self._held_for_admission.append((message, who))
+        return True
+
+    def _release_admission_holds(self, queues):
+        """Send, in order, the held frames whose admission has settled. Runs
+        before each new outbound message, so a held frame never goes out after
+        one queued behind it."""
+        if not self._held_for_admission:
+            return
+        still = deque()
+        while self._held_for_admission:
+            message, who = self._held_for_admission.popleft()
+            address = strip_cidr(who.address)
+            if not self._admission_settled(address) or any(
+                    strip_cidr(w.address) == address for _m, w in still):
+                still.append((message, who))
+                continue
+            try:
+                self._unicast(message, who)
+            except BrokenPipeError as err:
+                self.logger.error('Network: %s', err)
+        self._held_for_admission = still
 
     def _accept_unencrypted(self, raw_msg, from_whom, queues,
                             wire_format=NetWireFormat.json):
@@ -1301,6 +1388,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     '%s from a cohort we gateway; admitting across the boundary '
                     'would make a group span it' % message.function)
                 return
+            if rcvd_by != 'multicast':
+                self._note_admission(message, from_addr)
 
         # Deliver to any known process queue, not just subsystems.
         # Cross-instance request/response patterns (e.g. an inspector
@@ -1391,6 +1480,57 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         except Full:
             pass
 
+    def _unicast(self, message, who):
+        """Send *message* point-to-point to one recipient *who*."""
+        address = strip_cidr(who.address)
+        # Gateway boundary, invariant B: the pre-admission handshake stays
+        # inside the domain it started in.
+        if (message.function in BOOTSTRAP_VERBS
+                and self._crosses_gateway(address)):
+            self._boundary_refuse(
+                'bootstrap_across_gateway', address,
+                'refusing to send %s to a cohort we '
+                'gateway' % message.function)
+            return
+        # Reputation cut-off: skip an excluded recipient.
+        if self.reject_message(address):
+            _probes.counter('net.ptp', 'skip', 'excluded_target')
+            return
+        # Held while an admission of us settles; released in order by
+        # _release_admission_holds once we can say which format to use.
+        if self._hold_for_admission(message, who, address):
+            return
+        # A peer we can place speaks its group's format; one we cannot place
+        # gets JSON, which is what makes pre-admission traffic work in a proto
+        # cohort (doc/architecture/network-wire-format.md).
+        wire = message.to_wire(self._wire_format_for_addr(address))
+        if message.encrypt:
+            msg = self.myself.encrypt(wire, who)
+        else:
+            msg = wire
+        # An extension that reaches `who` some other way (rendezvous: behind
+        # a relay) carries it; the frame is already sealed.
+        carrier = self._unicast_carrier(who.uuid)
+        try:
+            if carrier is not None:
+                carrier.unicast(self, who.uuid, msg)
+            else:
+                self._also_unicast(who.uuid, message.process,
+                                   message.function, msg)
+                self.send_peer(msg, address)
+            self.track_send_stats(who.uuid, len(msg))
+            self._presence.sent(who.uuid, time.time())
+        except TransmissionError as err:
+            self.logger.error('Network: %s', err)
+            self.track_send_error(who.uuid)
+        except (OSError, ConnectionError) as err:
+            # Only a carried send is caught here; a direct one raises as it
+            # always has.
+            if carrier is None:
+                raise
+            self.logger.error('Network: relay: %s', err)
+            self.track_send_error(who.uuid)
+
     def _send_to_group_members(self, msg, addresses):
         """Send one encrypted group frame to each member address.
 
@@ -1466,6 +1606,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             try:
                 self.reap_idle_conns()
                 self._presence_step(queues)
+                self._release_admission_holds(queues)
                 for hooks in network_hooks(self):
                     if hooks.periodic is not None:
                         hooks.periodic(self, queues)
@@ -1593,55 +1734,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                              enc_grp, msg)
                             else:  # defaults to pseudo-multicast
                                 for who in message.to_whom:  # Message ensures this is list  # noqa
-                                    address = strip_cidr(who.address)
-                                    # Gateway boundary, invariant B: the
-                                    # pre-admission handshake stays inside the
-                                    # domain it started in.
-                                    if (message.function in BOOTSTRAP_VERBS
-                                            and self._crosses_gateway(address)):
-                                        self._boundary_refuse(
-                                            'bootstrap_across_gateway', address,
-                                            'refusing to send %s to a cohort we '
-                                            'gateway' % message.function)
-                                        continue
-                                    # Reputation cut-off: skip an excluded
-                                    # recipient.
-                                    if self.reject_message(address):
-                                        _probes.counter('net.ptp', 'skip', 'excluded_target')
-                                        continue
-                                    # A peer we can place speaks its group's
-                                    # format; one we cannot place gets JSON,
-                                    # which is what makes pre-admission traffic
-                                    # work in a proto cohort (doc/architecture/network-wire-format.md).
-                                    wire = message.to_wire(
-                                        self._wire_format_for_addr(address))
-                                    if message.encrypt:
-                                        msg = self.myself.encrypt(wire, who)
-                                    else:
-                                        msg = wire
-                                    # An extension that reaches `who` some
-                                    # other way (rendezvous: behind a relay)
-                                    # carries it; the frame is already sealed.
-                                    carrier = self._unicast_carrier(who.uuid)
-                                    try:
-                                        if carrier is not None:
-                                            carrier.unicast(self, who.uuid, msg)
-                                        else:
-                                            self._also_unicast(who.uuid, message.process,
-                                                               message.function, msg)
-                                            self.send_peer(msg, address)
-                                        self.track_send_stats(who.uuid, len(msg))
-                                        self._presence.sent(who.uuid, time.time())
-                                    except TransmissionError as err:
-                                        self.logger.error('Network: %s', err)
-                                        self.track_send_error(who.uuid)
-                                    except (OSError, ConnectionError) as err:
-                                        # Only a carried send is caught here; a
-                                        # direct one raises as it always has.
-                                        if carrier is None:
-                                            raise
-                                        self.logger.error('Network: relay: %s', err)
-                                        self.track_send_error(who.uuid)
+                                    self._unicast(message, who)
                         except BrokenPipeError as err:
                             self.logger.error('Network: %s', err)
                     else:
@@ -1682,8 +1775,9 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     if from_whom is not None:
                         try:
                             decrypt_msg = self.myself.decrypt(raw_msg, from_whom)
-                            self._msg_to_queue(decrypt_msg, from_whom, queues, 'point-to-point',
-                                               wire_format=self._wire_format_for_addr(from_addr))
+                            if not self._route_decrypted(decrypt_msg, from_whom, from_addr, queues):
+                                self.encrypted_messages.append(
+                                    (raw_msg, from_addr, time.monotonic()))
                         except Exception:
                             # Decrypt failed. Some protocol verbs are sent in
                             # PLAINTEXT by design (encrypt=False), and once a

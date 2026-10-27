@@ -1,0 +1,60 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: anchored-cohort-invite-from-a-contact-is-accepted
+byte_pinning: false
+description: |
+    A node under the join policy accepts an invitation to an anchored cohort
+    when the sender and every other listed member are anchors it counts, and
+    answers it (RD_14.4_HOSTILE_JOIN_PLAN.md Phase 6, D8 (b)).
+
+    Shape: alice, a verified contact of zed's, invites zed to the cohort
+    {alice, zed}. zed takes it (it now holds the cohort, key included) and
+    replies `[group uuid, key epoch, true]` to alice.
+
+    With the policy off zed ignores the invitation, holds nothing and answers
+    nothing.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: zed
+    role: border_guard
+
+fixtures:
+  first_contact:
+    enabled: true
+  contacts:
+    alice:
+      verified: true
+    zed:
+      verified: true
+  # Every participant holds every other as a peer and cohort member (the
+  # Python adapter's default; C needs it said).
+  mutual_peers: true
+  join_policy:
+    version: 1
+    enabled: true
+    anchors: [verified_contact]
+
+steps:
+  - id: 1
+    from: alice
+    to: zed
+    function: anchored_cohort_invite
+    payload:
+      members: [alice, zed]
+      group_uuid: "c0000000-0000-4000-8000-0000000000a1"
+      key_epoch: 0
+
+  - id: 2
+    in_response_to: 1
+    from: zed
+    to: alice
+    function: anchored_cohort_reply
+    no_propagate: true
+    description: zed answers.
+
+expected_state:
+  zed:
+    anchored_cohort_members: [alice, zed]

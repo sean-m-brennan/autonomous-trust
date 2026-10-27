@@ -3910,13 +3910,37 @@ double reputation_env_double(const char *name, double dflt)
  * settling at 0.43). Reporters with no reputation contribute nothing; if none
  * has any, the peer is at the neutral prior.
  */
+/* tx_history_by_peer over @p hist, then @p extra (NULL: none) appended:
+ * the anchored cohort's chain beside the primary one (RD_14.4 Phase 6).
+ * @p n_primary (optional) receives how many came from @p hist. */
+static void _by_peer_with(const tx_history_t *hist, const tx_history_t *extra,
+                          const uuid_t peer_uuid, transaction_t *txns,
+                          int *count, int max, int *n_primary)
+{
+    tx_history_by_peer(hist, peer_uuid, txns, count, max);
+    if (n_primary != NULL)
+        *n_primary = *count;
+    if (extra != NULL && *count < max) {
+        int more = 0;
+        tx_history_by_peer(extra, peer_uuid, txns + *count, &more, max - *count);
+        *count += more;
+    }
+}
+
 double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
                        const uuid_t peer_uuid,
                        const map_t *task_weights)
 {
+    return reputation_pure_with(hist, NULL, reps, peer_uuid, task_weights);
+}
+
+double reputation_pure_with(const tx_history_t *hist, const tx_history_t *extra,
+                            const reputations_t *reps, const uuid_t peer_uuid,
+                            const map_t *task_weights)
+{
     transaction_t txns[MAX_CHAIN_LEN];
     int count = 0;
-    tx_history_by_peer(hist, peer_uuid, txns, &count, MAX_CHAIN_LEN);
+    _by_peer_with(hist, extra, peer_uuid, txns, &count, MAX_CHAIN_LEN, NULL);
 
     if (count == 0)
         return PREREP_NEUTRAL;  /* Default neutral reputation */
@@ -3990,6 +4014,7 @@ static bool _index_told(int64_t index, const int64_t *told, size_t n_told)
 }
 
 static double reputation_prereputation_prior(const tx_history_t *hist,
+                                             const tx_history_t *extra,
                                              const reputations_t *reps,
                                              const uuid_t self_uuid,
                                              const uuid_t peer_uuid,
@@ -4002,7 +4027,9 @@ static double reputation_prereputation_prior(const tx_history_t *hist,
 
     transaction_t txns[MAX_CHAIN_LEN];
     int count = 0;
-    tx_history_by_peer(hist, peer_uuid, txns, &count, MAX_CHAIN_LEN);
+    int n_primary = 0;
+    _by_peer_with(hist, extra, peer_uuid, txns, &count, MAX_CHAIN_LEN,
+                  &n_primary);
 
     uuid_t seen[MAX_CHAIN_LEN];
     int    seen_count = 0;
@@ -4027,8 +4054,9 @@ static double reputation_prereputation_prior(const tx_history_t *hist,
         if (dup)
             continue;
         /* Under the join policy, an entry catch-up told us about is not
-         * evidence for the prior (RD_14.4 D4 (b)). */
-        if (_index_told(tx->index, told, n_told))
+         * evidence for the prior (RD_14.4 D4 (b)). The marks are primary-
+         * chain indices; the cohort chain's entries are never told. */
+        if (i < n_primary && _index_told(tx->index, told, n_told))
             continue;
         uuid_copy(seen[seen_count++], tx->task_uuid);
 
@@ -4117,9 +4145,20 @@ double reputation_contrite_tft_told(const tx_history_t *hist,
                                     const uuid_t peer_uuid,
                                     const int64_t *told, size_t n_told)
 {
+    return reputation_contrite_tft_told_with(hist, NULL, reps, self_uuid,
+                                             peer_uuid, told, n_told);
+}
+
+double reputation_contrite_tft_told_with(const tx_history_t *hist,
+                                         const tx_history_t *extra,
+                                         const reputations_t *reps,
+                                         const uuid_t self_uuid,
+                                         const uuid_t peer_uuid,
+                                         const int64_t *told, size_t n_told)
+{
     transaction_t txns[MAX_CHAIN_LEN];
     int count = 0;
-    tx_history_by_peer(hist, peer_uuid, txns, &count, MAX_CHAIN_LEN);
+    _by_peer_with(hist, extra, peer_uuid, txns, &count, MAX_CHAIN_LEN, NULL);
 
     double peer_sum = 0.0;
     double my_sum   = 0.0;
@@ -4145,8 +4184,8 @@ double reputation_contrite_tft_told(const tx_history_t *hist,
     if (n < 1)
         /* Cold-start: no bilateral history WITH us. Fall back to a
          * transaction-memory prior rather than a flat neutral (doc/architecture/networking.md). */
-        return reputation_prereputation_prior(hist, reps, self_uuid, peer_uuid,
-                                              told, n_told);
+        return reputation_prereputation_prior(hist, extra, reps, self_uuid,
+                                              peer_uuid, told, n_told);
 
     return reputation_ctft_blend(peer_last, peer_sum / (double)n,
                                  my_sum / (double)n);

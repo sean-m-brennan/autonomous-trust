@@ -121,6 +121,10 @@ _TRIGGER_HIERARCHY = 'trigger_hierarchy'
 # stashed so far (RD_14.4 plan, Phase 1); the wait itself is a timer. Mirrors
 # the C adapter's trigger_choose_group.
 _TRIGGER_CHOOSE_GROUP = 'trigger_choose_group'
+# The anchored cohort (RD_14.4 Phase 6): run the forming/coordinating pass now,
+# rather than waiting for a peer-list change or the resync cadence. Mirrors the
+# C adapter's trigger_anchored_cohort.
+_TRIGGER_ANCHORED_COHORT = 'trigger_anchored_cohort'
 
 # Pseudo-function: solicit membership in a cohort this participant is NOT in (runtime
 # cross-group join, doc/architecture/gateway-reputation-tree.md). The step's payload
@@ -728,6 +732,18 @@ class _Participant:
                         f'{self.id}: provisional_peer_count={actual}, '
                         f'expected {int(expected)}'
                     )
+            elif key == 'anchored_cohort_members':
+                # The anchored cohort this participant holds, as sorted
+                # participant ids; [] when it holds none (RD_14.4 Phase 6). C
+                # mirrors via identity_anchored_cohort_held.
+                from autonomous_trust.core._python.identity.anchored_cohort import member_uuids
+                by_uuid = {u.lower(): pid for pid, u in self.pid_to_uuid.items()}
+                held = getattr(self.process, 'anchored_cohort', None)
+                actual = sorted(by_uuid.get(u, u) for u in member_uuids(held))
+                if actual != sorted(expected or []):
+                    raise AssertionError(
+                        f'{self.id}: anchored_cohort_members={actual}, '
+                        f'expected {sorted(expected or [])}')
             elif key == 'join_provisional_count':
                 # Members this participant marked provisional when it adopted
                 # a history under the join policy: introduced by the cohort,
@@ -2049,6 +2065,9 @@ class IdentityAdapter:
         if inbound.function == _TRIGGER_CHOOSE_GROUP:
             participant.process._adopt_from_histories(participant.queues)
             return participant.drain_outbox()
+        if inbound.function == _TRIGGER_ANCHORED_COHORT:
+            participant.process._maybe_form_anchored_cohort(participant.queues)
+            return participant.drain_outbox()
         if inbound.function == _TRIGGER_HIERARCHY:
             participant.process._refresh_hierarchy(participant.queues)
             uuid = participant.process.parent_gateway
@@ -2326,6 +2345,18 @@ class IdentityAdapter:
                 # sends it. Mirrors the C adapter.
                 canonical.pop('wire_format', None)
             obj = to_json_string(canonical) if canonical is not None else ''
+        elif function == IdentityProtocol.cohort_invite:
+            # An anchored cohort minted from the payload (RD_14.4 Phase 6):
+            # {members: [pid, ...], group_uuid, key_epoch}, a fresh key, each
+            # member at its own address. Mirrors the C adapter.
+            from autonomous_trust.core._python.identity.encrypt import Encryptor as _Enc
+            members = {str(participants[m].impl.identity.uuid).lower():
+                       participants[m].impl.identity.address
+                       for m in payload.get('members') or []}
+            cohort = Group(UUID(payload.get('group_uuid')), members, 'anchored',
+                           _Enc.generate(), False,
+                           _key_epoch=int(payload.get('key_epoch', 0)))
+            obj = json.dumps(cohort.to_canonical())
         elif function == IdentityProtocol.hierarchy_req:
             # A late joiner asking the group to state their positions
             # (protocol step 7). The handler answers from its own claim and
@@ -2632,7 +2663,8 @@ class IdentityAdapter:
 
         if function in (_TRIGGER_CAPS_RESYNC, _TRIGGER_SUBTREE_ROSTER,
                         _TRIGGER_ATTEST_PULL, _TRIGGER_ATTEST_REPLAY,
-                        _TRIGGER_HIERARCHY, _TRIGGER_CHOOSE_GROUP):
+                        _TRIGGER_HIERARCHY, _TRIGGER_CHOOSE_GROUP,
+                        _TRIGGER_ANCHORED_COHORT):
             # Pseudo-function: no wire payload; _dispatch invokes the sweep /
             # roster enumeration directly instead of a handler.
             obj = ''

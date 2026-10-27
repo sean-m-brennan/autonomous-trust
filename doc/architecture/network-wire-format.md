@@ -164,6 +164,32 @@ strings into an all-defaults message, and without that check a corrupt frame
 becomes a message addressed to process `""` that routes nowhere with no
 diagnostic.
 
+### The moment of admission
+
+Admission is the one time two nodes legitimately disagree about which format
+the path between them speaks. The admitter adds the joiner to its group and from
+that instant speaks the cohort's format to it; the joiner learns that format only
+when its group arrives in `full_history`, and installs it a beat later. In a
+proto cohort, both directions of that gap used to lose frames: the joiner refused
+the admitter's proto on a JSON path, and the admitter refused the joiner's JSON
+on a proto one. The joiner closes both sides; the admitter does nothing special.
+
+- **Defer.** A point-to-point frame that *decrypted* from a known peer the
+  joiner cannot yet place in any group, and whose marker says it is not JSON,
+  goes to the out-of-order queue rather than being dropped. It is read in the
+  group's format once the sender can be placed, or reclaimed by the queue's age
+  bound if it never can. The proto parser still never sees it until a group says
+  it is proto. Probe: `net.wire/defer/unplaced_peer`.
+- **Hold.** From the moment an `access_granted` arrives from a sender the joiner
+  cannot place, its own non-bootstrap point-to-point traffic to that admitter is
+  held, not sent as JSON. The hold ends when the admitter can be placed, or when
+  the out-of-order age bound passes, after which frames go as the lookup says.
+  Held frames are released in order, before any new outbound frame. Bootstrap is
+  never held. Probe: `net.ptp/hold/admission_pending`.
+
+Neither is detection: in both, the format is still a group lookup, made once
+there is a group to look up.
+
 ## The gateway boundary
 
 Two invariants, both **normative**. They are assumptions the rest of this

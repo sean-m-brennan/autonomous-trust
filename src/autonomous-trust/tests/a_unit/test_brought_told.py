@@ -132,13 +132,29 @@ def test_an_anchored_peer_reads_told():
     assert rp._bounded(peer, told) == pytest.approx(0.95)
 
 
-def test_a_probe_half_is_not_own_evidence():
+def _probe(rp, peer, n, score=0.9):
+    """``n`` probes of ours: bilateral entries whose half of ours is on the
+    probe channel."""
+    for _ in range(n):
+        _pair(rp, rp.identity.uuid, score, peer, 0.9, a_channel=TX_CHANNEL_PROBE)
+
+
+def test_a_probe_verdict_is_own_evidence_under_the_policy():
+    """Phase 5 (the user's call, 2026-10-27): a verdict counts toward
+    own_evidence_min and into brought, with its score."""
     rp, peer = _rp(), uuid4()
-    for _ in range(3):
-        _pair(rp, rp.identity.uuid, 0.9, peer, 0.9, a_channel=TX_CHANNEL_PROBE)
-    _score(rp, peer)
-    assert rp._own_count(peer) == 0
-    assert str(peer) not in rp.reputations.brought
+    _probe(rp, peer, 3, 0.9)
+    _told(rp, peer, 3, 0.3)
+    told = _score(rp, peer, told=0.3)
+    assert rp._own_count(peer) == 3
+    assert rp.reputations.brought[str(peer)] > TIER1_CAP
+    assert rp._bounded(peer, told) == rp.reputations.brought[str(peer)]
+
+
+def test_a_probe_half_is_not_own_evidence_without_the_policy():
+    rp, peer = _rp(JoinPolicy()), uuid4()
+    _probe(rp, peer, 3)
+    assert rp._own_evidence(peer) == []
 
 
 def test_brought_reads_our_scores_not_the_peers():
@@ -292,3 +308,79 @@ def test_identity_publishes_anchors_on_change_only():
     proc.join_policy = JoinPolicy()
     proc._publish_anchors({})
     assert len(sent) == 2
+
+
+# --- The join burst's counts (Phase 5) --------------------------------------
+
+def _roster(rp, *peers):
+    from types import SimpleNamespace
+    rp.protocol.peers = SimpleNamespace(all=[SimpleNamespace(uuid=p) for p in peers])
+
+
+def _published(rp):
+    q = queue.Queue()
+    rp._last_counts_pass = None
+    rp._publish_probe_counts({rp.BOOTSTRAP_WORKER_QUEUE: q}, 0.0)
+    return [q.get_nowait().counts for _ in range(q.qsize())]
+
+
+def test_the_burst_count_is_probe_verdicts_while_bounded():
+    rp, peer = _rp(), uuid4()
+    assert rp._burst_count(peer) == 0
+    _probe(rp, peer, 1)
+    _own(rp, peer, 1)
+    assert rp._burst_count(peer) == 1
+    _probe(rp, peer, 1)
+    assert rp._burst_count(peer) is None          # graduated: 3 own entries
+
+
+def test_an_anchored_or_slashed_peer_is_no_target():
+    rp, a, b = _rp(), uuid4(), uuid4()
+    rp.protocol.anchored = frozenset({str(a)})
+    rp._slashed[str(b)] = (0.05, 1)
+    assert rp._burst_count(a) is None
+    assert rp._burst_count(b) is None
+
+
+def test_counts_publish_the_roster_on_change_only():
+    rp, a, b = _rp(), uuid4(), uuid4()
+    _roster(rp, a, b, rp.identity.uuid)
+    assert _published(rp) == [{str(a): 0, str(b): 0}]
+    assert _published(rp) == []
+    _probe(rp, a, 1)
+    rp._note_interaction(a)
+    assert _published(rp) == [{str(a): 1, str(b): 0}]
+    _probe(rp, a, 2)
+    rp._note_interaction(a)
+    assert _published(rp) == [{str(b): 0}]        # a graduated
+    _roster(rp, a)
+    assert _published(rp) == [{}]                 # b left the roster
+
+
+def test_an_anchoring_change_recounts():
+    rp, a = _rp(), uuid4()
+    _roster(rp, a)
+    assert _published(rp) == [{str(a): 0}]
+    rp.protocol.anchored = frozenset({str(a)})
+    rp._note_anchors()
+    assert _published(rp) == [{}]
+
+
+def test_counts_are_throttled_and_retried_when_refused():
+    rp, a = _rp(), uuid4()
+    _roster(rp, a)
+    full = queue.Queue(maxsize=1)
+    full.put('busy')
+    rp.q_cadence = 0.01
+    rp._publish_probe_counts({rp.BOOTSTRAP_WORKER_QUEUE: full}, 10.0)
+    assert full.get_nowait() == 'busy'
+    rp._publish_probe_counts({rp.BOOTSTRAP_WORKER_QUEUE: full}, 10.5)
+    assert full.empty()                           # throttled
+    rp._publish_probe_counts({rp.BOOTSTRAP_WORKER_QUEUE: full}, 11.0)
+    assert full.get_nowait().counts == {str(a): 0}
+
+
+def test_no_counts_without_the_policy():
+    rp, a = _rp(JoinPolicy()), uuid4()
+    _roster(rp, a)
+    assert _published(rp) == []

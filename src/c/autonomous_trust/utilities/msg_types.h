@@ -62,7 +62,9 @@ typedef enum {
     PEER_STANDING,           /**< An authority → reputation: a BOUND on what a peer may hold, not an interaction outcome (@ref peer_standing_msg_t). Local IPC only. Was ZTA_STANDING, and ZTA is still a producer — but so is an Ethne expulsion reaching the core through the app (Phase 4 P4.1), so the mechanism outlives the one authority that first needed it. */
     PEER_REMOVED,            /**< Identity → sibling processes: drop one peer from peers[] (@ref peer_removed_msg_t). The inverse of @ref PEER, which only ever appended. Local IPC only. Sent when the user removes a first-contact (direct) peer; a cohort member is never removed this way. */
     PEER_PRESENCE,           /**< Net-proc → sibling processes and the app: one peer went quiet, or came back (@ref peer_presence_msg_t). Advisory only: the peer stays on every roster and in every quorum; negotiation stops inviting it. Local IPC only. See doc/architecture/peer-presence.md. */
-    PEER_ANCHOR              /**< Identity → reputation: whether the join policy counts one peer as an anchor (@ref peer_anchor_msg_t), sent when that changes. An anchored peer's told score is read uncapped (RD_14.4 Phase 4), so this is a local type, never a verb a peer could send. Mirrors Python's AnchoredSet. */
+    PEER_ANCHOR              /**< Identity → reputation: whether the join policy counts one peer as an anchor (@ref peer_anchor_msg_t), sent when that changes. An anchored peer's told score is read uncapped (RD_14.4 Phase 4), so this is a local type, never a verb a peer could send. Mirrors Python's AnchoredSet. */,
+    PEER_PROBE_COUNT         /**< Reputation → negotiation: one peer's place among the join burst's targets and the probe verdicts held about it (@ref peer_probe_count_msg_t), sent when that changes (RD_14.4 Phase 5). Local IPC only; the bootstrap worker it feeds lives in negotiation. Mirrors Python's ProbeCounts. */,
+    ANCHORED_COHORT          /**< Identity → reputation: the anchored cohort this node holds, or none (@ref anchored_cohort_msg_t), sent when it changes (RD_14.4 Phase 6). Local IPC only; reputation routes a member's half to it. Mirrors Python's AnchoredCohort. */
     /* Core ids stop below AT_MSG_TYPE_EXT_MIN (msg_registry.h). A FEATURE's
      * types -- social (Agora's libat_social), ZTA
      * (zta/zta_msg_types.h) -- are registered at load in their own reserved
@@ -485,6 +487,30 @@ typedef struct {
     bool   anchored;
 } peer_anchor_msg_t;
 
+/** @brief Payload of @ref PEER_PROBE_COUNT: whether reputation reads a peer
+ *  under the told ceiling (a join-burst target) and, while it does, how many
+ *  probe verdicts this node holds about it (RD_14.4 Phase 5). */
+typedef struct {
+    uuid_t  peer_uuid;
+    /** False once the peer has left the ceiling: graduated, anchored,
+     *  slashed or off the roster. */
+    bool    bounded;
+    int32_t verdicts;
+} peer_probe_count_msg_t;
+
+/** Members an @ref ANCHORED_COHORT message can name. */
+#define AT_COHORT_MAX_MEMBERS 64
+
+/** @brief Payload of @ref ANCHORED_COHORT: the anchored cohort identity holds
+ *  (RD_14.4 Phase 6), as reputation needs it: its uuid and its members, this
+ *  node included. @c held false means none. */
+typedef struct {
+    bool     held;
+    uuid_t   group_uuid;
+    uint32_t n_members;
+    uuid_t   members[AT_COHORT_MAX_MEMBERS];
+} anchored_cohort_msg_t;
+
 /** @brief Sentinel for @ref peer_standing_msg_t::ceiling meaning "no bound". */
 #define PEER_NO_CEILING (-1.0)
 
@@ -543,6 +569,8 @@ typedef struct
         peer_removed_msg_t peer_removed;
         peer_presence_msg_t peer_presence;
         peer_anchor_msg_t peer_anchor;
+        peer_probe_count_msg_t peer_probe_count;
+        anchored_cohort_msg_t anchored_cohort;
         /** A registered (extension) type's payload -- see msg_registry.h. */
         _Alignas(max_align_t) uint8_t payload[AT_MSG_PAYLOAD_MAX];
     } info;         /**< Discriminated-union payload keyed by @c type. */

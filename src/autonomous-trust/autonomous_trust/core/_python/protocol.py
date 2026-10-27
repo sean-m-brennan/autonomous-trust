@@ -22,7 +22,7 @@ import icontract
 from .system import CfgIds, QueueType
 from .util import ClassEnumMeta
 from .identity import Group, ChildGroupSet, Peers, PeerStanding
-from .identity.join_policy import AnchoredSet
+from .identity.join_policy import AnchoredCohort, AnchoredSet
 from .identity.peer_standing import standing_source_valid
 from .network import Message
 from .network.presence import PeerPresence
@@ -55,6 +55,9 @@ class Protocol(object, metaclass=ClassEnumMeta):
         # IdentityProcess (AnchoredSet, RD_14.4 Phase 4). Empty while the
         # policy is off.
         self.anchored = frozenset()
+        # The anchored cohort this node holds (a Group, or None), from
+        # IdentityProcess (AnchoredCohort, RD_14.4 Phase 6).
+        self.anchored_cohort = None
         if configurations is not None:
             if CfgIds.peers in configurations:
                 self.peers = configurations[CfgIds.peers]
@@ -97,6 +100,9 @@ class Protocol(object, metaclass=ClassEnumMeta):
             return True
         if isinstance(message, AnchoredSet):
             self.anchored = message.uuids
+            return True
+        if isinstance(message, AnchoredCohort):
+            self.anchored_cohort = message.group
             return True
         if isinstance(message, PeerStanding):
             # Last writer wins WITHIN ONE AUTHORITY, deliberately: findings

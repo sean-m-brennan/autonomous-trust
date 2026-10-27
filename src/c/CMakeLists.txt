@@ -531,6 +531,7 @@ set(libsrc
     autonomous_trust/utilities/send_retry.c
     autonomous_trust/identity/id_ext.c
     autonomous_trust/identity/join_policy.c
+    autonomous_trust/identity/anchored_cohort.c
     autonomous_trust/identity/package_hash.c
     autonomous_trust/identity/peers.c
     autonomous_trust/identity/signature.c
@@ -929,6 +930,9 @@ target_link_libraries(bootstrap_capabilities_test PRIVATE ${AT_TEST_LIBS})
 add_executable(bootstrap_worker_test test/bootstrap_worker_test.c)
 set_source_files_properties(test/bootstrap_worker_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(bootstrap_worker_test PRIVATE ${AT_TEST_LIBS})
+add_executable(bootstrap_burst_test test/bootstrap_burst_test.c)
+set_source_files_properties(test/bootstrap_burst_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(bootstrap_burst_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(net_message_test test/net_message_test.c)
 set_source_files_properties(test/net_message_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1011,6 +1015,14 @@ add_executable(net_held_group_test test/net_held_group_test.c)
 set_source_files_properties(test/net_held_group_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(net_held_group_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME net_held_group_test COMMAND $<TARGET_FILE:net_held_group_test>)
+add_executable(net_admission_window_test test/net_admission_window_test.c)
+set_source_files_properties(test/net_admission_window_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_admission_window_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME net_admission_window_test COMMAND $<TARGET_FILE:net_admission_window_test>)
+add_executable(net_reject_dtn_test test/net_reject_dtn_test.c)
+set_source_files_properties(test/net_reject_dtn_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_reject_dtn_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME net_reject_dtn_test COMMAND $<TARGET_FILE:net_reject_dtn_test>)
 add_executable(send_retry_test test/send_retry_test.c)
 set_source_files_properties(test/send_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(send_retry_test PRIVATE ${AT_TEST_LIBS})
@@ -1195,6 +1207,7 @@ add_test(NAME dag_test COMMAND $<TARGET_FILE:dag_test>)
 add_test(NAME agreement_test COMMAND $<TARGET_FILE:agreement_test>)
 add_test(NAME bootstrap_capabilities_test COMMAND $<TARGET_FILE:bootstrap_capabilities_test>)
 add_test(NAME bootstrap_worker_test COMMAND $<TARGET_FILE:bootstrap_worker_test>)
+add_test(NAME bootstrap_burst_test COMMAND $<TARGET_FILE:bootstrap_burst_test>)
 add_test(NAME net_message_test COMMAND $<TARGET_FILE:net_message_test>)
 add_test(NAME socket_helpers_test COMMAND $<TARGET_FILE:socket_helpers_test>)
 add_test(NAME at_jansson_test COMMAND $<TARGET_FILE:at_jansson_test>)
@@ -1588,6 +1601,14 @@ target_compile_definitions(join_policy_test PRIVATE
     AT_REPO_ROOT_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/../..")
 add_test(NAME join_policy_test COMMAND $<TARGET_FILE:join_policy_test>)
 
+add_executable(anchored_cohort_test test/anchored_cohort_test.c)
+set_source_files_properties(test/anchored_cohort_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(anchored_cohort_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME anchored_cohort_test COMMAND $<TARGET_FILE:anchored_cohort_test>)
+add_executable(rep_cohort_test test/rep_cohort_test.c)
+set_source_files_properties(test/rep_cohort_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_cohort_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rep_cohort_test COMMAND $<TARGET_FILE:rep_cohort_test>)
 add_executable(rep_brought_test test/rep_brought_test.c)
 set_source_files_properties(test/rep_brought_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rep_brought_test PRIVATE ${AT_TEST_LIBS} m)

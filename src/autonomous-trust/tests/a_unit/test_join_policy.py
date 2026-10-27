@@ -66,6 +66,28 @@ def test_the_phase_four_bounds():
     assert (policy.told_tier, policy.own_evidence_min) == (0, 7)
 
 
+def test_the_phase_five_burst():
+    """burst_k follows own_evidence_min unless declared; 5 s and 4 by
+    default (RD_14.4 Phase 5)."""
+    assert (INERT.burst_k, INERT.burst_interval_sec,
+            INERT.burst_budget_factor) == (3, 5.0, 4)
+    assert parse_join_policy({'version': 1,
+                              'own_evidence_min': 7}).burst_k == 7
+    policy = parse_join_policy({'version': 1, 'own_evidence_min': 7,
+                                'burst_k': 2, 'burst_interval_sec': 0.5,
+                                'burst_budget_factor': 1})
+    assert (policy.burst_k, policy.burst_interval_sec,
+            policy.burst_budget_factor) == (2, 0.5, 1)
+    assert load_join_policy(EXAMPLE).burst_k == 3
+
+
+def test_the_phase_six_cohort_min():
+    assert INERT.anchored_cohort_min == 1
+    assert parse_join_policy({'version': 1,
+                              'anchored_cohort_min': 2}).anchored_cohort_min == 2
+    assert load_join_policy(EXAMPLE).anchored_cohort_min == 1
+
+
 @pytest.mark.parametrize('doc, why', [
     ([], 'not an object'),
     ({'enabled': True}, 'version'),
@@ -83,6 +105,15 @@ def test_the_phase_four_bounds():
     ({'version': 1, 'told_tier': True}, 'told_tier'),
     ({'version': 1, 'own_evidence_min': 0}, 'own_evidence_min'),
     ({'version': 1, 'own_evidence_min': '3'}, 'own_evidence_min'),
+    ({'version': 1, 'burst_k': 0}, 'burst_k'),
+    ({'version': 1, 'burst_k': 2.0}, 'burst_k'),
+    ({'version': 1, 'burst_interval_sec': 0}, 'burst_interval_sec'),
+    ({'version': 1, 'burst_interval_sec': -1.0}, 'burst_interval_sec'),
+    ({'version': 1, 'burst_interval_sec': '5'}, 'burst_interval_sec'),
+    ({'version': 1, 'burst_interval_sec': True}, 'burst_interval_sec'),
+    ({'version': 1, 'burst_budget_factor': 0}, 'burst_budget_factor'),
+    ({'version': 1, 'anchored_cohort_min': 0}, 'anchored_cohort_min'),
+    ({'version': 1, 'anchored_cohort_min': True}, 'anchored_cohort_min'),
 ])
 def test_malformed_is_refused(doc, why):
     with pytest.raises(JoinPolicyError, match=why):

@@ -88,11 +88,24 @@ static process_t *_mk_process(identity_t *self, identity_t *peer)
 
 static int g_last_tier;
 static int g_excluded;   /* +1 exclude sent, -1 readmit sent, 0 none */
+/* The join burst's counts sent to negotiation (Phase 5), and whether the hook
+ * refuses them as a full queue would. */
+static peer_probe_count_msg_t g_counts[8];
+static int g_n_counts;
+static bool g_refuse_counts;
 
 static int _hook(const char *key, const message_type_t type,
                  generic_msg_t *msg, bool blocking)
 {
     (void)blocking;
+    if (type == PEER_PROBE_COUNT) {
+        ck_assert_str_eq(key, "negotiation");
+        if (g_refuse_counts)
+            return EAGAIN;
+        if (g_n_counts < 8)
+            g_counts[g_n_counts++] = msg->info.peer_probe_count;
+        return 0;
+    }
     if (type != NET_MESSAGE || key == NULL || msg->info.net_msg.function == NULL)
         return 0;
     const char *fn = msg->info.net_msg.function;
@@ -141,6 +154,8 @@ static process_t *_begin(bool on)
     reputation_install_peer_reputation(other->uuid, 0.5);
     g_last_tier = -1;
     g_excluded = 0;
+    g_n_counts = 0;
+    g_refuse_counts = false;
     g_present = (double)time(NULL);
     messaging_set_test_hook(_hook);
     return proc;
@@ -262,13 +277,124 @@ DEFINE_TEST(test_an_anchored_peer_reads_told)
 }
 END_TEST_DEFINITION()
 
-DEFINE_TEST(test_a_probe_half_is_not_own_evidence)
+/* Phase 5 (the user's call, 2026-10-27): a probe verdict is own evidence
+ * under the policy, toward own_evidence_min and into brought with its score. */
+DEFINE_TEST(test_a_probe_verdict_is_own_evidence)
 {
     process_t *proc = _begin(true);
     _own(3, 0.9, TX_CHANNEL_PROBE);
-    _sweep(proc, -1.0);
+    _told(3, 0.3);
+    _sweep(proc, 0.3);
     double v = 0.0;
-    ck_assert_int_eq(reputation_get_brought(them->uuid, &v), -1);
+    ck_assert_ret_ok(reputation_get_brought(them->uuid, &v));
+    ck_assert_double_eq_tol(v, 0.9, 1e-3);
+    ck_assert_ret_ok(reputation_get_bounded(them->uuid, &v));
+    ck_assert_double_eq_tol(v, 0.9, 1e-3);
+    ck_assert_int_eq(g_last_tier, 4);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* --- The join burst's counts (Phase 5) ------------------------------------ */
+
+/* One publisher pass past the throttle; the counts it sent. */
+static int _publish(process_t *proc)
+{
+    g_n_counts = 0;
+    g_present += 10.0;
+    reputation_publish_probe_counts(proc, g_present);
+    return g_n_counts;
+}
+
+static void _note(void)
+{
+    reputation_note_interaction(them->uuid);
+}
+
+DEFINE_TEST(test_the_burst_count_is_probe_verdicts_while_bounded)
+{
+    process_t *proc = _begin(true);
+    _sweep(proc, -1.0);             /* resolves self, as the loop does first */
+    int n = -1;
+    ck_assert(reputation_burst_count(them->uuid, &n));
+    ck_assert_int_eq(n, 0);
+    _own(1, 0.9, TX_CHANNEL_PROBE);
+    _own(1, 0.9, NULL);
+    ck_assert(reputation_burst_count(them->uuid, &n));
+    ck_assert_int_eq(n, 1);
+    _own(1, 0.9, TX_CHANNEL_PROBE);
+    ck_assert(!reputation_burst_count(them->uuid, &n));   /* graduated */
+    _end();
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_counts_publish_on_change_only)
+{
+    process_t *proc = _begin(true);
+    _sweep(proc, -1.0);
+    ck_assert_int_eq(_publish(proc), 1);
+    ck_assert(uuid_compare(g_counts[0].peer_uuid, them->uuid) == 0);
+    ck_assert(g_counts[0].bounded);
+    ck_assert_int_eq(g_counts[0].verdicts, 0);
+    ck_assert_int_eq(_publish(proc), 0);
+    _own(1, 0.9, TX_CHANNEL_PROBE);
+    _note();
+    ck_assert_int_eq(_publish(proc), 1);
+    ck_assert_int_eq(g_counts[0].verdicts, 1);
+    _own(2, 0.9, TX_CHANNEL_PROBE);
+    _note();
+    ck_assert_int_eq(_publish(proc), 1);
+    ck_assert(!g_counts[0].bounded);                     /* graduated */
+    ck_assert_int_eq(_publish(proc), 0);
+    _end();
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_an_anchored_peer_or_one_off_the_roster_leaves)
+{
+    process_t *proc = _begin(true);
+    ck_assert_int_eq(_publish(proc), 1);
+    reputation_set_anchored(them->uuid, true);
+    ck_assert_int_eq(_publish(proc), 1);
+    ck_assert(!g_counts[0].bounded);
+    reputation_set_anchored(them->uuid, false);
+    ck_assert_int_eq(_publish(proc), 1);
+    ck_assert(g_counts[0].bounded);
+    proc->protocol.num_peers = 0;
+    ck_assert_int_eq(_publish(proc), 1);
+    ck_assert(!g_counts[0].bounded);
+    _end();
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_a_refused_count_is_resent_and_the_pass_throttled)
+{
+    process_t *proc = _begin(true);
+    g_refuse_counts = true;
+    ck_assert_int_eq(_publish(proc), 0);
+    g_refuse_counts = false;
+    g_n_counts = 0;
+    reputation_publish_probe_counts(proc, g_present + 0.5);   /* throttled */
+    ck_assert_int_eq(g_n_counts, 0);
+    ck_assert_int_eq(_publish(proc), 1);
+    ck_assert(g_counts[0].bounded);
+    /* A refused departure is resent too. */
+    reputation_set_anchored(them->uuid, true);
+    g_refuse_counts = true;
+    ck_assert_int_eq(_publish(proc), 0);
+    g_refuse_counts = false;
+    ck_assert_int_eq(_publish(proc), 1);
+    ck_assert(!g_counts[0].bounded);
+    _end();
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_no_counts_without_the_policy)
+{
+    process_t *proc = _begin(false);
+    ck_assert_int_eq(_publish(proc), 0);
+    int n = 0;
+    ck_assert(!reputation_burst_count(them->uuid, &n));
     _end();
 }
 END_TEST_DEFINITION()
@@ -382,6 +508,10 @@ DEFINE_TEST(test_peer_anchor_names_its_type)
     ck_assert_str_eq(message_type_to_string(PEER_ANCHOR), "PEER_ANCHOR");
     ck_assert_int_eq(message_type_core_by_name("PEER_ANCHOR"), PEER_ANCHOR);
     ck_assert_int_eq((int)message_size(PEER_ANCHOR), (int)sizeof(peer_anchor_msg_t));
+    ck_assert_str_eq(message_type_to_string(PEER_PROBE_COUNT), "PEER_PROBE_COUNT");
+    ck_assert_int_eq(message_type_core_by_name("PEER_PROBE_COUNT"), PEER_PROBE_COUNT);
+    ck_assert_int_eq((int)message_size(PEER_PROBE_COUNT),
+                     (int)sizeof(peer_probe_count_msg_t));
 }
 END_TEST_DEFINITION()
 
@@ -391,7 +521,12 @@ RUN_TESTS(RepBrought,
           test_own_evidence_min_lifts_the_bound,
           test_short_of_own_evidence_min_stays_capped,
           test_an_anchored_peer_reads_told,
-          test_a_probe_half_is_not_own_evidence,
+          test_a_probe_verdict_is_own_evidence,
+          test_the_burst_count_is_probe_verdicts_while_bounded,
+          test_counts_publish_on_change_only,
+          test_an_anchored_peer_or_one_off_the_roster_leaves,
+          test_a_refused_count_is_resent_and_the_pass_throttled,
+          test_no_counts_without_the_policy,
           test_brought_reads_our_scores_not_the_peers,
           test_told_alone_never_excludes,
           test_told_excludes_with_the_policy_off,

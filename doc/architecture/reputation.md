@@ -311,6 +311,11 @@ ratchet.
 
 ### Tenure
 
+(A joiner can also bound what a cohort's word alone buys a peer, by tier
+rather than by time: under the join policy a peer read only on told evidence
+holds at most `told_tier` until this node has `own_evidence_min` entries of
+its own. See [Joining a hostile cohort](hostile-join.md#brought-and-told).)
+
 Either strategy rewards a peer that answers well, and AT's own probes are cheap
 to answer well. Stele's red team showed what that costs (`rt-3717776`,
 2026-10-15): the owner's shill joined, answered four probes honestly, and ordered
