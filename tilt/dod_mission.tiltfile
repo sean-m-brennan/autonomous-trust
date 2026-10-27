@@ -158,6 +158,10 @@ if c_microdrones != "":
     # a C Pod (and vice-versa), else it can't load its own identity.
     _seed_args.append("--c-microdrones " + c_microdrones)
 _seed_cmd = " ".join(_seed_args).strip()
+# The containers rewrite their state dirs as root, and the seeder rewrites every
+# peer's group.cfg.json, so take the dir back first (a no-op when it's ours).
+if not _seed_force:
+    _seed_cmd = repo_root + "/scripts/reclaim-demo-state.sh " + seed_root + " && " + _seed_cmd
 if preseed != "1":
     _seed_cmd = "echo 'AT_PRESEED=0: skipping cohort seed'"
 # Simulator scenario is JSON (despite the .yaml extension) and gets

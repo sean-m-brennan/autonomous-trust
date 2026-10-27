@@ -971,7 +971,13 @@ PY
                     [[ "${AT_PRESEED_FORCE:-0}" == "1" ]] && seed_force="--force"
                     # On --reseed, clear root-owned container state first (see
                     # reseed_wipe_state) so the fresh seed isn't shadowed by it.
-                    [[ -n "$seed_force" ]] && reseed_wipe_state "$here/.demo-state/dod-mission"
+                    # Otherwise take that state back, since the seeder rewrites
+                    # every peer's group.cfg.json (see reclaim-demo-state.sh).
+                    if [[ -n "$seed_force" ]]; then
+                        reseed_wipe_state "$here/.demo-state/dod-mission"
+                    else
+                        "$here/scripts/reclaim-demo-state.sh" "$here/.demo-state/dod-mission"
+                    fi
                     # Seed C-format identities for the C microdrones so the SPEC
                     # matches generate_compose.py exactly (a peer running the C
                     # node must be seeded C, and vice-versa). No spaces in SPEC.
@@ -1021,7 +1027,13 @@ PY
                     [[ "${AT_PRESEED_FORCE:-0}" == "1" ]] && seed_force="--force"
                     # On --reseed, clear root-owned container state first (see
                     # reseed_wipe_state) so the fresh seed isn't shadowed by it.
-                    [[ -n "$seed_force" ]] && reseed_wipe_state "$here/.demo-state/dod-mission"
+                    # Otherwise take that state back, since the seeder rewrites
+                    # every peer's group.cfg.json (see reclaim-demo-state.sh).
+                    if [[ -n "$seed_force" ]]; then
+                        reseed_wipe_state "$here/.demo-state/dod-mission"
+                    else
+                        "$here/scripts/reclaim-demo-state.sh" "$here/.demo-state/dod-mission"
+                    fi
                     # Seed C-format identities for the C microdrones so the SPEC
                     # matches generate_k8s.py exactly (C Pod <-> C identity).
                     seed_c_arg=""
