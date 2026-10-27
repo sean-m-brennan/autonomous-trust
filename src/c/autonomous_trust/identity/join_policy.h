@@ -18,7 +18,9 @@
  *  RD_14.4_HOSTILE_JOIN_PLAN.md): how a joiner treats the cohort it joins.
  *
  *  `{"version": 1, "enabled": true, "anchors": ["verified_contact", ...],
- *  "told_tier": 1, "own_evidence_min": 3}`,
+ *  "told_tier": 1, "own_evidence_min": 3, "burst_k": 3,
+ *  "burst_interval_sec": 5, "burst_budget_factor": 4,
+ *  "anchored_cohort_min": 1}`,
  *  named by $AT_JOIN_POLICY. Opt-in (the user's call, D9): absent is inert,
  *  and a declaration that does not validate stops the node at start. The
  *  declaration chooses which anchor classes count (D6); an identity extension
@@ -59,11 +61,29 @@
 #define AT_JOIN_TOLD_TIER_DEFAULT        1
 #define AT_JOIN_OWN_EVIDENCE_MIN_DEFAULT 3
 
+/** Defaults for the Phase 5 join burst (the user's calls, 2026-10-27). burst_k
+ *  has none of its own: absent, it is own_evidence_min, so the burst just
+ *  reaches graduation. */
+#define AT_JOIN_BURST_INTERVAL_SEC_DEFAULT  5.0
+#define AT_JOIN_BURST_BUDGET_FACTOR_DEFAULT 4
+
+/** Default for the Phase 6 anchored cohort (the user's call, 2026-10-27): how
+ *  many of the cohort's members a joiner must count as anchors before it
+ *  forms an anchored cohort with them. */
+#define AT_JOIN_ANCHORED_COHORT_MIN_DEFAULT 1
+
 typedef struct {
     bool enabled;
     uint32_t anchors;   /* AT_ANCHOR_* bits declared */
     int told_tier;          /* "told_tier", 0..4 */
     int own_evidence_min;   /* "own_evidence_min", >= 1 */
+    /* The join burst (Phase 5): probe each peer read under the told ceiling
+     * until it holds burst_k verdicts, one probe per burst_interval_sec, at
+     * most burst_budget_factor x N x burst_k probes over N targets. */
+    int burst_k;                /* "burst_k", >= 1 */
+    double burst_interval_sec;  /* "burst_interval_sec", > 0 */
+    int burst_budget_factor;    /* "burst_budget_factor", >= 1 */
+    int anchored_cohort_min;    /* "anchored_cohort_min", >= 1 */
 } at_join_policy_t;
 
 /** The class bit for @p name, or 0 when it names none. */

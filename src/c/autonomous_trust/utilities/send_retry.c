@@ -97,6 +97,8 @@ bool at_send_retry_supported(long type)
     case PEER_REMOVED:
     case PEER_PRESENCE:
     case PEER_ANCHOR:
+    case PEER_PROBE_COUNT:
+    case ANCHORED_COHORT:
         return true;
     default:
         break;

@@ -51,6 +51,7 @@
 #include "utilities/freshness.h"
 #include "group_file.h"
 #include "join_policy.h"
+#include "anchored_cohort.h"
 
 /* Operator-attended signal helpers (ethne D8/Q9); defined below _build_announcement
  * but used earlier in handle_welcoming_committee. */
@@ -1771,8 +1772,10 @@ static int _add_peer(process_t *proc, directory_t *queues,
      * from here on, so a consumer that models what we observe should see it.
      * Two-phase admission gates the GROUP KEY, not visibility. */
     identity_emit_peer_observed(proc, new_peer);
-    /* Under the join policy, whether the new peer is an anchor. */
+    /* Under the join policy, whether the new peer is an anchor, and whether
+     * an anchored cohort forms or grows (RD_14.4 Phase 6). */
     identity_publish_anchors(proc);
+    identity_anchored_cohort_tick(proc);
 
     /* Two-phase admission (doc/architecture/identity-protocol.md): propagate the group key only for a
      * CONFIRMED peer. A provisional add records the peer above (visibility /
@@ -3913,6 +3916,16 @@ void identity_set_join_policy(const at_join_policy_t *policy)
         id_state.join_policy = *policy;
     else
         memset(&id_state.join_policy, 0, sizeof(id_state.join_policy));
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+void identity_get_join_policy(at_join_policy_t *out)
+{
+    if (out == NULL)
+        return;
+    _ensure_id_init();
+    pthread_mutex_lock(&id_state.lock);
+    *out = id_state.join_policy;
     pthread_mutex_unlock(&id_state.lock);
 }
 
@@ -9254,6 +9267,7 @@ int identity_register_handlers(process_t *proc)
     process_register_handler(proc, ID_IDENTITY_RESPONSE,
                              (handler_ptr_t)handle_identity_response);
     process_register_handler(proc, ID_TIER,          (handler_ptr_t)handle_tier_update);
+    identity_anchored_cohort_register(proc);
     process_register_handler(proc, ID_APP_PEER_STANDING,
                              (handler_ptr_t)handle_app_peer_standing);
     process_register_handler(proc, ID_APP_ROSTER,
@@ -9527,6 +9541,8 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
             }
         }
     }
+    /* The anchored cohort held before a restart (RD_14.4 Phase 6). */
+    identity_anchored_cohort_load(proc);
 
     /* What this node can do, for every caps_response and confirm it sends
      * (ISSUES §2.63). Nothing else installs it in production, so a C node
@@ -9777,6 +9793,7 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
             /* Anchors change with no peer change too (a contact verified, a
              * credential revoked). */
             identity_publish_anchors(proc);
+            identity_anchored_cohort_tick(proc);
         }
 
         /* TAKE EVERYTHING WAITING, not one per tick. The periodic work above

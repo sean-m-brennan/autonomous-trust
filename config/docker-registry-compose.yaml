@@ -9,4 +9,6 @@ services:
       - REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY=/data
     restart: unless-stopped
     volumes:
-      - ./data:/data
+      # $REGISTRY_DISK/data when REGISTRY_DISK is set (see
+      # scripts/local-registry.sh), else ./data beside this file.
+      - ${REGISTRY_DISK:-.}/data:/data

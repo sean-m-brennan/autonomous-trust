@@ -49,6 +49,7 @@
 #include "processes/extension.h"
 #include "utilities/util.h"
 #include "identity/group.h"           /* group_init / group_add_address */
+#include "identity/anchored_cohort.h" /* RD_14.4 Phase 6 */
 #include "identity/package_hash.h"    /* at_package_hash */
 #include "config/configuration.h"     /* config_t (proc->configs["identity"]) */
 #include "structures/data.h"          /* object_ptr_data */
@@ -1060,6 +1061,35 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
      * its peers[] and NOT in its group, which holds the participant itself
      * (R+D.md §13.5 D2). Mirrors the Python adapter, whose shared group
      * leaves every listed peer out. */
+    /* mutual_peers: every participant holds every other as a peer and as a
+     * member of its primary group, as the Python adapter's participants do
+     * by default (the anchored cohort, RD_14.4 Phase 6, counts the primary
+     * group's members it holds). */
+    if (json_is_true(json_object_get(fixtures, "mutual_peers"))) {
+        for (size_t i = 0; i < ctx->participant_count; i++) {
+            ic_impl_t *impl = (ic_impl_t *)ctx->participants[i].impl;
+            if (impl == NULL || impl->proc == NULL || impl->pub == NULL) continue;
+            process_t *p = impl->proc;
+            if (p->protocol.group.address_map.items == NULL)
+                map_init(&p->protocol.group.address_map);
+            /* One cohort, as Python's shared group is: a pinned uuid when the
+             * participant was given none. */
+            if (uuid_is_null(p->protocol.group.uuid))
+                uuid_parse("c0000000-0000-4000-8000-00000000c0c0",
+                           p->protocol.group.uuid);
+            for (size_t j = 0; j < ctx->participant_count; j++) {
+                ic_impl_t *o = (ic_impl_t *)ctx->participants[j].impl;
+                if (o == NULL || o->pub == NULL) continue;
+                char ou[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(o->pub->uuid, ou);
+                group_add_address(&p->protocol.group, ou, o->pub->address);
+                if (i == j || p->protocol.num_peers >= DEFAULT_MAX_PEERS) continue;
+                memcpy(&p->protocol.peers[p->protocol.num_peers], o->pub,
+                       sizeof(public_identity_t));
+                p->protocol.num_peers++;
+            }
+        }
+    }
     json_t *direct = json_object_get(fixtures, "direct_peers");
     if (json_is_object(direct)) {
         const char *dp_pid;
@@ -2267,6 +2297,41 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         return 0;
     }
 
+    if (strcmp(function, "anchored_cohort_invite") == 0) {
+        /* An anchored cohort minted from the payload (RD_14.4 Phase 6):
+         * {members: [pid, ...], group_uuid, key_epoch}, a fresh key, each
+         * member at its own address. Mirrors the Python adapter. */
+        group_t g;
+        memset(&g, 0, sizeof(g));
+        uuid_t gu;
+        const char *gs = json_string_value(json_object_get(payload, "group_uuid"));
+        if (gs == NULL || uuid_parse(gs, gu) != 0
+            || group_init(&gu, (char *)sender_impl->pub->address, &g) != 0) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "anchored_cohort_invite: bad payload");
+            return -1;
+        }
+        size_t mi;
+        json_t *mv;
+        json_array_foreach(json_object_get(payload, "members"), mi, mv) {
+            sce_participant_t *m = sce_find_participant(ctx, json_string_value(mv));
+            ic_impl_t *mimpl = m != NULL ? (ic_impl_t *)m->impl : NULL;
+            if (mimpl == NULL || mimpl->pub == NULL)
+                continue;
+            char mu[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(mimpl->pub->uuid, mu);
+            group_add_address(&g, mu, mimpl->pub->address);
+        }
+        g.key_epoch = json_integer_value(json_object_get(payload, "key_epoch"));
+        json_t *gj = NULL;
+        if (group_to_json(&g, &gj) == 0 && gj != NULL) {
+            net_msg_pack_json(&out->info.net_msg, gj);
+            json_decref(gj);
+        }
+        map_free(&g.address_map);
+        return 0;
+    }
+
     if (strcmp(function, "group_key_update") == 0) {
         json_t *gj = NULL;
         if (group_to_json(&sender_impl->proc->protocol.group, &gj) == 0
@@ -2708,6 +2773,14 @@ static int _dispatch(sce_run_ctx_t *ctx,
         impl->subtree_roster = ids;
         if (members != NULL) json_decref(members);
         if (privates != NULL) json_decref(privates);
+        return 0;
+    }
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
+        && strcmp(inbound->info.net_msg.function, "trigger_anchored_cohort") == 0) {
+        /* Pseudo-function: the anchored cohort's forming/coordinating pass,
+         * now (RD_14.4 Phase 6). Mirrors the Python adapter. */
+        identity_anchored_cohort_tick(impl->proc);
         return 0;
     }
     if (inbound->type == NET_MESSAGE
@@ -3730,6 +3803,44 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                              pid, got, want);
                     return -1;
                 }
+            } else if (strcmp(key, "anchored_cohort_members") == 0) {
+                /* The anchored cohort held, as sorted participant ids; [] when
+                 * none (RD_14.4 Phase 6). Identity state is one per scenario
+                 * here, so the cases asserting it assert one node's view.
+                 * Mirrors the Python adapter. */
+                group_t g;
+                json_t *got = json_array();
+                if (identity_anchored_cohort_held(&g)) {
+                    for (size_t pi = 0; pi < ctx->participant_count; pi++) {
+                        ic_impl_t *pimpl = (ic_impl_t *)ctx->participants[pi].impl;
+                        if (pimpl == NULL || pimpl->pub == NULL)
+                            continue;
+                        char pu[UUID_STRING_LEN + 1];
+                        uuid_unparse_lower(pimpl->pub->uuid, pu);
+                        data_t *d = NULL;
+                        if (map_get(&g.address_map, (map_key_t)pu, &d) == 0)
+                            json_array_append_new(
+                                got, json_string(ctx->participants[pi].id));
+                    }
+                    identity_anchored_cohort_release(&g);
+                }
+                bool same = json_array_size(got) == json_array_size(val);
+                for (size_t gi = 0; same && gi < json_array_size(val); gi++) {
+                    bool found = false;
+                    for (size_t gj = 0; gj < json_array_size(got) && !found; gj++)
+                        found = strcmp(json_string_value(json_array_get(val, gi)),
+                                       json_string_value(json_array_get(got, gj))) == 0;
+                    same = found;
+                }
+                if (!same) {
+                    char *gs = json_dumps(got, JSON_COMPACT);
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: anchored_cohort_members=%s", pid, gs ? gs : "?");
+                    free(gs);
+                    json_decref(got);
+                    return -1;
+                }
+                json_decref(got);
             } else if (strcmp(key, "join_provisional_count") == 0) {
                 /* Members marked provisional by an adoption under the join
                  * policy (RD_14.4 plan, D1 (d)); not the admission hold above.
@@ -4255,6 +4366,7 @@ void at_identity_run_ext(const at_case_t *c, at_case_result_t *out,
     /* Wipe singleton id_state so observables (peer_caps_count etc.) are
      * not polluted by prior scenarios. Preserves synchronous_dispatch. */
     identity_reset_state();
+    identity_anchored_cohort_reset();
 
     /* join_policy fixture: the declaration's own JSON (RD_14.4 plan, Phase
      * 2). One per node in C, so one per scenario; Python installs it on every

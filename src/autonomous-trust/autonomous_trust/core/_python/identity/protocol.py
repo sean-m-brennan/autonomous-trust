@@ -127,6 +127,11 @@ class IdentityProtocol(Protocol):
     # its local mirror; capability-gated negotiation reads peer._tier.
     # See doc/architecture/trust-tiers.md for the rank-vs-tier split.
     tier_update = 'tier_update'  # msg.obj <- (peer_uuid_str, new_tier_int)
+    # The anchored cohort (RD_14.4 Phase 6, identity/anchored_cohort.py),
+    # point-to-point between members. A node without the join policy ignores
+    # both.
+    cohort_invite = 'anchored_cohort_invite'  # msg.obj <- canonical group (key included)
+    cohort_reply = 'anchored_cohort_reply'  # msg.obj <- [group_uuid_str, key_epoch, accepted]
     # Local-only IPC (no wire egress). ReputationProcess emits this to
     # CfgIds.negotiation when a peer's trust tier drops (demotion).
     # NegotiationProcess.handle_tier_lost cancels any in-flight tasks whose

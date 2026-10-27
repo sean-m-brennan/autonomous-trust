@@ -67,6 +67,7 @@ DEFINE_TEST(test_the_example_lists_the_recommended_three)
                       AT_ANCHOR_VERIFIED_CONTACT | AT_ANCHOR_ZTA | AT_ANCHOR_OPERATOR);
     ck_assert_int_eq(p.told_tier, 1);
     ck_assert_int_eq(p.own_evidence_min, 3);
+    ck_assert_int_eq(p.burst_k, 3);
 }
 END_TEST_DEFINITION()
 
@@ -199,10 +200,49 @@ DEFINE_TEST(test_the_core_counts_only_declared_classes)
 }
 END_TEST_DEFINITION()
 
+/* Phase 5's burst: burst_k follows own_evidence_min unless declared; 5 s and 4
+ * by default; the same refusals as the Python suite. */
+DEFINE_TEST(test_the_phase_five_burst)
+{
+    at_join_policy_t p;
+    char err[256] = {0};
+    ck_assert(at_join_policy_parse("{\"version\": 1}", &p, err, sizeof(err)));
+    ck_assert_int_eq(p.burst_k, 3);
+    ck_assert_double_eq_tol(p.burst_interval_sec, 5.0, 1e-12);
+    ck_assert_int_eq(p.burst_budget_factor, 4);
+    ck_assert(at_join_policy_parse("{\"version\": 1, \"own_evidence_min\": 7}",
+                                   &p, err, sizeof(err)));
+    ck_assert_int_eq(p.burst_k, 7);
+    ck_assert(at_join_policy_parse(
+        "{\"version\": 1, \"own_evidence_min\": 7, \"burst_k\": 2, "
+        "\"burst_interval_sec\": 0.5, \"burst_budget_factor\": 1}",
+        &p, err, sizeof(err)));
+    ck_assert_int_eq(p.burst_k, 2);
+    ck_assert_double_eq_tol(p.burst_interval_sec, 0.5, 1e-12);
+    ck_assert_int_eq(p.burst_budget_factor, 1);
+    ck_assert(_parses("{\"version\": 1, \"burst_interval_sec\": 5}"));
+    ck_assert(!_parses("{\"version\": 1, \"burst_k\": 0}"));
+    ck_assert(!_parses("{\"version\": 1, \"burst_k\": 2.0}"));
+    ck_assert(!_parses("{\"version\": 1, \"burst_interval_sec\": 0}"));
+    ck_assert(!_parses("{\"version\": 1, \"burst_interval_sec\": -1.0}"));
+    ck_assert(!_parses("{\"version\": 1, \"burst_interval_sec\": \"5\"}"));
+    ck_assert(!_parses("{\"version\": 1, \"burst_interval_sec\": true}"));
+    ck_assert(!_parses("{\"version\": 1, \"burst_budget_factor\": 0}"));
+    /* Phase 6: the anchored cohort's minimum. */
+    ck_assert_int_eq(p.anchored_cohort_min, 1);
+    ck_assert(at_join_policy_parse("{\"version\": 1, \"anchored_cohort_min\": 2}",
+                                   &p, err, sizeof(err)));
+    ck_assert_int_eq(p.anchored_cohort_min, 2);
+    ck_assert(!_parses("{\"version\": 1, \"anchored_cohort_min\": 0}"));
+    ck_assert(!_parses("{\"version\": 1, \"anchored_cohort_min\": true}"));
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(JoinPolicy,
           test_absent_is_inert,
           test_the_example_lists_the_recommended_three,
           test_the_phase_four_bounds,
+          test_the_phase_five_burst,
           test_malformed_is_refused,
           test_a_missing_or_malformed_file_refuses_the_start,
           test_a_class_no_extension_answers_refuses_the_start,

@@ -56,6 +56,27 @@
  *  being uncertainty-directed. See bootstrap_worker_select_target. */
 #define AT_PROBE_MAX_TRACKED_PEERS 64
 
+/** The join burst (RD_14.4 Phase 5, D5 (b)) tracks this many peers that
+ *  reputation has listed; a peer listed beyond it is left to UCB. */
+#define AT_BURST_MAX_PEERS AT_PROBE_MAX_TRACKED_PEERS
+/** A uuid string with its NUL. */
+#define AT_BURST_UUID_LEN 37
+
+typedef enum {
+    BOOTSTRAP_BURST_IDLE = 0,   /* no count has listed a peer short of k */
+    BOOTSTRAP_BURST_ACTIVE,
+    BOOTSTRAP_BURST_DONE        /* for good: the burst is not re-entered */
+} bootstrap_burst_state_t;
+
+/** One peer reputation has listed (PEER_PROBE_COUNT). */
+typedef struct {
+    char uuid[AT_BURST_UUID_LEN];
+    bool listed;     /* read under the told ceiling, as last reported */
+    int  verdicts;   /* probe verdicts held, as last reported */
+    bool target;     /* joined the burst */
+    int  issued;     /* burst probes issued to it */
+} bootstrap_burst_peer_t;
+
 typedef struct {
     double   duration_sec;
     int      pairs_target;
@@ -92,6 +113,26 @@ typedef struct {
      * without this the selector would choose the same absent peer every
      * interval and probe nobody. */
     const bool *skip_peer;
+
+    /* --- The join burst (RD_14.4 Phase 5, D5 (b)) --------------------------
+     * Under the join policy: k probes per peer reputation reads under the
+     * told ceiling, one per burst_interval_sec, at most
+     * burst_budget_factor x N x k over N targets. Off unless
+     * bootstrap_worker_set_burst enables it. See _burst_tick. */
+    bool     burst_enabled;
+    int      burst_k;
+    double   burst_interval_sec;
+    int      burst_budget_factor;
+    bootstrap_burst_state_t burst_state;
+    bootstrap_burst_peer_t burst_peers[AT_BURST_MAX_PEERS];
+    size_t   n_burst_peers;
+    int      burst_budget;
+    int      burst_spent;
+    double   last_burst_sec;
+    bool     burst_ever;
+    /* The uuid string of each peer, by index, @c peer_count entries; NULL =
+     * no burst probe this tick. Borrowed for one tick, as skip_peer is. */
+    const char *const *peer_uuids;
 } bootstrap_worker_t;
 
 /** Invitation sink. Mirrors a `put` onto the negotiation queue: return true
@@ -207,13 +248,34 @@ bool bootstrap_worker_try_issue_probe(bootstrap_worker_t *w, size_t peer_count,
 
 /** One main-loop pass covering BOTH phases: the bootstrap window first, then
  *  continuous probing once the window has closed (by budget or by elapsed
- *  time). @ref bootstrap_worker_tick is this with @p probe_emit NULL, i.e. the
+ *  time). A join-burst probe, when one is due, takes the tick. @ref bootstrap_worker_tick is this with @p probe_emit NULL, i.e. the
  *  historical window-only behavior, which is what the existing seeded unit
  *  tests and the conformance coverage pin exercise. Mirrors Python
  *  BootstrapWorker._tick. */
 void bootstrap_worker_tick_all(bootstrap_worker_t *w, size_t peer_count,
                                double now_sec, bootstrap_emit_fn emit,
                                bootstrap_probe_emit_fn probe_emit, void *ctx);
+
+/* ----------------------------------------------------------------------------
+ * The join burst (RD_14.4 Phase 5, D5 (b))
+ * -------------------------------------------------------------------------- */
+
+/** Turn the join burst on (the join policy's burst_k, burst_interval_sec and
+ *  burst_budget_factor) or off. Off by default. */
+void bootstrap_worker_set_burst(bootstrap_worker_t *w, bool enabled, int k,
+                                double interval_sec, int budget_factor);
+
+/** Take one peer's count from reputation (PEER_PROBE_COUNT): whether it reads
+ *  under the told ceiling and the probe verdicts held. The first listing a
+ *  peer short of k starts the burst; a peer listed short while it runs joins
+ *  it and adds budget_factor x k to the budget. Ignored while the burst is
+ *  off or done. Mirrors Python BootstrapWorker._note_probe_counts. */
+void bootstrap_worker_note_probe_count(bootstrap_worker_t *w,
+                                       const char *peer_uuid, bool bounded,
+                                       int verdicts);
+
+/** Burst targets probed at least once. */
+int bootstrap_worker_burst_peers_probed(const bootstrap_worker_t *w);
 
 /** @} */
 

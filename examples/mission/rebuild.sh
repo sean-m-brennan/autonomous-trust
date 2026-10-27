@@ -17,7 +17,9 @@
 
 this_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 
-export DOCKER_ROOT=~/Software/.docker.dir
+# The registry's storage, $DOCKER_ROOT/registry: under $REGISTRY_DISK when set,
+# as for scripts/local-registry.sh.
+export DOCKER_ROOT=${REGISTRY_DISK:-~/Software/.docker.dir}
 #nocache="--no-cache"
 nocache=
 

@@ -36,6 +36,7 @@
 #include "utilities/util.h"       /* at_strlcpy */
 #include "bootstrap/bootstrap_capabilities.h"  /* known-answer probe verifiers */
 #include "bootstrap/bootstrap_worker.h"        /* probe allocation + window */
+#include "identity/join_policy.h"              /* the join burst's knobs */
 #include "negotiation/neg_oracle.h"            /* §12 verification layers */
 #include "negotiation/neg_ext.h"               /* extensions' tier caps */
 #include "negotiation/neg_certified.h"         /* §12.3 witness wire format */
@@ -206,6 +207,15 @@ static void _ensure_init(void)
          * three capabilities registered, which matches the static capability
          * table this runtime advertises them from. */
         bootstrap_worker_init(&neg_state.bootstrap);
+        /* The join burst (RD_14.4 Phase 5), under the join policy identity
+         * validated at start (identity_run refuses a bad one). */
+        at_join_policy_t policy;
+        char jerr[256];
+        if (at_join_policy_load_env(&policy, jerr, sizeof(jerr)))
+            bootstrap_worker_set_burst(&neg_state.bootstrap, policy.enabled,
+                                       policy.burst_k,
+                                       policy.burst_interval_sec,
+                                       policy.burst_budget_factor);
         freshness_init(&neg_state.freshness, "negotiation", NULL);
         neg_state.initialized = true;
     }
@@ -3390,12 +3400,19 @@ static void _bootstrap_tick(const process_t *proc)
 
     /* Who not to probe this pass: the peers reported absent. Snapshotted, so
      * the worker reads a stable view; indices match peers[] for this tick
-     * (_emit_bootstrap_task re-checks the index under the lock). */
+     * (_emit_bootstrap_task re-checks the index under the lock). The join
+     * burst names its targets by uuid, so it gets theirs too. */
     bool absent[DEFAULT_MAX_PEERS] = {false};
+    char uuids[DEFAULT_MAX_PEERS][AT_BURST_UUID_LEN];
+    const char *uuid_of[DEFAULT_MAX_PEERS];
     peers_read_lock(proc);
     size_t snap = proc->protocol.num_peers < DEFAULT_MAX_PEERS
                   ? proc->protocol.num_peers : DEFAULT_MAX_PEERS;
     memcpy(absent, proc->protocol.peer_absent, snap * sizeof(absent[0]));
+    for (size_t i = 0; i < snap; i++) {
+        uuid_unparse_lower(proc->protocol.peers[i].uuid, uuids[i]);
+        uuid_of[i] = uuids[i];
+    }
     peers_read_unlock(proc);
     if (peer_count > snap)
         peer_count = snap;
@@ -3403,9 +3420,11 @@ static void _bootstrap_tick(const process_t *proc)
     probe_ctx_t ctx = { .proc = proc, .peer_count = peer_count };
     double now_sec = _now_sec();
     neg_state.bootstrap.skip_peer = absent;
+    neg_state.bootstrap.peer_uuids = uuid_of;
     bootstrap_worker_tick_all(&neg_state.bootstrap, peer_count, now_sec,
                               _pair_emit, _probe_emit, &ctx);
     neg_state.bootstrap.skip_peer = NULL;
+    neg_state.bootstrap.peer_uuids = NULL;
 }
 
 /****************************
@@ -4173,6 +4192,19 @@ int negotiation_run(process_t *proc, directory_t *queues, queue_id_t signal, log
             int rerr = messaging_recv(&buf);
             if (rerr == -1 || rerr == ENOMSG)
                 break;
+            if (buf.type == PEER_PROBE_COUNT)
+            {
+                /* Reputation's count for the join burst (RD_14.4 Phase 5): a
+                 * local struct, like reputation's PEER_ANCHOR, not a net_msg
+                 * run_message_handlers could route. */
+                char pu[AT_BURST_UUID_LEN];
+                uuid_unparse_lower(buf.info.peer_probe_count.peer_uuid, pu);
+                bootstrap_worker_note_probe_count(
+                    &neg_state.bootstrap, pu,
+                    buf.info.peer_probe_count.bounded,
+                    (int)buf.info.peer_probe_count.verdicts);
+                continue;
+            }
             run_message_handlers(proc, queues, buf.type, &buf);
         }
         messaging_recv_release(&buf);

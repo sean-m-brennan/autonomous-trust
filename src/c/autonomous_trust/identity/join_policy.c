@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <limits.h>
+#include <math.h>
 #include <string.h>
 
 #include <jansson.h>
@@ -56,6 +57,10 @@ static void _inert(at_join_policy_t *out)
     memset(out, 0, sizeof(*out));
     out->told_tier = AT_JOIN_TOLD_TIER_DEFAULT;
     out->own_evidence_min = AT_JOIN_OWN_EVIDENCE_MIN_DEFAULT;
+    out->burst_k = AT_JOIN_OWN_EVIDENCE_MIN_DEFAULT;
+    out->burst_interval_sec = AT_JOIN_BURST_INTERVAL_SEC_DEFAULT;
+    out->burst_budget_factor = AT_JOIN_BURST_BUDGET_FACTOR_DEFAULT;
+    out->anchored_cohort_min = AT_JOIN_ANCHORED_COHORT_MIN_DEFAULT;
 }
 
 /* @p key of @p root as an integer in [low, high] into @p out, left alone when
@@ -122,7 +127,11 @@ bool at_join_policy_parse(const char *text, at_join_policy_t *out,
         if (strcmp(key, "version") != 0 && strcmp(key, "enabled") != 0
             && strcmp(key, "anchors") != 0 && strcmp(key, "note") != 0
             && strcmp(key, "told_tier") != 0
-            && strcmp(key, "own_evidence_min") != 0) {
+            && strcmp(key, "own_evidence_min") != 0
+            && strcmp(key, "burst_k") != 0
+            && strcmp(key, "burst_interval_sec") != 0
+            && strcmp(key, "burst_budget_factor") != 0
+            && strcmp(key, "anchored_cohort_min") != 0) {
             _fail(err, err_len, "unknown key(s) %s", key);
             goto done;
         }
@@ -166,10 +175,35 @@ bool at_join_policy_parse(const char *text, at_join_policy_t *out,
         || !_bounded_int(root, "own_evidence_min", 1, INT_MAX, &own_min,
                          err, err_len))
         goto done;
+    int burst_k = own_min;
+    int factor = AT_JOIN_BURST_BUDGET_FACTOR_DEFAULT;
+    if (!_bounded_int(root, "burst_k", 1, INT_MAX, &burst_k, err, err_len)
+        || !_bounded_int(root, "burst_budget_factor", 1, INT_MAX, &factor,
+                         err, err_len))
+        goto done;
+    int cohort_min = AT_JOIN_ANCHORED_COHORT_MIN_DEFAULT;
+    if (!_bounded_int(root, "anchored_cohort_min", 1, INT_MAX, &cohort_min,
+                      err, err_len))
+        goto done;
+    double interval = AT_JOIN_BURST_INTERVAL_SEC_DEFAULT;
+    json_t *jint = json_object_get(root, "burst_interval_sec");
+    if (jint != NULL) {
+        /* An integer or a real, as Python takes either; a boolean is neither
+         * in jansson, so it is refused here as it is there. */
+        interval = json_is_number(jint) ? json_number_value(jint) : -1.0;
+        if (!(interval > 0.0) || isinf(interval)) {
+            _fail(err, err_len, "burst_interval_sec: not a positive number");
+            goto done;
+        }
+    }
     out->enabled = json_is_true(enabled);
     out->anchors = bits;
     out->told_tier = told_tier;
     out->own_evidence_min = own_min;
+    out->burst_k = burst_k;
+    out->burst_interval_sec = interval;
+    out->burst_budget_factor = factor;
+    out->anchored_cohort_min = cohort_min;
     ok = true;
 done:
     json_decref(root);

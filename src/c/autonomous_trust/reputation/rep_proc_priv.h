@@ -337,6 +337,13 @@ void reputation_install_tx_pair_tagged(const uuid_t task_uuid,
                                        const uuid_t p2_uuid, double p2_score,
                                        const char *p2_channel);
 
+/** reputation_install_tx_pair on the chain @p group_uuid resolves to (the
+ *  anchored cohort's, RD_14.4 Phase 6; the primary for any other). */
+void reputation_install_tx_pair_in(const char *group_uuid,
+                                   const uuid_t task_uuid,
+                                   const uuid_t p1_uuid, double p1_score,
+                                   const uuid_t p2_uuid, double p2_score);
+
 /** Pre-install ONE SIDE of a Transaction (@p task_uuid): @p peer_uuid scored
  *  at @p score, the counterparty slot left open.
  *
@@ -452,6 +459,21 @@ int reputation_get_brought(const uuid_t peer_uuid, double *out);
 /** What a decision about @p peer_uuid reads (bounded): 0 and @p out, or -1
  *  when no told score is held. */
 int reputation_get_bounded(const uuid_t peer_uuid, double *out);
+
+/** Record identity's anchored cohort (RD_14.4 Phase 6), as an
+ *  ANCHORED_COHORT message does; NULL or not held: none. Reset by
+ *  reputation_reset_state. */
+void reputation_set_anchored_cohort(const anchored_cohort_msg_t *m);
+
+/** Whether @p peer_uuid is a join-burst target (RD_14.4 Phase 5: read under
+ *  the told ceiling), and if so the probe verdicts held about it, into
+ *  @p verdicts. False with the policy off. */
+bool reputation_burst_count(const uuid_t peer_uuid, int *verdicts);
+
+/** One pass of the join burst's count publisher at @p present: a
+ *  PEER_PROBE_COUNT to negotiation for each peer whose count changed,
+ *  throttled to one pass a second. Run by the process loop. */
+void reputation_publish_probe_counts(const process_t *proc, double present);
 
 /** Record identity's judgement that @p peer_uuid is (or is no longer) an
  *  anchor, as a PEER_ANCHOR message does. Reset by reputation_reset_state. */
