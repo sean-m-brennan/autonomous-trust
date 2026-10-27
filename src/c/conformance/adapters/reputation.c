@@ -126,6 +126,7 @@ typedef struct {
     int halves_held;
     int certified_halves;
     int signed_halves;   /* carrying their scorer's signature (R+D.md §14.2) */
+    int cohort_halves_held;   /* on the anchored cohort's chain (RD_14.4 Phase 6) */
     /* Ordered placement (doc/architecture/reputation.md, "Agreeing on an
      * order"): the primary chain's tasks in index order, and the ballot this
      * node has promised. */
@@ -184,6 +185,15 @@ static void _uuid5(const char *prefix, const char *name, uuid_t out)
     char buf[256];
     snprintf(buf, sizeof(buf), "%s%s", prefix, name);
     uuid_generate_sha1(out, REP_NS, buf, strlen(buf));
+}
+
+/* The anchored cohort's uuid string when a case stages one (RD_14.4 Phase 6),
+ * the same in both adapters; a scenario names it as `cohort`. */
+static void _cohort_uuid_str(char out[UUID_STRING_LEN + 1])
+{
+    uuid_t u;
+    _uuid5("group:", "anchored-cohort", u);
+    uuid_unparse_lower(u, out);
 }
 
 /* Resolve a generic_msg_t.to_whom uuid back to a participant id, or
@@ -906,6 +916,16 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
             reputation_install_proposal(e_id1, e_id2, score, task_uuid,
                                         json_string_value(json_object_get(e, "channel")),
                                         prop_named != NULL ? *prop_named : NULL);
+            /* `group: cohort` binds the round to the anchored cohort, as
+             * _forward_transaction does for a half about a member (RD_14.4
+             * Phase 6). Mirrors the Python adapter. */
+            const char *e_group = json_string_value(json_object_get(e, "group"));
+            if (e_group != NULL && strcmp(e_group, "cohort") == 0)
+            {
+                char ck[UUID_STRING_LEN + 1];
+                _cohort_uuid_str(ck);
+                reputation_install_round_group(e_id1, e_id2, ck);
+            }
         }
     }
 
@@ -1248,6 +1268,28 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
             if (u != NULL)
                 reputation_set_anchored(*u, true);
         }
+    }
+    /* Phase 6 (RD_14.4): `anchored_cohort` {pid: [member, ...]} is the cohort
+     * identity would have sent (ANCHORED_COHORT), members this participant
+     * included. reputation_reset_state cleared the last one. Mirrors the
+     * Python adapter. */
+    json_t *ac = json_object_get(json_object_get(g_fixtures, "anchored_cohort"),
+                                 target_id);
+    if (json_is_array(ac) && json_array_size(ac) > 0)
+    {
+        anchored_cohort_msg_t m;
+        memset(&m, 0, sizeof(m));
+        m.held = true;
+        _uuid5("group:", "anchored-cohort", m.group_uuid);
+        size_t i;
+        json_t *v;
+        json_array_foreach(ac, i, v)
+        {
+            const uuid_t *u = _uuid_of(ctx, json_string_value(v));
+            if (u != NULL && m.n_members < AT_COHORT_MAX_MEMBERS)
+                uuid_copy(m.members[m.n_members++], *u);
+        }
+        reputation_set_anchored_cohort(&m);
     }
     json_t *sd = json_object_get(json_object_get(g_fixtures, "seeds"), target_id);
     if (json_is_object(sd))
@@ -1875,7 +1917,15 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         if (!(payload && json_is_false(json_object_get(payload, "certify"))))
             json_object_set_new(body, "certify", json_true());
         if (!(payload && json_is_false(json_object_get(payload, "placing"))))
-            json_object_set_new(body, "group", json_string(""));
+        {
+            /* `group: cohort` names the anchored cohort (RD_14.4 Phase 6). */
+            const char *grp = payload != NULL
+                ? json_string_value(json_object_get(payload, "group")) : NULL;
+            char ck[UUID_STRING_LEN + 1] = "";
+            if (grp != NULL && strcmp(grp, "cohort") == 0)
+                _cohort_uuid_str(ck);
+            json_object_set_new(body, "group", json_string(ck));
+        }
         if (task_slug)
         {
             uuid_t task_uuid;
@@ -2583,6 +2633,7 @@ static int _dispatch(sce_run_ctx_t *ctx,
         s->committed_tx_count = reputation_get_committed_tx_count();
         reputation_get_commit_cert_counts(&s->halves_held, &s->certified_halves);
         s->signed_halves = reputation_get_signed_half_count();
+        s->cohort_halves_held = reputation_get_cohort_half_count();
         reputation_get_window_root(s->window_root);
         reputation_get_checkpoint_root(s->checkpoint_root);
         s->chain_task_n = reputation_get_chain_tasks(s->chain_tasks, 64);
@@ -2807,10 +2858,12 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
             }
             else if (strcmp(key, "halves_held") == 0
                      || strcmp(key, "certified_halves") == 0
-                     || strcmp(key, "signed_halves") == 0)
+                     || strcmp(key, "signed_halves") == 0
+                     || strcmp(key, "cohort_halves_held") == 0)
             {
                 int have = strcmp(key, "halves_held") == 0 ? snap->halves_held
                          : strcmp(key, "certified_halves") == 0 ? snap->certified_halves
+                         : strcmp(key, "cohort_halves_held") == 0 ? snap->cohort_halves_held
                          : snap->signed_halves;
                 int want = (int)json_integer_value(val);
                 if (have != want)

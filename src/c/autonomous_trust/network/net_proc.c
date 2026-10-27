@@ -3229,6 +3229,36 @@ void net_send_outbound(const net_outbound_t *out, const generic_msg_t *buf)
     }
 }
 
+/* The checks network_run makes once the filters are in place and before
+ * any receiver starts; -1 refuses the start. */
+static int net_start_checks(const network_config_t *net_cfg, logger_t *logger)
+{
+    /* Refuse a config the filters cannot honour (the envelope with
+     * libat_gateway absent) rather than join a cohort speaking a different
+     * wire format. */
+    if (net_filters_check_config(net_cfg, logger) != 0)
+        return -1;
+    /* The optional half of the plaintext receive policy (identity_run checked
+     * it too, but this is the process that consults it). */
+    net_presence_init();
+    net_liveness_reset(net_liveness_now());
+    if (plaintext_verbs_configure(NULL, logger) != 0)
+        return -1;
+    /* An extension whose configuration cannot be honoured refuses the start,
+     * as the filters and plaintext verbs above do. */
+    if (net_ext_check_config(logger) != 0) {
+        log_error(logger, "Network: an extension refused its configuration; "
+                  "not starting\n");
+        return -1;
+    }
+    return 0;
+}
+
+int net_proc_test_start_checks(const network_config_t *net_cfg, logger_t *logger)
+{
+    return net_start_checks(net_cfg, logger);
+}
+
 /* Frama-C: skipped —
  * [solver-timeout] network_run: state-cascade through smrt_deref/
  * process_setup/map_get/identity_publish/at_logging (same pattern as
@@ -3328,28 +3358,8 @@ static int network_run(const net_transport_t *transport,
      * still want one here, and must have it before the receivers start. */
     at_extensions_register_handlers(proc, "network");
 
-    /* The filters are in place now; refuse a config they cannot honour (the
-     * envelope with libat_gateway absent) rather than join a cohort speaking
-     * a different wire format. */
-    if (net_filters_check_config(net_cfg, logger) != 0) {
-        transport->close(tctx);
-        if (my_public != NULL) smrt_deref(my_public);
-        return -1;
-    }
-    /* The optional half of the plaintext receive policy (identity_run checked
-     * it too, but this is the process that consults it). */
-    net_presence_init();
-    net_liveness_reset(net_liveness_now());
-    if (plaintext_verbs_configure(NULL, logger) != 0) {
-        transport->close(tctx);
-        if (my_public != NULL) smrt_deref(my_public);
-        return -1;
-    }
-    /* An extension whose configuration cannot be honoured refuses the start,
-     * as the filters and plaintext verbs above do. */
-    if (net_ext_check_config(logger) != 0) {
-        log_error(logger, "Network: an extension refused its configuration; "
-                  "not starting\n");
+    /* The filters are in place now. */
+    if (net_start_checks(net_cfg, logger) != 0) {
         transport->close(tctx);
         if (my_public != NULL) smrt_deref(my_public);
         return -1;

@@ -74,6 +74,9 @@ from ..scenario_engine import (
 
 
 _NS = UUID('00000000-0000-0000-0000-000000000aaa')
+# The anchored cohort's uuid when a case stages one (RD_14.4 Phase 6), the
+# same in both adapters; a scenario names it as `cohort`.
+_COHORT_UUID = uuid5(_NS, 'group:anchored-cohort')
 
 
 class _CapturingQueue:
@@ -215,13 +218,20 @@ class _Participant:
                         f'{self.id}: committed_tx_count={actual}, '
                         f'expected {expected}'
                     )
-            elif key in ('halves_held', 'certified_halves', 'signed_halves'):
+            elif key in ('halves_held', 'certified_halves', 'signed_halves',
+                         'cohort_halves_held'):
                 # Ordinary halves held (in the chain or waiting in the pool),
                 # how many carry a commit certificate
                 # (doc/architecture/reputation.md, "Commit certificates"), and
                 # how many carry their scorer's own signature (R+D.md §14.2).
+                # cohort_halves_held counts the anchored cohort's chain
+                # instead (RD_14.4 Phase 6); 0 when none is held.
                 held = certified = signed = 0
                 hist = self.process.history
+                if key == 'cohort_halves_held':
+                    ck = self.process._cohort_key()
+                    hist = (self.process._chain_for_group(ck) if ck
+                            else TransactionHistory())
                 for tx in (list(hist._task_mapping.values())
                            + list(hist._pool.values())):
                     if tx.attested:
@@ -233,7 +243,8 @@ class _Participant:
                         certified += tx.certificate_of(scorer) is not None
                         signed += tx.half_sig_of(scorer) is not None
                 actual = {'halves_held': held, 'certified_halves': certified,
-                          'signed_halves': signed}[key]
+                          'signed_halves': signed,
+                          'cohort_halves_held': held}[key]
                 if actual != expected:
                     raise AssertionError(
                         f'{self.id}: {key}={actual}, expected {expected}')
@@ -934,7 +945,12 @@ class ReputationAdapter:
                                   else None),
                 )
                 participant.process.proposals[idx] = score
-                participant.process.round_group[idx] = str(group.uuid)
+                # `group: cohort` binds the round to the anchored cohort, as
+                # _start_paxos does for a half about a member (RD_14.4 Phase
+                # 6). Mirrors the C adapter.
+                participant.process.round_group[idx] = (
+                    str(_COHORT_UUID) if entry.get('group') == 'cohort'
+                    else str(group.uuid))
 
             # tx_history: each entry installs a bilateral Transaction via
             # two history.update calls (matching how handle_committed
@@ -1094,6 +1110,14 @@ class ReputationAdapter:
                 str(identities[o].uuid)
                 for o in (fixtures.get('anchored') or {}).get(pid) or ()
                 if o in identities)
+            # Phase 6 (RD_14.4): `anchored_cohort` {pid: [member, ...]} is the
+            # cohort identity would have published (AnchoredCohort), members
+            # this participant included. Mirrors the C adapter.
+            members = (fixtures.get('anchored_cohort') or {}).get(pid)
+            participant.process.protocol.anchored_cohort = Group(
+                _COHORT_UUID, {str(identities[m].uuid): identities[m].address
+                               for m in members if m in identities},
+                'anchored', Encryptor.generate(), False) if members else None
             for other_pid, seed in ((fixtures.get('seeds') or {}).get(pid)
                                     or {}).items():
                 if other_pid in identities:
@@ -1508,7 +1532,9 @@ class ReputationAdapter:
             if payload.get('placing', True) is True:
                 if len(tup) < 3:
                     tup = tup + (False,)
-                tup = tup + ('',)
+                # `group: cohort` names the anchored cohort (RD_14.4 Phase 6).
+                tup = tup + (str(_COHORT_UUID)
+                             if payload.get('group') == 'cohort' else '',)
             obj = to_json_string(tup)
         elif function == ReputationProtocol.accepted:
             tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)

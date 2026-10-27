@@ -37,6 +37,7 @@
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
 #include "rendezvous/net_relay.h"
+#include "network/net_liveness.h"
 #include "network/net_proc_priv.h"
 #include "rendezvous/net_rendezvous.h"
 #include "rendezvous/reach.h"
@@ -349,6 +350,7 @@ DEFINE_TEST(test_a_relayed_frame_must_claim_the_sender_the_relay_stamped)
 
     messaging_set_test_hook(_hook);
     g_routed = 0;
+    net_liveness_reset(net_liveness_now() - 100.0);
     /* Stamped as Mallory, the envelope says Bob: dropped. */
     handle_inbound_relayed(&ctx, frame, len, mu);
     ck_assert_int_eq(g_routed, 0);
@@ -356,6 +358,9 @@ DEFINE_TEST(test_a_relayed_frame_must_claim_the_sender_the_relay_stamped)
     handle_inbound_relayed(&ctx, frame, len, bu);
     ck_assert_int_eq(g_routed, 1);
     ck_assert_str_eq(g_routed_fn, "access_granted");
+    /* Neither came through the transport, so neither is heard from. */
+    ck_assert(net_liveness_quiet_for(bob->uuid, net_liveness_now()) >= 100.0);
+    ck_assert(net_liveness_quiet_for(mallory->uuid, net_liveness_now()) >= 100.0);
     free(frame);
     /* A verb that is not plaintext, from a sender we do not hold: refused
      * before routing, whoever the relay stamped (ISSUES §2.17). */

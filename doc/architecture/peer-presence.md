@@ -53,7 +53,15 @@ while quiet could not read the cohort when it came back.
 | Variable | Default | Meaning |
 |---|---|---|
 | `AT_PRESENCE_HEARTBEAT_SEC` | 30 | Send a presence frame after this long with nothing sent to some member |
-| `AT_PRESENCE_ABSENT_SEC` | 90 | A peer heard from nothing for longer than this is absent |
+| `AT_PRESENCE_ABSENT_SEC` | 150 | A peer heard from nothing for longer than this is absent |
+
+Why 150, five heartbeats: a healthy idle peer can be silent for up to two
+heartbeat intervals (an announcement to the group restarts its heartbeat clock),
+so a transport that takes over when the usual path goes quiet, such as muudd's
+LoRa fallback, can only decide the path is down after that, about 60 s. Absence
+has to wait long enough for the next heartbeat to arrive over the new path
+after that decision; at 90 s it could not, and every outage marked the peer
+absent first.
 
 A value that is not a positive number keeps the default. The absent threshold
 is held at or above the heartbeat, since a peer cannot be absent before it was
