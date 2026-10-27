@@ -1,0 +1,97 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: cohort-half-commits-to-members-only
+byte_pinning: false
+description: |
+    The anchored cohort (RD_14.4_HOSTILE_JOIN_PLAN.md Phase 6, D8 (b);
+    doc/architecture/hostile-join.md). Under the join policy, a half whose
+    counterparty is a member of the anchored cohort names the cohort, goes
+    only to its members, and commits to the cohort's chain with a quorum of
+    the members.
+
+    alice and ally hold the anchored cohort {alice, ally}; other is in the
+    primary group with both but not in the cohort. alice's round for t-1
+    names ally and is bound to the cohort. She proposes it to ally under
+    the cohort's name, and ally accepts, since alice is a member. One
+    other member out of one is the cohort's majority with alice's own
+    vote, so alice writes her half to the cohort chain (not the primary
+    one) and sends the commit to ally alone. other receives nothing.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: ally
+    role: acceptor
+  - id: other
+    role: member
+
+fixtures:
+  join_policy:
+    version: 1
+    enabled: true
+    anchors: [verified_contact]
+  anchored_cohort:
+    alice: [alice, ally]
+    ally: [alice, ally]
+  proposals:
+    alice:
+      - id1: 1000
+        id2: 1
+        task_id: t-1
+        score: 0.9
+        names: ally
+        group: cohort
+
+steps:
+  - id: 1
+    from: alice
+    to: ally
+    function: transaction
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+      task_id: t-1
+      score: 0.9
+      group: cohort
+    description: alice's half about ally, naming the cohort.
+
+  - id: 2
+    from: ally
+    to: alice
+    function: tx accepted
+    in_response_to: 1
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+      # The C engine rebuilds a propagated message from these keys; Python
+      # re-delivers ally's real one.
+      task_id: t-1
+      score: 0.9
+      signed: true
+    description: ally, a member, accepts and signs.
+
+  - id: 3
+    from: alice
+    to: ally
+    function: tx committed
+    in_response_to: 2
+    no_propagate: true
+    description: The commit goes to the cohort's member.
+
+  - id: 4
+    from: alice
+    to: other
+    function: tx committed
+    in_response_to: 2
+    expect_none: true
+    description: |
+        And not to other, who is in the primary group but not the
+        cohort. A commit sent to the whole group would match here.
+
+expected_state:
+  alice:
+    cohort_halves_held: 1
+    halves_held: 0

@@ -15339,6 +15339,17 @@ void reputation_install_proposal(int64_t id1, int64_t id2, double score,
     pthread_mutex_unlock(&rep_state.lock);
 }
 
+void reputation_install_round_group(int64_t id1, int64_t id2,
+                                    const char *group_uuid)
+{
+    _ensure_init();
+    char key[PAXOS_KEY_LEN];
+    paxos_id_index(key, sizeof(key), id1, id2);
+    pthread_mutex_lock(&rep_state.lock);
+    _set_round_group_locked(key, group_uuid);
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
 int reputation_get_chain_len(void)
 {
     if (!rep_state.initialized) return -1;
@@ -15357,13 +15368,14 @@ int reputation_get_committed_tx_count(void)
     return len;
 }
 
-void reputation_get_commit_cert_counts(int *halves_held, int *certified_halves)
+/* The ordinary halves @p h holds, chain and pool, and how many carry a commit
+ * certificate. Caller holds rep_state.lock. */
+static void _half_counts_locked(const tx_history_t *h, int *halves_held,
+                                int *certified_halves)
 {
     int held = 0, certified = 0;
-    if (rep_state.initialized)
+    if (h != NULL)
     {
-        pthread_mutex_lock(&rep_state.lock);
-        const tx_history_t *h = &rep_state.history;
         for (int i = 0; i < h->chain_len; i++)
         {
             const transaction_t *t = &h->chain[i];
@@ -15402,10 +15414,32 @@ void reputation_get_commit_cert_counts(int *halves_held, int *certified_halves)
                     certified++;
             }
         }
-        pthread_mutex_unlock(&rep_state.lock);
     }
     if (halves_held != NULL) *halves_held = held;
     if (certified_halves != NULL) *certified_halves = certified;
+}
+
+void reputation_get_commit_cert_counts(int *halves_held, int *certified_halves)
+{
+    if (!rep_state.initialized)
+    {
+        _half_counts_locked(NULL, halves_held, certified_halves);
+        return;
+    }
+    pthread_mutex_lock(&rep_state.lock);
+    _half_counts_locked(&rep_state.history, halves_held, certified_halves);
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+int reputation_get_cohort_half_count(void)
+{
+    int held = 0;
+    if (!rep_state.initialized)
+        return 0;
+    pthread_mutex_lock(&rep_state.lock);
+    _half_counts_locked(_cohort_chain_locked(), &held, NULL);
+    pthread_mutex_unlock(&rep_state.lock);
+    return held;
 }
 
 int reputation_get_signed_half_count(void)

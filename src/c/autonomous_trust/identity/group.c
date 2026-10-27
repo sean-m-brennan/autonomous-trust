@@ -41,7 +41,14 @@ int group_init(uuid_t *uuid, char *address, group_t *group)
     group->address[ADDR_LEN] = '\0';   /* strncpy does not terminate when src is >= ADDR_LEN */
     map_init(&group->address_map);
     /* Explicit rather than left to zeroed storage: a group initialized here
-     * has declared nothing, whatever memory it was handed. */
+     * has declared nothing, whatever memory it was handed. It has no known
+     * age, has never rotated, keeps no superseded keys and speaks JSON. The
+     * whole struct cannot be cleared because the smrt_ptr header sits at the
+     * front of it. */
+    group->created = 0.0;
+    group->key_epoch = 0;
+    group->num_previous_keys = 0;
+    group->wire_format = NET_WIRE_JSON;
     unsigned char *eseed = encryptor_generate();
     if (eseed == NULL)
         return -1;

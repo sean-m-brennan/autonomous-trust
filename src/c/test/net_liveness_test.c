@@ -24,6 +24,8 @@
 #include <string.h>
 #include <uuid/uuid.h>
 
+#include "identity/identity.h"
+#include "identity/identity_priv.h"
 #include "network/net_liveness.h"
 #include "network/net_message.h"
 #include "network/net_proc_priv.h"
@@ -175,10 +177,81 @@ DEFINE_TEST(test_only_member_paths_stamp_a_claimed_uuid)
 }
 END_TEST_DEFINITION()
 
+static identity_t *_mk_id(const char *name, const char *addr)
+{
+    uuid_t u;
+    uuid_generate(u);
+    identity_t *id = NULL;
+    ck_assert_ret_ok(identity_create(&u, addr, name, name, &id));
+    return id;
+}
+
+/* A plaintext access_granted from @p sender, as a relay would carry it. */
+static uint8_t *_plain_wire(identity_t *sender, size_t *len)
+{
+    public_identity_t *pub = NULL;
+    ck_assert_ret_ok(identity_publish(sender, &pub));
+    net_wire_msg_t w = {0};
+    snprintf(w.process, sizeof(w.process), "%s", "identity");
+    w.function = strdup("access_granted");
+    w.data = (uint8_t *)strdup("{}");
+    w.data_len = 2;
+    w.to_whom.type = RECIPIENT_BROADCAST;
+    memcpy(&w.from_whom, pub, sizeof(*pub));
+    uint8_t *out = NULL;
+    ck_assert_ret_ok(net_message_to_wire(&w, sender, &out, len));
+    free(w.function);
+    free(w.data);
+    smrt_deref(pub);
+    return out;
+}
+
+/* A relayed frame from a sender we do not hold leaves by one of three ways:
+ * unreadable, an envelope naming someone other than the sender the relay
+ * stamped, or a stranger's plaintext routed as such. None stamps, and each
+ * puts the thread's mark back, so the next transport frame stamps as ever. */
+DEFINE_TEST(test_every_relayed_way_out_restores_the_transport_stamp)
+{
+    messaging_set_test_hook(_hook);
+    process_t *proc = _mk_proc();
+    identity_t *me = _mk_id("me", "10.0.0.1");
+    identity_t *bob = _mk_id("bob", "10.0.0.2"), *mallory = _mk_id("mallory", "10.0.0.3");
+    net_thread_ctx_t ctx = { .proc = proc, .myself = me };
+    char bu[UUID_STR_LEN + 1], mu[UUID_STR_LEN + 1];
+    uuid_unparse_lower(bob->uuid, bu);
+    uuid_unparse_lower(mallory->uuid, mu);
+    size_t len = 0;
+    uint8_t *frame = _plain_wire(bob, &len);
+    uint8_t junk[] = "not a frame";
+    struct { const uint8_t *buf; size_t len; const char *from; } ways[] = {
+        { junk, sizeof(junk) - 1, bu },   /* unreadable */
+        { frame, len, mu },               /* claims bob, stamped as mallory */
+        { frame, len, bu },               /* a stranger's hello */
+    };
+    for (size_t i = 0; i < sizeof(ways) / sizeof(ways[0]); i++) {
+        net_liveness_reset(net_liveness_now() - 100.0);
+        handle_inbound_relayed(&ctx, ways[i].buf, ways[i].len, ways[i].from);
+        ck_assert(net_liveness_quiet_for(bob->uuid, net_liveness_now()) >= 100.0);
+        ck_assert(net_liveness_quiet_for(mallory->uuid, net_liveness_now()) >= 100.0);
+        uuid_t c;
+        uuid_generate(c);
+        _route_from(proc, c);
+        ck_assert(net_liveness_quiet_for(c, net_liveness_now()) < 5.0);
+    }
+    free(frame);
+    identity_free(mallory);
+    identity_free(bob);
+    identity_free(me);
+    messaging_set_test_hook(NULL);
+    smrt_deref(proc);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(NET_LIVENESS,
           test_never_heard_counts_from_start,
           test_heard_resets_quiet_and_older_is_ignored,
           test_quiet_is_never_negative,
           test_full_table_forgets_the_longest_quiet,
           test_transport_frames_stamp_and_extension_frames_do_not,
-          test_only_member_paths_stamp_a_claimed_uuid)
+          test_only_member_paths_stamp_a_claimed_uuid,
+          test_every_relayed_way_out_restores_the_transport_stamp)
