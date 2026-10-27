@@ -438,6 +438,9 @@ int identity_join_policy_check(logger_t *logger);
 /** Install @p policy (NULL: inert). Test hook as well as the loader's. */
 void identity_set_join_policy(const at_join_policy_t *policy);
 
+/** A copy of the join policy identity holds, into @p out. */
+void identity_get_join_policy(at_join_policy_t *out);
+
 /** The out-of-band anchor classes (AT_ANCHOR_* bits) @p ident holds here and
  *  the join policy counts: the extensions' answers (id_ext.h anchor_classes)
  *  intersected with the declared classes; 0 under an inert policy. Mirrors

@@ -63,6 +63,12 @@ Each node needs a root directory for its keys and config. Point
 `AUTONOMOUS_TRUST_ROOT` at a per-node directory before constructing the node;
 the node derives `etc/at` and `var/at` under it.
 
+A node that may join a cohort it does not trust can declare a join policy:
+set `AT_JOIN_POLICY` to a JSON file shaped like
+`config/cfg/join_policy.example.json`. Absent, nothing changes; a file that
+does not validate stops the node at start. See
+[Joining a hostile cohort](architecture/hostile-join.md).
+
 ```python
 import os
 from autonomous_trust.core import Configuration

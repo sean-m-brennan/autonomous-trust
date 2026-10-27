@@ -412,3 +412,131 @@ class TestBootstrapCoverage:
             assert worker._counts_by_cap[cap_name] >= 1, (
                 f'{cap_name} never fired (counts={worker._counts_by_cap})'
             )
+
+
+class TestQueueDrain:
+    """The worker reads its queue (RD_14.4 Phase 5). Before, it read nothing,
+    so under multiproc it knew only the peers on disk at start and a fresh
+    node's window never opened."""
+
+    def test_a_peers_update_reaches_the_worker(self, setup_teardown):
+        from autonomous_trust.core._python.identity.peers import Peers
+        worker, _ = _make_worker(peer_count=0)
+        fresh = Peers()
+        q = queue.Queue()
+        q.put(fresh)
+        worker._tick({worker.name: q, CfgIds.negotiation: queue.Queue()})
+        assert worker.peers is fresh
+        assert q.empty()
+
+    def test_what_does_not_concern_it_is_dropped(self, setup_teardown):
+        worker, _ = _make_worker()
+        before = worker.peers
+        q = queue.Queue()
+        q.put('a group key')
+        q.put(object())
+        worker._tick({worker.name: q, CfgIds.negotiation: queue.Queue()})
+        assert worker.peers is before
+        assert q.empty()
+
+
+class TestJoinBurst:
+    """The join burst (RD_14.4 Phase 5, D5 (b)): under the join policy, k
+    probes per peer reputation reads under the told ceiling, at the burst's
+    own rate and budget."""
+
+    @pytest.fixture
+    def clock(self, monkeypatch):
+        from datetime import datetime, timedelta, timezone
+        from autonomous_trust.core._python import bootstrap_worker as mod
+        state = {'t': datetime(2026, 10, 27, tzinfo=timezone.utc)}
+
+        def advance(sec=10.0):
+            state['t'] += timedelta(seconds=sec)
+        monkeypatch.setattr(mod, 'now', lambda: state['t'])
+        return advance
+
+    @staticmethod
+    def _worker(peer_count=3, **policy):
+        from autonomous_trust.core._python.identity.join_policy import JoinPolicy
+        # The window closes at once (no pairs), and continuous probing is off
+        # (_make_worker's default), so every probe counted is a burst probe.
+        worker, peers = _make_worker(env_overrides={'AT_BOOTSTRAP_PAIRS': '0'},
+                                     peer_count=peer_count)
+        worker.join_policy = JoinPolicy(enabled=policy.pop('enabled', True),
+                                        **policy)
+        return worker, peers
+
+    @staticmethod
+    def _run(worker, ticks, clock, counts=None, step=10.0):
+        from autonomous_trust.core._python.identity.join_policy import ProbeCounts
+        neg = queue.Queue()
+        own = queue.Queue()
+        if counts is not None:
+            own.put(ProbeCounts(counts))
+        for _ in range(ticks):
+            worker._tick({worker.name: own, CfgIds.negotiation: neg})
+            clock(step)
+        return [m.to_whom for m in TestContinuousProbing._drain(neg)]
+
+    def test_the_policy_off_runs_no_burst(self, setup_teardown, clock):
+        worker, peers = self._worker(enabled=False)
+        sent = self._run(worker, 6, clock, {p.uuid: 0 for p in peers})
+        assert sent == [] and worker._burst_state == 'idle'
+
+    def test_k_probes_each_spread_over_the_targets(self, setup_teardown, clock):
+        worker, peers = self._worker(burst_k=2)
+        a, b, c = peers
+        sent = self._run(worker, 4, clock, {a.uuid: 0, b.uuid: 0})
+        # Fewest burst probes first, lowest uuid on a tie: a and b alternate,
+        # and c, which reputation did not list, is never probed.
+        assert sorted(p.uuid for p in sent) == sorted([a.uuid, b.uuid] * 2)
+        assert c not in sent
+        assert worker._burst_budget == 4 * 2 * 2
+        assert worker._probes_by_peer == {a.uuid: 2, b.uuid: 2}   # UCB tallies
+
+    def test_the_burst_ends_when_every_target_has_k(self, setup_teardown, clock):
+        worker, peers = self._worker(burst_k=2)
+        a, b, _ = peers
+        self._run(worker, 2, clock, {a.uuid: 0, b.uuid: 0})
+        # a reached k; b graduated and left the list.
+        sent = self._run(worker, 4, clock, {a.uuid: 2})
+        assert sent == [] and worker._burst_state == 'done'
+        assert worker._burst_spent == 2
+
+    def test_the_budget_bounds_a_burst_whose_verdicts_never_come(
+            self, setup_teardown, clock):
+        worker, peers = self._worker(burst_k=1, burst_budget_factor=2)
+        sent = self._run(worker, 20, clock, {p.uuid: 0 for p in peers})
+        assert len(sent) == 2 * 1 * 3
+        assert worker._burst_state == 'done'
+
+    def test_the_interval_spaces_burst_probes(self, setup_teardown, clock):
+        worker, peers = self._worker(burst_interval_sec=5.0)
+        sent = self._run(worker, 10, clock, {p.uuid: 0 for p in peers},
+                         step=1.0)
+        assert len(sent) == 2                     # t = 0 and t = 5
+
+    def test_a_peer_listed_later_joins_and_grows_the_budget(
+            self, setup_teardown, clock):
+        worker, peers = self._worker(burst_k=1, burst_budget_factor=1)
+        a, b, _ = peers
+        self._run(worker, 1, clock, {a.uuid: 0})
+        assert worker._burst_budget == 1
+        sent = self._run(worker, 3, clock, {a.uuid: 1, b.uuid: 0})
+        assert worker._burst_budget == 2
+        assert sent == [b]
+
+    def test_the_burst_is_not_reentered(self, setup_teardown, clock):
+        worker, peers = self._worker(burst_k=1)
+        a, b, _ = peers
+        self._run(worker, 2, clock, {a.uuid: 0})
+        self._run(worker, 2, clock, {a.uuid: 1})
+        assert worker._burst_state == 'done'
+        assert self._run(worker, 3, clock, {b.uuid: 0}) == []
+
+    def test_a_target_not_yet_held_waits(self, setup_teardown, clock):
+        worker, _ = self._worker()
+        sent = self._run(worker, 3, clock, {'not-a-peer-yet': 0})
+        assert sent == [] and worker._burst_state == 'active'
+        assert worker._burst_spent == 0

@@ -42,6 +42,10 @@ class RedTeamHarness:
         self.baseline_path = baseline_path
         self.scenarios = scenarios
         self._baseline: Optional[dict] = None
+        # Seams for the standalone path: how a command runs, and how the
+        # harness waits out a run (tests substitute both).
+        self._exec = subprocess.run
+        self._sleep = time.sleep
 
     def _load_baseline(self) -> dict:
         if self._baseline is None:
@@ -82,9 +86,16 @@ class RedTeamHarness:
             else:
                 for scenario in self.scenarios:
                     scenario.setup(sim_config, compose_config)
-                attack_metrics = self._run_simulation(
-                    quick=quick, timeout_s=timeout_s,
-                    sim_config=sim_config)
+                if compose_config.get('standalone'):
+                    # The scenario built the whole deployment itself
+                    # (colluding_cohort): run it as it stands.
+                    attack_metrics = self._run_standalone(
+                        compose_config, sim_config,
+                        duration_s=max(60, timeout_s - 60))
+                else:
+                    attack_metrics = self._run_simulation(
+                        quick=quick, timeout_s=timeout_s,
+                        sim_config=sim_config)
             report = self.build_report(attack_metrics=attack_metrics)
 
         except Exception:
@@ -108,6 +119,32 @@ class RedTeamHarness:
             f.write(md_content)
 
         return report
+
+    def _run_standalone(self, compose_config: dict, sim_config: dict,
+                        duration_s: int, project: str = 'at-redteam') -> dict:
+        """Bring a scenario's own compose up, let it run ``duration_s``, read
+        the logs of the containers ``sim_config['collect_logs']`` names, and
+        bring it down. Returns ``{'logs': {name: text}}`` for the scenario's
+        ``collect``. Needs docker on the host."""
+        import tempfile
+        doc = {k: v for k, v in compose_config.items() if k != 'standalone'}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'docker-compose.json')
+            with open(path, 'w') as f:
+                json.dump(doc, f, indent=2)
+            base = ['docker', 'compose', '-p', project, '-f', path]
+            self._exec(base + ['up', '-d'], check=True)
+            logs = {}
+            try:
+                self._sleep(duration_s)
+                for name in sim_config.get('collect_logs') or []:
+                    out = self._exec(['docker', 'logs', name], check=False,
+                                     capture_output=True, text=True)
+                    logs[name] = (getattr(out, 'stdout', '') or '') + \
+                        (getattr(out, 'stderr', '') or '')
+            finally:
+                self._exec(base + ['down', '-v'], check=False)
+        return {'logs': logs}
 
     def _run_simulation(self, quick: bool, timeout_s: int,
                         sim_config: dict, caldera: bool = False,

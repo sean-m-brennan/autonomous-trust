@@ -1,0 +1,72 @@
+schema_version: "1"
+kind: scenario
+protocol: bootstrap
+name: join-burst-respects-budget
+byte_pinning: false
+description: |
+    The join burst stops when its budget is spent, even though no verdict
+    ever comes back (RD_14.4_HOSTILE_JOIN_PLAN.md Phase 5, D5 (b)).
+
+    Why this matters: a lost probe is retried while the budget lasts, so a
+    burst whose verdicts never arrive (a cohort that drops every probe half,
+    or a reputation process that never reports) would otherwise probe
+    without end at the burst's rate, far above the continuous interval. The
+    budget, budget_factor x N x k probes over the N targets at entry, is
+    what bounds it, and after it the worker hands back to continuous
+    probing.
+
+    Shape: one host, three peers, all listed by reputation with no verdicts
+    before tick 1 and never again. k is 1 and the factor 2, so the budget is
+    2 x 3 x 1 = 6. Twenty ticks at interval 0: six probes, then the burst
+    ends with every target still short. Continuous probing is off and the
+    window holds one pair, so every probe counted is a burst probe.
+
+    Observables:
+      - `burst_probes_issued: 6` — exactly the budget, though fourteen ticks
+        were left.
+      - `burst_peers_probed: 3` — the retries spread (fewest burst probes
+        first) rather than piling onto one peer.
+      - `burst_done: true`.
+
+    With the policy off the worker runs no burst (0 / 0 / false).
+
+participants:
+  - id: self
+    role: new_node
+  - id: peer_a
+    role: border_guard
+  - id: peer_b
+    role: border_guard
+  - id: peer_c
+    role: border_guard
+
+fixtures:
+  bootstrap:
+    seed: 12345
+    ticks: 20
+    pairs_target: 1
+    duration_sec: 999
+    continuous: false
+    join_burst:
+      enabled: true
+      k: 1
+      interval_sec: 0
+      budget_factor: 2
+    probe_counts:
+      - tick: 1
+        counts: {peer_a: 0, peer_b: 0, peer_c: 0}
+
+steps:
+  - id: 1
+    from: self
+    to: self
+    function: run_bootstrap_window
+    description: |
+        Trigger. Reputation's counts reach the worker's queue before tick 1;
+        no later count arrives.
+
+expected_state:
+  self:
+    burst_probes_issued: 6
+    burst_peers_probed: 3
+    burst_done: true

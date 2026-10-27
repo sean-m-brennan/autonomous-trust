@@ -36,7 +36,8 @@ from ..extensions import (identity_hooks, load_extensions, reputation_hooks,
 from ..config import (Configuration, atomic_write, from_json_string,
                       to_json_string)
 from ..identity.protocol import IdentityProtocol
-from ..identity.join_policy import INERT as JOIN_POLICY_INERT, load_join_policy_env
+from ..identity.join_policy import (INERT as JOIN_POLICY_INERT, ProbeCounts,
+                                    load_join_policy_env)
 from ..identity.identity import (public_identity_to_canonical,
                                  public_identity_from_canonical)
 from ..identity.peer_standing import STANDING_PROVED, STANDING_FAILED
@@ -164,6 +165,40 @@ def _brought_of(proc) -> dict:
     return brought if brought is not None else {}
 
 
+def _evidence_by_peer(proc, peer_uuid, split=False):
+    """The entries about ``peer_uuid`` the scorers read: ``proc``'s primary
+    chain's, then its anchored cohort chain's (RD_14.4 Phase 6). Raises
+    KeyError, as ``by_peer`` does, when neither holds any. ``split`` returns
+    the two lists apart (the primary chain's indices mean something the cohort
+    chain's do not). A process holding no cohort reads its primary chain
+    alone."""
+    primary, missing = [], False
+    try:
+        primary = list(proc.history.by_peer(peer_uuid))
+    except KeyError:
+        missing = True
+    cohort = []
+    grp = (getattr(getattr(proc, 'protocol', None), 'anchored_cohort', None)
+           if _policy_on(proc) else None)
+    chain = (getattr(proc, 'child_histories', {}).get(str(grp.uuid))
+             if grp is not None else None)
+    if chain is not None:
+        try:
+            cohort = list(chain.by_peer(peer_uuid))
+        except KeyError:
+            cohort = []
+    if missing and not cohort:
+        raise KeyError(peer_uuid)
+    return (primary, cohort) if split else primary + cohort
+
+
+def _probe_of_ours(tx, me) -> bool:
+    """Whether ``tx``'s half by ``me`` is one of AT's probes (the ``probe``
+    channel): a verdict this node reached by asking a known-answer question."""
+    mine = tx.p1_channel if tx.p1_id == me else tx.p2_channel
+    return (mine or TX_CHANNEL_DEFAULT) == TX_CHANNEL_PROBE
+
+
 def contrite_tft_of(peer_scores, my_scores):
     """Contrite tit-for-tat over non-empty, aligned lists: the scores this
     node gave the peer and the scores the peer gave this node, oldest first.
@@ -262,6 +297,15 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
     # Seconds between rescore sweeps (_rescore_sweep). Mirrors C
     # REP_RESCORE_INTERVAL. Override: AT_REP_RESCORE_SEC.
     RESCORE_INTERVAL = _env_float('AT_REP_RESCORE_SEC', 60.0)
+    # Seconds between passes of the join burst's count publisher
+    # (_publish_probe_counts, RD_14.4 Phase 5). Short against the burst's
+    # 5 s default, unlike the rescore sweep: a count that lags is a probe
+    # the burst spends on a peer already done. Mirrors C
+    # REP_PROBE_COUNTS_INTERVAL.
+    PROBE_COUNTS_INTERVAL = 1.0
+    #: The queue the counts go to: the bootstrap worker's (BootstrapWorker's
+    #: proc_name; named here, as imports run the other way).
+    BOOTSTRAP_WORKER_QUEUE = 'bootstrap_worker'
     # Tenure (doc/architecture/reputation.md, "Tenure"): the highest tier a
     # member this node has held for less than AT_REP_MIN_TENURE_SEC may hold.
     # Below the replication tier (3). Mirrors C REP_TENURE_TIER.
@@ -604,6 +648,13 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         # The anchored set last acted on (Protocol.anchored), so a change
         # rescores the peers it moved.
         self._anchored_seen = frozenset()
+        # The join burst's counts (Phase 5): the peers whose count may have
+        # moved since the last pass, the roster that pass saw, the map last
+        # sent to the bootstrap worker, and when the last pass ran.
+        self._counts_due = set()
+        self._counts_roster = frozenset()
+        self._counts_published = None
+        self._last_counts_pass = None
         # Idle-decay bookkeeping. _last_interaction maps peer-uuid-str ->
         # epoch seconds of our most recent committed transaction with that
         # peer; the staleness sweep relaxes idle peers toward almost-
@@ -931,7 +982,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             return ''
         if self.group is not None and key == str(self.group.uuid):
             return ''
-        if key in self.child_groups:
+        if key in self.child_groups or key == self._cohort_key():
             return key
         return ''
 
@@ -961,7 +1012,58 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         key = str(group_uuid)
         if self.group is not None and key == str(self.group.uuid):
             return self.group
+        if key == self._cohort_key():
+            return self._anchored_cohort()
         return self.child_groups.get(key)
+
+    # --- The anchored cohort (RD_14.4 Phase 6, D8 (b)) ----------------------
+    # A second group a node holds beside its cohort, formed by identity with
+    # the cohort's members it counts as anchors (identity/anchored_cohort.py).
+    # A half whose counterparty is a member names it, goes only to its
+    # members (pairwise), and commits to its own chain with its own quorum;
+    # the scorers read that chain beside the primary one. Inert with the
+    # policy off: no cohort is ever held.
+
+    def _anchored_cohort(self):
+        """The anchored cohort this node holds (Protocol.anchored_cohort), or
+        None. Only under the join policy."""
+        if not _policy_on(self):
+            return None
+        return getattr(self.protocol, 'anchored_cohort', None)
+
+    def _cohort_key(self) -> str:
+        """The anchored cohort's uuid string, '' when none is held."""
+        grp = self._anchored_cohort()
+        return str(grp.uuid) if grp is not None else ''
+
+    def _cohort_members(self):
+        """The held peers that are the anchored cohort's other members."""
+        grp = self._anchored_cohort()
+        if grp is None:
+            return []
+        members = getattr(grp, '_address_map', {}) or {}
+        keys = {str(k).lower() for k in members}
+        me = str(self.identity.uuid).lower()
+        return [p for p in list(getattr(self.peers, 'all', None) or [])
+                if str(p.uuid).lower() in keys and str(p.uuid).lower() != me]
+
+    def _cohort_group_for(self, peer_uuid):
+        """The anchored cohort's uuid when ``peer_uuid`` is a member of it,
+        else None (the primary group)."""
+        grp = self._anchored_cohort()
+        if grp is None or peer_uuid is None:
+            return None
+        members = getattr(grp, '_address_map', {}) or {}
+        if str(peer_uuid).lower() in {str(k).lower() for k in members}:
+            return str(grp.uuid)
+        return None
+
+    def _send_target(self, group_uuid):
+        """Whom a half or a commit for ``group_uuid``'s chain goes to: the
+        anchored cohort's members, pairwise, or the group itself."""
+        if group_uuid is not None and str(group_uuid) == self._cohort_key():
+            return self._cohort_members()
+        return self._group_by_uuid(group_uuid) or self.group
 
     def _members_of_group(self, group):
         """Peers (from self.peers.all) whose address is in this group's
@@ -1024,7 +1126,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         key = str(group_uuid)
         if self.group is not None and key == str(self.group.uuid):
             return self.history
-        if key in self.child_groups:
+        if key in self.child_groups or key == self._cohort_key():
             if key not in self.child_histories:
                 self.child_histories[key] = TransactionHistory()
             return self.child_histories[key]
@@ -1058,7 +1160,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         the half (handle_transaction)."""
         obj = (tuple(pax_id), score, True, str(group_uuid or ''))
         msg = Message(self.name, ReputationProtocol.transaction,
-                      to_json_string(obj), self.group, from_whom=self.identity)
+                      to_json_string(obj), self._send_target(group_uuid),
+                      from_whom=self.identity)
         queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
         self.logger.debug('Submit transaction score')
 
@@ -1205,6 +1308,11 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         id2 = len(self.history) + 1
         idx = self._paxos_id_index(id1, id2)
         pax_id = (id1, id2, self.identity.uuid)
+        if group_uuid is None:
+            # A half about an anchored cohort member goes to the cohort
+            # (RD_14.4 Phase 6).
+            group_uuid = self._cohort_group_for(
+                getattr(score, 'subject_uuid', None))
         if group_uuid is None and self.group is not None:
             group_uuid = str(self.group.uuid)
         # The half needs no round of its own: its place in the chain is
@@ -1274,6 +1382,12 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             if not message.verified:
                 self.logger.warning('Rejecting unverified Paxos proposal from %s', message.from_whom)
                 return True  # drop unverified proposal
+            refused = self._refuse_placing_group(placing_group, message.from_whom)
+            if refused:
+                self.logger.warning('Refusing a proposal from %s: %s',
+                                    getattr(message.from_whom, 'nickname', '?'),
+                                    refused)
+                return True
             if idx not in self.proposals:
                 self.proposals[idx] = score
                 self.logger.debug("Tx to proposals ")
@@ -1351,6 +1465,23 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                              self.MAX_PROBE_HALVES)
             return False
         return True
+
+    def _refuse_placing_group(self, placing_group, sender):
+        """Why a half naming ``placing_group`` from ``sender`` is refused, or
+        None (RD_14.4 Phase 6). A half naming the anchored cohort must come
+        from a member; under the policy a half naming a group this node does
+        not hold is refused, so one meant for a cohort it left cannot land on
+        its primary chain, where the cohort reads it."""
+        if not _policy_on(self) or not placing_group:
+            return None
+        key = str(placing_group)
+        if key == self._cohort_key():
+            if self._cohort_group_for(getattr(sender, 'uuid', None)) is None:
+                return 'it names the anchored cohort and is not a member'
+            return None
+        if self._group_by_uuid(key) is None:
+            return 'it names a group this node does not hold'
+        return None
 
     def forward_transaction(self, queues, message):
         if isinstance(message, TransactionScore):
@@ -1536,7 +1667,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                     commit_msg = Message(
                         self.name, ReputationProtocol.committed,
                         to_json_string(commit_obj),
-                        self._group_by_uuid(round_group_uuid) or self.group,
+                        self._send_target(round_group_uuid),
                         from_whom=self.identity)
                     queues[CfgIds.network].put(
                         commit_msg, block=True, timeout=self.q_cadence)
@@ -2137,6 +2268,9 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 target[:8], slasher[:8], epoch,
                 self._slash_hw.get(hw_key, 0))
             return
+        # Slashed or lifted, the peer's place among the join burst's targets
+        # may change (Phase 5).
+        getattr(self, '_counts_due', set()).add(target)
         if attestation.reason == SlashAttestation.REASON_REHABILITATE:
             self._slashed.pop(target, None)
             # Drop the sticky floor AND the running-EMA latch so the score
@@ -2879,7 +3013,10 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
 
     def _checkpoint_roster(self, group_uuid=None) -> int:
         """The roster a checkpoint's quorum is sized from, this node NOT
-        included: the peers, or a gateway's members of that child group."""
+        included: the peers, or a gateway's members of that child group, or
+        the anchored cohort's other members."""
+        if group_uuid is not None and str(group_uuid) == self._cohort_key():
+            return len(self._cohort_members())
         if not self.child_groups:
             return len(self._roster_peers())
         grp = self._group_by_uuid(group_uuid)
@@ -4595,7 +4732,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         # is also a string in this codebase).
         peer_uuid = peer if isinstance(peer, (UUID, str)) else peer.uuid
         try:
-            txs = list(self.history.by_peer(peer_uuid))
+            txs = _evidence_by_peer(self, peer_uuid)
         except KeyError:
             return self.PREREP_NEUTRAL
         # A true weighted average: the divisor carries the reputation too.
@@ -4636,7 +4773,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         peer_scores = []
         my_scores = []
         try:
-            for tx in self.history.by_peer(peer_uuid):
+            for tx in _evidence_by_peer(self, peer_uuid):
                 rated = bilateral_scores(tx, peer_uuid, self.identity.uuid)
                 if rated is not None:
                     peer_scores.append(rated[0])
@@ -4672,9 +4809,13 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         if os.environ.get('AT_PREREP_HEURISTIC') == '0':
             return neutral
         try:
-            txs = list(self.history.by_peer(peer_uuid))
+            txs, cohort_txs = _evidence_by_peer(self, peer_uuid, split=True)
         except (KeyError, AttributeError):
             return neutral
+        # The catch-up marks are primary-chain indices; the anchored cohort
+        # chain's entries are never told (Phase 6), so they go last, unmarked.
+        n_primary = len(txs)
+        txs = txs + cohort_txs
         self_uuid = getattr(self.identity, 'uuid', None)
         # Under the join policy, entries catch-up told us about are not
         # evidence for the prior (RD_14.4 D4 (b)): an unprobed member of the
@@ -4686,10 +4827,10 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         count = 0
         seen = set()  # by_peer can list a tx twice (mapped under p1 and p2);
         #               one transaction is one observation for the prior.
-        for tx in txs:
+        for i, tx in enumerate(txs):
             if tx.task_id in seen:
                 continue
-            if tx.index in told:
+            if i < n_primary and tx.index in told:
                 continue
             about = tx.about(peer_uuid)
             if about is None:
@@ -4724,8 +4865,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
     # stored score (reputations.current), unchanged: every entry on the chain,
     # whoever wrote it. BROUGHT (reputations.brought) is scored by the same
     # regimes over this node's OWN evidence alone: its halves of bilateral
-    # transactions, physics and calibration findings among them, probes
-    # excluded until Phase 5. A peer with no own evidence has no brought score
+    # transactions, physics and calibration findings among them, and probes
+    # (Phase 5). A peer with no own evidence has no brought score
     # (a seed or a slash aside); it does not fall back to the prior. Each
     # reader names the one it reads (the plan's reader table): decisions read
     # BOUNDED (_bounded), exclusion reads brought + slash (_exclusion_score),
@@ -4734,14 +4875,16 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
 
     def _own_evidence(self, peer_uuid):
         """``[(ours of the peer, the peer's of us, tx)]``, oldest first: the
-        bilateral transactions with ``peer_uuid`` whose half of ours is not a
-        probe. Mirrors C _own_evidence_locked."""
+        bilateral transactions with ``peer_uuid``. A probe of ours counts
+        under the join policy (Phase 5: the user's call, 2026-10-27, a
+        verdict is full own evidence) and not otherwise. Mirrors C
+        _own_evidence_locked."""
         me = self.identity.uuid
         # The chain is keyed by whichever form its entries carry (a uuid
         # string in production); accept either.
         for key in (peer_uuid, str(peer_uuid), _as_uuid(peer_uuid)):
             try:
-                txs = list(self.history.by_peer(key))
+                txs = _evidence_by_peer(self, key)
             except (KeyError, AttributeError, TypeError):
                 continue
             peer_uuid = key
@@ -4750,14 +4893,14 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             return []
         own = []
         seen = set()
+        probes_count = _policy_on(self)
         for tx in txs:
             if tx.task_id in seen or getattr(tx, 'attested', False):
                 continue
             rated = bilateral_scores(tx, peer_uuid, me)
             if rated is None:
                 continue
-            mine = tx.p1_channel if tx.p1_id == me else tx.p2_channel
-            if (mine or TX_CHANNEL_DEFAULT) == TX_CHANNEL_PROBE:
+            if not probes_count and _probe_of_ours(tx, me):
                 continue
             seen.add(tx.task_id)
             own.append((rated[0], rated[1], tx))
@@ -4766,6 +4909,66 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
     def _own_count(self, peer_uuid) -> int:
         """How many own entries this node holds about ``peer_uuid``."""
         return len(self._own_evidence(peer_uuid))
+
+    # --- The join burst's counts (RD_14.4 Phase 5, D5 (b)) -----------------
+    # Reputation tells the bootstrap worker which peers it reads under the
+    # told ceiling and how many probe verdicts it holds about each, so the
+    # burst probes exactly the peers the ceiling holds and stops when they
+    # graduate: one source of truth with the ceiling (the user's call,
+    # 2026-10-27).
+
+    def _burst_count(self, peer_uuid):
+        """The probe verdicts this node holds about ``peer_uuid`` while it is
+        a burst target (read under the told ceiling: not anchored, not
+        slashed, short of own_evidence_min own entries), else None."""
+        key = str(peer_uuid)
+        if self._is_anchored(key) or key in getattr(self, '_slashed', {}):
+            return None
+        own = self._own_evidence(key)
+        if len(own) >= self.join_policy.own_evidence_min:
+            return None
+        me = self.identity.uuid
+        return sum(1 for _ours, _theirs, tx in own if _probe_of_ours(tx, me))
+
+    def _publish_probe_counts(self, queues, present):
+        """Send the bootstrap worker the burst targets and their probe-verdict
+        counts (ProbeCounts) when that has changed. Recounts only the peers
+        whose chain moved, whose anchoring changed, or who joined or left the
+        roster since the last pass; throttled to PROBE_COUNTS_INTERVAL. A
+        send the queue refuses is retried on the next pass. Nothing is sent
+        while the policy is off. Mirrors C _publish_probe_counts."""
+        if not _policy_on(self):
+            return
+        if (self._last_counts_pass is not None
+                and present - self._last_counts_pass < self.PROBE_COUNTS_INTERVAL):
+            return
+        self._last_counts_pass = present
+        me = str(self.identity.uuid)
+        roster = frozenset(str(getattr(p, 'uuid', p))
+                           for p in list(getattr(self.peers, 'all', None) or [])
+                           ) - {me}
+        due = self._counts_due | (roster ^ self._counts_roster)
+        self._counts_due = set()
+        self._counts_roster = roster
+        counts = dict(self._counts_published or {})
+        for key in due:
+            counts.pop(key, None)
+            if key in roster:
+                n = self._burst_count(key)
+                if n is not None:
+                    counts[key] = n
+        if counts == self._counts_published:
+            return
+        q = queues.get(self.BOOTSTRAP_WORKER_QUEUE)
+        if q is None:
+            self._counts_published = counts
+            return
+        try:
+            q.put(ProbeCounts(counts), block=True, timeout=self.q_cadence)
+        except Full:
+            self._counts_due |= due
+            return
+        self._counts_published = counts
 
     def _brought_pure(self, own):
         """Cooperation mode over own entries: the task-weighted mean of this
@@ -4865,6 +5068,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         if anchored == self._anchored_seen:
             return
         self._rescore_due.update(anchored ^ self._anchored_seen)
+        self._counts_due.update(anchored ^ self._anchored_seen)
         self._anchored_seen = anchored
 
     @classmethod
@@ -4955,6 +5159,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             return
         self._last_interaction[key] = now().timestamp()
         self._rescore_due.add(key)
+        self._counts_due.add(key)
 
     def _rescore_sweep(self, present):
         """Rescore every peer whose chain advanced since it was last scored,
@@ -6938,6 +7143,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 # Score whoever the chain moved for (see _rescore_sweep), so
                 # the drain below publishes them this same iteration.
                 self._rescore_sweep(now().timestamp())
+                # The join burst's targets and their counts (Phase 5).
+                self._publish_probe_counts(queues, now().timestamp())
                 # Drain tier updates queued by _compute_reputation.
                 while self.pending_tiers:
                     peer_uuid, rep_score = self.pending_tiers.pop(0)

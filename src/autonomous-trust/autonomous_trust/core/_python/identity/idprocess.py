@@ -17,6 +17,7 @@
 import base64
 import hmac
 import os
+import pickle
 import sys
 import time
 import uuid
@@ -38,6 +39,7 @@ from .peer_standing import (PeerStanding, STANDINGS, STANDING_SOURCE_ZTA,
                             standing_source_or_default, standing_source_valid)
 from .history.history import IdentityHistory
 from .join_policy import AnchoredSet, load_join_policy_env
+from .anchored_cohort import AnchoredCohortMixin
 
 #: Members learned only from a history adopted under the join policy
 #: (RD_14.4, D1 (d)): ``<cfg>/provisional_members.cfg.json``, a list of uuids.
@@ -143,7 +145,7 @@ def aggregate_subtree_roster(top_gateway_uuid, fetch, max_nodes=SUBTREE_ROSTER_M
     return members, complete, private_boundaries
 
 
-class IdentityProcess(Process, metaclass=ProcMeta,
+class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
                       proc_name=CfgIds.identity, description='Identity registration'):
     """
     Handle Identity and Peer tracking
@@ -219,6 +221,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # names one. The node checked it at start (check_join_policy), so a
         # bad one does not get this far in a running node.
         self.join_policy = load_join_policy_env()
+        # The anchored cohort (RD_14.4 Phase 6): a second group formed with
+        # the cohort's members this node counts as anchors.
+        self._cohort_init()
         # 3-tuple: (group, history-steps, peer-identities). The peer
         # list rides along to seed self.peers with welcomer-known peers
         # whose admission confirm broadcasts predated our join. Older
@@ -385,6 +390,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.partition_signal, self.handle_partition_signal)
         self.protocol.register_handler(IdentityProtocol.partition_probe, self.handle_partition_probe)
         self.protocol.register_handler(IdentityProtocol.partition_response, self.handle_partition_response)
+        self.protocol.register_handler(IdentityProtocol.cohort_invite,
+                                       self.handle_anchored_cohort_invite)
+        self.protocol.register_handler(IdentityProtocol.cohort_reply,
+                                       self.handle_anchored_cohort_reply)
         # Optional features (..extensions): first contact, opt-in via
         # AT_FIRST_CONTACT, is the first of them. Each checks its own gate, so
         # a normal node registers none of their handlers. Mirrors C
@@ -467,7 +476,22 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                             json.dump((obj[0], obj[1].to_dict()), cfg, cls=ConfigJSONEncoder, indent=2)
                         else:
                             json.dump((obj[0], obj[1]), cfg, cls=ConfigJSONEncoder, indent=2)
-                    self.update(obj[0], queues)
+                    published = obj[0]
+                    if isinstance(published, Group):
+                        # Publish a snapshot, never self.group itself. With
+                        # multiproc=False the queues carry references, so the
+                        # other processes would hold the very object this one
+                        # keeps mutating. Admission queues full_history to the
+                        # joiner and only then add_address()es it, so the
+                        # network thread, encoding that queued frame, saw the
+                        # joiner as a member and sent it the group's proto
+                        # format before it held any group: it refused the frame
+                        # and minted its own. Pickling is exactly what
+                        # multiproc mode already does to every queued object,
+                        # so both modes now see the same thing: the group as of
+                        # this publish, changed only by the next one.
+                        published = pickle.loads(pickle.dumps(published))
+                    self.update(published, queues)
                     # The history (obj[1]) is intentionally NOT broadcast.
                     # protocol.run_message_handlers has no isinstance branch
                     # for IdentityHistory / IdentityByAuthority, so every
@@ -1380,6 +1404,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self._remember_activity(queues, CfgIds.peers, self.peers)
         self._remember_activity(queues, CfgIds.capabilities, self.peer_capabilities)
         self._publish_anchors(queues)
+        self._maybe_form_anchored_cohort(queues)
         # Reliable re-put of self.peers to the main proc. _remember_activity's
         # update() fan-put uses the q_cadence (10 ms) timeout, which silently
         # DROPS under main-proc queue contention — e.g. the dod_mission
@@ -4375,6 +4400,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # cohort(s) from group_child_*.cfg.json before grouping. No-op
         # on leaf nodes. See doc/architecture/gateway-reputation-tree.md.
         self._load_child_groups(queues)
+        # The anchored cohort held before a restart (RD_14.4 Phase 6).
+        if getattr(self.join_policy, 'enabled', False):
+            self._cohort_load(queues)
         # Features restore what they persisted (IdentityHooks.on_start).
         for hook in identity_hooks(self):
             if hook.on_start is not None:
@@ -4425,6 +4453,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     # Anchors change with no peer change too (a contact
                     # verified, a credential revoked).
                     self._publish_anchors(queues)
+                    self._maybe_form_anchored_cohort(queues)
 
                 # Features that pace work of their own off this loop (ZTA's
                 # background re-verification, on its policy's interval).

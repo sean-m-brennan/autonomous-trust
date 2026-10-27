@@ -19,7 +19,13 @@
 #
 # Source this file from other scripts to get registry helper functions.
 # The registry stores images on disk at REGISTRY_DISK so they survive
-# Docker restarts and system reboots.
+# Docker restarts and system reboots. REGISTRY_DISK comes from the environment
+# (default ~/Software/.docker.dir), and every registry this repository starts
+# reads it (config/config.py, src/docker-registry.yaml,
+# config/docker-registry-compose.yaml), so one export moves them all, e.g.
+#   export REGISTRY_DISK=/home/me/.docker/registry
+# A running registry on another directory is recreated on the new one at the
+# next start; the images already pushed stay where they were.
 #
 # Usage (standalone):
 #   ./local-registry.sh start       # start the registry
@@ -61,14 +67,28 @@ registry_running() {
     docker inspect -f '{{.State.Running}}' "$REGISTRY_CONTAINER" 2>/dev/null | grep -q true
 }
 
-start_registry() {
-    if registry_running; then
-        _reg_info "Registry already running at $REGISTRY_HOST"
-        return 0
-    fi
+# The host directory the registry container stores into, or nothing.
+registry_storage() {
+    docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/registry"}}{{.Source}}{{end}}{{end}}' \
+        "$REGISTRY_CONTAINER" 2>/dev/null
+}
 
+start_registry() {
     # Ensure storage directory exists
     mkdir -p "$REGISTRY_DISK"
+    local want
+    want=$(cd "$REGISTRY_DISK" && pwd -P)
+
+    if registry_running; then
+        local have
+        have=$(registry_storage)
+        if [[ "$have" == "$want" ]]; then
+            _reg_info "Registry already running at $REGISTRY_HOST"
+            return 0
+        fi
+        _reg_warn "Registry is running on ${have:-a Docker volume}, not $want: recreating it" \
+                  "(images pushed to the old directory stay there)"
+    fi
 
     # Remove stopped container if it exists
     docker rm -f "$REGISTRY_CONTAINER" 2>/dev/null || true
@@ -78,7 +98,7 @@ start_registry() {
         --name "$REGISTRY_CONTAINER" \
         --restart unless-stopped \
         -p "${REGISTRY_PORT}:5000" \
-        -v "${REGISTRY_DISK}:/var/lib/registry" \
+        -v "${want}:/var/lib/registry" \
         "$REGISTRY_IMAGE"
 
     # Wait for registry to be ready
@@ -231,7 +251,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         stop)   stop_registry ;;
         status)
             if registry_running; then
-                _reg_info "Registry is running at $REGISTRY_HOST (storage: $REGISTRY_DISK)"
+                _reg_info "Registry is running at $REGISTRY_HOST (storage: $(registry_storage))"
             else
                 _reg_info "Registry is not running"
             fi
