@@ -50,6 +50,7 @@ import re
 import time
 
 from autonomous_trust.core._python.reputation.repprocess import ReputationProcess
+from autonomous_trust.core._python.reputation.reputation import score_to_milli
 from autonomous_trust.core._python.processes import ProcMeta
 from autonomous_trust.evaluation.redteam import AttackScenario
 
@@ -76,7 +77,8 @@ class ColludingReputationProcess(ReputationProcess, metaclass=ProcMeta,
         subject = getattr(score, 'subject_uuid', None)
         peer = self.peers.find_by_uuid(subject) if subject is not None else None
         nick = getattr(peer, 'nickname', '') or ''
-        score.score = INFLATE if nick.startswith(COLLUDER_PREFIX) else SLANDER
+        score.score_milli = score_to_milli(
+            INFLATE if nick.startswith(COLLUDER_PREFIX) else SLANDER)
         return super()._start_paxos(queues, score, group_uuid)
 
 

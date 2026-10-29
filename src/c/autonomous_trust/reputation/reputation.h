@@ -21,6 +21,7 @@
  *  @{
  */
 
+#include <math.h>                    /* lround */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>                  /* getenv, for SLASH_ENABLED */
@@ -195,6 +196,49 @@ static inline bool tx_score_in_range(double score)
     return score >= TX_SCORE_MIN && score <= TX_SCORE_MAX;
 }
 
+/* Scores travel, are signed and are hashed as integer thousandths, 0..1000
+ * for 0.0..1.0 (doc/architecture/reputation.md, "Integer scores"). Text for a
+ * double depends on the libc that prints and parses it -- uClibc-ng, the libc
+ * of SPARC LEON3 Linux, misreads about a quarter of three-decimal values --
+ * and a node that converts differently signs and hashes different bytes. An
+ * integer has one spelling everywhere. Floats stop at the producer's
+ * tx_score_msg_t: the score is rounded once (tx_score_to_milli) and
+ * everything after holds the integer; the algebra divides by TX_SCORE_SCALE
+ * where it does arithmetic. Mirrors TX_SCORE_SCALE in Python's
+ * reputation.py. */
+#define TX_SCORE_SCALE 1000
+
+/** True iff @p milli is a score on the 0..TX_SCORE_SCALE integer scale. */
+static inline bool tx_milli_in_range(long long milli)
+{
+    return milli >= 0 && milli <= TX_SCORE_SCALE;
+}
+
+/** @p score (which must pass tx_score_in_range) as integer thousandths,
+ *  rounded half away from zero. One IEEE multiply and lround, which Python's
+ *  score_to_milli reproduces exactly. */
+static inline int tx_score_to_milli(double score)
+{
+    return (int)lround(score * (double)TX_SCORE_SCALE);
+}
+
+/** Integer thousandths as the 0.0..1.0 double the algebra computes with. */
+static inline double tx_milli_to_score(int milli)
+{
+    return (double)milli / (double)TX_SCORE_SCALE;
+}
+
+/** Read a score off the wire: true and @p out set only for a JSON INTEGER in
+ *  0..TX_SCORE_SCALE. A real is refused even when integral, so a value from a
+ *  node that predates integer scores (0.8) is never read as thousandths. */
+static inline bool tx_milli_from_json(const json_t *v, int *out)
+{
+    if (!json_is_integer(v) || !tx_milli_in_range(json_integer_value(v)))
+        return false;
+    *out = (int)json_integer_value(v);
+    return true;
+}
+
 /* --- Slashing: OFF unless armed (R+D.md §12.8) ---
  * Slashing pins a peer's reputation from outside the EMA, on one detector's
  * say-so plus a quorum co-signature. Nothing arms it automatically: the
@@ -237,7 +281,9 @@ static inline bool tx_score_in_range(double score)
 typedef struct {
     smrt_ptr_t;
     uuid_t task_uuid;
-    double score;
+    /* Integer thousandths, 0..TX_SCORE_SCALE. Mirrors Python
+     * TransactionScore.score_milli. */
+    int score_milli;
     /* Optional: name of the Capability that produced this TS. Used by
      * _pure_reputation to look up transaction_weight (Slice 3). Empty
      * string == "unknown / legacy" — weight defaults to 1. Mirrors
@@ -296,10 +342,10 @@ typedef struct {
 typedef struct {
     uuid_t task_uuid;
     uuid_t p1_uuid;
-    double p1_score;
+    int    p1_score_milli;      /* thousandths, 0..TX_SCORE_SCALE */
     bool   p1_set;
     uuid_t p2_uuid;
-    double p2_score;
+    int    p2_score_milli;
     bool   p2_set;
     int    index;
     /* Phase 1 hash-linking (reputation-vs-blockchain-analysis.md §2.1):
@@ -640,7 +686,7 @@ const char *tx_history_attest_cert(const tx_history_t *hist, const uuid_t task_u
  * history or an unknown channel. Nothing here touches the chain. Mirrors
  * Python TransactionHistory.record_half. */
 int  tx_history_record_half(tx_history_t *hist, const uuid_t task_uuid,
-                            const uuid_t peer_uuid, double score,
+                            const uuid_t peer_uuid, int score_milli,
                             const char *channel, const char *cert_json);
 /* tx_history_record_half for a half that names @p counterparty (NULL: names
  * nobody, as a half held before names did) and carries its scorer's signature
@@ -650,7 +696,7 @@ int  tx_history_record_half(tx_history_t *hist, const uuid_t task_uuid,
  * the one it names, and this half names somebody else -- and otherwise this
  * one is refused with TX_HALF_MISMATCH. Mirrors Python record_half. */
 int  tx_history_record_signed_half(tx_history_t *hist, const uuid_t task_uuid,
-                                   const uuid_t peer_uuid, double score,
+                                   const uuid_t peer_uuid, int score_milli,
                                    const char *channel, const char *cert_json,
                                    const uuid_t counterparty,
                                    const char *half_sig);
@@ -728,7 +774,7 @@ const char *tx_history_roster_members(const tx_history_t *hist,
 
 /**
  * @brief The bytes an acceptor signs to certify ONE half of an ordinary
- *        commit: "AT-COMMIT\0" scorer "|" task "|" %.17g score "|" channel.
+ *        commit: "AT-COMMIT\0" scorer "|" task "|" score_milli "|" channel.
  *
  * Lowercase uuids, and the channel normalized (NULL / "" == task_outcome), so
  * an absent channel and an explicit default are one claim with one signature.
@@ -736,7 +782,7 @@ const char *tx_history_roster_members(const tx_history_t *hist,
  *
  * @return the designation's length, or 0 if @p cap is too small.
  */
-size_t commit_designation(const uuid_t scorer, const uuid_t task, double score,
+size_t commit_designation(const uuid_t scorer, const uuid_t task, int score_milli,
                           const char *channel, uint8_t *out, size_t cap);
 /**
  * @brief Keep @p cert_json ({voter: sig hex}) as the commit certificate of
@@ -754,11 +800,11 @@ int tx_history_attach_commit_cert(tx_history_t *hist, const uuid_t task,
 const char *tx_history_commit_cert(const tx_history_t *hist, const uuid_t task,
                                    const uuid_t scorer);
 
-/* Room for half_designation: tag, task, two uuids, a %.17g score, a channel. */
+/* Room for half_designation: tag, task, two uuids, a score, a channel. */
 #define HALF_DESIG_MAX (16 + 3 * UUID_STRING_LEN + 32 + TX_CHANNEL_NAMELEN)
 /**
  * @brief The bytes a SCORER signs over its own half (R+D.md §14.2):
- *        "AT-HALF\0" task "|" scorer "|" counterparty "|" %.17g score "|"
+ *        "AT-HALF\0" task "|" scorer "|" counterparty "|" score_milli "|"
  *        channel.
  *
  * Lowercase uuids, the channel normalized (NULL / "" == task_outcome), as
@@ -768,7 +814,7 @@ const char *tx_history_commit_cert(const tx_history_t *hist, const uuid_t task,
  * @return the designation's length, or 0 if @p cap is too small.
  */
 size_t half_designation(const uuid_t task, const uuid_t scorer,
-                        const uuid_t counterparty, double score,
+                        const uuid_t counterparty, int score_milli,
                         const char *channel, uint8_t *out, size_t cap);
 /** @brief Keep @p sig_hex as @p scorer's own signature over its half of
  *         @p task. The caller has verified it. Nothing is kept unless the
@@ -781,7 +827,7 @@ const char *tx_history_half_sig(const tx_history_t *hist, const uuid_t task,
                                 const uuid_t scorer);
 
 int  tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
-                       const uuid_t peer_uuid, double score,
+                       const uuid_t peer_uuid, int score_milli,
                        const char *channel);
 
 /*@
@@ -1226,7 +1272,7 @@ int reputation_consensus_by_tier(const tx_history_t *hist, const uuid_t peer_uui
  *
  * The schema is pinned so a future shape change is a refusal to rebuild --
  * which degrades safely to clamped restoration -- rather than a misparse. */
-#define REP_EVIDENCE_SCHEMA "1"
+#define REP_EVIDENCE_SCHEMA "2"   /* 2: scores are integer thousandths */
 #define REP_EVIDENCE_FILE   "reputation-history"
 
 /* Per-(target, slasher) slash high-water marks. A separate file from the chain

@@ -57,10 +57,10 @@ class TestPendingHalvesAreHandedToJoiners:
         rp, queues, net_q, alice, carol = _cohort()
         me = rp.identity.uuid
         mine, both, theirs = uuid4(), uuid4(), uuid4()
-        rp.history.record_half(mine, me, 0.9, 'probe')
-        rp.history.record_half(both, me, 0.9)
-        rp.history.record_half(both, alice.uuid, 0.9)
-        rp.history.record_half(theirs, alice.uuid, 0.9)
+        rp.history.record_half(mine, me, 900, 'probe')
+        rp.history.record_half(both, me, 900)
+        rp.history.record_half(both, alice.uuid, 900)
+        rp.history.record_half(theirs, alice.uuid, 900)
 
         t0 = now().timestamp()
         assert rp._hand_off_pending_halves(queues, t0) == 0
@@ -74,7 +74,7 @@ class TestPendingHalvesAreHandedToJoiners:
         for f in frames:
             task, peer, score, group, channel = from_json_string(f.obj)[:5]
             assert str(task) == str(mine) and str(peer) == str(me)
-            assert score == 0.9 and group is None and channel == 'probe'
+            assert score == 900 and group is None and channel == 'probe'
         assert rp._hand_off_pending_halves(queues, t0 + 6) == 0
 
         # A late tick past both remaining passes sends once, not twice.
@@ -87,7 +87,7 @@ class TestPendingHalvesAreHandedToJoiners:
         assert rp._hand_off_pending_halves(queues, t0) == 0
         assert rp._hand_off_pending_halves(queues, t0 + 100) == 0  # none pending
 
-        rp.history.record_half(uuid4(), rp.identity.uuid, 0.9)
+        rp.history.record_half(uuid4(), rp.identity.uuid, 900)
         rp.protocol.peers.all = []
         assert rp._hand_off_pending_halves(queues, t0 + 400) == 0  # alice left
         rp.protocol.peers.all = [alice]

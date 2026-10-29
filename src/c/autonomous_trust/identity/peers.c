@@ -74,8 +74,10 @@ DECLARE_CONFIGURATION(peers, sizeof(peers_t), peers_to_json, peers_from_json);
 static const public_identity_t *_peer_from_data(data_t *value)
 {
     bytes_t bytes = NULL;
+    /* bytes_data() calloc()s the buffer, so it is aligned for any type; the
+     * void * step tells -Wcast-align so on strict-alignment targets. */
     if (data_bytes_ptr(value, &bytes) == 0)
-        return (const public_identity_t *)bytes;
+        return (const public_identity_t *)(void *)bytes;
     return NULL;
 }
 

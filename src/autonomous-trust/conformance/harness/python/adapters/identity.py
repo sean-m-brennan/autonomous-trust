@@ -230,6 +230,20 @@ def _app_verb(function, body):
 _FIXTURE_GROUP_PUB: dict[str, bytes] = {}
 
 
+def _child_tag(proc, address):
+    """The uuid of the child cohort listing *address* when the primary group
+    does not, else None: NetworkProcess._child_group_of on the receiver."""
+    if not address:
+        return None
+    group = getattr(proc, 'group', None)
+    if group is not None and address in list(group.addresses):
+        return None
+    for key, child in (getattr(proc, 'child_groups', None) or {}).items():
+        if address in list(child.addresses):
+            return str(key)
+    return None
+
+
 @dataclass
 class _Participant:
     """Wraps an IdentityProcess and the captured outbox for a participant."""
@@ -2198,6 +2212,11 @@ class IdentityAdapter:
                    for m in members if str(m.get('uuid')) in self._roster_uuid_to_pid]
             participant.subtree_roster = sorted(ids)
             return participant.drain_outbox()
+        # The network process tags a frame from a cohort this node gateways
+        # (NetworkProcess._child_group_of); the harness delivers straight to
+        # identity, so it applies the same tag here. C mirrors in its adapter.
+        inbound.child_group = _child_tag(participant.process,
+                                         getattr(inbound.from_whom, 'address', None))
         # The protocol's handler dispatch is run synchronously. Threads
         # spawned via _spawn() are inlined because synchronous_dispatch is on.
         participant.process.protocol.run_message_handlers(participant.queues, inbound)
@@ -2565,6 +2584,10 @@ class IdentityAdapter:
             grp = sender.process.group
             group_uuid = str(grp.uuid) if grp is not None \
                 else '00000000-0000-0000-0000-000000000000'
+            # A gateway also queries each child cohort; a step names that
+            # group explicitly. C mirrors.
+            if isinstance(payload, dict) and isinstance(payload.get('group_uuid'), str):
+                group_uuid = payload['group_uuid']
             obj = to_json_string({'group_uuid': group_uuid, 'have': have})
         elif function == IdentityProtocol.id_response:
             # Identity-resync response: the responder's published identity +

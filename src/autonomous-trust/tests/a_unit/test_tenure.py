@@ -59,8 +59,8 @@ def _node():
     rp.peers.all = [SimpleNamespace(uuid=them.uuid, signature=them.signature)]
     for _ in range(4):
         tid = uuid4()
-        rp.history.update(tid, rp.identity.uuid, 0.9)
-        rp.history.update(tid, them.uuid, 0.9)
+        rp.history.update(tid, rp.identity.uuid, 900)
+        rp.history.update(tid, them.uuid, 900)
     return rp, them
 
 

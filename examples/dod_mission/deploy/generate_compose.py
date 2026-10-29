@@ -50,6 +50,8 @@ from pathlib import Path
 from typing import Optional
 
 from ..scenario import DoDMissionScenario  # noqa: E402
+from .hierarchy import (COMMAND_NETWORK, cohort_size_from_env,  # noqa: E402
+                        field_network, field_subnet, plan_layout)
 
 _HERE = Path(__file__).resolve().parent
 
@@ -74,6 +76,10 @@ DEBUG_PEERS = frozenset(
 
 def _peer_log_level(peer_name: str) -> str:
     return "debug" if peer_name in DEBUG_PEERS else PEER_LOG_LEVEL
+# How long a hierarchy field joiner keeps asking to be admitted before founding
+# a group of its own (AT_JOIN_PATIENCE_SEC). Bring-up of a 96-node stack on one
+# host has spread over twenty minutes.
+JOIN_PATIENCE_SEC = os.environ.get("AT_COMPOSE_JOIN_PATIENCE", "1800")
 SUBNET = "172.30.0.0/24"
 SUBNET_BASE = "172.30.0"  # ip suffix slots: 2=simulator, 3=coordinator, 10+=peers
 BASE_PEER_OCTET = 10
@@ -165,7 +171,8 @@ def _service_block(name: str, ip: str, *, image: str,
                    volumes: Optional[list] = None,
                    ports: Optional[list] = None,
                    depends_on: Optional[list] = None,
-                   cap_add: bool = True) -> dict:
+                   cap_add: bool = True,
+                   networks: Optional[dict] = None) -> dict:
     env = dict(common_env)
     if extra_env:
         env.update(extra_env)
@@ -173,7 +180,10 @@ def _service_block(name: str, ip: str, *, image: str,
         "image": image,
         "container_name": name,
         "environment": env,
-        "networks": {NETWORK_NAME: {"ipv4_address": ip}},
+        # `networks` maps network name -> address for a node on several
+        # networks (a hierarchy gateway); without it the node sits on dod-net.
+        "networks": ({n: {"ipv4_address": a} for n, a in networks.items()}
+                     if networks else {NETWORK_NAME: {"ipv4_address": ip}}),
         "restart": "unless-stopped",
     }
     if cap_add:
@@ -191,7 +201,9 @@ def _service_block(name: str, ip: str, *, image: str,
 
 def _add_c_microdrone(services: dict, ingest_volumes: set, peer_name: str,
                       ip: str, delay: int, common_env: dict,
-                      c_image: str, demo_image: str) -> None:
+                      c_image: str, demo_image: str,
+                      networks: Optional[dict] = None,
+                      extra_env: Optional[dict] = None) -> None:
     """Emit a C ``at_demo`` node + its Python flight-stub sidecar for one
     microdrone (Stretch Goal 3, Path B).
 
@@ -214,11 +226,13 @@ def _add_c_microdrone(services: dict, ingest_volumes: set, peer_name: str,
     }
     if delay > 0:
         c_env["STARTUP_DELAY"] = str(delay)
+    if extra_env:
+        c_env.update(extra_env)
     services[peer_name] = _service_block(
         peer_name, ip, image=c_image, common_env=common_env, extra_env=c_env,
         volumes=[f"{PERSIST_HOST_DIR}/{peer_name}/etc/at:/etc/at",
                  f"{ingest_vol}:/ingest"],
-        depends_on=["simulator"])
+        depends_on=["simulator"], networks=networks)
 
     # Flight-stub sidecar: produces ISR readings; no fabric IP (default net).
     services[f"{peer_name}-stub"] = {
@@ -245,7 +259,15 @@ def build_compose(scenario_kwargs: Optional[dict] = None,
                   c_microdrones: Optional[frozenset] = None,
                   c_image: str = C_IMAGE) -> dict:
     sc = DoDMissionScenario(**(scenario_kwargs or {}))
-    if c_microdrones is None:
+    # Hierarchical deployment (AT_COHORT_SIZE): the layout decides each peer's
+    # cohort, networks and addresses, and which microdrones run C (all but one
+    # Python anchor per field cohort).
+    max_cohort = cohort_size_from_env()
+    layout = plan_layout(sc, max_cohort) if max_cohort else None
+    gateways = {c.gateway for c in layout.cohorts} if layout else set()
+    if layout is not None:
+        c_microdrones = frozenset(layout.c_microdrones())
+    elif c_microdrones is None:
         c_microdrones = parse_c_microdrones(sc, None)
     ingest_volumes: set[str] = set()
 
@@ -266,7 +288,10 @@ def build_compose(scenario_kwargs: Optional[dict] = None,
         "AT_INCLUDE_MQ800": "1" if sc._include_mq800 else "0",  # noqa
         "AT_INCLUDE_JET": "1" if sc._include_jet else "0",  # noqa
         "AT_INCLUDE_COMMAND": "1" if sc._include_command else "0",  # noqa
+        "AT_RQ86_COUNT": str(sc._rq86_count),  # noqa
     }
+    if layout is not None:
+        sc_env["AT_COHORT_SIZE"] = str(max_cohort)
     # Shared scenario epoch — DoDDataProcess uses this to anchor every
     # peer's reading timestamps to the same wall-clock origin, so the
     # sensor-comparison charts on the coordinator can line up consensus
@@ -337,6 +362,10 @@ def build_compose(scenario_kwargs: Optional[dict] = None,
         },
         volumes=["../simulator/scenario.yaml:/app/config/scenario.yaml:ro"],
         ports=["8051:8051"],
+        # In a hierarchy the simulator sits on every network, at .2 of each.
+        networks=({COMMAND_NETWORK: f"{SUBNET_BASE}.2",
+                   **{field_network(c.index): f"172.30.{c.index}.2"
+                      for c in layout.cohorts}} if layout else None),
     )
 
     # Coordinator (dashboard + validators).
@@ -384,6 +413,17 @@ def build_compose(scenario_kwargs: Optional[dict] = None,
     # Per-peer
     for i, (peer_name, role) in enumerate(sc.peers.items()):
         ip = f"{SUBNET_BASE}.{BASE_PEER_OCTET + i}"
+        nets = (dict(layout.addresses[peer_name]) if layout is not None
+                else None)
+        # A field joiner has no seeded group to fall back on, and its cohort's
+        # admitter can come up long after it on a loaded host, so it keeps
+        # asking to be admitted instead of founding a group of one. Anchors,
+        # gateways and command members load their seeded group and do not wait.
+        joiner_env = {}
+        if layout is not None:
+            coh = layout.cohort_of(peer_name)
+            if coh is not None and peer_name not in (coh.anchor, coh.gateway):
+                joiner_env["AT_JOIN_PATIENCE_SEC"] = JOIN_PATIENCE_SEC
 
         # Late joiners — phase-index drives the join delay.
         # Per-peer index stagger stacks on top: peers in group `g`
@@ -397,7 +437,8 @@ def build_compose(scenario_kwargs: Optional[dict] = None,
         # --- C at_demo microdrone: native node + Python flight-stub sidecar ---
         if peer_name in c_microdrones:
             _add_c_microdrone(services, ingest_volumes, peer_name, ip, delay,
-                              common_env, c_image, image_name)
+                              common_env, c_image, image_name, networks=nets,
+                              extra_env=joiner_env)
             continue
 
         extra: dict[str, str] = {
@@ -409,6 +450,7 @@ def build_compose(scenario_kwargs: Optional[dict] = None,
         }
         if delay > 0:
             extra["AT_JOIN_DELAY_SEC"] = str(delay)
+        extra.update(joiner_env)
 
         # Role-specific compromise wiring.  The scenario marks these in
         # PeerRole.metadata; we translate to env vars the participant reads.
@@ -417,6 +459,17 @@ def build_compose(scenario_kwargs: Optional[dict] = None,
             extra["AT_COMPROMISE_MODE"] = "abrupt"  # overridable at run-demo.sh
         if role.metadata.get("forged_identity"):
             extra["AT_FORGERY_MODE"] = "self_signed"
+
+        # Hierarchy gateway: one hybrid-transport leg per network. It stays
+        # out of admission, since as a border guard it would propose field
+        # joiners into its primary (command) group, and it relays readings
+        # from the field peers it is given.
+        if peer_name in gateways:
+            extra["AT_TRANSPORT"] = ("autonomous_trust.core.network.hybrid."
+                                     "HybridNetworkProcess")
+            extra["AT_BORDER_GUARD"] = "0"
+            extra["AT_GATEWAY_FIELD_PEERS"] = ",".join(
+                layout.cohort_of(peer_name).members)
 
         # Persistent-state mount. The full $AUTONOMOUS_TRUST_ROOT
         # (parent of etc/at and var/at) is bind-mounted so AT — running
@@ -432,17 +485,22 @@ def build_compose(scenario_kwargs: Optional[dict] = None,
             extra_env=extra,
             volumes=[f"{PERSIST_HOST_DIR}/{peer_name}:/app/config/{peer_name}"],
             depends_on=["simulator"],
+            networks=nets,
         )
 
-    compose = {
-        "services": services,
-        "networks": {
-            NETWORK_NAME: {
-                "driver": "bridge",
-                "ipam": {"config": [{"subnet": SUBNET}]},
-            },
+    networks = {
+        NETWORK_NAME: {
+            "driver": "bridge",
+            "ipam": {"config": [{"subnet": SUBNET}]},
         },
     }
+    if layout is not None:
+        for c in layout.cohorts:
+            networks[field_network(c.index)] = {
+                "driver": "bridge",
+                "ipam": {"config": [{"subnet": field_subnet(c.index)}]},
+            }
+    compose = {"services": services, "networks": networks}
     # Named volumes carrying the AF_UNIX ingest socket shared by each C
     # microdrone and its flight-stub sidecar.
     if ingest_volumes:
@@ -483,6 +541,9 @@ def main(argv=None):
     p.add_argument("--no-mq800", action="store_true")
     p.add_argument("--no-jet", action="store_true")
     p.add_argument("--no-command", action="store_true")
+    p.add_argument("--rq86-count", type=int, default=2,
+                   help="RQ-86 gateways; with AT_COHORT_SIZE set, one per "
+                        "field cohort (default %(default)s).")
     p.add_argument("--record", metavar="FILE", default=None,
                    help="Record the run to FILE (basename; written under "
                         f"{RECORD_HOST_DIR}/ on the host via a coordinator "
@@ -497,6 +558,7 @@ def main(argv=None):
         include_mq800=not args.no_mq800,
         include_jet=not args.no_jet,
         include_command=not args.no_command,
+        rq86_count=args.rq86_count,
     )
     c_microdrones = parse_c_microdrones(DoDMissionScenario(**scenario_kwargs),
                                         args.c_microdrones)

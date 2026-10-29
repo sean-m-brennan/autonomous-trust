@@ -40,6 +40,7 @@
 #include "network/net_transport.h"
 #include "processes/process_tracker.h"
 #include "utilities/util.h"
+#include "utilities/socket_helpers.h"
 
 DEFINE_ERROR(EGEN_NOIF, "No suitable network interface found");
 
@@ -136,18 +137,23 @@ static int read_bootstrap(const char *cfg_dir, char *addr_out, size_t addr_len,
 static void fill_ipv4(net_iface_t *iface, struct ifaddrs *ifa,
                       const char *override_ip)
 {
-    struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+    /* Copy out rather than cast: struct sockaddr only promises 2-byte
+     * alignment, and strict-alignment targets (SPARC) trap on the wider
+     * fields of sockaddr_in / sockaddr_in6. Same for every sockaddr below. */
+    struct sockaddr_in sa;
+    memcpy(&sa, ifa->ifa_addr, sizeof(sa));
 
     /* Use the bootstrap-provided IP if given, otherwise the interface's own */
     if (override_ip != NULL && override_ip[0] != '\0')
         strncpy(iface->ip4_addr, override_ip, IPV4_ADDR_LEN);
     else
-        inet_ntop(AF_INET, &sa->sin_addr, iface->ip4_addr, IPV4_ADDR_LEN);
+        inet_ntop(AF_INET, &sa.sin_addr, iface->ip4_addr, IPV4_ADDR_LEN);
 
     if (ifa->ifa_netmask != NULL)
     {
-        struct sockaddr_in *nm = (struct sockaddr_in *)ifa->ifa_netmask;
-        uint32_t mask = ntohl(nm->sin_addr.s_addr);
+        struct sockaddr_in nm;
+        memcpy(&nm, ifa->ifa_netmask, sizeof(nm));
+        uint32_t mask = ntohl(nm.sin_addr.s_addr);
         int bits = 0;
         while (mask & 0x80000000) { bits++; mask <<= 1; }
         /* Format into a scratch buffer larger than any possible input, then
@@ -183,7 +189,7 @@ static int discover_network_for(net_iface_t *iface, const char *preferred_ip)
     if (preferred_ip != NULL && preferred_ip[0] != '\0')
     {
         struct in_addr pa;
-        if (inet_pton(AF_INET, preferred_ip, &pa) == 1)
+        if (at_inet_pton(AF_INET, preferred_ip, &pa) == 1)
             pref_addr = ntohl(pa.s_addr);
     }
 
@@ -207,10 +213,11 @@ static int discover_network_for(net_iface_t *iface, const char *preferred_ip)
             /* If we have a preferred IP, check if this interface's subnet matches */
             if (pref_addr != 0 && ifa->ifa_netmask != NULL)
             {
-                struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
-                struct sockaddr_in *nm = (struct sockaddr_in *)ifa->ifa_netmask;
-                uint32_t if_net  = ntohl(sa->sin_addr.s_addr) & ntohl(nm->sin_addr.s_addr);
-                uint32_t pref_net = pref_addr & ntohl(nm->sin_addr.s_addr);
+                struct sockaddr_in sa, nm;
+                memcpy(&sa, ifa->ifa_addr, sizeof(sa));
+                memcpy(&nm, ifa->ifa_netmask, sizeof(nm));
+                uint32_t if_net  = ntohl(sa.sin_addr.s_addr) & ntohl(nm.sin_addr.s_addr);
+                uint32_t pref_net = pref_addr & ntohl(nm.sin_addr.s_addr);
                 if (if_net == pref_net)
                 {
                     fill_ipv4(iface, ifa, preferred_ip);
@@ -221,16 +228,18 @@ static int discover_network_for(net_iface_t *iface, const char *preferred_ip)
         }
         else if (family == AF_INET6)
         {
-            struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)ifa->ifa_addr;
-            inet_ntop(AF_INET6, &sa6->sin6_addr, iface->ip6_addr, IPV6_ADDR_LEN);
+            struct sockaddr_in6 sa6;
+            memcpy(&sa6, ifa->ifa_addr, sizeof(sa6));
+            inet_ntop(AF_INET6, &sa6.sin6_addr, iface->ip6_addr, IPV6_ADDR_LEN);
 
             if (ifa->ifa_netmask != NULL)
             {
-                struct sockaddr_in6 *nm6 = (struct sockaddr_in6 *)ifa->ifa_netmask;
+                struct sockaddr_in6 nm6;
+                memcpy(&nm6, ifa->ifa_netmask, sizeof(nm6));
                 int bits = 0;
                 for (int i = 0; i < 16; i++)
                 {
-                    uint8_t byte = nm6->sin6_addr.s6_addr[i];
+                    uint8_t byte = nm6.sin6_addr.s6_addr[i];
                     while (byte & 0x80)
                     {
                         bits++;

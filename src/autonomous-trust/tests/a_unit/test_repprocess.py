@@ -19,6 +19,7 @@ from queue import Full
 from uuid import uuid4, UUID
 from unittest.mock import MagicMock, patch, PropertyMock
 
+from autonomous_trust.core.reputation.reputation import score_to_milli
 from autonomous_trust.core.reputation.repprocess import ReputationProcess
 from autonomous_trust.core.reputation.reputation import (
     Reputation,
@@ -29,6 +30,23 @@ from autonomous_trust.core.network.message import Message
 from autonomous_trust.core.processes import ProcessTracker
 from autonomous_trust.core.system import CfgIds
 from autonomous_trust.core.config import to_yaml_string, from_yaml_string
+
+
+def _tx_body(id1, id2, proposer, score, certify=True, group=''):
+    """A `transaction` proposal in its wire shape: the JSON object with named
+    fields both runtimes send. `certify`/`group` of None leave the key off, as
+    a half-round build's proposal did."""
+    from autonomous_trust.core.config import to_json_string
+    body = {'id1': id1, 'id2': id2, 'peer_uuid': str(proposer),
+            'score_milli': score.score_milli, 'task_uuid': str(score.task_id)}
+    if getattr(score, 'channel', None):
+        body['channel'] = score.channel
+    if certify is not None:
+        body['certify'] = certify
+    if group is not None:
+        body['group'] = group
+    return to_json_string(body)
+
 
 
 def _make_mock_peer(uid=None, nickname='peer1', address='10.0.0.1'):
@@ -92,9 +110,9 @@ class TestHandleTransaction:
         rp = _make_rep_process()
         peer = _make_mock_peer()
         score = TransactionScore(uuid4(), 0.8)
-        data = ((100, 1, peer.uuid), score)
         msg = Message(CfgIds.reputation, ReputationProtocol.transaction,
-                      to_yaml_string(data), from_whom=peer)
+                      _tx_body(100, 1, peer.uuid, score, None, None),
+                      from_whom=peer)
         result = rp.handle_transaction({CfgIds.network: queue.Queue()}, msg)
         assert result is True  # dropped (not in requests)
 
@@ -187,8 +205,8 @@ class TestContriteTitForTat:
         peer = _make_mock_peer()
         # Set up transactions
         tid = uuid4()
-        rp.history.update(tid, peer.uuid, 0.8)
-        rp.history.update(tid, rp.identity.uuid, 0.9)
+        rp.history.update(tid, peer.uuid, 800)
+        rp.history.update(tid, rp.identity.uuid, 900)
         result = rp._contrite_tit_for_tat(peer)
         assert isinstance(result, float)
 
@@ -200,8 +218,8 @@ class TestPureReputation:
         other = _make_mock_peer(nickname='other', address='10.0.0.2')
         rp.reputations.update(other.uuid, 0.8)
         tid = uuid4()
-        rp.history.update(tid, peer.uuid, 0.7)
-        rp.history.update(tid, other.uuid, 0.9)
+        rp.history.update(tid, peer.uuid, 700)
+        rp.history.update(tid, other.uuid, 900)
         result = rp._pure_reputation(peer)
         assert isinstance(result, float)
 
@@ -218,7 +236,7 @@ class TestHandleTransactionDeeper:
         rp._detached_sig = MagicMock(return_value='ab')  # a mock cannot sign
         net_q = queue.Queue()
         msg = Message(CfgIds.reputation, ReputationProtocol.transaction,
-                      to_yaml_string(((id1, id2, peer.uuid), score, True, '')),
+                      _tx_body(id1, id2, peer.uuid, score),
                       from_whom=peer)
         msg.verified = True  # simulate signed message (mock peer can't sign)
         result = rp.handle_transaction({CfgIds.network: net_q}, msg)
@@ -234,8 +252,8 @@ class TestHandleTransactionDeeper:
         peer = _make_mock_peer()
         net_q = queue.Queue()
         msg = Message(CfgIds.reputation, ReputationProtocol.transaction,
-                      to_yaml_string(((100, 1, peer.uuid),
-                                      TransactionScore(uuid4(), 0.8))),
+                      _tx_body(100, 1, peer.uuid, TransactionScore(uuid4(), 0.8),
+                               None, None),
                       from_whom=peer)
         msg.verified = True
         assert rp.handle_transaction({CfgIds.network: net_q}, msg) is True
@@ -257,7 +275,7 @@ class TestHandleTransactionDeeper:
         idx = rp._paxos_id_index(id1, id2)
         score = TransactionScore(uuid4(), 0.8, channel='physical')
 
-        payload = to_yaml_string(((id1, id2, peer.uuid), score, True, ''))
+        payload = _tx_body(id1, id2, peer.uuid, score)
         assert 'physical' in payload
         payload = payload.replace('physical', 'physicall')
 
@@ -269,6 +287,48 @@ class TestHandleTransactionDeeper:
         assert result is True          # consumed, not passed to another handler
         assert net_q.empty()           # and no `tx accepted` went back
         assert idx not in rp.proposals  # nothing recorded from a refused payload
+
+
+class TestTransactionWireShape:
+    """The proposal travels as a JSON object with named fields, the shape the
+    C twin sends. A payload of any other shape is dropped without raising:
+    a peer-supplied frame must not lever an exception into the process loop."""
+
+    def _msg(self, payload, peer):
+        msg = Message(CfgIds.reputation, ReputationProtocol.transaction,
+                      payload, from_whom=peer)
+        msg.verified = True
+        return msg
+
+    def test_a_c_shaped_proposal_is_accepted(self):
+        rp = _make_rep_process()
+        rp._detached_sig = MagicMock(return_value='ab')
+        peer = _make_mock_peer()
+        task = uuid4()
+        payload = ('{"id1": 100, "id2": 1, "peer_uuid": "%s", "score_milli": 800, '
+                   '"task_uuid": "%s", "capability_name": "dod.sensor-report", '
+                   '"certify": true, "group": ""}' % (peer.uuid, task))
+        net_q = queue.Queue()
+        assert rp.handle_transaction({CfgIds.network: net_q},
+                                     self._msg(payload, peer)) is True
+        score = rp.proposals[rp._paxos_id_index(100, 1)]
+        assert score.score == 0.8 and score.task_id == task
+        assert score.capability_name == 'dod.sensor-report'
+        assert not net_q.empty()
+
+    def test_an_object_missing_fields_is_dropped_not_raised(self):
+        rp = _make_rep_process()
+        peer = _make_mock_peer()
+        msg = self._msg('{"score_milli": 800, "certify": true, "group": ""}', peer)
+        assert rp.handle_transaction({CfgIds.network: queue.Queue()}, msg) is True
+        assert rp.proposals == {}
+
+    def test_a_positional_list_is_dropped_not_raised(self):
+        rp = _make_rep_process()
+        peer = _make_mock_peer()
+        msg = self._msg('[[100, 1, "%s"], 0.8, true, ""]' % peer.uuid, peer)
+        assert rp.handle_transaction({CfgIds.network: queue.Queue()}, msg) is True
+        assert rp.proposals == {}
 
 
 class TestHandleAcceptedDeeper:
@@ -371,8 +431,8 @@ class TestComputeReputation:
         rp.reputations.update(other.uuid, 0.8)
         # Set up history for _pure_reputation
         tid = uuid4()
-        rp.history.update(tid, peer.uuid, 0.7)
-        rp.history.update(tid, other.uuid, 0.9)
+        rp.history.update(tid, peer.uuid, 700)
+        rp.history.update(tid, other.uuid, 900)
         rp._compute_reputation(peer, 'proc', MagicMock())
         assert len(rp.requested_reps) == 1
 
@@ -387,8 +447,8 @@ class TestContriteTitForTatBranches:
         peer = _make_mock_peer()
         # We judged the peer to have defected (0.3) AND it rates us low (0.3).
         tid = uuid4()
-        rp.history.update(tid, peer.uuid, 0.3)        # the peer's rating of us
-        rp.history.update(tid, rp.identity.uuid, 0.3)  # our rating of the peer
+        rp.history.update(tid, peer.uuid, 300)        # the peer's rating of us
+        rp.history.update(tid, rp.identity.uuid, 300)  # our rating of the peer
         result = rp._contrite_tit_for_tat(peer)
         assert result >= 0.51  # cooperate despite defection because my standing is low
 
@@ -398,8 +458,8 @@ class TestContriteTitForTatBranches:
         # We judged the peer to have defected (0.3) while it rates us well
         # (0.8): punish.
         tid = uuid4()
-        rp.history.update(tid, peer.uuid, 0.8)         # the peer's rating of us
-        rp.history.update(tid, rp.identity.uuid, 0.3)  # our rating of the peer
+        rp.history.update(tid, peer.uuid, 800)         # the peer's rating of us
+        rp.history.update(tid, rp.identity.uuid, 300)  # our rating of the peer
         result = rp._contrite_tit_for_tat(peer)
         assert result <= 0.49  # punish defection
 
@@ -409,8 +469,8 @@ class TestContriteTitForTatBranches:
         rp = _make_rep_process()
         peer = _make_mock_peer()
         tid = uuid4()
-        rp.history.update(tid, peer.uuid, 1.0)
-        rp.history.update(tid, rp.identity.uuid, 0.3)
+        rp.history.update(tid, peer.uuid, 1000)
+        rp.history.update(tid, rp.identity.uuid, 300)
         assert rp._contrite_tit_for_tat(peer) == pytest.approx(0.3)
 
     def test_cooperate(self):
@@ -418,8 +478,8 @@ class TestContriteTitForTatBranches:
         peer = _make_mock_peer()
         # Our last rating of the peer >= 0.5 (it cooperated).
         tid = uuid4()
-        rp.history.update(tid, peer.uuid, 0.6)         # the peer's rating of us
-        rp.history.update(tid, rp.identity.uuid, 0.7)  # our rating of the peer
+        rp.history.update(tid, peer.uuid, 600)         # the peer's rating of us
+        rp.history.update(tid, rp.identity.uuid, 700)  # our rating of the peer
         result = rp._contrite_tit_for_tat(peer)
         assert result == pytest.approx(0.7)
 
@@ -440,8 +500,8 @@ class TestHandleOutdatedDeeper:
         # Add some history
         tid = uuid4()
         peer = _make_mock_peer()
-        rp.history.update(tid, peer.uuid, 0.5)
-        rp.history.update(tid, rp.identity.uuid, 0.7)
+        rp.history.update(tid, peer.uuid, 500)
+        rp.history.update(tid, rp.identity.uuid, 700)
         net_q = queue.Queue()
         msg = Message(CfgIds.reputation, ReputationProtocol.outdated,
                       '0', from_whom=peer)
@@ -516,8 +576,8 @@ class TestPureReputation:
         other = _make_mock_peer(nickname='o', address='10.0.0.3')
         rp.reputations.update(other.uuid, 0.8)
         tid = uuid4()
-        rp.history.update(tid, peer.uuid, 0.7)
-        rp.history.update(tid, other.uuid, 0.9)
+        rp.history.update(tid, peer.uuid, 700)
+        rp.history.update(tid, other.uuid, 900)
         result = rp._pure_reputation(peer)
         assert isinstance(result, float)
 
@@ -532,7 +592,7 @@ class TestHandleUpdateMajority:
 
         # Use real Transaction chain data for catchup
         tid = uuid4()
-        tx = Transaction(tid, peer1.uuid, 0.8, peer2.uuid, 0.7, index=1)
+        tx = Transaction(tid, peer1.uuid, 800, peer2.uuid, 700, index=1)
         chain_data = [tx]
         # The vote, not the certificates (test_commit_certificates.py).
         rp._chain_certified = lambda *a, **k: True
@@ -553,7 +613,7 @@ class TestHandleUpdateMajority:
         # Send 3 different updates - no majority so _request_update is called
         for i, peer in enumerate([peer1, peer2, peer3]):
             tid = uuid4()
-            tx = Transaction(tid, peer.uuid, 0.5 + i * 0.1, rp.identity.uuid, 0.6 + i * 0.1)
+            tx = Transaction(tid, peer.uuid, 500 + i * 100, rp.identity.uuid, 600 + i * 100)
             msg = Message(CfgIds.reputation, ReputationProtocol.update,
                           to_yaml_string([tx]), from_whom=peer)
             rp.handle_update({CfgIds.network: queue.Queue()}, msg)
@@ -652,7 +712,7 @@ class TestHandleUpdateFullPaths:
         rp.num_updates = 2
 
         tid = uuid4()
-        tx = Transaction(tid, peer1.uuid, 0.8, peer2.uuid, 0.7, index=1)
+        tx = Transaction(tid, peer1.uuid, 800, peer2.uuid, 700, index=1)
         chain = [tx]
         # The vote, not the certificates (test_commit_certificates.py).
         rp._chain_certified = lambda *a, **k: True
@@ -679,7 +739,7 @@ class TestHandleUpdateFullPaths:
         # Each peer sends a different chain → no majority
         for i, peer in enumerate([peer1, peer2, peer3]):
             tid = uuid4()
-            tx = Transaction(tid, peer.uuid, 0.4 + i * 0.1, rp.identity.uuid, 0.5 + i * 0.1)
+            tx = Transaction(tid, peer.uuid, 400 + i * 100, rp.identity.uuid, 500 + i * 100)
             msg = Message(CfgIds.reputation, ReputationProtocol.update,
                           to_yaml_string([tx]), from_whom=peer)
             rp.handle_update({CfgIds.network: queue.Queue()}, msg)
@@ -699,8 +759,8 @@ class TestPureReputationBranches:
         rp.reputations.update(other.uuid, 0.9)
         tid = uuid4()
         # peer is p1, other is p2
-        rp.history.update(tid, peer.uuid, 0.7)
-        rp.history.update(tid, other.uuid, 0.8)
+        rp.history.update(tid, peer.uuid, 700)
+        rp.history.update(tid, other.uuid, 800)
         result = rp._pure_reputation(peer)
         assert isinstance(result, float)
         # One entry: the weighted average is p2_score itself (trust-tiers.md §5)
@@ -715,8 +775,8 @@ class TestPureReputationBranches:
         rp.reputations.update(other.uuid, 0.8)
         tid = uuid4()
         # other is p1, peer is p2
-        rp.history.update(tid, other.uuid, 0.6)
-        rp.history.update(tid, peer.uuid, 0.7)
+        rp.history.update(tid, other.uuid, 600)
+        rp.history.update(tid, peer.uuid, 700)
         result = rp._pure_reputation(peer)
         assert isinstance(result, float)
         # One entry: the weighted average is p1_score itself (trust-tiers.md §5)
@@ -732,8 +792,8 @@ class TestContriteTitForTatBranches2:
         peer = _make_mock_peer()
         tid = uuid4()
         # identity is p1, peer is p2
-        rp.history.update(tid, rp.identity.uuid, 0.7)
-        rp.history.update(tid, peer.uuid, 0.8)
+        rp.history.update(tid, rp.identity.uuid, 700)
+        rp.history.update(tid, peer.uuid, 800)
         result = rp._contrite_tit_for_tat(peer)
         # Our rating of the peer is p1_score (0.7), its rating of us p2_score:
         # cooperate, max(0.51, peer_standing=0.7) = 0.7
@@ -745,8 +805,8 @@ class TestContriteTitForTatBranches2:
         peer = _make_mock_peer()
         tid = uuid4()
         # peer is p1, identity is p2
-        rp.history.update(tid, peer.uuid, 0.6)
-        rp.history.update(tid, rp.identity.uuid, 0.7)
+        rp.history.update(tid, peer.uuid, 600)
+        rp.history.update(tid, rp.identity.uuid, 700)
         result = rp._contrite_tit_for_tat(peer)
         # Our rating of the peer is p2_score (0.7), its rating of us p1_score:
         # cooperate, max(0.51, 0.7) = 0.7
@@ -761,8 +821,8 @@ class TestContriteTitForTatBranches2:
         other2 = _make_mock_peer(nickname='o2', address='10.0.0.3')
         tid = uuid4()
         # History entry but neither p1 nor p2 is peer
-        rp.history.update(tid, other1.uuid, 0.7)
-        rp.history.update(tid, other2.uuid, 0.8)
+        rp.history.update(tid, other1.uuid, 700)
+        rp.history.update(tid, other2.uuid, 800)
         result = rp._contrite_tit_for_tat(peer)
         assert result == 0.2  # not enough info → cold-start neutral
 
@@ -815,8 +875,8 @@ class TestRunningConsensus:
     @staticmethod
     def _commit(rp, peer, observed):
         tid = uuid4()
-        rp.history.update(tid, uuid4(), observed)  # counterparty (p1) score
-        rp.history.update(tid, peer, 0.9)          # scored peer as p2
+        rp.history.update(tid, uuid4(), score_to_milli(observed))  # counterparty (p1) score
+        rp.history.update(tid, peer, 900)          # scored peer as p2
         # Mirror what handle_accepted / handle_committed do on a real commit:
         # fold the completed tx into the running consensus EMA immediately.
         rp._fold_committed_tx(tid, rp.history)
@@ -892,8 +952,8 @@ class TestRunningConsensus:
         child = TransactionHistory()
         P = uuid4()
         tid = uuid4()
-        child.update(tid, uuid4(), 0.8)
-        child.update(tid, P, 0.9)
+        child.update(tid, uuid4(), 800)
+        child.update(tid, P, 900)
         rp._fold_committed_tx(tid, child)       # child chain, not self.history
         assert str(P) not in rp._consensus_ema
 
@@ -923,11 +983,9 @@ class TestScoreRangeAtTheRemoteBoundary:
         """A `transaction` message whose payload carries `score_json` verbatim,
         which is how an out-of-range score would actually arrive."""
         peer_id = peer_id or uuid4()
-        payload = ('[[%d, %d, "%s"], {"__type__": "autonomous_trust.core.'
-                   '_python.reputation.reputation.TransactionScore", '
-                   '"task_id": {"__type__": "UUID", "__value__": "%s"}, '
-                   '"score": %s, "capability_name": null}, true, ""]'
-                   % (id1, id2, peer_id, uuid4(), score_json))
+        payload = ('{"id1": %d, "id2": %d, "peer_uuid": "%s", '
+                   '"task_uuid": "%s", "score_milli": %s, "certify": true, '
+                   '"group": ""}' % (id1, id2, peer_id, uuid4(), score_json))
         msg = MagicMock()
         msg.function = ReputationProtocol.transaction
         msg.obj = payload
@@ -937,7 +995,7 @@ class TestScoreRangeAtTheRemoteBoundary:
 
     def test_an_out_of_range_proposal_is_dropped_not_raised(self):
         rp = _make_rep_process()
-        msg = self._proposal('7.5')
+        msg = self._proposal('7500')
         assert rp.handle_transaction({}, msg) is True     # consumed, no raise
         assert rp.proposals == {}                         # nothing recorded
 
@@ -950,7 +1008,7 @@ class TestScoreRangeAtTheRemoteBoundary:
         """The negative control: the drop must not swallow honest traffic."""
         rp = _make_rep_process()
         queues = {CfgIds.network: queue.Queue()}
-        assert rp.handle_transaction(queues, self._proposal('0.75')) is True
+        assert rp.handle_transaction(queues, self._proposal('750')) is True
         assert list(rp.proposals.values())[0].score == 0.75
 
     @staticmethod
@@ -962,7 +1020,7 @@ class TestScoreRangeAtTheRemoteBoundary:
 
     @staticmethod
     def _committed(score_json, peer_id=None, task_id=None, names=None):
-        """`committed` carries a BARE float, so it bypasses the constructor
+        """`committed` carries a BARE integer, so it bypasses the constructor
         entirely -- and it is the path that pools a half on every acceptor.
         It carries a stand-in certificate and scorer signature, which `_rp`
         accepts: the range check is the subject here, certificates are
@@ -995,10 +1053,10 @@ class TestScoreRangeAtTheRemoteBoundary:
         assert len(rp.history) == before
 
     def test_an_out_of_range_committed_tx_never_reaches_history(self):
-        self._assert_not_staged(self._rp(), '42.0')
+        self._assert_not_staged(self._rp(), '42000')
 
     def test_a_negative_committed_tx_never_reaches_history(self):
-        self._assert_not_staged(self._rp(), '-3.0')
+        self._assert_not_staged(self._rp(), '-3000')
 
     def test_a_nan_committed_tx_never_reaches_history(self):
         self._assert_not_staged(self._rp(), 'NaN')
@@ -1007,7 +1065,7 @@ class TestScoreRangeAtTheRemoteBoundary:
         """Control for the assertion above: an in-range score DOES stage."""
         rp = self._rp()
         task_id = uuid4()
-        rp.handle_committed(None, self._committed('0.9', task_id=task_id))
+        rp.handle_committed(None, self._committed('900', task_id=task_id))
         assert rp.history.pooled(task_id) is not None
 
     def test_an_in_range_committed_tx_is_recorded(self):
@@ -1016,9 +1074,9 @@ class TestScoreRangeAtTheRemoteBoundary:
         rp = self._rp()
         task_id, a, b = uuid4(), uuid4(), uuid4()
         assert rp.handle_committed(None, self._committed(
-            '0.9', peer_id=a, task_id=task_id, names=b)) is True
+            '900', peer_id=a, task_id=task_id, names=b)) is True
         assert rp.handle_committed(None, self._committed(
-            '0.8', peer_id=b, task_id=task_id, names=a)) is True
+            '800', peer_id=b, task_id=task_id, names=a)) is True
         assert len(rp.history.pooled(task_id)) == 2
 
     def test_a_rejected_side_cannot_complete_a_transaction(self):
@@ -1026,9 +1084,9 @@ class TestScoreRangeAtTheRemoteBoundary:
         side must NOT commit, or the rejection would only have delayed it."""
         rp = self._rp()
         task_id, a, b = uuid4(), uuid4(), uuid4()
-        rp.handle_committed(None, self._committed('0.9', peer_id=a,
+        rp.handle_committed(None, self._committed('900', peer_id=a,
                                                   task_id=task_id, names=b))
-        rp.handle_committed(None, self._committed('42.0', peer_id=b,
+        rp.handle_committed(None, self._committed('42000', peer_id=b,
                                                   task_id=task_id, names=a))
         assert len(rp.history) == 0
         assert len(rp.history.pooled(task_id)) == 1

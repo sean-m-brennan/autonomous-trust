@@ -69,6 +69,7 @@
 
 #define CAP 0.5
 #define TX_SCORE 0.9
+#define TX_SCORE_MILLI 900   /* TX_SCORE in thousandths, as the chain holds it */
 
 /* `reputations_t` keeps scores as a float (reputation.h: "uuid_str -> data_t*
  * (float score)"), so a value read back has ~1e-7 of rounding on it. Comparing
@@ -149,8 +150,8 @@ static void _transact(const uuid_t self_uuid, const uuid_t peer, int n,
         uuid_clear(task);
         task[0] = (unsigned char)(first_task + i);
         task[15] = 1;
-        reputation_install_tx_pair(task, self_uuid, TX_SCORE,
-                                   peer, TX_SCORE);
+        reputation_install_tx_pair(task, self_uuid, TX_SCORE_MILLI,
+                                   peer, TX_SCORE_MILLI);
     }
 }
 
@@ -652,7 +653,7 @@ DEFINE_TEST(test_a_finding_never_raises_a_peer_known_through_others)
         uuid_clear(task);
         task[0] = (unsigned char)(40 + i);
         task[15] = 2;
-        reputation_install_tx_pair(task, other->uuid, 0.9, them->uuid, 0.9);
+        reputation_install_tx_pair(task, other->uuid, 900, them->uuid, 900);
     }
     double first = 0.0;
     ck_assert(reputation_get_peer_reputation(them->uuid, &first) != 0);   /* never scored */
@@ -667,7 +668,7 @@ DEFINE_TEST(test_a_finding_never_raises_a_peer_known_through_others)
     finding[0] = 50;
     finding[15] = 2;
     /* p1's score is the one p1 gave: `other` scores `them` 0.3. */
-    reputation_install_tx_pair(finding, other->uuid, 0.3, them->uuid, 0.9);
+    reputation_install_tx_pair(finding, other->uuid, 300, them->uuid, 900);
     _dispatch(proc, them, REP_REQ_FN, payload);
     double after = 0.0;
     ck_assert_ret_ok(reputation_get_peer_reputation(them->uuid, &after));

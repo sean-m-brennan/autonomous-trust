@@ -81,12 +81,12 @@ def _entry(everyone, a, b, task=None):
     two other members."""
     task = task or uuid4()
     others = [m for m in everyone if m is not a and m is not b]
-    tx = Transaction(task, p1_id=a.uuid, p1_score=0.9, p2_id=b.uuid,
-                     p2_score=0.7,
-                     commit_sigs={str(a.uuid): _cert(a, task, 0.9, others),
-                                  str(b.uuid): _cert(b, task, 0.7, others)},
-                     half_sigs={str(a.uuid): _half_sig(a, b, task, 0.9),
-                                str(b.uuid): _half_sig(b, a, task, 0.7)})
+    tx = Transaction(task, p1_id=a.uuid, p1_score_milli=900, p2_id=b.uuid,
+                     p2_score_milli=700,
+                     commit_sigs={str(a.uuid): _cert(a, task, 900, others),
+                                  str(b.uuid): _cert(b, task, 700, others)},
+                     half_sigs={str(a.uuid): _half_sig(a, b, task, 900),
+                                str(b.uuid): _half_sig(b, a, task, 700)})
     return placement_entry(tx)
 
 
@@ -224,7 +224,7 @@ class TestAccept:
         elif spoil == 'order':
             d = value[0]
             d['p1'], d['p2'] = d['p2'], d['p1']
-            d['p1_score'], d['p2_score'] = d['p2_score'], d['p1_score']
+            d['p1_score_milli'], d['p2_score_milli'] = d['p2_score_milli'], d['p1_score_milli']
             d['p1_cert'], d['p2_cert'] = d['p2_cert'], d['p1_cert']
             d['p1_sig'], d['p2_sig'] = d['p2_sig'], d['p1_sig']
         elif spoil == 'unsorted':
@@ -243,7 +243,7 @@ class TestAccept:
             d['p1_sig'] = ReputationProcess._detached_sig(
                 forger, half_designation(e1.task_id if str(e1.task_id) == d['task']
                                          else e2.task_id, scorer.uuid,
-                                         other.uuid, d['p1_score']))
+                                         other.uuid, d['p1_score_milli']))
         elif spoil == 'held':
             _pool(rp, e1)
             rp.history.apply_placed(0, rp.history.ready_items())
@@ -291,7 +291,7 @@ class TestLearn:
         prop, obs = four[0], four[3]
         rp, q = _placing(obs, four)
         e = _entry(four, obs, four[1])
-        rp.history.record_half(e.task_id, obs.uuid, 0.9)
+        rp.history.record_half(e.task_id, obs.uuid, 900)
         rp.awaiting_commit[str(e.task_id)] = [0.9, 0, 0, None, 0, 0]
         value = _value(e)
         _placed(rp, q, prop, value, _certify(value, 0, b'', four[:3]))
@@ -318,7 +318,7 @@ class TestLearn:
         sigs = {str(m.uuid): ReputationProcess._detached_sig(m, att.designation)
                 for m in (ver, prop, obs)}
         tx = Transaction(attest_task_id(ver.uuid, subj.uuid, digest),
-                         p1_id=ver.uuid, p1_score=0.3, p1_channel='probe',
+                         p1_id=ver.uuid, p1_score_milli=300, p1_channel='probe',
                          attested=True, subject_id=subj.uuid,
                          evidence_digest=digest, attest_sigs=sigs)
         value = _value(placement_entry(tx))
@@ -411,7 +411,7 @@ def _grant(rp, q, voter, req, accepted=None):
 
 
 def _pool(rp, e):
-    for uid, score in ((e.p1_id, e.p1_score), (e.p2_id, e.p2_score)):
+    for uid, score in ((e.p1_id, e.p1_score_milli), (e.p2_id, e.p2_score_milli)):
         rp.history.record_half(e.task_id, uid, score,
                                certificate=e.certificate_of(uid),
                                counterparty=e.counterparty_of(uid),

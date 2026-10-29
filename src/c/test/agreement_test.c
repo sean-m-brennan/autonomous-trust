@@ -239,6 +239,114 @@ DEFINE_TEST(test_voter_effective_rank)
 }
 END_TEST_DEFINITION()
 
+/* Cast one vote per entry of @p voters[i] / @p approve[i] and finalize.
+ * @p me is the protocol's own voter; blob originator is someone else so
+ * the originator short-circuit does not apply. */
+static bool _vote_and_finalize(agreement_protocol_t *proto, const char *blob_uuid,
+                               const char **voters, const bool *approve, int n)
+{
+    static const uint8_t digest[] = {1, 2, 3, 4};
+    merkle_blob_t *blob = _make_blob(blob_uuid, "someone-else");
+    agreement_proof_t *proofs[8] = {0};
+    for (int i = 0; i < n && i < 8; i++)
+    {
+        ck_assert_ret_ok(agreement_proof_create(voters[i], digest, sizeof(digest),
+                                                approve[i], NULL, 0, &proofs[i]));
+        ck_assert(agreement_verify(proto, blob, proofs[i], NULL, 0));
+    }
+    bool result = agreement_finalize(proto, blob);
+    for (int i = 0; i < n && i < 8; i++)
+        agreement_proof_free(proofs[i]);
+    free(blob);
+    return result;
+}
+
+static agreement_voter_t _voter(const char *uuid, int rank, int tier)
+{
+    agreement_voter_t v = {.rank = rank, .tier = tier};
+    strncpy(v.uuid, uuid, AGREEMENT_UUID_LEN - 1);
+    return v;
+}
+
+DEFINE_TEST(test_authority_tied_leaders)
+{
+    /* RD_13.1 D7: voters tied at the leader rank combine by conjunction.
+     * Mirror of Python TestAuthorityAccumulateLeaderAbstains tie cases. */
+    agreement_voter_t me = _voter("low", 0, 0);
+    agreement_voter_t others[] = {_voter("lead-a", 5, 0), _voter("lead-b", 5, 0)};
+    agreement_protocol_t *proto = NULL;
+    ck_assert_ret_ok(agreement_by_authority_create(&me, others, 2, 0, &proto));
+
+    const char *ab[] = {"lead-a", "lead-b"};
+    const char *ba[] = {"lead-b", "lead-a"};
+    const bool yes_no[] = {true, false};
+    const bool yes_yes[] = {true, true};
+    /* split vote rejects whichever arrives first */
+    ck_assert(!_vote_and_finalize(proto, "b1", ab, yes_no, 2));
+    ck_assert(!_vote_and_finalize(proto, "b2", ba, yes_no, 2));
+    ck_assert(_vote_and_finalize(proto, "b3", ab, yes_yes, 2));
+    /* one tied leader silent: the other's vote stands */
+    ck_assert(_vote_and_finalize(proto, "b4", ab, yes_yes, 1));
+
+    agreement_protocol_free(proto);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_trust_majority)
+{
+    /* RD_13.1: PoT is a strict majority of eligible voters (tier >= the
+     * threshold, default TRUST_DEFAULT_THRESHOLD_TIER), abstention counts
+     * against, below-threshold votes are dropped. Mirror of Python
+     * TestAgreementByTrust. */
+    agreement_voter_t me = _voter("t1b", 0, 1);
+    agreement_voter_t others[] = {_voter("t4", 0, 4), _voter("t2a", 0, 2),
+                                  _voter("t2b", 0, 2), _voter("t1a", 0, 1)};
+    agreement_protocol_t *proto = NULL;
+    ck_assert_ret_ok(agreement_by_trust_create(&me, others, 4, TRUST_THRESHOLD_DERIVE, &proto));
+    ck_assert_int_eq(proto->state.trust.threshold_tier, TRUST_THRESHOLD_DERIVE);
+
+    /* climbed top tier rejects, 3 of 5 eligible approve -> true */
+    const char *climbed[] = {"t4", "t2a", "t2b", "t1a"};
+    const bool climbed_v[] = {false, true, true, true};
+    ck_assert(_vote_and_finalize(proto, "c1", climbed, climbed_v, 4));
+
+    /* top tier alone cannot approve */
+    const char *top[] = {"t4"};
+    const bool yes[] = {true};
+    ck_assert(!_vote_and_finalize(proto, "c2", top, yes, 1));
+
+    /* 2 of 5 approve, 3 silent: abstention counts against */
+    const char *two[] = {"t2a", "t2b"};
+    const bool yes_yes[] = {true, true};
+    ck_assert(!_vote_and_finalize(proto, "c3", two, yes_yes, 2));
+
+    /* replayed approval counts once: t2a x3 is still 1 of 5 */
+    const char *replay[] = {"t2a", "t2a", "t2a"};
+    const bool yes3[] = {true, true, true};
+    ck_assert(!_vote_and_finalize(proto, "c4", replay, yes3, 3));
+    agreement_protocol_free(proto);
+
+    /* explicit threshold 3: only t4 and t3 eligible; tier-1/2 votes dropped */
+    agreement_voter_t me3 = _voter("t3", 0, 3);
+    ck_assert_ret_ok(agreement_by_trust_create(&me3, others, 4, 3, &proto));
+    const char *hi[] = {"t4", "t3", "t2a", "t2b", "t1a"};
+    const bool hi_v[] = {true, true, false, false, false};
+    ck_assert(_vote_and_finalize(proto, "c5", hi, hi_v, 5));
+    /* tie between the two eligible voters rejects */
+    const bool tie_v[] = {true, false, true, true, true};
+    ck_assert(!_vote_and_finalize(proto, "c6", hi, tie_v, 5));
+    agreement_protocol_free(proto);
+
+    /* zero eligible -> false */
+    agreement_voter_t me0 = _voter("t1b", 0, 1);
+    ck_assert_ret_ok(agreement_by_trust_create(&me0, others + 1, 3, 5, &proto));
+    const char *low[] = {"t2a", "t2b", "t1a"};
+    ck_assert(!_vote_and_finalize(proto, "c7", low, yes3, 3));
+    agreement_protocol_free(proto);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(agreement, test_proof_create, test_authority_voting,
           test_stake_voting, test_work_voting, test_originator_auto_approve,
-          test_voter_effective_rank)
+          test_voter_effective_rank, test_authority_tied_leaders,
+          test_trust_majority)

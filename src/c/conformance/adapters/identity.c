@@ -73,6 +73,7 @@
 #include "utilities/allocation.h"
 #include <math.h>
 #include "network/network.h"
+#include "network/net_proc_priv.h"
 /* First contact's half of this adapter is compiled only when its library is
  * built (AT_FIRST_CONTACT_LIB); without it, its scenarios skip. */
 #ifdef AT_FIRST_CONTACT_ENABLED
@@ -2353,6 +2354,12 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     if (strcmp(function, "peer_identity_query") == 0) {
         char guuid[UUID_STRING_LEN + 1] = {0};
         uuid_unparse_lower(sender_impl->proc->protocol.group.uuid, guuid);
+        /* A gateway also queries each child cohort; a step names that group
+         * explicitly. Mirrors the Python adapter. */
+        const char *named = json_is_object(payload)
+            ? json_string_value(json_object_get(payload, "group_uuid")) : NULL;
+        if (named != NULL)
+            snprintf(guuid, sizeof(guuid), "%s", named);
         json_t *have = json_array();
         if (json_is_object(payload)) {
             json_t *h = json_object_get(payload, "have");
@@ -2816,6 +2823,13 @@ static int _dispatch(sce_run_ctx_t *ctx,
         data_t *qn = string_data((string_t)qnames[i], strlen(qnames[i]));
         if (qn != NULL) array_append(queues, qn);
     }
+    /* net_proc tags a frame from a cohort this node gateways (route_to_process
+     * -> net_child_group_of); the harness delivers straight to identity, so it
+     * applies the same tag here. Mirrors the Python adapter's _child_tag. */
+    if (inbound->type == NET_MESSAGE)
+        (void)net_child_group_of(impl->proc, inbound->info.net_msg.from_whom.address,
+                                 inbound->info.net_msg.child_group,
+                                 sizeof(inbound->info.net_msg.child_group));
     run_message_handlers(impl->proc, queues, NET_MESSAGE, inbound);
     array_free(queues);
     return 0;

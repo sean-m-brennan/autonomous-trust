@@ -150,7 +150,7 @@ static char *_cert(identity_t **signers, int n, const uuid_t scorer,
                    const uuid_t task, double score)
 {
     uint8_t desig[512];
-    size_t dlen = commit_designation(scorer, task, score, NULL, desig, sizeof(desig));
+    size_t dlen = commit_designation(scorer, task, tx_score_to_milli(score), NULL, desig, sizeof(desig));
     json_t *sigs = json_object();
     for (int i = 0; i < n; i++)
     {
@@ -170,7 +170,7 @@ static void _half_sig(identity_t *scorer, identity_t *other, const uuid_t task,
                       double score, char *out)
 {
     uint8_t desig[HALF_DESIG_MAX];
-    size_t dlen = half_designation(task, scorer->uuid, other->uuid, score, NULL,
+    size_t dlen = half_designation(task, scorer->uuid, other->uuid, tx_score_to_milli(score), NULL,
                                    desig, sizeof(desig));
     ck_assert(dlen > 0);
     _hex_sig(scorer, desig, dlen, out);
@@ -188,8 +188,8 @@ static void _ready_task(identity_t *a, identity_t *b, identity_t *c,
     char sa[crypto_sign_BYTES * 2 + 1] = {0}, sb[crypto_sign_BYTES * 2 + 1] = {0};
     _half_sig(a, b, task, 0.9, sa);
     _half_sig(b, a, task, 0.6, sb);
-    reputation_record_named_half_on("", task, a->uuid, 0.9, NULL, ca, b->uuid, sa);
-    ck_assert_int_eq(reputation_record_named_half_on("", task, b->uuid, 0.6, NULL,
+    reputation_record_named_half_on("", task, a->uuid, 900, NULL, ca, b->uuid, sa);
+    ck_assert_int_eq(reputation_record_named_half_on("", task, b->uuid, 600, NULL,
                                                      cb, a->uuid, sb),
                      TX_HALF_READY);
     free(ca);
@@ -220,8 +220,8 @@ static void _digest_of(json_t *place, char out[TX_HASH_HEX_LEN + 1])
         uuid_parse(json_string_value(json_object_get(d, "task")), entries[i].task_uuid);
         uuid_parse(json_string_value(json_object_get(d, "p1")), entries[i].p1_uuid);
         uuid_parse(json_string_value(json_object_get(d, "p2")), entries[i].p2_uuid);
-        entries[i].p1_score = json_number_value(json_object_get(d, "p1_score"));
-        entries[i].p2_score = json_number_value(json_object_get(d, "p2_score"));
+        entries[i].p1_score_milli = (int)json_integer_value(json_object_get(d, "p1_score_milli"));
+        entries[i].p2_score_milli = (int)json_integer_value(json_object_get(d, "p2_score_milli"));
         entries[i].p1_set = entries[i].p2_set = true;
     }
     place_value_digest(entries, n, (int)json_integer_value(json_object_get(place, "k")), out);
@@ -360,9 +360,9 @@ DEFINE_TEST(test_a_reported_value_is_carried_instead_of_ours)
     char sl[crypto_sign_BYTES * 2 + 1] = {0}, sh[crypto_sign_BYTES * 2 + 1] = {0};
     _half_sig(lo, hi, theirs, lo == p[1] ? 0.9 : 0.6, sl);
     _half_sig(hi, lo, theirs, hi == p[1] ? 0.9 : 0.6, sh);
-    json_t *entry = json_pack("{s:s, s:s, s:f, s:s, s:f, s:o, s:o, s:s, s:s}", "task", t,
-                              "p1", a, "p1_score", lo == p[1] ? 0.9 : 0.6,
-                              "p2", b, "p2_score", hi == p[1] ? 0.9 : 0.6,
+    json_t *entry = json_pack("{s:s, s:s, s:i, s:s, s:i, s:o, s:o, s:s, s:s}", "task", t,
+                              "p1", a, "p1_score_milli", lo == p[1] ? 900 : 600,
+                              "p2", b, "p2_score_milli", hi == p[1] ? 900 : 600,
                               "p1_cert", json_loads(ca, 0, NULL),
                               "p2_cert", json_loads(cb, 0, NULL),
                               "p1_sig", sl, "p2_sig", sh);
@@ -485,9 +485,9 @@ DEFINE_TEST(test_a_child_chain_round_goes_to_that_group_alone)
     char sa[crypto_sign_BYTES * 2 + 1] = {0}, sb[crypto_sign_BYTES * 2 + 1] = {0};
     _half_sig(p[0], p[1], task, 0.9, sa);
     _half_sig(p[1], p[0], task, 0.6, sb);
-    reputation_record_named_half_on(key, task, p[0]->uuid, 0.9, NULL, ca,
+    reputation_record_named_half_on(key, task, p[0]->uuid, 900, NULL, ca,
                                     p[1]->uuid, sa);
-    ck_assert_int_eq(reputation_record_named_half_on(key, task, p[1]->uuid, 0.6,
+    ck_assert_int_eq(reputation_record_named_half_on(key, task, p[1]->uuid, 600,
                                                      NULL, cb, p[0]->uuid, sb),
                      TX_HALF_READY);
     free(ca);
@@ -677,8 +677,8 @@ static void _placed_at_one(process_t *proc, identity_t *from,
     uuid_copy(e.p1_uuid, a->uuid);
     uuid_copy(e.p2_uuid, b->uuid);
     e.p1_set = e.p2_set = true;
-    e.p1_score = 0.9;
-    e.p2_score = 0.6;
+    e.p1_score_milli = 900;
+    e.p2_score_milli = 600;
     char head[TX_HASH_HEX_LEN + 1], digest[TX_HASH_HEX_LEN + 1], task[UUID_STRING_LEN + 1];
     reputation_get_head_hash(head);
     place_value_digest(&e, 1, 1, digest);
@@ -697,8 +697,8 @@ static void _placed_at_one(process_t *proc, identity_t *from,
     char sa[crypto_sign_BYTES * 2 + 1] = {0}, sb[crypto_sign_BYTES * 2 + 1] = {0};
     _half_sig(a, b, e.task_uuid, 0.9, sa);
     _half_sig(b, a, e.task_uuid, 0.6, sb);
-    json_t *value = json_pack("[{s:s, s:s, s:f, s:s, s:f, s:s, s:s}]", "task", task,
-                              "p1", ua, "p1_score", 0.9, "p2", ub, "p2_score", 0.6,
+    json_t *value = json_pack("[{s:s, s:s, s:i, s:s, s:i, s:s, s:s}]", "task", task,
+                              "p1", ua, "p1_score_milli", 900, "p2", ub, "p2_score_milli", 600,
                               "p1_sig", sa, "p2_sig", sb);
     json_t *msg = json_pack("{s:s, s:i, s:o, s:o}", "group", "", "k", 1,
                             "value", value, "sigs", sigs);
@@ -769,7 +769,7 @@ DEFINE_TEST(test_a_placed_attestation_is_logged_as_committed)
     e.p1_set = true;
     uuid_copy(e.p1_uuid, p[0]->uuid);
     uuid_copy(e.subject_uuid, p[2]->uuid);
-    e.p1_score = 0.3;
+    e.p1_score_milli = 300;
     at_strlcpy(e.p1_channel, "probe", sizeof(e.p1_channel));
     memset(e.evidence_digest, 'a', TX_ATTEST_DIGEST_HEX_LEN);
     tx_attest_task_uuid(e.p1_uuid, e.subject_uuid, e.evidence_digest, e.task_uuid);
@@ -793,8 +793,8 @@ DEFINE_TEST(test_a_placed_attestation_is_logged_as_committed)
     uuid_unparse_lower(e.subject_uuid, subj);
     /* The learner takes the attestation's own certificate on the placement's
      * word, so placeholder signatures stand in for it here. */
-    json_t *value = json_pack("[{s:s, s:b, s:s, s:f, s:s, s:s, s:s, s:{s:s, s:s, s:s}}]",
-                              "task", task, "attested", 1, "p1", ver, "p1_score", 0.3,
+    json_t *value = json_pack("[{s:s, s:b, s:s, s:i, s:s, s:s, s:s, s:{s:s, s:s, s:s}}]",
+                              "task", task, "attested", 1, "p1", ver, "p1_score_milli", 300,
                               "p1_channel", "probe", "subject", subj,
                               "evidence_digest", e.evidence_digest, "attest_sigs",
                               "x", "00", "y", "01", "z", "02");
@@ -981,8 +981,8 @@ static int _catch_up(process_t *proc, identity_t **add_signers, int n_add,
     uuid_copy(t.p1_uuid, a->uuid);
     uuid_copy(t.p2_uuid, b->uuid);
     t.p1_set = t.p2_set = true;
-    t.p1_score = 0.9;
-    t.p2_score = 0.8;
+    t.p1_score_milli = 900;
+    t.p2_score_milli = 800;
     identity_t *two[2] = { p[0], p[1] };
     _src_place(&src, 1, &t, two, 2);
     /* Each scorer signs its own half (R+D.md §14.2): placement cover does not
@@ -1045,8 +1045,8 @@ DEFINE_TEST(test_a_chain_from_before_rosters_is_reset)
     process_t *proc = _begin_with(0);
     uuid_t t;
     uuid_generate(t);
-    reputation_install_tx_single(t, p[0]->uuid, 0.9);
-    reputation_install_tx_single(t, p[1]->uuid, 0.8);
+    reputation_install_tx_single(t, p[0]->uuid, 900);
+    reputation_install_tx_single(t, p[1]->uuid, 800);
     ck_assert_int_eq(reputation_get_committed_tx_count(), 1);
     ck_assert(reputation_reset_pre_roster(proc));
     ck_assert_int_eq(reputation_get_committed_tx_count(), 0);
@@ -1054,8 +1054,8 @@ DEFINE_TEST(test_a_chain_from_before_rosters_is_reset)
 
     proc = _begin();                          /* a roster in force */
     uuid_generate(t);
-    reputation_install_tx_single(t, p[0]->uuid, 0.9);
-    reputation_install_tx_single(t, p[1]->uuid, 0.8);
+    reputation_install_tx_single(t, p[0]->uuid, 900);
+    reputation_install_tx_single(t, p[1]->uuid, 800);
     ck_assert(!reputation_reset_pre_roster(proc));
     ck_assert_int_eq(reputation_get_committed_tx_count(), 1);
     _end();

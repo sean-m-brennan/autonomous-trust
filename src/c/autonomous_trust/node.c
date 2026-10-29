@@ -34,6 +34,7 @@
 #include "node_priv.h"
 #include "config/generate.h"
 #include "utilities/clock.h"
+#include "utilities/float_selftest.h"
 #include "utilities/sighandler.h"
 #include "utilities/socket_helpers.h"  /* at_socket_close */
 #include "utilities/util.h"
@@ -74,6 +75,12 @@ int at_node_init(at_node_t *node, const at_node_config_t *cfg)
      * AT_REQUIRE_SYNCED_CLOCK=1), advisory elsewhere so a developer machine
      * still runs. */
     if (at_clock_require_synced(&node->log, 0) != 0)
+        return -1;
+
+    /* Number conversions, before anything that signs, hashes or parses a
+     * peer's JSON: a node that formats or parses doubles differently from the
+     * fleet rejects valid data from it (utilities/float_selftest.h). */
+    if (at_float_selftest(&node->log) != 0)
         return -1;
 
     /* Ensure required directories exist */

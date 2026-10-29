@@ -498,6 +498,7 @@ ffi.cdef("""
         char trace_id[33];      /* 32-char hex + NUL; NET_TRACE_ID_LEN */
         bool verified;
         bool has_signature;
+        char child_group[37];   /* sender's child cohort uuid on a gateway; "" = none */
     } net_msg_t;
 
     typedef enum {
@@ -660,10 +661,13 @@ ffi.cdef("""
     typedef struct {
         unsigned char task_uuid[16];
         unsigned char p1_uuid[16];
-        double p1_score;
+        /* Changed 2026-10-28 (doc/architecture/reputation.md, "Integer
+         * scores"): each side's score is integer thousandths, an int where a
+         * double was, so every field after it moved. */
+        int p1_score_milli;
         bool p1_set;
         unsigned char p2_uuid[16];
-        double p2_score;
+        int p2_score_milli;
         bool p2_set;
         int index;
         /* Added 2026-08-12 (doc/architecture/native-ffi-dual-implementation.md):
@@ -699,7 +703,7 @@ ffi.cdef("""
     int  tx_history_init(tx_history_t *hist);
     void tx_history_destroy(tx_history_t *hist);
     int  tx_history_update(tx_history_t *hist, const unsigned char *task_uuid,
-                           const unsigned char *peer_uuid, double score,
+                           const unsigned char *peer_uuid, int score_milli,
                            const char *channel);
     int  tx_history_len(const tx_history_t *hist);
     void tx_history_free(tx_history_t *hist);

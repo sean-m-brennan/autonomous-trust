@@ -296,3 +296,75 @@ def test_missing_config_refuses(monkeypatch):
     proc = HybridNetworkProcess.__new__(HybridNetworkProcess)
     with pytest.raises(ValueError, match='hybrid_net.cfg.json'):
         HybridNetworkProcess.__init__(proc, {}, None, None)
+
+
+# ---- the sender address a frame carries is the address of its leg ----
+#
+# A gateway sits on two networks, and each side can reach it only at the
+# address it holds on that side. A frame that named its identity address on
+# every leg sent the far side's receivers an address they cannot reach, which
+# they then took for the member having moved.
+
+TWO_NETS = {
+    'typename': 'hybrid_net',
+    'inners': [
+        {'kind': 'udp_net_4', 'match_cidr': '10.0.0.0/24', 'is_default': True,
+         'net_cfg': {'ip4_cidr': '10.0.0.7/24'}},
+        {'kind': 'udp_net_4', 'match_cidr': '172.20.0.0/16',
+         'net_cfg': {'ip4_cidr': '172.20.0.7/16'}},
+    ],
+    'is_gateway': True,
+}
+
+
+def _signed_message(address='10.0.0.7'):
+    from autonomous_trust.core.identity import Identity
+    from autonomous_trust.core.network import Message
+    me = Identity.initialize('gw@test', 'gw', address)
+    return Message('identity', 'update', 'payload', from_whom=me)
+
+
+def _from_address(frame):
+    import json
+    return json.loads(frame)['from_address']
+
+
+def test_envelope_address_is_the_routed_legs(monkeypatch):
+    proc = _proc(monkeypatch, TWO_NETS)
+    assert proc._envelope_address('172.20.4.4') == '172.20.0.7'
+    assert proc._envelope_address('10.0.0.9') == '10.0.0.7'
+    assert proc._envelope_address('192.168.1.1') == '10.0.0.7'    # the default leg
+
+
+def test_unicast_names_the_far_legs_address_and_keeps_the_signature(monkeypatch):
+    proc = _proc(monkeypatch, TWO_NETS)
+    msg = _signed_message()
+    stamped = proc._as_sent_from(msg, '172.20.4.4')
+    assert stamped.from_whom.address == '172.20.0.7'
+    assert stamped.signature == msg.signature
+    assert msg.from_whom.address == '10.0.0.7'          # the original is untouched
+    assert proc._as_sent_from(msg, '10.0.0.9') is msg   # already right: no copy
+
+
+def test_broadcast_names_each_legs_own_address(monkeypatch):
+    proc = _proc(monkeypatch, TWO_NETS)
+    proc._send_any_message(_signed_message())
+    assert [_from_address(leg.sent[-1][2]) for leg in proc.legs] == ['10.0.0.7', '172.20.0.7']
+
+
+def test_broadcast_fails_only_on_every_leg_when_stamped(monkeypatch):
+    proc = _proc(monkeypatch, TWO_NETS)
+    proc.legs[0].fail = True
+    proc._send_any_message(_signed_message())
+    assert _from_address(proc.legs[1].sent[-1][2]) == '172.20.0.7'
+    proc.legs[1].fail = True
+    with pytest.raises(TransmissionError, match='every leg'):
+        proc._send_any_message(_signed_message())
+
+
+def test_a_single_network_node_keeps_its_identity_address():
+    from autonomous_trust.core.network.netprocess import NetworkProcess
+    proc = NetworkProcess.__new__(NetworkProcess)
+    msg = _signed_message()
+    assert proc._envelope_address('172.20.4.4') is None
+    assert proc._as_sent_from(msg, '172.20.4.4') is msg

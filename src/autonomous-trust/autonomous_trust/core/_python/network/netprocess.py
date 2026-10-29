@@ -15,6 +15,7 @@
 # ******************
 
 import concurrent.futures
+import copy
 import errno
 import json
 import socket
@@ -139,6 +140,19 @@ class NetStat(object):
         self.recv_total += num_bytes
         self.err_in += errors
 
+
+
+def sent_from_address(message, addr):
+    """*message*, or a copy of it whose sender names *addr*. The signature
+    covers process, function and payload only, so the copy keeps it."""
+    me = getattr(message, 'from_whom', None)
+    if not addr or me is None or getattr(me, 'address', None) == addr:
+        return message
+    who = copy.copy(me)
+    who.address = addr
+    stamped = copy.copy(message)
+    stamped.from_whom = who
+    return stamped
 
 class NetworkProcess(Process, metaclass=_NetProcMeta):
     """
@@ -381,6 +395,16 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 'Gateway boundary: refusing %s involving %s -- %s (count: %d)',
                 kind, addr, detail, n)
         return True
+
+    def _child_group_of(self, addr):
+        """The uuid of the child cohort *addr* belongs to when it is on the far
+        side of a gateway boundary from our primary group, else None. A frame
+        so tagged is news about that cohort, which the identity process keeps
+        apart from the primary. Always None on a leaf node."""
+        if not self.child_groups or not self._crosses_gateway(addr):
+            return None
+        grp = self._group_for_sender(addr)
+        return str(grp.uuid) if grp is not None else None
 
     def _crosses_gateway(self, addr):
         """True when *addr* sits on the far side of a gateway boundary from our
@@ -1422,6 +1446,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         # 'main') need 'main' as a valid destination. Restricting to
         # subsystems silently dropped those responses with "Recvd
         # message for unknown main process".
+        message.child_group = self._child_group_of(from_addr)
         target = message.process
         if target not in queues:
             # A C process Python runs inside another one (ZTA's zta_verify
@@ -1504,6 +1529,27 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         except Full:
             pass
 
+    def _envelope_address(self, target):
+        """The address a frame bound for *target* names as its sender, or None
+        to name the identity address. A node on one network has one address
+        and names it; a transport with several networks (the hybrid) answers
+        with the address it holds on the network the frame leaves on."""
+        return None
+
+    def _as_sent_from(self, message, target):
+        """*message* as it should leave for *target*: the same message when it
+        already names the right sender address, else a copy whose sender names
+        the address :meth:`_envelope_address` gives. The signature covers
+        process, function and payload only, so the copy keeps it."""
+        return sent_from_address(message, self._envelope_address(target))
+
+    def _send_any_message(self, message):
+        """Broadcast *message* and return the frame sent. A transport whose
+        legs each need their own sender address overrides this."""
+        msg = bytes(message)
+        self.send_any(msg)
+        return msg
+
     def _unicast(self, message, who):
         """Send *message* point-to-point to one recipient *who*."""
         address = strip_cidr(who.address)
@@ -1527,6 +1573,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         # A peer we can place speaks its group's format; one we cannot place
         # gets JSON, which is what makes pre-admission traffic work in a proto
         # cohort (doc/architecture/network-wire-format.md).
+        message = self._as_sent_from(message, address)
         wire = message.to_wire(self._wire_format_for_addr(address))
         if message.encrypt:
             msg = self.myself.encrypt(wire, who)
@@ -1601,8 +1648,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         # the JSON form.
         msg = bytes(message)
         try:
-            self.send_any(msg)
-            self.track_send_stats(self.unknown_peer, len(msg))
+            sent = self._send_any_message(message)
+            self.track_send_stats(self.unknown_peer, len(sent))
             self._presence.sent(None, time.time())
         except TransmissionError as err:
             self.logger.error('Network: %s', err)
@@ -1635,6 +1682,12 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         # about what the recipients SPEAK.
         tgt_fmt = getattr(tgt, 'wire_format', None) or \
             self._wire_format_for_group(self.group)
+        # A group stops at the gateway, so every member sits on one of our
+        # networks; the first other member's names the sender address.
+        mine = getattr(getattr(self, 'myself', None), 'address', None)
+        first = next((a for a in getattr(tgt, 'addresses', ()) or () if a != mine), None)
+        if first is not None:
+            message = self._as_sent_from(message, first)
         wire = message.to_wire(tgt_fmt)
         if message.encrypt and enc_grp is not None:
             msg = enc_grp.encrypt(wire, enc_grp)
@@ -1725,7 +1778,9 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                           encrypt=message.encrypt,
                                           to_addr=to_addr,
                                           to=str(to_whom)[:80])
-                        self.logger.debug('Send network message: %s:%s', message.process, message.function)
+                        self.logger.debug('Send network message: %s:%s to %s (encrypt=%s)',
+                                          message.process, message.function, to_addr,
+                                          message.encrypt)
                         try:
                             if (message.function == app_roster_request
                                     and message.process == CfgIds.network):

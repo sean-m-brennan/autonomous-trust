@@ -51,6 +51,7 @@
 #include <jansson.h>
 
 #include "probes.h"
+#include "utilities/numfmt.h"
 
 /* ---------- env-var-driven configuration ---------- */
 
@@ -317,12 +318,12 @@ static void _ensure_init(void)
     }
     const char *flush_s = getenv("AT_PROBES_FLUSH_SEC");
     if (flush_s != NULL && flush_s[0] != '\0') {
-        double v = strtod(flush_s, NULL);
+        double v = at_strtod(flush_s, NULL);
         if (v > 0) g_flush_sec = v;
     }
     const char *counter_s = getenv("AT_PROBES_COUNTER_SEC");
     if (counter_s != NULL && counter_s[0] != '\0') {
-        double v = strtod(counter_s, NULL);
+        double v = at_strtod(counter_s, NULL);
         if (v > 0) g_counter_sec = v;
     }
 

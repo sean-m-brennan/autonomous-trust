@@ -57,8 +57,10 @@ class TransactionHistory:
         self._ptr = ptr_holder[0]
 
     def update(self, task_uuid: _uuid.UUID, peer_uuid: _uuid.UUID,
-               score: float, channel: str = None):
-        """Record a transaction score.
+               score_milli: int, channel: str = None):
+        """Record a transaction score, in integer thousandths (0..1000; see
+        doc/architecture/reputation.md, "Integer scores"), as the pure-Python
+        ``TransactionHistory.update`` takes it.
 
         ``channel`` is the evidence channel of the score, part of the
         committed entry and of its hash (doc/architecture/reputation.md,
@@ -78,8 +80,8 @@ class TransactionHistory:
         # the null pointer keeps the "no channel" case one representation.
         chan_buf = ffi.NULL if not channel else ffi.new('char[]',
                                                         str(channel).encode())
-        rc = lib.tx_history_update(self._ptr, task_buf, peer_buf, score,
-                                   chan_buf)
+        rc = lib.tx_history_update(self._ptr, task_buf, peer_buf,
+                                   int(score_milli), chan_buf)
         if rc != 0:
             raise RuntimeError(f"tx_history_update failed with rc={rc}")
 

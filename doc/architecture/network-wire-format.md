@@ -210,6 +210,28 @@ verbs are the only ones that move membership. Everything else crosses freely:
 deliberately spans a group-*key* boundary
 ([partition recovery](partition-recovery.md)) while staying inside one domain.
 
+### What crosses freely is still the cohort's
+
+`group_key_update` and the `confirm` broadcast cross the boundary because they
+are news a gateway needs: a member joined its child cohort, or the cohort's key
+rotated. They are news about **that** cohort, though, and a gateway's identity
+process once read them as news about its primary. A field cohort larger than
+the command cohort then won the size rule that settles a merge between two
+primaries, and the gateway swapped its command group for the field group.
+
+So the network process tags each frame whose sender is in a child cohort and
+not in the primary with that child's uuid (`Message.child_group`, C
+`net_msg_t.child_group`), and identity applies a tagged update or confirmation
+to the child alone: membership and key for the same group, nothing for any
+other. Invariant G is what makes the tag unambiguous, since no address but the
+gateway's own sits in two of its groups. Pinned by
+`identity/gateway-child-update-keeps-primary`.
+
+A gateway also names, as the sender of each frame, the address it holds on the
+network the frame leaves on. Its identity address is on one network only, and
+a frame naming it on the other side read there as a member that had moved,
+which its peers then readdressed out of reach.
+
 ### What they buy: detection is unnecessary, not merely deferred
 
 With both invariants held, the case analysis on an arriving frame is **total**:

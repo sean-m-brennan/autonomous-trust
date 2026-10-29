@@ -24,6 +24,7 @@
 #include "certificates/drat.h"
 #include "certificates/rng.h"
 #include "utilities/util.h"   /* at_strlcpy */
+#include "utilities/numfmt.h"
 
 /****************************
  * Coercion helpers
@@ -199,7 +200,10 @@ static bool _node_key(json_t *j, char *buf, size_t len)
         if (isfinite(d) && fabs(d - (double)truncated) <= 0.0)
             snprintf(buf, len, "%lld", truncated);
         else
-            snprintf(buf, len, "%.17g", d);
+        {
+            char g17[AT_G17_LEN];
+            snprintf(buf, len, "%s", at_fmt_g17(d, g17));
+        }
         return true;
     }
     if (json_is_true(j) || json_is_false(j))

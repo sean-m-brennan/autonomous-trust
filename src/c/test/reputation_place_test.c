@@ -63,9 +63,9 @@ static void _ready(tx_history_t *h, int n)
 {
     uuid_t t;
     _task(n, t);
-    ck_assert_int_eq(tx_history_record_half(h, t, B, 0.8, NULL, NULL),
+    ck_assert_int_eq(tx_history_record_half(h, t, B, 800, NULL, NULL),
                      TX_HALF_PENDING);
-    ck_assert_int_eq(tx_history_record_half(h, t, A, 0.6, NULL, NULL),
+    ck_assert_int_eq(tx_history_record_half(h, t, A, 600, NULL, NULL),
                      TX_HALF_READY);
 }
 
@@ -74,13 +74,13 @@ DEFINE_TEST(test_halves_wait_in_the_pool)
     tx_history_t *h = _hist();
     uuid_t t;
     _task(1, t);
-    ck_assert_int_eq(tx_history_record_half(h, t, A, 0.6, NULL, NULL), TX_HALF_PENDING);
-    ck_assert_int_eq(tx_history_record_half(h, t, A, 0.6, NULL, NULL), TX_HALF_DUP);
-    ck_assert_int_eq(tx_history_record_half(h, t, B, 0.8, NULL, NULL), TX_HALF_READY);
-    ck_assert_int_eq(tx_history_record_half(h, t, C, 0.5, NULL, NULL), TX_HALF_DUP);
+    ck_assert_int_eq(tx_history_record_half(h, t, A, 600, NULL, NULL), TX_HALF_PENDING);
+    ck_assert_int_eq(tx_history_record_half(h, t, A, 600, NULL, NULL), TX_HALF_DUP);
+    ck_assert_int_eq(tx_history_record_half(h, t, B, 800, NULL, NULL), TX_HALF_READY);
+    ck_assert_int_eq(tx_history_record_half(h, t, C, 500, NULL, NULL), TX_HALF_DUP);
     ck_assert_int_eq(tx_history_len(h), 0);
     ck_assert(tx_history_pooled(h, t) != NULL);
-    ck_assert_int_eq(tx_history_record_half(h, t, C, 0.5, "no-such-channel", NULL), -1);
+    ck_assert_int_eq(tx_history_record_half(h, t, C, 500, "no-such-channel", NULL), -1);
     tx_history_destroy(h);
 }
 END_TEST_DEFINITION()
@@ -94,7 +94,7 @@ DEFINE_TEST(test_placed_and_evicted_tasks_are_not_pooled_again)
     ck_assert_int_eq(tx_history_apply_placed(h, 0, items, 1, NULL), TX_PLACE_APPLIED);
     uuid_t t;
     _task(1, t);
-    ck_assert_int_eq(tx_history_record_half(h, t, C, 0.5, NULL, NULL), TX_HALF_PLACED);
+    ck_assert_int_eq(tx_history_record_half(h, t, C, 500, NULL, NULL), TX_HALF_PLACED);
     /* Fill the window past it, so it is evicted and tombstoned. */
     for (int n = 2; n <= MAX_CHAIN_LEN + 1; n++)
     {
@@ -103,7 +103,7 @@ DEFINE_TEST(test_placed_and_evicted_tasks_are_not_pooled_again)
         ck_assert_int_eq(tx_history_apply_placed(h, n - 1, items, 1, NULL),
                          TX_PLACE_APPLIED);
     }
-    ck_assert_int_eq(tx_history_record_half(h, t, C, 0.5, NULL, NULL), TX_HALF_TOMBSTONED);
+    ck_assert_int_eq(tx_history_record_half(h, t, C, 500, NULL, NULL), TX_HALF_TOMBSTONED);
     tx_history_destroy(h);
 }
 END_TEST_DEFINITION()
@@ -114,7 +114,7 @@ DEFINE_TEST(test_ready_items_are_by_task_with_halves_by_scorer)
     _ready(h, 3);
     uuid_t t2;
     _task(2, t2);
-    tx_history_record_half(h, t2, A, 0.6, NULL, NULL);   /* pending */
+    tx_history_record_half(h, t2, A, 600, NULL, NULL);   /* pending */
     _ready(h, 1);
     transaction_t items[PLACE_BATCH_MAX];
     ck_assert_int_eq(tx_history_ready_items(h, items, PLACE_BATCH_MAX), 2);
@@ -125,7 +125,7 @@ DEFINE_TEST(test_ready_items_are_by_task_with_halves_by_scorer)
     ck_assert(uuid_compare(items[1].task_uuid, t3) == 0);
     /* B's half arrived first; A sorts first. */
     ck_assert(uuid_compare(items[0].p1_uuid, A) == 0);
-    ck_assert_double_eq_tol(items[0].p1_score, 0.6, 1e-12);
+    ck_assert_int_eq(items[0].p1_score_milli, 600);
     ck_assert_int_eq(tx_history_ready_items(h, items, 1), 1);
     tx_history_destroy(h);
 }
@@ -165,8 +165,8 @@ DEFINE_TEST(test_pooled_certificates_follow_the_entry)
     tx_history_t *h = _hist();
     uuid_t t;
     _task(1, t);
-    tx_history_record_half(h, t, A, 0.6, NULL, "{\"v\":\"a\"}");
-    tx_history_record_half(h, t, B, 0.8, NULL, "{\"v\":\"b\"}");
+    tx_history_record_half(h, t, A, 600, NULL, "{\"v\":\"a\"}");
+    tx_history_record_half(h, t, B, 800, NULL, "{\"v\":\"b\"}");
     ck_assert(tx_history_commit_cert(h, t, A) == NULL);
     transaction_t items[PLACE_BATCH_MAX];
     ck_assert_int_eq(tx_history_ready_items(h, items, PLACE_BATCH_MAX), 1);
@@ -187,8 +187,8 @@ DEFINE_TEST(test_two_nodes_hold_the_same_chain)
     for (int n = 1; n <= 3; n++)
     {
         _task(n, t);
-        tx_history_record_half(one, t, A, 0.6, NULL, NULL);
-        tx_history_record_half(one, t, B, 0.8, NULL, NULL);
+        tx_history_record_half(one, t, A, 600, NULL, NULL);
+        tx_history_record_half(one, t, B, 800, NULL, NULL);
     }
     for (int n = 3; n >= 1; n--)
         _ready(two, n);
@@ -211,7 +211,7 @@ DEFINE_TEST(test_an_attestation_is_pooled_once_and_placed)
     tx.attested = true;
     uuid_copy(tx.p1_uuid, A);
     tx.p1_set = true;
-    tx.p1_score = 0.3;
+    tx.p1_score_milli = 300;
     snprintf(tx.p1_channel, sizeof(tx.p1_channel), "probe");
     uuid_copy(tx.subject_uuid, B);
     memset(tx.evidence_digest, 'a', TX_ATTEST_DIGEST_HEX_LEN);
@@ -237,10 +237,10 @@ DEFINE_TEST(test_placement_bytes_match_python)
     uuid_t t1, t2;
     _task(1, t1);
     _task(2, t2);
-    tx_history_record_half(h, t2, C, 0.5, "probe", NULL);
-    tx_history_record_half(h, t2, A, 0.25, NULL, NULL);
-    tx_history_record_half(h, t1, B, 0.8, NULL, NULL);
-    tx_history_record_half(h, t1, A, 0.6, NULL, NULL);
+    tx_history_record_half(h, t2, C, 500, "probe", NULL);
+    tx_history_record_half(h, t2, A, 250, NULL, NULL);
+    tx_history_record_half(h, t1, B, 800, NULL, NULL);
+    tx_history_record_half(h, t1, A, 600, NULL, NULL);
     transaction_t items[PLACE_BATCH_MAX];
     ck_assert_int_eq(tx_history_ready_items(h, items, PLACE_BATCH_MAX), 2);
 
@@ -248,10 +248,10 @@ DEFINE_TEST(test_placement_bytes_match_python)
     size_t len = place_value_bytes(items, 2, 3, raw, sizeof(raw));
     static const char want_tail[] =
         "00000000-0000-4000-8000-000000000001|aaaaaaaa-0000-4000-8000-000000000001"
-        "|0.59999999999999998|bbbbbbbb-0000-4000-8000-000000000002"
-        "|0.80000000000000004|3\n"
+        "|600|bbbbbbbb-0000-4000-8000-000000000002"
+        "|800|3\n"
         "00000000-0000-4000-8000-000000000002|aaaaaaaa-0000-4000-8000-000000000001"
-        "|0.25|cccccccc-0000-4000-8000-000000000003|0.5|4|task_outcome|probe";
+        "|250|cccccccc-0000-4000-8000-000000000003|500|4|task_outcome|probe";
     ck_assert_int_eq((int)len, (int)(sizeof("AT-PLACE-VALUE") + strlen(want_tail)));
     ck_assert(memcmp(raw, "AT-PLACE-VALUE\0", sizeof("AT-PLACE-VALUE")) == 0);
     ck_assert(memcmp(raw + sizeof("AT-PLACE-VALUE"), want_tail, strlen(want_tail)) == 0);
@@ -259,7 +259,7 @@ DEFINE_TEST(test_placement_bytes_match_python)
     char digest[TX_HASH_HEX_LEN + 1];
     place_value_digest(items, 2, 3, digest);
     ck_assert_str_eq(digest,
-        "7c61046d768b39b2f1c38ecf1ca40b91114ee713c0469130ba0a174a7a90a1d4");
+        "8da27aa30fdcd2634c5c8e4b7ac1b5e709cba5060d2ddb27dd13103c96a82c05");
 
     char prev[TX_HASH_HEX_LEN + 1];
     memset(prev, 'f', TX_HASH_HEX_LEN);
@@ -272,7 +272,7 @@ DEFINE_TEST(test_placement_bytes_match_python)
     ck_assert_int_eq(tx_history_apply_placed(h, 0, items, 2, "{\"v\":\"s\"}"),
                      TX_PLACE_APPLIED);
     ck_assert_str_eq(h->head_hash,
-        "19ba4e2ca83541b1c851e1c42b0c56c50aec51becf2422722558e55a10028377");
+        "f419a694c6df00722afb207082041d1033b497aade69644a03398e167f45cc84");
     ck_assert_int_eq(tx_history_placed_end(h), 2);
     tx_history_destroy(h);
 }

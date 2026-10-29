@@ -242,15 +242,33 @@ simulator models light-lag, occultation and laser and RF links. Phase II adds
 BPSec to the bundle path, exercises the fabric against contact-window and
 light-lag scenarios, and builds one adapter for devices that cannot host the
 agent. We propose two reference platforms: an sUAS-class companion computer (ARM
-Cortex-A72, the feasibility platform) and [TODO: a small-satellite
-onboard-computer class]. The adapter follows from that choice ([TODO: MAVLink or
-CAN for the sUAS; SpaceWire or MIL-STD-1553 for the spacecraft]). We
-characterize the agent on representative flight-class processors and run a
-feasibility study for microcontroller-class devices, which are the smallest
-members of an IoBT and currently out of the agent's reach.
+Cortex-A72, the feasibility platform) and a small-satellite onboard computer of
+the radiation-tolerant ARMv8 class, represented by a Zynq UltraScale+ MPSoC
+(quad Cortex-A53) of the kind commercial smallsat computers are built on. The
+two share an instruction set, so the Buildroot image and the footprint
+measurements carry from one to the other, and the MPSoC's secure boot and
+on-chip device key give the integrity work of O2 a root of trust the platform
+already has. Both boards are flight-representative rather than
+flight-qualified, which keeps the hardware bill small. The adapter follows from
+that choice ([TODO: MAVLink or CAN for the sUAS; SpaceWire for the
+spacecraft]).
+
+Not every spacecraft is ARM. To show the C core is not tied to one
+architecture, we run it and the conformance corpus on big-endian SPARC under
+QEMU's LEON3 model, the processor family behind radiation-hardened parts such
+as the GR740. A byte-for-byte corpus is a direct test of wire-format
+portability, and emulation costs nothing in hardware. The platforms AT will
+eventually have to cover are radiation-hardened LEON, the RISC-V High
+Performance Spaceflight Computing processor (Microchip PIC64-HPSC), and the
+microcontroller-class computers most CubeSats fly. Phase II reaches the first
+by emulation and the last by a feasibility study, since microcontroller-class
+devices are the smallest members of an IoBT and currently out of the agent's
+reach; HPSC is a Phase III target. We characterize the agent on the
+flight-class reference hardware.
 
 **Method.** Integration on the reference hardware, confirmed with the TPOCs at
-M1; footprint and latency reported as first-class results.
+M1; the LEON3 conformance run under emulation; footprint and latency reported
+as first-class results.
 
 **Commercial application.** Commercial constellations and drone fleets operate
 under the same link constraints, and the bus adapters open the agent to devices
@@ -437,6 +455,9 @@ the reference platforms.
 4.5.4 The contractor shall characterize processor, memory and link overhead on
 representative flight-class hardware, and shall report on the feasibility of
 microcontroller-class deployment.
+
+4.5.5 The contractor shall execute the conformance corpus against the C core
+on an emulated big-endian SPARC (LEON3) target and report the results.
 
 **4.6 Task 6: Scale.** The contractor shall demonstrate operation at a scale of
 not less than 1,000 nodes and report overhead and decision latency against node

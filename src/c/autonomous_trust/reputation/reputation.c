@@ -30,6 +30,7 @@
 #include "utilities/util.h"          /* at_strlcpy */
 #include "structures/data.h"
 #include "identity/identity.h"
+#include "utilities/numfmt.h"
 
 DEFINE_ERROR(EREP_NOTX, "Transaction not found");
 DEFINE_ERROR(EREP_NOPEER, "Peer not found in reputation map");
@@ -54,8 +55,10 @@ int transaction_canonical_bytes(const transaction_t *tx, char *out, size_t outsz
 {
     /* Deterministic, language-agnostic serialization of everything EXCEPT
      * prev_hash. MUST match Python Transaction._canonical_bytes:
-     *   task_id|p1_id|p1_score|p2_id|p2_score|index
-     * UUIDs lowercase-hyphenated (or "null"), floats "%.17g" (or "null"),
+     *   task_id|p1_id|p1_score_milli|p2_id|p2_score_milli|index
+     * UUIDs lowercase-hyphenated (or "null"), scores their integer
+     * thousandths in decimal (or "null"), so no libc float conversion is
+     * involved,
      * index decimal (or "null" when pending / -1). The task_uuid is always
      * present. p1/p2 follow their *_set flags; a pending (index < 0) tx
      * serializes index as "null" to match Python's None.
@@ -84,12 +87,12 @@ int transaction_canonical_bytes(const transaction_t *tx, char *out, size_t outsz
     n += snprintf(buf + n, sizeof(buf) - n, "%s|", tstr);
     n += append_uuid_field(buf + n, sizeof(buf) - n, tx->p1_uuid, tx->p1_set);
     if (tx->p1_set)
-        n += snprintf(buf + n, sizeof(buf) - n, "|%.17g|", tx->p1_score);
+        n += snprintf(buf + n, sizeof(buf) - n, "|%d|", tx->p1_score_milli);
     else
         n += snprintf(buf + n, sizeof(buf) - n, "|null|");
     n += append_uuid_field(buf + n, sizeof(buf) - n, tx->p2_uuid, tx->p2_set);
     if (tx->p2_set)
-        n += snprintf(buf + n, sizeof(buf) - n, "|%.17g|", tx->p2_score);
+        n += snprintf(buf + n, sizeof(buf) - n, "|%d|", tx->p2_score_milli);
     else
         n += snprintf(buf + n, sizeof(buf) - n, "|null|");
     if (tx->index < 0)
@@ -164,7 +167,7 @@ bool transaction_score_about(const transaction_t *tx, const uuid_t peer_uuid,
     if (tx == NULL || !tx_is_committed(tx) || tx->roster)
         return false;
     const uuid_t *from = NULL;
-    double s = 0.0;
+    int s = 0;
     if (tx->attested)
     {
         /* About its subject only; the verifier is the author and gains
@@ -172,22 +175,22 @@ bool transaction_score_about(const transaction_t *tx, const uuid_t peer_uuid,
         if (uuid_compare(tx->subject_uuid, peer_uuid) != 0)
             return false;
         from = &tx->p1_uuid;
-        s = tx->p1_score;
+        s = tx->p1_score_milli;
     }
     else if (uuid_compare(tx->p1_uuid, peer_uuid) == 0)
     {
         from = &tx->p2_uuid;
-        s = tx->p2_score;
+        s = tx->p2_score_milli;
     }
     else if (uuid_compare(tx->p2_uuid, peer_uuid) == 0)
     {
         from = &tx->p1_uuid;
-        s = tx->p1_score;
+        s = tx->p1_score_milli;
     }
     else
         return false;
     if (score != NULL)
-        *score = s;
+        *score = tx_milli_to_score(s);
     if (author != NULL)
         uuid_copy(author, *from);
     return true;
@@ -1052,9 +1055,13 @@ void tx_history_destroy(tx_history_t *hist)
  */
 /* Frama-C: skipped — [solver-timeout] map/array mutation preconditions */
 int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
-                      const uuid_t peer_uuid, double score,
+                      const uuid_t peer_uuid, int score_milli,
                       const char *channel)
 {
+    /* The score is in the entry hash too: off the 0..TX_SCORE_SCALE scale it
+     * is refused, as Python's Transaction.add refuses it. */
+    if (!tx_milli_in_range(score_milli))
+        return EXCEPTION(EINVAL);
     /* Refused before anything is written, and refused rather than coerced:
      * the channel is part of the entry hash (transaction_canonical_bytes), so
      * a spelling this node's vocabulary does not have would fork its chain
@@ -1107,7 +1114,7 @@ int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
         memset(tx, 0, sizeof(transaction_t));
         uuid_copy(tx->task_uuid, task_uuid);
         uuid_copy(tx->p1_uuid, peer_uuid);
-        tx->p1_score = score;
+        tx->p1_score_milli = score_milli;
         tx->p1_set = true;
         /* memset above already left this empty for an absent channel, which
          * is how "no channel" is spelled in the struct. */
@@ -1162,7 +1169,7 @@ int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
         if (!tx->p1_set)
         {
             uuid_copy(tx->p1_uuid, peer_uuid);
-            tx->p1_score = score;
+            tx->p1_score_milli = score_milli;
             tx->p1_set = true;
             if (channel != NULL && channel[0] != '\0')
                 at_strlcpy(tx->p1_channel, channel, sizeof(tx->p1_channel));
@@ -1180,7 +1187,7 @@ int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
             if (uuid_compare(tx->p1_uuid, peer_uuid) == 0)
                 return 0;
             uuid_copy(tx->p2_uuid, peer_uuid);
-            tx->p2_score = score;
+            tx->p2_score_milli = score_milli;
             tx->p2_set = true;
             if (channel != NULL && channel[0] != '\0')
                 at_strlcpy(tx->p2_channel, channel, sizeof(tx->p2_channel));
@@ -1240,7 +1247,7 @@ static bool _attested_well_formed(const transaction_t *in)
         return false;
     if (uuid_is_null(in->subject_uuid) || uuid_compare(in->subject_uuid, in->p1_uuid) == 0)
         return false;
-    if (!(in->p1_score >= 0.0 && in->p1_score <= 1.0))
+    if (!tx_milli_in_range(in->p1_score_milli))
         return false;
     if (!tx_channel_attestable(in->p1_channel))
         return false;
@@ -1274,7 +1281,7 @@ int tx_history_append_attested(tx_history_t *hist, const transaction_t *in,
     *tx = *in;
     tx->p2_channel[0] = '\0';
     memset(tx->p2_uuid, 0, sizeof(tx->p2_uuid));
-    tx->p2_score = 0.0;
+    tx->p2_score_milli = 0;
     tx->index = hist->next_index++;
     if (hist->committed_count == 0)
         hist->first_index = tx->index;
@@ -1460,10 +1467,10 @@ static transaction_t *_pool_append(tx_history_t *hist)
 }
 
 int tx_history_record_half(tx_history_t *hist, const uuid_t task_uuid,
-                           const uuid_t peer_uuid, double score,
+                           const uuid_t peer_uuid, int score_milli,
                            const char *channel, const char *cert_json)
 {
-    return tx_history_record_signed_half(hist, task_uuid, peer_uuid, score,
+    return tx_history_record_signed_half(hist, task_uuid, peer_uuid, score_milli,
                                          channel, cert_json, NULL, NULL);
 }
 
@@ -1541,12 +1548,12 @@ const char *tx_history_pool_half_sig(const tx_history_t *hist,
 }
 
 int tx_history_record_signed_half(tx_history_t *hist, const uuid_t task_uuid,
-                                  const uuid_t peer_uuid, double score,
+                                  const uuid_t peer_uuid, int score_milli,
                                   const char *channel, const char *cert_json,
                                   const uuid_t counterparty,
                                   const char *half_sig)
 {
-    if (hist == NULL)
+    if (hist == NULL || !tx_milli_in_range(score_milli))
         return -1;
     if (channel != NULL && channel[0] != '\0' && !tx_channel_valid(channel))
         return -1;
@@ -1622,14 +1629,14 @@ int tx_history_record_signed_half(tx_history_t *hist, const uuid_t task_uuid,
     if (!tx->p1_set)
     {
         uuid_copy(tx->p1_uuid, peer_uuid);
-        tx->p1_score = score;
+        tx->p1_score_milli = score_milli;
         tx->p1_set = true;
         at_strlcpy(tx->p1_channel, chan, sizeof(tx->p1_channel));
     }
     else
     {
         uuid_copy(tx->p2_uuid, peer_uuid);
-        tx->p2_score = score;
+        tx->p2_score_milli = score_milli;
         tx->p2_set = true;
         at_strlcpy(tx->p2_channel, chan, sizeof(tx->p2_channel));
     }
@@ -1659,7 +1666,7 @@ int tx_history_pool_attested(tx_history_t *hist, const transaction_t *in,
     tx->prev_hash[0] = '\0';
     tx->p2_channel[0] = '\0';
     memset(tx->p2_uuid, 0, sizeof(tx->p2_uuid));
-    tx->p2_score = 0.0;
+    tx->p2_score_milli = 0;
     if (cert_json != NULL && cert_json[0] != '\0')
         map_set(&hist->pool_certs, (map_key_t)task_str,
                 string_data((string_t)cert_json, strlen(cert_json)));
@@ -1691,9 +1698,9 @@ void placement_entry(const transaction_t *in, transaction_t *out)
     uuid_copy(u, out->p1_uuid);
     uuid_copy(out->p1_uuid, out->p2_uuid);
     uuid_copy(out->p2_uuid, u);
-    double sc = out->p1_score;
-    out->p1_score = out->p2_score;
-    out->p2_score = sc;
+    int sc = out->p1_score_milli;
+    out->p1_score_milli = out->p2_score_milli;
+    out->p2_score_milli = sc;
     char ch[TX_CHANNEL_NAMELEN + 1];
     memcpy(ch, out->p1_channel, sizeof(ch));
     memcpy(out->p1_channel, out->p2_channel, sizeof(ch));
@@ -1999,19 +2006,19 @@ const char *tx_history_place_cert(const tx_history_t *hist,
  * Commit certificates (doc/architecture/reputation.md)
  ****************************/
 
-size_t commit_designation(const uuid_t scorer, const uuid_t task, double score,
+size_t commit_designation(const uuid_t scorer, const uuid_t task, int score_milli,
                           const char *channel, uint8_t *out, size_t cap)
 {
     static const char tag[] = "AT-COMMIT";
     size_t tag_len = sizeof(tag);   /* includes the NUL separator */
-    if (out == NULL || cap <= tag_len)
+    if (out == NULL || cap <= tag_len || !tx_milli_in_range(score_milli))
         return 0;
     char s_str[UUID_STRING_LEN + 1];
     char t_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(scorer, s_str);
     uuid_unparse_lower(task, t_str);
-    int n = snprintf((char *)out + tag_len, cap - tag_len, "%s|%s|%.17g|%s",
-                     s_str, t_str, score, tx_channel_or_default(channel));
+    int n = snprintf((char *)out + tag_len, cap - tag_len, "%s|%s|%d|%s",
+                     s_str, t_str, score_milli, tx_channel_or_default(channel));
     if (n < 0 || (size_t)n >= cap - tag_len)
         return 0;
     memcpy(out, tag, tag_len);
@@ -2074,12 +2081,12 @@ const char *tx_history_commit_cert(const tx_history_t *hist, const uuid_t task,
  ****************************/
 
 size_t half_designation(const uuid_t task, const uuid_t scorer,
-                        const uuid_t counterparty, double score,
+                        const uuid_t counterparty, int score_milli,
                         const char *channel, uint8_t *out, size_t cap)
 {
     static const char tag[] = "AT-HALF";
     size_t tag_len = sizeof(tag);   /* includes the NUL separator */
-    if (out == NULL || cap <= tag_len)
+    if (out == NULL || cap <= tag_len || !tx_milli_in_range(score_milli))
         return 0;
     char t_str[UUID_STRING_LEN + 1];
     char s_str[UUID_STRING_LEN + 1];
@@ -2087,8 +2094,8 @@ size_t half_designation(const uuid_t task, const uuid_t scorer,
     uuid_unparse_lower(task, t_str);
     uuid_unparse_lower(scorer, s_str);
     uuid_unparse_lower(counterparty, c_str);
-    int n = snprintf((char *)out + tag_len, cap - tag_len, "%s|%s|%s|%.17g|%s",
-                     t_str, s_str, c_str, score, tx_channel_or_default(channel));
+    int n = snprintf((char *)out + tag_len, cap - tag_len, "%s|%s|%s|%d|%s",
+                     t_str, s_str, c_str, score_milli, tx_channel_or_default(channel));
     if (n < 0 || (size_t)n >= cap - tag_len)
         return 0;
     memcpy(out, tag, tag_len);
@@ -2535,10 +2542,10 @@ int tx_history_era_to_json(const tx_history_t *hist, int start_idx, int end_idx,
         char p2_str[UUID_STRING_LEN + 1];
         uuid_unparse_lower(tx->p2_uuid, p2_str);
 
-        json_t *obj = json_pack("{s:s, s:s, s:f, s:b, s:s, s:f, s:b, s:i, s:s}",
+        json_t *obj = json_pack("{s:s, s:s, s:i, s:b, s:s, s:i, s:b, s:i, s:s}",
             "task", task_str,
-            "p1", p1_str, "p1_score", tx->p1_score, "p1_set", tx->p1_set,
-            "p2", p2_str, "p2_score", tx->p2_score, "p2_set", tx->p2_set,
+            "p1", p1_str, "p1_score_milli", tx->p1_score_milli, "p1_set", tx->p1_set,
+            "p2", p2_str, "p2_score_milli", tx->p2_score_milli, "p2_set", tx->p2_set,
             "index", tx->index,
             "prev_hash", tx->prev_hash);  /* Phase 1 hash-link */
         if (obj == NULL)
@@ -2607,11 +2614,16 @@ static bool _tx_from_json(const json_t *obj, transaction_t *tx)
     memset(tx, 0, sizeof(*tx));
     uuid_parse(task_str, tx->task_uuid);
     uuid_parse(p1_str, tx->p1_uuid);
-    tx->p1_score = json_number_value(json_object_get((json_t *)obj, "p1_score"));
     tx->p1_set = json_boolean_value(json_object_get((json_t *)obj, "p1_set"));
     uuid_parse(p2_str, tx->p2_uuid);
-    tx->p2_score = json_number_value(json_object_get((json_t *)obj, "p2_score"));
     tx->p2_set = json_boolean_value(json_object_get((json_t *)obj, "p2_set"));
+    /* A filled side's score must be an integer on the scale (thousandths);
+     * anything else is malformed, not a score to guess at. */
+    json_t *m1 = json_object_get((json_t *)obj, "p1_score_milli");
+    json_t *m2 = json_object_get((json_t *)obj, "p2_score_milli");
+    if ((tx->p1_set && !tx_milli_from_json(m1, &tx->p1_score_milli))
+        || (tx->p2_set && !tx_milli_from_json(m2, &tx->p2_score_milli)))
+        return false;
     json_t *j_index = json_object_get((json_t *)obj, "index");
     tx->index = json_is_integer(j_index) ? (int)json_integer_value(j_index) : -1;
     /* Channels feed the entry hash, so the link check needs them too. An
@@ -3209,7 +3221,7 @@ done:
             continue;
         }
         const unsigned char *who[2] = { t->p1_uuid, t->p2_uuid };
-        const double sc[2] = { t->p1_score, t->p2_score };
+        const int sc[2] = { t->p1_score_milli, t->p2_score_milli };
         const char *ch[2] = { t->p1_channel, t->p2_channel };
         const bool set[2] = { t->p1_set, t->p2_set };
         for (int side = 0; side < 2; side++)
@@ -3376,9 +3388,10 @@ int reputation_evidence_to_json(const tx_history_t *hist,
         json_t *obj = json_pack("{s:s, s:o, s:o, s:o, s:o, s:i, s:s}",
             "task_id", task_str,
             "p1_id", tx->roster ? json_null() : json_string(p1_str),
-            "p1_score", tx->roster ? json_null() : json_real(tx->p1_score),
+            "p1_score_milli", tx->roster ? json_null() : json_integer(tx->p1_score_milli),
             "p2_id", tx->attested || tx->roster ? json_null() : json_string(p2_str),
-            "p2_score", tx->attested || tx->roster ? json_null() : json_real(tx->p2_score),
+            "p2_score_milli", tx->attested || tx->roster ? json_null()
+                                                    : json_integer(tx->p2_score_milli),
             "index", tx->index,
             "prev_hash", tx->prev_hash);
         if (obj == NULL)
@@ -3565,8 +3578,17 @@ int reputation_evidence_from_json(const json_t *doc, tx_history_t *hist_out,
             free(staged);
             return -1;
         }
-        tx->p1_score = json_number_value(json_object_get(obj, "p1_score"));
-        tx->p2_score = json_number_value(json_object_get(obj, "p2_score"));
+        /* Integer thousandths, refused off the scale (Python's Transaction
+         * constructor raises on them), so a schema-1 float never loads. */
+        if (!tx_milli_from_json(json_object_get(obj, "p1_score_milli"),
+                                &tx->p1_score_milli)
+            || (!attested
+                && !tx_milli_from_json(json_object_get(obj, "p2_score_milli"),
+                                       &tx->p2_score_milli)))
+        {
+            free(staged);
+            return -1;
+        }
         /* The set flags are not on the wire: Python's document omits them, and
          * an entry naming both counterparties with an index IS bilateral by
          * construction. Deriving them beats trusting a field that could
@@ -3733,12 +3755,13 @@ int reputation_evidence_ceilings(const tx_history_t *hist,
          * direction reputation_consensus folds. An attested entry is about its
          * subject only, its certificate standing in for the counterparty. */
         const uuid_t *who[2] = { &tx->p1_uuid, &tx->p2_uuid };
-        double score[2] = { tx->p2_score, tx->p1_score };
+        double score[2] = { tx_milli_to_score(tx->p2_score_milli),
+                            tx_milli_to_score(tx->p1_score_milli) };
         int sides = 2;
         if (tx->attested)
         {
             who[0] = &tx->subject_uuid;
-            score[0] = tx->p1_score;
+            score[0] = tx_milli_to_score(tx->p1_score_milli);
             sides = 1;
         }
         for (int s = 0; s < sides; s++)
@@ -3886,7 +3909,7 @@ double reputation_env_double(const char *name, double dflt)
         return dflt;
     char *end = NULL;
     errno = 0;
-    double val = strtod(raw, &end);
+    double val = at_strtod(raw, &end);
     if (errno != 0 || end == raw)
         return dflt;
     return val;

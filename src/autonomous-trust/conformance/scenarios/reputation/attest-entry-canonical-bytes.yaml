@@ -67,4 +67,4 @@ steps:
 expected_state:
   bob:
     committed_tx_count: 2
-    window_root: "6aa70e940960572281d601bb91a953b28e1829256d297e211950a06aa784c254"
+    window_root: "458e04b77708afc9ef018077cf1b6ce13926adac132444b9658afe05e68441b1"

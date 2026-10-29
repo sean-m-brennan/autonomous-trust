@@ -436,7 +436,10 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
          * `tiers` fixture (peer_id -> int) was already folded into
          * voters[].tier above via _build_voters_from_participants. */
         json_t *thr_j = json_object_get(fixtures_j, "threshold_tier");
-        int threshold = json_is_integer(thr_j) ? (int)json_integer_value(thr_j) : 0;
+        /* Absent threshold_tier selects the default floor, matching
+         * Python's threshold_tier=None. */
+        int threshold = json_is_integer(thr_j) ? (int)json_integer_value(thr_j)
+                                               : TRUST_THRESHOLD_DERIVE;
         if (agreement_by_trust_create(me, others, other_count, threshold, &proto) != 0
             || proto == NULL) {
             snprintf(err, err_len, "scenario: trust_create failed");
@@ -476,7 +479,7 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
                 goto cleanup;
             }
             if (strlen(key) >= MERKLE_UUID_LEN) {
-                snprintf(err, err_len, "scenario: blob id %s too long", key);
+                snprintf(err, err_len, "scenario: blob id %.64s... too long", key);
                 goto cleanup;
             }
             strncpy(blobs[blob_count].id, key, MERKLE_UUID_LEN - 1);

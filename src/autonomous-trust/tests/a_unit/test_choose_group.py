@@ -186,3 +186,62 @@ def test_with_no_history_a_persisted_group_is_restored(tmp_path, monkeypatch):
     assert str(steps[0].uuid) == 'b1d8104b-ed19-405b-a3fe-58ef942ac0b7'
     assert steps[0].payload == b'cd' * 32
     assert steps[0].timestamp.tzinfo is not None
+
+
+# ---- a joiner keeps asking until it is admitted -----------------------------
+#
+# A joiner used to broadcast request_access once and found a group of its own
+# five seconds later. On a loaded host a large share of UDP sends is dropped at
+# the sender while the kernel reports success, and in a large deployment a
+# cohort's admitter can come up minutes after its members; at 96 nodes either
+# was enough to split a cohort into self-founded groups.
+
+def _waiting_chooser(me, patience=0.0):
+    node = _chooser(me)
+    node.histories = []
+    node.init_timeout = 0.3
+    node.rejoin_interval = 0.05
+    node.rejoin_interval_cap = 0.2
+    node.join_patience = patience
+    node._broadcast_request_access = MagicMock()
+    return node
+
+
+def test_a_joiner_re_announces_while_it_waits(monkeypatch, tmp_path):
+    from autonomous_trust.core.config import Configuration
+    monkeypatch.setattr(Configuration, 'get_cfg_dir', staticmethod(lambda: str(tmp_path)))
+    node = _waiting_chooser(_peer('me'))
+    node.choose_group(_queues())
+    assert node._broadcast_request_access.call_count >= 3
+
+
+def test_patience_waits_past_the_init_timeout_for_a_late_admitter(monkeypatch, tmp_path):
+    """With patience set, a joiner that hears nothing in init_timeout keeps
+    asking; the admitter's history, arriving later, is adopted instead of a
+    group of one."""
+    from autonomous_trust.core.config import Configuration
+    monkeypatch.setattr(Configuration, 'get_cfg_dir', staticmethod(lambda: str(tmp_path)))
+    me, admitter = _peer('me'), _peer('anchor')
+    cohort = _group(admitter, name='field')
+    node = _waiting_chooser(me, patience=3.0)
+    calls = []
+
+    def announce(queues, target_group=None):
+        calls.append(1)
+        if len(calls) == 8:                     # well past init_timeout
+            node.histories.append((cohort.to_canonical(), ['s1'], []))
+    node._broadcast_request_access.side_effect = announce
+    node.choose_group(_queues())
+    assert node.group == cohort
+
+
+def test_without_patience_the_joiner_still_founds_its_own_group(monkeypatch, tmp_path):
+    from autonomous_trust.core.config import Configuration
+    monkeypatch.setattr(Configuration, 'get_cfg_dir', staticmethod(lambda: str(tmp_path)))
+    me = _peer('me')
+    node = _waiting_chooser(me)
+    import time
+    t = time.monotonic()
+    node.choose_group(_queues())
+    assert time.monotonic() - t < 2.0
+    assert node.group is not None and str(me.uuid) in {str(k) for k in node.group._address_map}

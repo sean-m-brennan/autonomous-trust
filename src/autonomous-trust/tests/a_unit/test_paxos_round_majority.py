@@ -64,7 +64,7 @@ def _accept(rp, q, voter, idx=(7, 1)):
     """`voter` accepts round `idx`, signing the half it carries (any half,
     for a round the proposer never ran)."""
     score = rp.proposals.get(idx) or TransactionScore(uuid4(), 0.9, subject_uuid=uuid4())
-    sig = _sign(voter, rp.identity, score.task_id, score.score)
+    sig = _sign(voter, rp.identity, score.task_id, score.score_milli)
     rp.handle_accepted(q, _msg(ReputationProtocol.accepted,
                                (idx[0], idx[1], rp.identity.uuid, sig), voter))
 

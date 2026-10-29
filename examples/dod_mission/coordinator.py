@@ -55,23 +55,15 @@ from autonomous_trust.inspector.transitive_trust import (
 from autonomous_trust.evaluation.scenarios.recording import EventRecorder
 from autonomous_trust.core import LOG_FORMAT, LOG_DATEFMT
 
-def _roster_name_of(peer):
-    """Bare roster name for a peer == the local-part of its ONLINE nickname.
-
-    The online nickname (e.g. ``mq800@tekfive.com``) is the only globally-
-    consistent, wire-carried name; the local petname is deliberately arbitrary
-    (a random suffix is minted on receipt -- see
-    identity.derive_local_petname) and must NOT be used to match a peer to its
-    scenario roster role. We strip the ``@domain`` to recover the deployment-set
-    AT_PEER_NAME (``mq800``) the scenario keys on.
-
-    Accepts either a raw ``Identity`` (``.nickname``) or a peer wrapper that
-    exposes ``.identity`` (the inspector's ``PeerDataAcq``), and tolerates a
-    nickname with no ``@`` (returned as-is)."""
-    ident = getattr(peer, "identity", None) or peer
-    nn = (getattr(ident, "nickname", None)
-          or getattr(peer, "nickname", None) or "")
-    return str(nn).split('@', 1)[0].strip()
+# Imported as examples.dod_mission.coordinator (tests) or run as a script, where
+# the sibling module resolves by bare name.
+try:
+    from .subscribe_policy import (
+        pending_roster_subscriptions, resub_due, roster_name_of as _roster_name_of)
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from subscribe_policy import (  # noqa: E402
+        pending_roster_subscriptions, resub_due, roster_name_of as _roster_name_of)
 
 
 def _peer_permits_neighbor(name: str, agency: str,
@@ -339,54 +331,10 @@ try:
                             "Unhandled message of type %s",
                             type(message).__name__)
 
-        @staticmethod
-        def _pending_roster_subscriptions(peers_all, already, data_producers):
-            """Roster peers that produce data but aren't satisfied yet.
-
-            Pure decision half of the late-joiner fallback (see
-            _patched_process): given the admitted roster, the set of peers
-            already satisfied, and the set of data-producer roster names,
-            return the peers to (re)subscribe to now. ``already`` may hold
-            Identity objects (the cap path's servicers) OR bare uuid strings
-            (the retry path's _received_data_uuids) — both reduce to a uuid
-            string. Dedups by uuid string so a peer already serviced / already
-            delivering data is skipped, and the same peer isn't returned twice
-            within one pass.
-            """
-            subscribed = {str(getattr(s, "uuid", s)) for s in already}
-            pending = []
-            for p in peers_all:
-                # Match on the ONLINE nickname's local-part, NOT the petname:
-                # the petname is local-only and arbitrary on the receiver side
-                # (random suffix), so it never equals a roster name like
-                # "mq800". See _roster_name_of / identity.derive_local_petname.
-                if _roster_name_of(p) not in data_producers:
-                    continue
-                uid = str(getattr(p, "uuid", ""))
-                if not uid or uid in subscribed:
-                    continue
-                subscribed.add(uid)
-                pending.append(p)
-            return pending
-
-        @staticmethod
-        def _resub_due(schedule, uid, tick, base, cap):
-            """True when peer ``uid`` is due another subscribe at ``tick``.
-
-            Pure backoff half of the retry path: the first attempt is
-            immediate, then the gap doubles from ``base`` ticks up to ``cap``.
-            ``schedule`` maps uid -> (next due tick, current gap) and is
-            updated in place whenever an attempt is due.
-            """
-            entry = schedule.get(uid)
-            if entry is None:
-                schedule[uid] = (tick + base, min(base * 2, cap))
-                return True
-            due_at, gap = entry
-            if tick < due_at:
-                return False
-            schedule[uid] = (tick + gap, min(gap * 2, cap))
-            return True
+        # Shared with GatewayRelay (subscribe_policy); kept as attributes so
+        # existing callers and tests reach them through the receiver.
+        _pending_roster_subscriptions = staticmethod(pending_roster_subscriptions)
+        _resub_due = staticmethod(resub_due)
 
         def _resolve_identity(self, ref):
             """Accept Identity, UUID, or uuid-string; return Identity
@@ -447,7 +395,7 @@ except ImportError as _exc:
 # regardless of how the script was invoked.
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
-from scenario import DoDMissionScenario  # noqa: E402
+from scenario import DoDMissionScenario, scenario_from_env  # noqa: E402
 from dashboard.dod_app import build_dashboard  # noqa: E402
 from dashboard import live_server  # noqa: E402
 from dashboard.narration_script import DOD_NARRATION  # noqa: E402
@@ -1860,15 +1808,7 @@ def main():
 
     # Build the scenario from env-var knobs so the same coordinator
     # image works for a 16-peer demo and a 100-peer scale test.
-    scenario = DoDMissionScenario(
-        squad_size=int(os.environ.get("AT_SQUAD_SIZE", "4")),
-        swarm_size=int(os.environ.get("AT_SWARM_SIZE", "4")),
-        sensor_count=int(os.environ.get("AT_SENSOR_COUNT", "3")),
-        hacked_sensors=int(os.environ.get("AT_HACKED_SENSORS", "2")),
-        include_mq800=os.environ.get("AT_INCLUDE_MQ800", "1") != "0",
-        include_jet=os.environ.get("AT_INCLUDE_JET", "1") != "0",
-        include_command=os.environ.get("AT_INCLUDE_COMMAND", "1") != "0",
-    )
+    scenario = scenario_from_env()
 
     if setup_mode:
         # Signature: generate_worker_config(cfg_dir, proc_name, cfg_class, defaults).

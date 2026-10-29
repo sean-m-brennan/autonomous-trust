@@ -373,7 +373,9 @@ int ip4_binary_to_addr(uint32_t ip, char *addr);
 */
 int cidr4_to_broadcast(char *cidr, char *bcast_addr);
 
-#ifdef __FRAMAC__
+/* Only ever memcpy'd, so the struct form is enough where there is no native
+ * 128-bit integer (32-bit targets such as SPARC). */
+#if defined(__FRAMAC__) || !defined(__SIZEOF_INT128__)
 typedef struct { uint64_t lo; uint64_t hi; } uint128_t;
 #else
 typedef unsigned __int128 uint128_t;

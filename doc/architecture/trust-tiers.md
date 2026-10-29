@@ -158,7 +158,7 @@ def _pure_reputation(self, peer):
     for tx in self.history.by_peer(peer.uuid):
         reporter_score = ...
         if reporter_score is None: continue
-        peer_score = tx.p1_score if tx.p1_id == peer.uuid else tx.p2_score
+        peer_score = tx.about(peer.uuid)[0]   # 0.0..1.0, from p*_score_milli
         w = self._tx_weight(tx)  # transaction_weight from cached capability
         total += reporter_score * peer_score * w
         total_w += reporter_score * w
@@ -467,7 +467,7 @@ Every Python element has a C mirror.
 | `peer._tier` | `peer_t::tier` |
 | `handle_tier_lost`, task cancellation | `handle_tier_lost` in `neg_proc.c`, walking the same map |
 | `BootstrapWorker` | `bootstrap_worker_t` |
-| `AgreementByTrust` | `_trust_count_vote` and friends in `agreement.c` |
+| `AgreementByTrust`, `DEFAULT_THRESHOLD_TIER` | `_trust_accumulate` and friends in `agreement.c`, `TRUST_DEFAULT_THRESHOLD_TIER` |
 | The three bootstrap capabilities | identical C implementations, registered by the C bootstrap |
 
 ## 10. Proof of trust
@@ -476,12 +476,29 @@ The authority agreement class reads rank and is the right shape for
 capability-gated decisions, meaning cases where only gateways should vote. It is
 unchanged.
 
-The trust agreement class is a parallel one that reads tier. It applies when the
-correctness of an agreement depends on behavioral track record rather than on
-inherent node capability, as when authorizing a data-sharing operation where any
-well-behaved peer should be eligible to vote regardless of whether it is a
-gateway. It mirrors the authority class in shape, differing only in the
-attribute it reads and the name of its threshold field.
+The trust agreement class reads tier. It applies when the correctness of an
+agreement depends on behavioral track record rather than on inherent node
+capability, as when authorizing a data-sharing operation where any well-behaved
+peer should be eligible to vote regardless of whether it is a gateway.
+
+Unlike the authority class it has no leader. A voter is eligible when its tier
+is at or above `threshold_tier`, which defaults to tier 1 (reputation 0.50 or
+better) and can be set per agreement. The blob is approved when more than half
+of the eligible voters approve. An eligible voter that stays silent counts
+against, a tie rejects, and a vote from below the threshold is dropped rather
+than counted as a nay. The rule holds while fewer than half of the eligible
+voters are Byzantine, and no single voter decides however high it has climbed.
+
+Until R+D.md §13.1 the class was a copy of the authority class on the tier
+axis, so the highest-tier peer decided every vote. It changed in place because
+nothing called it. Two limits carry over. Tiers are each node's own opinion and
+are not on the wire, so two honest nodes can count different eligible sets for
+the same blob. And eligibility is only as sound as the reputation that sets it.
+`RD_13.1_TRIMMED_AGREEMENT_PLAN.md` §6 covers both.
+
+When voters tie for the authority leader's rank, every tied leader who votes
+must approve. Before §13.1 the C runtime took the first such vote and Python
+the last.
 
 The two coexist rather than one replacing the other, and any given agreement
 uses whichever matches what its consequence actually depends on. Rank answers

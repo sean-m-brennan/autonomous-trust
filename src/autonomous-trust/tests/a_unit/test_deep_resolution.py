@@ -42,6 +42,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from autonomous_trust.core.reputation.reputation import score_to_milli
 from autonomous_trust.core.config import Configuration, to_json_string
 from autonomous_trust.core.reputation.repprocess import ReputationProcess
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
@@ -87,8 +88,8 @@ def _chain_with(holder: Identity, peer_uuid, count=3, score=TX_SCORE):
     history = TransactionHistory()
     for i in range(count):
         tid = UUID(int=i + 1)
-        history.update(tid, holder.uuid, score)
-        history.update(tid, peer_uuid, score)
+        history.update(tid, holder.uuid, score_to_milli(score))
+        history.update(tid, peer_uuid, score_to_milli(score))
     return history
 
 
@@ -186,7 +187,7 @@ class TestPrimitives:
         history = _chain_with(holder, peer, count=3)
         # A one-sided (not yet bilateral) entry has no index and is not
         # evidence of anything; it must not move the root.
-        history.update(UUID(int=99), holder.uuid, 0.1)
+        history.update(UUID(int=99), holder.uuid, 100)
         assert window_root_of(list(history)) == history.window_root()
 
     def test_score_from_window_matches_the_process_fold(self):
@@ -258,7 +259,7 @@ class TestVerifyResolved:
 
     def test_edited_score_is_refused(self):
         _holder, _peer, signers, doc = self._answer()
-        doc['chain'][0]['p2_score'] = 0.01
+        doc['chain'][0]['p2_score_milli'] = 10
         _q, _p, _s, chain, signed, carried = resolved_from_dict(doc)
         ok, _reason = verify_resolved(chain, signed, carried,
                                       _verify_with(signers), _always)

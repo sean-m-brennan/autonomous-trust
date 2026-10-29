@@ -111,7 +111,7 @@ class TestShape:
         back = from_json_string(to_json_string([_genesis(), _add()]))
         assert [t.entry_hash() for t in back] == [G_HASH, A_HASH]
         assert back[1].roster_members == [list(m) for m in sorted(map(tuple, M3))]
-        plain = Transaction(T0, p1_id=UUID(A), p1_score=0.5)
+        plain = Transaction(T0, p1_id=UUID(A), p1_score_milli=500)
         assert 'roster_op' not in plain.to_dict()
 
     def test_evidence_round_trips_and_checks_the_digest(self):
@@ -135,8 +135,8 @@ class TestRosterAt:
         hist = TransactionHistory(max_chain_len=cap)
         g = Transaction(T0, roster_op='genesis', roster_digest=D2, roster_members=M2)
         assert hist.apply_placed(0, [g]) == 'applied'
-        tx = Transaction(UUID(int=7), p1_id=UUID(A), p1_score=0.5,
-                         p2_id=UUID(B), p2_score=0.6)
+        tx = Transaction(UUID(int=7), p1_id=UUID(A), p1_score_milli=500,
+                         p2_id=UUID(B), p2_score_milli=600)
         assert hist.apply_placed(1, [tx]) == 'applied'
         a = Transaction(T1, roster_op='add', roster_uuid=UUID(C),
                         roster_digest=D3, roster_members=M3)
@@ -162,8 +162,8 @@ class TestRosterAt:
     def test_one_evicted_from_the_window_is_gone(self):
         hist = self._placed(cap=1)
         assert hist.roster_at(3).task_id == T1
-        tx = Transaction(UUID(int=8), p1_id=UUID(A), p1_score=0.5,
-                         p2_id=UUID(B), p2_score=0.6)
+        tx = Transaction(UUID(int=8), p1_id=UUID(A), p1_score_milli=500,
+                         p2_id=UUID(B), p2_score_milli=600)
         hist.apply_placed(3, [tx])
         assert hist.latest_roster() is None      # restatement's job to prevent
 
@@ -209,12 +209,12 @@ class TestJudgedByRoster:
         roster = _roster_of(roster_idents or [ada, dee, amy])
         assert rp.history.apply_placed(0, [roster]) == 'applied'
         t = uuid4()
-        entry = Transaction(t, p1_id=dee.uuid, p1_score=0.9, p2_id=amy.uuid,
-                            p2_score=0.8,
-                            commit_sigs={str(dee.uuid): _half_cert([ada], dee, t, 0.9),
-                                         str(amy.uuid): _half_cert([ada], amy, t, 0.8)},
-                            half_sigs={str(dee.uuid): _half(dee, amy, t, 0.9),
-                                       str(amy.uuid): _half(amy, dee, t, 0.8)})
+        entry = Transaction(t, p1_id=dee.uuid, p1_score_milli=900, p2_id=amy.uuid,
+                            p2_score_milli=800,
+                            commit_sigs={str(dee.uuid): _half_cert([ada], dee, t, 900),
+                                         str(amy.uuid): _half_cert([ada], amy, t, 800)},
+                            half_sigs={str(dee.uuid): _half(dee, amy, t, 900),
+                                       str(amy.uuid): _half(amy, dee, t, 800)})
         from autonomous_trust.core.reputation.reputation import placement_entry
         entries = [placement_entry(entry)]
         desig = place_designation(1, rp.history.head_hash,
@@ -258,7 +258,7 @@ class TestJudgedByRoster:
         # One co-signature a half: a majority of the roster of three with
         # its scorer, short of the live view's four.
         assert rp._place_value_ok(entries, rp.history, None) is None
-        assert not rp._commit_cert_ok(dee.uuid, entries[0].task_id, 0.9, None,
+        assert not rp._commit_cert_ok(dee.uuid, entries[0].task_id, 900, None,
                                       entries[0].certificate_of(dee.uuid),
                                       roster=None)
 
@@ -308,8 +308,8 @@ class TestRosterValue:
     def test_a_roster_entry_is_placed_alone(self):
         rp, me, others = self._acceptor()
         t = uuid4()
-        tx = Transaction(t, p1_id=me.uuid, p1_score=0.9, p2_id=others[0].uuid,
-                         p2_score=0.8)
+        tx = Transaction(t, p1_id=me.uuid, p1_score_milli=900, p2_id=others[0].uuid,
+                         p2_score_milli=800)
         assert rp._place_value_ok([self._add(rp, others[2]), tx], rp.history, None)
 
     def test_an_early_restatement_and_a_wrong_task_are_refused(self):
@@ -367,10 +367,10 @@ class TestAnchor:
         src = TransactionHistory()
         _place(src, 0, _roster_of([a, b, c]), [a, b, c])
         t = uuid4()
-        _place(src, 1, Transaction(t, p1_id=a.uuid, p1_score=0.9, p2_id=b.uuid,
-                                   p2_score=0.8,
-                                   half_sigs={str(a.uuid): _half(a, b, t, 0.9),
-                                              str(b.uuid): _half(b, a, t, 0.8)}),
+        _place(src, 1, Transaction(t, p1_id=a.uuid, p1_score_milli=900, p2_id=b.uuid,
+                                   p2_score_milli=800,
+                                   half_sigs={str(a.uuid): _half(a, b, t, 900),
+                                              str(b.uuid): _half(b, a, t, 800)}),
                [a, b])
         _place(src, 2, _add_of(src, d), [a, b])
         rp, _q = _node(d, [a, b, c])
@@ -423,15 +423,15 @@ class TestBeforeTheRoster:
     def test_nothing_but_a_genesis_is_accepted_before_a_roster(self, tmp_path):
         rp, (me, a, b) = self._node(tmp_path)
         t = uuid4()
-        tx = Transaction(t, p1_id=a.uuid, p1_score=0.9, p2_id=b.uuid, p2_score=0.8)
+        tx = Transaction(t, p1_id=a.uuid, p1_score_milli=900, p2_id=b.uuid, p2_score_milli=800)
         assert rp._place_value_ok([tx], rp.history, None) == \
             'nothing is placed before the genesis'
 
     def test_a_chain_from_before_rosters_is_reset_at_boot(self, tmp_path):
         rp, (me, a, b) = self._node(tmp_path)
         t = uuid4()
-        rp.history.update(t, a.uuid, 0.9)
-        rp.history.update(t, b.uuid, 0.8)
+        rp.history.update(t, a.uuid, 900)
+        rp.history.update(t, b.uuid, 800)
         for path in (rp._placement_path(''), rp._pool_path('')):
             open(path, 'w').write('{}')
         assert rp._reset_pre_roster_chain('')

@@ -34,7 +34,7 @@ fixtures:
       rogue: 0.6
   checkpoint:
     bob:
-      root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+      root: "f9bf077e5bfd8ef4cdf5fb0519b70ec51fb7df536515bf16c594a477ce6d5168"
       epoch: 1
       count: 3
 
@@ -52,9 +52,9 @@ steps:
         # Tampered: leading 0 -> 1. The proof no longer reproduces the root.
         leaf: "17b59d032e50c07b60566f7a37db00376b53774dd25e892cda3d3941f3fad7b7"
         proof:
-          - ["6e0ab4df99d68b69c33d3477346184c131caffaa37578386ca6a5b9ab834665f", false]
-          - ["1b7150f96be8562a226f831d4535ec4855b1c08530956ea149114e16799e52b7", false]
-        root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+          - ["244a27c19915c64129429a834fdb517b1a3f51395d2940a950eb47b88e5c766d", false]
+          - ["4f165ec5ff8ed7eb52a08bd0c648f50dd5944a673f6531e635cb637cd47bbad9", false]
+        root: "f9bf077e5bfd8ef4cdf5fb0519b70ec51fb7df536515bf16c594a477ce6d5168"
     description: |
         alice broadcasts a slash whose evidence proof does not verify; bob
         rejects it and rogue's reputation is unchanged.

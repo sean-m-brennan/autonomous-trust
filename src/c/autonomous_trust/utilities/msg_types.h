@@ -132,6 +132,12 @@ typedef struct
      * leave verified=false but only the latter is a security event. */
     bool verified;
     bool has_signature;
+    /* On a gateway, the uuid (hyphenated, lowercase) of the child cohort the
+     * sender belongs to, set by net_proc on receipt; empty for a frame from the
+     * primary cohort, a stranger, or on any node with no child group. Identity
+     * applies a tagged group update or confirmation to that child group, never
+     * to the primary. Mirrors Python Message.child_group. */
+    char child_group[37];
 } net_msg_t;
 
 /** Free @p msg's payload (see net_msg_t.obj) and clear obj/len. NULL-safe.

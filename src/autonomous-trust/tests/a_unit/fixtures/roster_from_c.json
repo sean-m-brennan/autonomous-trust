@@ -1,21 +1,21 @@
 {
   "members": {
-    "d41c249a-6df9-4338-94a5-e4ee15cacb1c": {
-      "first_seen": 1791243335,
-      "pubkey": "250798932a57e6b8afd5ea84115fc8bc9af1b8e022a5f7d8dd2c534c7bedd9e5",
-      "last_seen": 1791243336,
+    "e501e0c9-c5ee-4fd7-bb90-95fc54924910": {
+      "first_seen": 1793222286,
+      "pubkey": "fd5176f65932f6a6bcf21c77ba247cca34501c3a366dc2f90876d710f508345d",
+      "last_seen": 1793222287,
       "member": true
     },
-    "04b730cc-e65d-4e08-9f36-25e2288bc51e": {
-      "first_seen": 1791243335,
-      "pubkey": "a4bcf8931508816652fd04c062a02d93652ef3b4b49c9d1cfdfceb8532b41f5a",
-      "last_seen": 1791243336,
+    "e7627950-1201-4cba-ad31-58dc8af528a5": {
+      "first_seen": 1793221986,
+      "pubkey": "601a7ea36e8fd5c6d533d5db2a786756982106d106a742fd191e45214c5c0e4d",
+      "last_seen": 1793222287,
       "member": true
     },
-    "137d3a90-d631-4e77-b29a-04861311900d": {
-      "first_seen": 1791243335,
-      "pubkey": "0dd90c9548b01e5d445cf1658da54da0a5bd3bdb4dd35d2b8d690dbe2078702b",
-      "last_seen": 1791243336,
+    "722bb452-2bfb-4b7e-976a-c3885e9ac51b": {
+      "first_seen": 1793222286,
+      "pubkey": "162b246d8e5ee0e6346d9da1e44678f63bfc17c8e50afe701b9c4215c0fed86e",
+      "last_seen": 1793222287,
       "member": true
     }
   },
@@ -23,12 +23,12 @@
     {
       "group_uuid": "",
       "epoch": 1,
-      "root": "02a100be361a30be72523d220513ac338d35e6ef4a88782002230b16bfe8f570",
+      "root": "f92692723b79e976772f2f769ba73c683b0c09c7bba8b9b58a0faacf353baefe",
       "first_index": 0,
       "count": 1
     }
   ],
   "schema": "1",
   "group_uuid": "00000000-0000-0000-0000-000000000000",
-  "self": "d41c249a-6df9-4338-94a5-e4ee15cacb1c"
+  "self": "e501e0c9-c5ee-4fd7-bb90-95fc54924910"
 }

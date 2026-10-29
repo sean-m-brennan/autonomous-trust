@@ -39,6 +39,7 @@
 #include "replication/bisection.h"
 #include "replication/replication.h"
 #include "replication/sampling.h"
+#include "utilities/numfmt.h"
 
 /* Draw comparison tolerance. The draw is exact power-of-two-scaled integer
  * arithmetic, so this is tight; it exists only so a pinned literal need not
@@ -136,8 +137,8 @@ static int _check_vs(json_t *event, int index, const char *const *peers,
                 || strcmp(ch, wc) != 0)
             {
                 snprintf(err, err_len,
-                         "event %d: %.63s score=(%.17g,%.40s), expected "
-                         "(%.17g,%.40s)", index, peers[i], sc, ch, ws,
+                         "event %d: %.63s score=(%s,%.40s), expected "
+                         "(%s,%.40s)", index, peers[i], AT_G17(sc), ch, AT_G17(ws),
                          wc ? wc : "(null)");
                 return -1;
             }
@@ -337,8 +338,8 @@ static int _run_live_prob(const at_replication_model_t *model, json_t *event,
     double got = at_replication_live_prob_for(model, cap);
     if (fabs(got - want) > AT_REPL_TOL)
     {
-        snprintf(err, err_len, "event %d: live_prob_for('%s')=%.17g, expected %.17g",
-                 index, cap ? cap : "(null)", got, want);
+        snprintf(err, err_len, "event %d: live_prob_for('%s')=%s, expected %s",
+                 index, cap ? cap : "(null)", AT_G17(got), AT_G17(want));
         return -1;
     }
     return 0;
@@ -578,10 +579,10 @@ void at_replication_conformance_run(const at_case_t *c, at_case_result_t *out)
                 {
                     snprintf(err, sizeof(err),
                              "event %d: replicate=%s, expected %s "
-                             "(prob=%g, seed=%llu, draw=%.17g)",
+                             "(prob=%s, seed=%llu, draw=%s)",
                              index, decision ? "True" : "False",
-                             expected ? "True" : "False", prob,
-                             (unsigned long long)seed, draw);
+                             expected ? "True" : "False", AT_G17(prob),
+                             (unsigned long long)seed, AT_G17(draw));
                     goto done;
                 }
             }
@@ -592,8 +593,8 @@ void at_replication_conformance_run(const at_case_t *c, at_case_result_t *out)
                 if (fabs(draw - w) > AT_REPL_TOL)
                 {
                     snprintf(err, sizeof(err),
-                             "event %d: draw=%.17g, expected %.17g",
-                             index, draw, w);
+                             "event %d: draw=%s, expected %s",
+                             index, AT_G17(draw), AT_G17(w));
                     goto done;
                 }
             }
@@ -604,8 +605,8 @@ void at_replication_conformance_run(const at_case_t *c, at_case_result_t *out)
                 if (fabs(prob - w) > AT_REPL_TOL)
                 {
                     snprintf(err, sizeof(err),
-                             "event %d: effective_prob=%.17g, expected %.17g",
-                             index, prob, w);
+                             "event %d: effective_prob=%s, expected %s",
+                             index, AT_G17(prob), AT_G17(w));
                     goto done;
                 }
             }
@@ -649,8 +650,8 @@ void at_replication_conformance_run(const at_case_t *c, at_case_result_t *out)
             if (fabs(actual - want) > AT_REPL_TOL)
             {
                 snprintf(err, sizeof(err),
-                         "event %d: prob_for('%s')=%.17g, expected %.17g",
-                         index, cap ? cap : "(null)", actual, want);
+                         "event %d: prob_for('%s')=%s, expected %s",
+                         index, cap ? cap : "(null)", AT_G17(actual), AT_G17(want));
                 goto done;
             }
         }

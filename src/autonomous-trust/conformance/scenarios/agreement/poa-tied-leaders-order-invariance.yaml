@@ -1,0 +1,83 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: poa-tied-leaders-order-invariance
+byte_pinning: false
+description: |
+    Companion to poa-tied-leaders-split-vote with the arrival order
+    reversed, plus a second blob both tied leaders approve. Pins that the
+    tied-leader outcome does not depend on which vote arrives first
+    (RD_13.1 D7).
+
+    Setup: alice and carol at rank 5, bob at rank 0 and myself.
+    blob-x: carol rejects, then alice approves, outcome false.
+    blob-y: carol approves, then alice approves, outcome true.
+
+participants:
+  - id: alice
+    role: voter
+  - id: carol
+    role: voter
+  - id: bob
+    role: voter
+
+fixtures:
+  impl: authority
+  threshold_rank: 0
+  ranks:
+    alice: 5
+    carol: 5
+    bob: 0
+  myself: bob
+  blobs:
+    blob-x:
+      originator: alice
+      payload: "order-invariance-x"
+    blob-y:
+      originator: alice
+      payload: "order-invariance-y"
+
+steps:
+  - id: 1
+    from: carol
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: false
+    description: |
+        carol (tied leader) rejects blob-x first.
+  - id: 2
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: |
+        alice (tied leader) approves blob-x second. Still false.
+  - id: 3
+    from: carol
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-y
+      approval: true
+    description: |
+        carol approves blob-y.
+  - id: 4
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-y
+      approval: true
+    description: |
+        alice approves blob-y. Both tied leaders approve, so true.
+
+expected_state:
+  agreement:
+    blob-x:
+      outcome: false
+    blob-y:
+      outcome: true

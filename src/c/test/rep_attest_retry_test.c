@@ -193,7 +193,7 @@ DEFINE_TEST(test_reproposals_are_bounded_then_the_round_is_abandoned)
 DEFINE_TEST(test_a_round_already_in_the_chain_is_forgotten)
 {
     _begin_with_a_lost_propose();
-    ck_assert_ret_ok(reputation_install_tx_attested(g_ver->uuid, 0.3, "probe",
+    ck_assert_ret_ok(reputation_install_tx_attested(g_ver->uuid, 300, "probe",
                                                     g_subj->uuid, DIGEST));
     ck_assert_int_eq((int)_retry_pending_attestations(g_proc, _later(1)), 0);
     ck_assert_int_eq((int)g_proposes, 0);
@@ -208,7 +208,7 @@ DEFINE_TEST(test_a_round_already_in_the_chain_is_forgotten)
 DEFINE_TEST(test_a_round_already_in_the_pool_is_forgotten)
 {
     _begin_with_a_lost_propose();
-    ck_assert_ret_ok(reputation_install_pooled_attested(g_ver->uuid, 0.3, "probe",
+    ck_assert_ret_ok(reputation_install_pooled_attested(g_ver->uuid, 300, "probe",
                                                         g_subj->uuid, DIGEST));
     ck_assert_int_eq((int)_retry_pending_attestations(g_proc, _later(1)), 0);
     ck_assert_int_eq((int)g_proposes, 0);
@@ -230,12 +230,12 @@ static void _sign_from(identity_t *signer, identity_t *subject)
     tx_attest_task_uuid(g_ver->uuid, subject->uuid, DIGEST, task);
     uuid_unparse_lower(task, t_str);
 
-    /* "AT-ATTEST\0" verifier|subject|task|%.17g|channel|digest */
+    /* "AT-ATTEST\0" verifier|subject|task|score_milli|channel|digest */
     static const char tag[] = "AT-ATTEST";
     uint8_t desig[512];
     memcpy(desig, tag, sizeof(tag));
     int n = snprintf((char *)desig + sizeof(tag), sizeof(desig) - sizeof(tag),
-                     "%s|%s|%s|%.17g|%s|%s", v_str, s_str, t_str, 0.3, "probe",
+                     "%s|%s|%s|%d|%s|%s", v_str, s_str, t_str, 300, "probe",
                      DIGEST);
     ck_assert(n > 0 && (size_t)n < sizeof(desig) - sizeof(tag));
     unsigned char sig[crypto_sign_BYTES];
@@ -290,7 +290,7 @@ DEFINE_TEST(test_retiring_one_round_keeps_another_rounds_signatures)
     _forward_attestation(g_proc, &ts, g_ver->uuid);
     ck_assert_int_eq((int)reputation_attest_pending_count(), 2);
 
-    ck_assert_ret_ok(reputation_install_tx_attested(g_ver->uuid, 0.3, "probe",
+    ck_assert_ret_ok(reputation_install_tx_attested(g_ver->uuid, 300, "probe",
                                                     g_subj->uuid, DIGEST));
     _retry_pending_attestations(g_proc, _later(1));   /* retires round A */
     ck_assert_int_eq((int)reputation_attest_pending_count(), 1);

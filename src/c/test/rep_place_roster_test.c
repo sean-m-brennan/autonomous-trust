@@ -302,8 +302,8 @@ static void _placed(tx_history_t *h)
     uuid_parse(A, t.p1_uuid);
     uuid_parse(B, t.p2_uuid);
     t.p1_set = t.p2_set = true;
-    t.p1_score = 0.5;
-    t.p2_score = 0.6;
+    t.p1_score_milli = 500;
+    t.p2_score_milli = 600;
     json_t *m2 = _members(2), *m3 = _members(3);
     ck_assert_ret_ok(tx_history_roster_put(h, m2, NULL));
     ck_assert_ret_ok(tx_history_roster_put(h, m3, NULL));

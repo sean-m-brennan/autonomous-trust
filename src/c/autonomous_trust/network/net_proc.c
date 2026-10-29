@@ -1191,6 +1191,12 @@ void net_proc_test_backdate_admissions(int64_t secs)
     pthread_mutex_unlock(&admission_lock);
 }
 
+static bool address_crosses_gateway(const process_t *proc,
+                                    const identity_t *myself,
+                                    const char *address);
+static const group_t *group_for_sender(const process_t *proc,
+                                       const char *address);
+
 static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
                             directory_t *queues, logger_t *logger,
                             net_route_path_t path)
@@ -1258,6 +1264,12 @@ static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
      * (network/message.py:243) and read by repprocess.handle_*. */
     gmsg.info.net_msg.verified = wmsg->verified;
     gmsg.info.net_msg.has_signature = wmsg->has_signature;
+    /* A frame from a cohort we gateway is news about that cohort. The
+     * from_whom here is the peer we attributed the frame to (the parser copies
+     * the known peer in), so this is the sender's placement, not its claim. */
+    (void)net_child_group_of(proc, wmsg->from_whom.address,
+                             gmsg.info.net_msg.child_group,
+                             sizeof(gmsg.info.net_msg.child_group));
 
     /* Every inbound frame from the wire passes here, on a receiver thread, and
      * the sibling's queue holds ten. A refused frame is KEPT (one try, so a
@@ -1458,11 +1470,22 @@ static int _peer_unicast(const net_transport_t *transport,
     return transport->send_unicast(ctx, buf, len, host, port);
 }
 
-static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
-                                const net_wire_msg_t *msg,
-                                const net_transport_t *transport,
-                                net_transport_ctx_t *ctx,
-                                int port, net_wire_format_t fmt, logger_t *logger)
+/* A broadcast or group frame on one leg (@p leg >= 0), or on all of them. */
+static int _send_on(const net_transport_t *transport, net_transport_ctx_t *ctx,
+                    int leg, net_channel_t channel,
+                    const uint8_t *buf, size_t len, int port)
+{
+    if (leg >= 0)
+        return transport->send_on_leg(ctx, (size_t)leg, channel, buf, len, port);
+    return transport->send_broadcast(ctx, channel, buf, len, port);
+}
+
+static int _seal_and_send(const identity_t *myself, const group_t *grp,
+                          const net_wire_msg_t *msg,
+                          const net_transport_t *transport,
+                          net_transport_ctx_t *ctx,
+                          int port, net_wire_format_t fmt, logger_t *logger,
+                          int leg)
 {
     uint8_t *wire = NULL;
     size_t wire_len = 0;
@@ -1488,7 +1511,7 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
             free(wire);
             return SYS_EXCEPTION();
         }
-        int ret = transport->send_broadcast(ctx, NET_CHAN_BROADCAST,
+        int ret = _send_on(transport, ctx, leg, NET_CHAN_BROADCAST,
                                             send_buf, send_len, port);
         net_ext_fanout(NET_CHAN_BROADCAST, msg->process, msg->function, grp,
                        send_buf, send_len);
@@ -1572,7 +1595,7 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
             free(frame);
             return SYS_EXCEPTION();
         }
-        int ret = transport->send_broadcast(ctx, NET_CHAN_GROUP,
+        int ret = _send_on(transport, ctx, leg, NET_CHAN_GROUP,
                                             send_buf, send_len, port);
         net_ext_fanout(NET_CHAN_GROUP, msg->process, msg->function, grp,
                        send_buf, send_len);
@@ -1657,6 +1680,56 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
         free((void *)send_buf);
     free(wire);
     return ret;
+}
+
+/* The sender address a frame names is the address this node holds on the
+ * network the frame leaves on. A node on one network has one address and names
+ * it. A transport with several legs (the hybrid) gives each leg's: each side
+ * reaches a gateway only at the address it holds on that side, and a frame
+ * naming the identity address on every leg made the far side take the gateway
+ * for a member that had moved, and readdress it out of reach. The envelope's
+ * signature covers process, function and payload, so a restamped copy keeps
+ * it. Mirrors Python NetworkProcess._as_sent_from / Hybrid._send_any_message. */
+static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
+                                const net_wire_msg_t *msg,
+                                const net_transport_t *transport,
+                                net_transport_ctx_t *ctx,
+                                int port, net_wire_format_t fmt, logger_t *logger)
+{
+    bool named = msg->from_whom.address[0] != '\0';
+    if (named && (msg->to_whom.type == RECIPIENT_BROADCAST
+                  || msg->to_whom.type == RECIPIENT_GROUP)
+        && transport->leg_count != NULL && transport->leg_address != NULL
+        && transport->send_on_leg != NULL && transport->leg_count(ctx) > 1) {
+        size_t n = transport->leg_count(ctx);
+        int ret = -1;
+        for (size_t i = 0; i < n; i++) {
+            net_wire_msg_t stamped = *msg;
+            char addr[sizeof(stamped.from_whom.address)];
+            if (transport->leg_address(ctx, i, addr, sizeof(addr)) == 0)
+                at_strlcpy(stamped.from_whom.address, addr,
+                           sizeof(stamped.from_whom.address));
+            int rc = _seal_and_send(myself, grp, &stamped, transport, ctx, port,
+                                    fmt, logger, (int)i);
+            if (rc == 0 || ret != 0)
+                ret = rc;
+        }
+        return ret;
+    }
+    if (named && msg->to_whom.type == RECIPIENT_PEER
+        && transport->address_for_target != NULL) {
+        char addr[sizeof(msg->from_whom.address)];
+        if (transport->address_for_target(ctx, msg->to_whom.target.peer.address,
+                                          addr, sizeof(addr)) == 0
+            && strcmp(addr, msg->from_whom.address) != 0) {
+            net_wire_msg_t stamped = *msg;
+            at_strlcpy(stamped.from_whom.address, addr,
+                       sizeof(stamped.from_whom.address));
+            return _seal_and_send(myself, grp, &stamped, transport, ctx, port,
+                                  fmt, logger, -1);
+        }
+    }
+    return _seal_and_send(myself, grp, msg, transport, ctx, port, fmt, logger, -1);
 }
 
 int net_proc_test_encrypt_and_send(const identity_t *myself, const group_t *grp,
@@ -1861,6 +1934,22 @@ static const group_t *group_for_sender(const process_t *proc,
         map_end_for_each
     }
     return found;
+}
+
+bool net_child_group_of(const process_t *proc, const char *address,
+                        char *out, size_t out_len)
+{
+    if (out == NULL || out_len == 0)
+        return false;
+    out[0] = '\0';
+    if (address == NULL || address[0] == '\0'
+        || !address_crosses_gateway(proc, NULL, address))
+        return false;
+    const group_t *grp = group_for_sender(proc, address);
+    if (grp == NULL || out_len < UUID_STRING_LEN + 1)
+        return false;
+    uuid_unparse_lower(grp->uuid, out);
+    return true;
 }
 
 /* Count + rate-limited log for a boundary refusal. Always returns true so call

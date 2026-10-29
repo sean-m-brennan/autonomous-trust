@@ -76,4 +76,4 @@ expected_state:
     # The bilateral entry exists (a dropped commit would leave 0)...
     committed_tx_count: 1
     # ...and both runtimes hash its channel into the same root.
-    window_root: "d2900d8d9ed3fcf3a1750238bb572fbb7792bef07fd997d256cc313831225cb1"
+    window_root: "964443af0b38bda8bbb2cd0d197b684c531ab62cb3b0adcd0370baf65b10e1c4"

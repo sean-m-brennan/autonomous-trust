@@ -22,7 +22,7 @@ to be certified. An acceptor in such a group signs it without having granted
 it; one in a group that does not place its order still needs the grant, which
 is what orders that chain. Mirrors the C cases in rep_place_halves_test.c.
 """
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from autonomous_trust.core.config import from_json_string
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
@@ -30,6 +30,23 @@ from autonomous_trust.core.reputation.reputation import TransactionScore
 
 from tests.a_unit.test_commit_certificates import (_msg, _node, _roster, _sent,
                                                    four)  # noqa: F401
+
+
+def _tx_body(id1, id2, proposer, score, certify=True, group=''):
+    """A `transaction` proposal in its wire shape: the JSON object with named
+    fields both runtimes send. `certify`/`group` of None leave the key off, as
+    a half-round build's proposal did."""
+    from autonomous_trust.core.config import to_json_string
+    body = {'id1': id1, 'id2': id2, 'peer_uuid': str(proposer),
+            'score_milli': score.score_milli, 'task_uuid': str(score.task_id)}
+    if getattr(score, 'channel', None):
+        body['channel'] = score.channel
+    if certify is not None:
+        body['certify'] = certify
+    if group is not None:
+        body['group'] = group
+    return to_json_string(body)
+
 
 
 def _placing(me, everyone):
@@ -55,17 +72,19 @@ class TestProposer:
         assert not set(ReputationProtocol.retired) & set(out)
         assert len(out[ReputationProtocol.transaction]) == 1
         parts = from_json_string(out[ReputationProtocol.transaction][0].obj)
-        assert parts[2] is True
-        assert parts[3] == str(rp.protocol.group.uuid)
+        assert parts['certify'] is True
+        assert parts['group'] == str(rp.protocol.group.uuid)
         assert len(rp.proposals) == 1
 
 
 
 class TestAcceptor:
     def _offer(self, acc, q, proposer, tail):
+        from autonomous_trust.core.config import from_json_string
         score = TransactionScore(uuid4(), 0.9)
         acc.handle_transaction(q, _msg(ReputationProtocol.transaction,
-                                       ((7, 1, proposer.uuid), score) + tail,
+                                       from_json_string(_tx_body(
+                                           7, 1, proposer.uuid, score, *tail)),
                                        proposer))
         return [from_json_string(m.obj) for m in _sent(q)
                 if m.function == ReputationProtocol.accepted]
@@ -88,7 +107,7 @@ def test_end_to_end_the_half_reaches_every_pool(four):
     obs, _ = _placing(o, four)
     out = _proposal(prop, pq)
     tx = out[ReputationProtocol.transaction][0]
-    task = from_json_string(tx.obj)[1].task_id
+    task = UUID(from_json_string(tx.obj)['task_uuid'])
     for (acc, q), who in zip(accs, (a1, a2)):
         acc.handle_transaction(q, _msg(ReputationProtocol.transaction,
                                        from_json_string(tx.obj), p))

@@ -65,8 +65,14 @@ module.
 
 ## 3. Architecture
 
-[TODO: architecture figure, OV-1 for an air/space FEC fleet. Must read in black
-and white.]
+![Figure 1. Operational concept (OV-1). AT cohorts of smallsats, sUAS and
+ground IoBT sensors each decide on their own. The sUAS cohort detects a
+credentialed but compromised node, demotes it and gates it out of the
+data-sharing tier with no reach-back on the decision path (§4). The smallsat
+cohort refuses an unsigned update (§5). Fog-tier gateways roll reputation up the
+hierarchy (§3.4), a late joiner and a sub-threshold admission sit at a capped
+tier (§3.5), and the operator stays on the
+loop.](./autonomoustrust_ov1_dv002.png){width=100%}
 
 ### 3.1 The node
 

@@ -93,8 +93,8 @@ def _fill(rp, n):
     """Commit n bilateral txs into rp's history so window_root is non-trivial."""
     for _ in range(n):
         tid, p1, p2 = uuid4(), uuid4(), uuid4()
-        rp.history.update(tid, p1, 0.7)
-        rp.history.update(tid, p2, 0.5)
+        rp.history.update(tid, p1, 700)
+        rp.history.update(tid, p2, 500)
 
 
 # --- serialization ----------------------------------------------------------
@@ -148,8 +148,8 @@ class TestCheckpointFlow:
         # Member and proposer share the SAME committed window content.
         seed = [(uuid4(), uuid4(), uuid4()) for _ in range(3)]
         for tid, p1, p2 in seed:
-            member.history.update(tid, p1, 0.7)
-            member.history.update(tid, p2, 0.5)
+            member.history.update(tid, p1, 700)
+            member.history.update(tid, p2, 500)
         matching_root = member.history.window_root()
         ck = Checkpoint(proposer_uuid=proposer_id, root=matching_root,
                         epoch=7, first_index=0, count=3)
@@ -276,8 +276,8 @@ class TestOutvotedRequestsTheQuorumChain:
         ours, theirs = rp.history, TransactionHistory()
         for hist, letters in ((ours, 'abx'), (theirs, 'abc')):
             for c in letters:
-                hist.update(tasks[c], rp.identity.uuid, 0.7)
-                hist.update(tasks[c], proposer.uuid, 0.6)
+                hist.update(tasks[c], rp.identity.uuid, 700)
+                hist.update(tasks[c], proposer.uuid, 600)
         return proposer, rp, theirs
 
     @staticmethod

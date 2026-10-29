@@ -135,7 +135,7 @@ static process_t *_begin(const char *tenure)
     {
         uuid_t task;
         uuid_generate(task);
-        reputation_install_tx_pair(task, me->uuid, 0.9, them->uuid, 0.9);
+        reputation_install_tx_pair(task, me->uuid, 900, them->uuid, 900);
     }
     g_last_tier = -1;
     g_present = (double)time(NULL);

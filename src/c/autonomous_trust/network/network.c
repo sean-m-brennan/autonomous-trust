@@ -26,6 +26,7 @@
 #include "utilities/exception.h"
 #include "config/configuration.h"
 #include "utilities/util.h"
+#include "utilities/socket_helpers.h"
 
 /* Protobuf wire path for inter-host network messages — IMPLEMENTED (2026-08-18;
  * doc/architecture/network-wire-format.md). This note used to describe the four
@@ -127,7 +128,7 @@ int cidr4_to_ip4_binary(char *cidr, uint32_t *ip, uint8_t *mask)
     /* inet_pton returns 1 on success, 0 on a MALFORMED address, -1 only on a bad
      * family. The old `< 0` therefore accepted garbage silently, which is what
      * hid the truncation above. */
-    if (inet_pton(AF_INET, addr, &addr_struct) != 1)
+    if (at_inet_pton(AF_INET, addr, &addr_struct) != 1)
         return EXCEPTION(EINVAL);
     *ip = addr_struct.s_addr;
     *mask = atoi(mask_str);
@@ -170,7 +171,7 @@ int cidr6_to_ip6_binary(char *cidr, uint128_t *ip, uint8_t *mask)
     struct in6_addr addr_struct = {0};
     /* See the note in cidr4_to_ip4_binary: 0 means malformed, and `< 0` never
      * caught it. */
-    if (inet_pton(AF_INET6, addr, &addr_struct) != 1)
+    if (at_inet_pton(AF_INET6, addr, &addr_struct) != 1)
         return EXCEPTION(EINVAL);
     memcpy(ip, &addr_struct.s6_addr, sizeof(uint128_t));  // keep in host order (internal only)
     *mask = atoi(mask_str);

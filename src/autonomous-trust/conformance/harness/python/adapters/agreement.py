@@ -208,7 +208,11 @@ class AgreementAdapter:
         if myself_id is None:
             raise AssertionError("fixtures.myself is required")
         threshold = int(fixtures.get('threshold_rank', 0))
-        threshold_tier = int(fixtures.get('threshold_tier', 0))
+        # Absent threshold_tier selects PoT's default floor (None), matching
+        # the C adapter's TRUST_THRESHOLD_DERIVE.
+        threshold_tier = fixtures.get('threshold_tier')
+        if threshold_tier is not None:
+            threshold_tier = int(threshold_tier)
 
         # Build voters with deterministic seeds + ranks/tiers from the fixture.
         identities: dict[str, Identity] = {}

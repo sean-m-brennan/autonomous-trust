@@ -40,8 +40,8 @@ def _seed(n):
 
 def _commit(rp, entries):
     for tid, p1, p2 in entries:
-        rp.history.update(tid, p1, 0.7)
-        rp.history.update(tid, p2, 0.5)
+        rp.history.update(tid, p1, 700)
+        rp.history.update(tid, p2, 500)
 
 
 def _root_of(entries):

@@ -43,7 +43,7 @@ static transaction_t _attested(double score, const char *channel)
     tx.p1_set = true;
     uuid_copy(tx.p1_uuid, g_v);
     uuid_copy(tx.subject_uuid, g_s);
-    tx.p1_score = score;
+    tx.p1_score_milli = tx_score_to_milli(score);
     snprintf(tx.p1_channel, sizeof(tx.p1_channel), "%s", channel);
     snprintf(tx.evidence_digest, sizeof(tx.evidence_digest), "%s", DIGEST);
     tx_attest_task_uuid(g_v, g_s, DIGEST, tx.task_uuid);
@@ -55,8 +55,8 @@ static void _bilateral(tx_history_t *h, double a, double b)
 {
     uuid_t t;
     uuid_generate(t);
-    ck_assert_ret_ok(tx_history_update(h, t, g_v, a, NULL));
-    ck_assert_ret_ok(tx_history_update(h, t, g_s, b, NULL));
+    ck_assert_ret_ok(tx_history_update(h, t, g_v, tx_score_to_milli(a), NULL));
+    ck_assert_ret_ok(tx_history_update(h, t, g_s, tx_score_to_milli(b), NULL));
 }
 
 static bool _same_root(const tx_history_t *a, const tx_history_t *b)
@@ -90,7 +90,7 @@ DEFINE_TEST(test_attest_append_rules)
     ck_assert_str_eq(tx_history_attest_cert(&h, tx.task_uuid), CERT);
 
     /* Nothing may fill the half its subject never gave. */
-    ck_assert_ret_ok(tx_history_update(&h, tx.task_uuid, g_s, 1.0, NULL));
+    ck_assert_ret_ok(tx_history_update(&h, tx.task_uuid, g_s, 1000, NULL));
     transaction_t out;
     ck_assert_ret_ok(tx_history_by_task(&h, tx.task_uuid, &out));
     ck_assert(!out.p2_set);

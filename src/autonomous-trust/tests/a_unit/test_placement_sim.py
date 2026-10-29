@@ -165,7 +165,7 @@ class Sim:
         ia, ib = self.idents[a], self.idents[b]
         others = [x for x in self.idents if x is not ia and x is not ib]
         halves = []
-        for who, other, score in ((ia, ib, 0.9), (ib, ia, 0.6)):
+        for who, other, score in ((ia, ib, 900), (ib, ia, 600)):
             cert = {str(s.uuid): ReputationProcess._detached_sig(
                 s, commit_designation(who.uuid, task, score)) for s in others}
             sig = ReputationProcess._detached_sig(
@@ -238,8 +238,8 @@ def test_a_minority_island_places_nothing(tmp_path, monkeypatch):
     for i in (0, 1, 2):
         rp, _q = sim.nodes[i]
         held = sim.nodes[3][0].history.pooled(minority)
-        for who, score in ((held.p1_id, held.p1_score),
-                           (held.p2_id, held.p2_score)):
+        for who, score in ((held.p1_id, held.p1_score_milli),
+                           (held.p2_id, held.p2_score_milli)):
             rp.history.record_half(minority, who, score,
                                    certificate=held.certificate_of(who),
                                    counterparty=held.counterparty_of(who),

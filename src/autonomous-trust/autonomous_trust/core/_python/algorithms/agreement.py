@@ -213,9 +213,10 @@ class AgreementProtocol(VoterTracker):
         # from a second voter, so a replayed ballot used to be counted again.
         # Under stake-weighted accumulation that is not merely redundant: it
         # adds the voter's stake a second time and flips the outcome at a
-        # tight margin. Rank/tier accumulation was already insensitive to it
-        # (both reduce a tally to the leader's verdict), so this changes the
-        # observable result for stake only.
+        # tight margin. The same holds for trust (PoT), which counts a
+        # majority of eligible voters (RD_13.1). Rank accumulation (PoA) was
+        # already insensitive to it, because it reduces the tally to the
+        # leader's verdict.
         #
         # Scoped to this tally deliberately: the round's votes are consumed
         # and deleted below, so the set does not outlive the decision it

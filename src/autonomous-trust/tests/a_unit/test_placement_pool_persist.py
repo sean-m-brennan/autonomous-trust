@@ -42,32 +42,32 @@ T2 = UUID('00000000-0000-4000-8000-000000000002')
 # ready entry with channels, and an attested entry. Pinned so the C twin
 # (src/c/test/rep_place_pool_persist_test.c) reads exactly these bytes.
 PINNED = (
-    '{"schema": 1, "pool": ['
+    '{"schema": 2, "pool": ['
     '{"task": "00000000-0000-4000-8000-000000000001", "halves": ['
-    '{"by": "aaaaaaaa-0000-4000-8000-000000000001", "score": 0.75, '
+    '{"by": "aaaaaaaa-0000-4000-8000-000000000001", "score_milli": 750, '
     '"cert": {"bbbbbbbb-0000-4000-8000-000000000002": "abcd"}}]}, '
     '{"task": "00000000-0000-4000-8000-000000000002", "halves": ['
-    '{"by": "bbbbbbbb-0000-4000-8000-000000000002", "score": 0.5, '
+    '{"by": "bbbbbbbb-0000-4000-8000-000000000002", "score_milli": 500, '
     '"channel": "probe"}, '
-    '{"by": "aaaaaaaa-0000-4000-8000-000000000001", "score": 0.25}]}, '
+    '{"by": "aaaaaaaa-0000-4000-8000-000000000001", "score_milli": 250}]}, '
     '{"task": "%s", "attested": true, '
-    '"p1": "aaaaaaaa-0000-4000-8000-000000000001", "p1_score": 0.25, '
+    '"p1": "aaaaaaaa-0000-4000-8000-000000000001", "p1_score_milli": 250, '
     '"p1_channel": "probe", "subject": "bbbbbbbb-0000-4000-8000-000000000002", '
     '"evidence_digest": "%s", "attest_sigs": {"cccc": "ef01"}}]}'
     % (attest_task_id(A, B, 'ab' * 32), 'ab' * 32))
 
 
 def _attested():
-    return Transaction(attest_task_id(A, B, 'ab' * 32), p1_id=A, p1_score=0.25,
+    return Transaction(attest_task_id(A, B, 'ab' * 32), p1_id=A, p1_score_milli=250,
                        p1_channel='probe', attested=True, subject_id=B,
                        evidence_digest='ab' * 32)
 
 
 def _pinned_history():
     hist = TransactionHistory()
-    hist.record_half(T1, A, 0.75, certificate={str(B): 'abcd'})
-    hist.record_half(T2, B, 0.5, 'probe')
-    hist.record_half(T2, A, 0.25)
+    hist.record_half(T1, A, 750, certificate={str(B): 'abcd'})
+    hist.record_half(T2, B, 500, 'probe')
+    hist.record_half(T2, A, 250)
     assert hist.pool_attested(_attested(), {'cccc': 'ef01'})
     return hist
 
@@ -87,15 +87,15 @@ class TestPoolDocument:
 
     def test_what_was_placed_meanwhile_stays_out(self):
         hist = TransactionHistory()
-        hist.record_half(T2, B, 0.5)
-        hist.record_half(T2, A, 0.25)
+        hist.record_half(T2, B, 500)
+        hist.record_half(T2, A, 250)
         hist.apply_placed(0, hist.ready_items())
         hist.pool_from_dict(json.loads(PINNED))
         assert hist.pooled(T2) is None and hist.pooled(T1) is not None
 
     def test_a_bad_item_is_skipped(self):
         doc = json.loads(PINNED)
-        doc['pool'][0]['halves'][0]['score'] = 7
+        doc['pool'][0]['halves'][0]['score_milli'] = 7000
         doc['pool'][1]['task'] = 'not a uuid'
         hist = TransactionHistory()
         assert hist.pool_from_dict(doc) == 1      # only the attested entry
@@ -103,13 +103,13 @@ class TestPoolDocument:
     def test_every_change_bumps_the_revision(self):
         hist = TransactionHistory()
         revs = [hist.pool_rev]
-        hist.record_half(T1, A, 0.75)
+        hist.record_half(T1, A, 750)
         revs.append(hist.pool_rev)
-        hist.record_half(T1, A, 0.75, certificate={'x': 'y'})
+        hist.record_half(T1, A, 750, certificate={'x': 'y'})
         revs.append(hist.pool_rev)
-        hist.record_half(T1, A, 0.75, certificate={'x': 'y'})   # same again
+        hist.record_half(T1, A, 750, certificate={'x': 'y'})   # same again
         assert hist.pool_rev == revs[-1]
-        hist.record_half(T1, B, 0.5)
+        hist.record_half(T1, B, 500)
         revs.append(hist.pool_rev)
         hist.apply_placed(0, hist.ready_items())
         revs.append(hist.pool_rev)
@@ -122,7 +122,7 @@ class TestRestart:
         rp, q = _placing(me, four)
         e = _entry(four, four[1], four[2])
         _pool(rp, e)
-        rp.history.record_half(T1, four[3].uuid, 0.4)
+        rp.history.record_half(T1, four[3].uuid, 400)
         rp._persist_pools()
         again, _ = _placing(me, four)
         assert again.history.pooled(T1) is not None
@@ -133,12 +133,12 @@ class TestRestart:
 
     def test_an_unchanged_pool_is_not_rewritten(self, four):
         rp, q = _placing(four[0], four)
-        rp.history.record_half(T1, four[3].uuid, 0.4)
+        rp.history.record_half(T1, four[3].uuid, 400)
         rp._persist_pools()
         os.remove(rp._pool_path(''))
         rp._persist_pools()
         assert not os.path.exists(rp._pool_path(''))
-        rp.history.record_half(T1, four[2].uuid, 0.4)
+        rp.history.record_half(T1, four[2].uuid, 400)
         rp._persist_pools()
         assert os.path.exists(rp._pool_path(''))
 

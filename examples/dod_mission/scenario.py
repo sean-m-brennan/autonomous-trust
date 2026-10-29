@@ -1000,6 +1000,23 @@ class DoDMissionScenario(Scenario):
 
 
 # Module-level CLI for quick inspection: `python -m examples.dod_mission.scenario`
+def scenario_from_env() -> DoDMissionScenario:
+    """The scenario every container builds from the knobs generate_compose
+    puts in its environment. One function, so that a knob reaching one process
+    and not another cannot give them different rosters."""
+    import os
+    return DoDMissionScenario(
+        squad_size=int(os.environ.get("AT_SQUAD_SIZE", "4")),
+        swarm_size=int(os.environ.get("AT_SWARM_SIZE", "4")),
+        sensor_count=int(os.environ.get("AT_SENSOR_COUNT", "3")),
+        hacked_sensors=int(os.environ.get("AT_HACKED_SENSORS", "2")),
+        rq86_count=int(os.environ.get("AT_RQ86_COUNT", "2")),
+        include_mq800=os.environ.get("AT_INCLUDE_MQ800", "1") != "0",
+        include_jet=os.environ.get("AT_INCLUDE_JET", "1") != "0",
+        include_command=os.environ.get("AT_INCLUDE_COMMAND", "1") != "0",
+    )
+
+
 if __name__ == "__main__":
     import argparse
 

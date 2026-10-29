@@ -46,7 +46,7 @@ from .placement import PlacementMixin
 from .reputation import (TransactionHistory, ReconcileResult, Reputation, Reputations,
                          TransactionScore, SlashAttestation, SignedSlash,
                          AttestedScore, SignedAttestation,
-                         Checkpoint, SignedCheckpoint, validate_tx_score,
+                         Checkpoint, SignedCheckpoint, validate_tx_score, validate_tx_milli, milli_to_score, TX_SCORE_SCALE,
                          validate_tx_channel, commit_designation, half_designation,
                          window_root_of, _hex_str, byzantine_f,
                          PeerReputation, EVIDENCE_FILE, SLASH_MARKS_FILE,
@@ -1154,11 +1154,19 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         return True
 
     def _propose_half(self, queues, pax_id, score, group_uuid):
-        """Send our half to the group to co-sign. The proposal asks each
-        acceptor to sign what it accepts (the third element) and names its
-        group (the fourth), which is what an acceptor checks before it takes
-        the half (handle_transaction)."""
-        obj = (tuple(pax_id), score, True, str(group_uuid or ''))
+        """Send our half to the group to co-sign. The proposal is a JSON object
+        with named fields, the shape the C twin sends. It asks each acceptor to
+        sign what it accepts (`certify`) and names its group (`group`), which is
+        what an acceptor checks before it takes the half (handle_transaction)."""
+        obj = {'id1': int(pax_id[0]), 'id2': int(pax_id[1]),
+               'peer_uuid': str(pax_id[2]), 'score_milli': int(score.score_milli),
+               'certify': True, 'group': str(group_uuid or '')}
+        if getattr(score, 'task_id', None) is not None:
+            obj['task_uuid'] = str(score.task_id).lower()
+        if getattr(score, 'capability_name', None):
+            obj['capability_name'] = score.capability_name
+        if getattr(score, 'channel', None):
+            obj['channel'] = score.channel
         msg = Message(self.name, ReputationProtocol.transaction,
                       to_json_string(obj), self._send_target(group_uuid),
                       from_whom=self.identity)
@@ -1355,16 +1363,27 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
     def handle_transaction(self, queues, message):
         if message.function == ReputationProtocol.transaction:
             try:
-                parts = from_json_string(message.obj)
-                (id1, id2, peer_id), score = parts[0], parts[1]
-                # The third element asks for a commit certificate and the
-                # fourth names the round's group. A proposal without both is
-                # from a build that still ran the half round, which this
-                # node no longer grants.
-                certify = len(parts) > 2 and parts[2] is True
-                placing_group = (parts[3] if certify and len(parts) > 3
-                                 and isinstance(parts[3], str) else None)
-            except (ValueError, TypeError, IndexError) as err:
+                # The proposal is a JSON object with named fields, the shape
+                # both runtimes send (C's _propose / Python's _propose_half).
+                # `certify` asks for a commit certificate and `group` names the
+                # round's group; a proposal without both is from a build that
+                # still ran the half round, which this node no longer grants.
+                body = from_json_string(message.obj)
+                if not isinstance(body, dict):
+                    raise TypeError('proposal is not a JSON object')
+                id1, id2 = int(body['id1']), int(body['id2'])
+                peer_id = body['peer_uuid']
+                task = body.get('task_uuid')
+                score = TransactionScore(
+                    UUID(task) if task else None,
+                    score_milli=body['score_milli'],
+                    capability_name=body.get('capability_name'),
+                    channel=body.get('channel'))
+                certify = body.get('certify') is True
+                group = body.get('group')
+                placing_group = (group if certify and isinstance(group, str)
+                                 else None)
+            except (ValueError, TypeError, KeyError, IndexError) as err:
                 # An out-of-range score is rejected in TransactionScore's
                 # constructor (doc/architecture/reputation.md), which `from_json_string` runs. Dropping
                 # here rather than letting it propagate: the payload is
@@ -1410,7 +1429,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                     try:
                         reply = reply + (self._detached_sig(
                             self.identity, commit_designation(
-                                peer_id, score.task_id, score.score,
+                                peer_id, score.task_id, score.score_milli,
                                 score.channel)),)
                     except Exception:
                         self.logger.error(
@@ -1544,7 +1563,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             voter = self._attributed_voter(message, None, 'accepted')
             sig = parts[3] if len(parts) > 3 else None
             desig = commit_designation(peer_id, score.task_id,
-                                       score.score, score.channel)
+                                       score.score_milli, score.channel)
             if voter is None or not self._verify_cosignature(
                     desig, voter, sig,
                     self._roster_for_group(round_group_uuid)):
@@ -1555,7 +1574,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 return True
             pending = self.commit_sigs_pending.setdefault(score.task_id, {})
             pending[voter] = sig
-            if self._commit_cert_ok(peer_id, score.task_id, score.score,
+            if self._commit_cert_ok(peer_id, score.task_id, score.score_milli,
                                     score.channel, pending,
                                     round_group_uuid):
                 certificate = dict(pending)
@@ -1594,7 +1613,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                         half_sig = self._detached_sig(
                             self.identity, half_designation(
                                 score.task_id, peer_id, counterparty,
-                                score.score, score.channel))
+                                score.score_milli, score.channel))
                     except Exception:
                         half_sig = None
                 if half_sig is None:
@@ -1617,7 +1636,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 # for the rationale). Route to the round's group chain
                 # — primary for leaf nodes, a child chain on a gateway.
                 self._record_committed_half(
-                    round_group_uuid, score.task_id, peer_id, score.score,
+                    round_group_uuid, score.task_id, peer_id, score.score_milli,
                     score.channel, certificate, counterparty, half_sig)
                 self.commit_sigs_pending.pop(score.task_id, None)
                 self.acceptances.pop(idx, None)
@@ -1661,7 +1680,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                     # The certificate rides as element 6. Elements 7 and 8
                     # are whom the half names and the scorer's signature over
                     # it (R+D.md §14.2): a commit without them is refused.
-                    commit_obj = (score.task_id, peer_id, score.score,
+                    commit_obj = (score.task_id, peer_id, score.score_milli,
                                   round_group_uuid, score.channel,
                                   certificate, str(counterparty), half_sig)
                     commit_msg = Message(
@@ -1733,12 +1752,12 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                     str(peer_id)[:8])
                 return True
             try:
-                # doc/architecture/reputation.md: this payload is a BARE float on the wire, not a
-                # TransactionScore, so it bypasses the constructor's check --
-                # and this is the path that writes history on every acceptor.
-                # An out-of-range score here would be averaged into a
-                # reputation by an unbounded amount.
-                score = validate_tx_score(score, 'handle_committed')
+                # doc/architecture/reputation.md: this payload is a BARE
+                # integer on the wire, not a TransactionScore, so it bypasses
+                # the constructor's check -- and this is the path that writes
+                # history on every acceptor. An out-of-range score here would
+                # be averaged into a reputation by an unbounded amount.
+                score = validate_tx_milli(score, 'handle_committed')
             except ValueError as err:
                 self.logger.warning(
                     'Dropping committed tx from %s: %s', str(peer_id)[:8], err)
@@ -1980,7 +1999,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
     # never sees the task -- so the lie it leaves open is a scorer's about its
     # own half, which is R+D.md §14.2's to answer, not this one's.
 
-    def _commit_cert_ok(self, scorer, task_id, score, channel, sigs,
+    def _commit_cert_ok(self, scorer, task_id, score_milli, channel, sigs,
                         group_uuid=None, roster=...) -> bool:
         """Do `sigs` certify `scorer`'s half? At least ``_round_quorum``
         distinct members of OUR view must have signed its
@@ -1990,7 +2009,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         if not isinstance(sigs, dict) or not sigs:
             return False
         try:
-            desig = commit_designation(scorer, task_id, score, channel)
+            desig = commit_designation(scorer, task_id, score_milli, channel)
         except (TypeError, ValueError):
             return False
         if roster is ...:
@@ -2033,7 +2052,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                      reverse=True)
         return rosters
 
-    def _half_sig_ok(self, task_id, scorer, counterparty, score, channel,
+    def _half_sig_ok(self, task_id, scorer, counterparty, score_milli, channel,
                      sig, hist=None) -> bool:
         """Is `sig` `scorer`'s own signature over its half, naming
         `counterparty`? False for a half that names nobody or names its own
@@ -2042,8 +2061,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 or str(scorer).lower() == str(counterparty).lower():
             return False
         try:
-            desig = half_designation(task_id, scorer, counterparty, score,
-                                     channel)
+            desig = half_designation(task_id, scorer, counterparty,
+                                     score_milli, channel)
         except (TypeError, ValueError):
             return False
         return any(self._verify_cosignature(desig, scorer, sig, roster)
@@ -2056,8 +2075,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         if getattr(tx, 'attested', False) or getattr(tx, 'is_roster', False):
             return None
         for scorer, other, score, chan in (
-                (tx.p1_id, tx.p2_id, tx.p1_score, tx.p1_channel),
-                (tx.p2_id, tx.p1_id, tx.p2_score, tx.p2_channel)):
+                (tx.p1_id, tx.p2_id, tx.p1_score_milli, tx.p1_channel),
+                (tx.p2_id, tx.p1_id, tx.p2_score_milli, tx.p2_channel)):
             if not self._half_sig_ok(tx.task_id, scorer, other, score, chan,
                                      tx.half_sig_of(scorer), hist):
                 return str(scorer)
@@ -2131,8 +2150,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 continue
             if self._held_identically(tx, hist):
                 continue
-            for scorer, score, chan in ((tx.p1_id, tx.p1_score, tx.p1_channel),
-                                        (tx.p2_id, tx.p2_score, tx.p2_channel)):
+            for scorer, score, chan in ((tx.p1_id, tx.p1_score_milli, tx.p1_channel),
+                                        (tx.p2_id, tx.p2_score_milli, tx.p2_channel)):
                 if scorer is None:
                     continue
                 sigs = (getattr(tx, 'commit_sigs', None) or {}).get(str(scorer))
@@ -3809,18 +3828,18 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             if tx.attested:
                 # About its subject only, as in _fold_tx_for_peer. Its quorum
                 # certificate stands in for the counterparty's agreement.
-                pairs = ((tx.subject_id, tx.p1_score),)
+                pairs = ((tx.subject_id, tx.p1_score_milli),)
             elif len(tx) < 2:
                 continue  # not bilateral: no counterparty agreed to it
             else:
                 # A peer's score in a tx is the COUNTERPARTY's side of it, as
                 # in _fold_tx_for_peer: p1's standing is what p2 scored it.
-                pairs = ((tx.p1_id, tx.p2_score), (tx.p2_id, tx.p1_score))
-            for peer, score in pairs:
+                pairs = ((tx.p1_id, tx.p2_score_milli), (tx.p2_id, tx.p1_score_milli))
+            for peer, milli in pairs:
                 key = str(peer)
-                if key == self_uuid or score is None:
+                if key == self_uuid or milli is None:
                     continue
-                totals[key] = totals.get(key, 0.0) + float(score)
+                totals[key] = totals.get(key, 0.0) + milli_to_score(milli)
                 counts[key] = counts.get(key, 0) + 1
         ceilings = {}
         k = self.RESTORE_SHRINKAGE_K
@@ -4471,7 +4490,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 and str(held.evidence_digest) == str(tx.evidence_digest)
                 and (getattr(held, 'attest_scope', None) or '')
                 == (getattr(tx, 'attest_scope', None) or '')
-                and float(held.p1_score) == float(tx.p1_score))
+                and held.p1_score_milli == tx.p1_score_milli)
 
     def _chain_certified(self, chain, message, key: str = '') -> bool:
         """Catch-up refuses a segment carrying an attested entry whose
@@ -4520,7 +4539,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                     return True
         return False
 
-    def _record_committed_half(self, group_uuid, task_id, scorer, score,
+    def _record_committed_half(self, group_uuid, task_id, scorer, score_milli,
                                channel, certificate, counterparty=None,
                                half_sig=None) -> str:
         """Put a committed half in its chain's pool, where it waits to be
@@ -4528,7 +4547,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         Returns record_half's outcome; a half that does not pair with the one
         the task holds ('mismatch') is logged and left out."""
         got = self._chain_for_group(group_uuid).record_half(
-            task_id, scorer, score, channel, certificate=certificate,
+            task_id, scorer, score_milli, channel, certificate=certificate,
             counterparty=counterparty, half_sig=half_sig)
         if got == 'mismatch':
             self.logger.warning(
@@ -4594,7 +4613,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 # The same tuple handle_accepted broadcasts; the primary chain
                 # carries no group uuid.
                 cert = tx.certificate_of(tx.p1_id)
-                commit_obj = (tx.task_id, tx.p1_id, tx.p1_score, None,
+                commit_obj = (tx.task_id, tx.p1_id, tx.p1_score_milli, None,
                               tx.p1_channel, cert or None,
                               tx.counterparty_of(tx.p1_id),
                               tx.half_sig_of(tx.p1_id))
@@ -7033,15 +7052,15 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 try:
                     for tx in self.history.by_peer(subj):
                         if tx.p1_id == subj:
-                            s = tx.p1_score
+                            s = tx.p1_score_milli
                         elif tx.p2_id == subj:
-                            s = tx.p2_score
+                            s = tx.p2_score_milli
                         else:
                             continue
                         if s is None:
                             continue
                         n += 1
-                        if s >= 0.5:
+                        if s >= TX_SCORE_SCALE // 2:
                             coop += 1
                         else:
                             defect += 1

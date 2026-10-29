@@ -1,0 +1,140 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 920" width="1200" height="920" role="img" aria-label="DoDAF OV-1 for DAF27TZ01-DV002: AutonomousTrust cohorts of smallsats, sUAS and ground IoBT sensors detect, demote and gate out a credentialed but compromised edge node without reach-back, with fog-tier gateways rolling reputation up the hierarchy."><style>
+  .bg{fill:#e4eaf0}
+  .frame{fill:#ffffff;stroke:#c3ced8;stroke-width:1}
+  .frameline{stroke:#c3ced8;stroke-width:1}
+  .figbar{font-family:ui-monospace, 'SF Mono', 'Roboto Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace;font-size:12.5px;letter-spacing:.08em;fill:#5d7081;font-weight:600}
+  .figbar.b{fill:#16222e}
+  .z-space{fill:#e3eef3}
+  .z-air{fill:#eff5f8}
+  .z-ground{fill:#f4f5f2}
+  .zone-line{stroke:#9fb0bd;stroke-width:1;stroke-dasharray:2 6}
+  .zone-label{font-family:ui-monospace, 'SF Mono', 'Roboto Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace;font-size:12px;letter-spacing:.16em;fill:#5d7081}
+  .cohort{fill:none;stroke:#0a6f7a;stroke-width:1.4;stroke-dasharray:2 6}
+  .cohort-label{font-family:ui-monospace, 'SF Mono', 'Roboto Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace;font-size:11px;letter-spacing:.12em;fill:#0a5a63}
+  .edge{fill:none;stroke-linecap:round}
+  .edge.track{stroke:#0a6f7a;stroke-width:2.4}
+  .edge.fog{stroke:#16222e;stroke-width:2.6;stroke-dasharray:14 5 3 5;stroke-linecap:butt}
+  .edge.inject{stroke:#b8322e;stroke-width:2.2;stroke-dasharray:7 6}
+  .edge.reach{stroke:#6c7f8e;stroke-width:1.8;stroke-dasharray:2 6}
+  .cut{stroke:#b8322e;stroke-width:3;stroke-linecap:round}
+  .ah-track{fill:#0a6f7a} .ah-red{fill:#b8322e}
+  .node-ring{fill:#ffffff;stroke-width:2.4}
+  .node-ring.good{stroke:#1f7a4a}
+  .node-ring.forming{stroke:#9a6a10;stroke-dasharray:7 4}
+  .node-ring.bad{stroke:#b8322e;stroke-width:3.6}
+  .node-ring.bad-inner{fill:none;stroke:#b8322e;stroke-width:1.2}
+  .node-ring.infra{stroke:#6c7f8e;stroke-dasharray:2 4;stroke-width:2}
+  .glyph{fill:none;stroke:#16222e;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
+  .glyph.filled{fill:#16222e;stroke:none}
+  .glyph.infra{stroke:#47596a}
+  .node-label{font-family:ui-monospace, 'SF Mono', 'Roboto Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace;font-size:12.5px;fill:#16222e;font-weight:700}
+  .node-sub{font-family:-apple-system, 'Segoe UI', Roboto, Helvetica, Arial, 'DejaVu Sans', sans-serif;font-size:11.5px;fill:#3d4f5f}
+  .score{font-family:ui-monospace, 'SF Mono', 'Roboto Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace;font-size:12px;font-weight:700}
+  .score.good{fill:#1f7a4a} .score.forming{fill:#9a6a10} .score.bad{fill:#b8322e}
+  .badge-bg{fill:#16222e}
+  .badge-t{font-family:ui-monospace, 'SF Mono', 'Roboto Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace;font-size:10px;letter-spacing:.06em;fill:#ffffff;font-weight:700}
+  .chip{fill:#ffffff;stroke:#16222e;stroke-width:1.2}
+  .chip-t{font-family:ui-monospace, 'SF Mono', 'Roboto Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace;font-size:9px;letter-spacing:.05em;fill:#16222e;font-weight:700}
+  .hotl{font-family:ui-monospace, 'SF Mono', 'Roboto Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace;font-size:9.5px;letter-spacing:.04em;fill:#0a5a63;font-weight:700}
+  .edge-label{font-family:-apple-system, 'Segoe UI', Roboto, Helvetica, Arial, 'DejaVu Sans', sans-serif;font-size:11px;fill:#3d4f5f;font-style:italic}
+  .edge-label.red{fill:#b8322e;font-style:normal;font-weight:600}
+  .callout{fill:#ffffff;stroke:#16222e;stroke-width:1.1}
+  .callout-h{font-family:ui-monospace, 'SF Mono', 'Roboto Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace;font-size:10.5px;letter-spacing:.12em;fill:#16222e;font-weight:700}
+  .callout-n{font-family:ui-monospace, 'SF Mono', 'Roboto Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace;font-size:11px;fill:#16222e;font-weight:700}
+  .callout-t{font-family:-apple-system, 'Segoe UI', Roboto, Helvetica, Arial, 'DejaVu Sans', sans-serif;font-size:11.5px;fill:#3d4f5f}
+  .legend-h{font-family:ui-monospace, 'SF Mono', 'Roboto Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace;font-size:11px;letter-spacing:.16em;fill:#5d7081;font-weight:700}
+  .leg-text{font-family:-apple-system, 'Segoe UI', Roboto, Helvetica, Arial, 'DejaVu Sans', sans-serif;font-size:12.5px;fill:#3d4f5f}
+  .leg-b{fill:#16222e;font-weight:700}
+  .footer{font-family:ui-monospace, 'SF Mono', 'Roboto Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace;font-size:10.5px;letter-spacing:.02em;fill:#5d7081}
+</style><defs><marker id="arrow-track" viewBox="0 0 10 10" refX="8" refY="5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ah-track"/></marker><marker id="arrow-red" viewBox="0 0 10 10" refX="8" refY="5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ah-red"/></marker></defs><rect class="bg" x="0" y="0" width="1200" height="920"/>
+<rect class="frame" x="0.5" y="0.5" width="1199" height="832" rx="14"/>
+<text class="figbar" x="24" y="28"><tspan class="figbar b">OPERATIONAL CONCEPT</tspan><tspan xml:space="preserve">  ·  AIR AND SPACE FOG/EDGE FLEET UNDER CYBER ATTACK, CONTESTED (DDIL)  ·  DAF27TZ01-DV002</tspan></text>
+<line class="frameline" x1="0" y1="44" x2="1200" y2="44"/>
+<rect class="z-space" x="1" y="44" width="1198" height="192"/>
+<rect class="z-air" x="1" y="236" width="1198" height="304"/>
+<rect class="z-ground" x="1" y="540" width="1198" height="180"/>
+<line class="zone-line" x1="0" y1="236" x2="1200" y2="236"/>
+<line class="zone-line" x1="0" y1="540" x2="1200" y2="540"/>
+<line class="frameline" x1="0" y1="720" x2="1200" y2="720"/>
+<text class="zone-label" x="20" y="68">SPACE · LEO</text>
+<text class="zone-label" x="20" y="260">AIR · CONTESTED, JAMMED (DDIL)</text>
+<text class="zone-label" x="20" y="564">GROUND · TACTICAL EDGE AND REACH-BACK</text>
+<rect class="cohort" x="290" y="84" width="660" height="140" rx="18"/>
+<text class="cohort-label" x="620" y="78" text-anchor="middle">SMALLSAT COHORT — light-lag, intermittent ground contact</text>
+<rect class="cohort" x="190" y="282" width="690" height="248" rx="20"/>
+<text class="cohort-label" x="204" y="276">sUAS ISR COHORT — responds on its own</text>
+<rect class="cohort" x="560" y="578" width="530" height="132" rx="18"/>
+<text class="cohort-label" x="660" y="572">IoBT COHORT — sub-threshold quorum, capped admission</text>
+<path class="edge track" d="M 330.4 340.8 L 607.6 393.8" marker-end="url(#arrow-track)"/>
+<path class="edge track" d="M 330.7 440.9 L 607.3 404.3" marker-end="url(#arrow-track)"/>
+<path class="edge track" d="M 547.9 444.5 L 610.3 414.4" marker-end="url(#arrow-track)"/>
+<path class="edge track" d="M 391.0 140.0 L 607.0 140.0" marker-end="url(#arrow-track)"/>
+<path class="edge track" d="M 521.0 140.0 L 607.0 140.0" marker-end="url(#arrow-track)"/>
+<path class="edge track" d="M 839.0 140.0 L 673.0 140.0" marker-end="url(#arrow-track)"/>
+<path class="edge track" d="M 789.0 635.0 L 673.0 635.0" marker-end="url(#arrow-track)"/>
+<path class="edge inject" d="M 979.5 335.8 L 672.4 393.9" marker-end="url(#arrow-red)"/>
+<line class="cut" x1="858.6" y1="368.8" x2="854.8" y2="349.2"/>
+<text class="edge-label red" x="865" y="345" text-anchor="middle">false track severed</text>
+<path class="edge track" d="M 969.0 635.0 L 853.0 635.0" marker-end="url(#arrow-track)"/>
+<path class="edge inject" d="M 1059.0 140.0 L 903.0 140.0" marker-end="url(#arrow-red)"/>
+<line class="cut" x1="988.8" y1="150.0" x2="988.8" y2="130.0"/>
+<text class="edge-label red" x="983" y="164" text-anchor="middle">unsigned update refused</text>
+<path class="edge fog" d="M 640.0 369.0 L 640.0 171.0"/>
+<text class="edge-label" x="652" y="258">reputation roll-up / deep query (fog tier)</text>
+<path class="edge fog" d="M 640.0 431.0 L 640.0 604.0"/>
+<path class="edge reach" d="M 321.0 630.4 L 609.0 634.6"/>
+<path class="edge reach" d="M 121.0 630.0 L 259.0 630.0"/>
+<g transform="translate(360 140)"><circle class="node-ring good" cx="0" cy="0" r="27"/><rect x="-5.5" y="-7" width="11" height="14" rx="1.5" class="glyph"/><rect x="-20" y="-5" width="11" height="10" class="glyph"/><rect x="9" y="-5" width="11" height="10" class="glyph"/><line x1="-9" y1="0" x2="-5.5" y2="0" class="glyph"/><line x1="5.5" y1="0" x2="9" y2="0" class="glyph"/><line x1="-14.5" y1="-5" x2="-14.5" y2="5" class="glyph"/><line x1="14.5" y1="-5" x2="14.5" y2="5" class="glyph"/><line x1="0" y1="7" x2="0" y2="12" class="glyph"/><circle cx="0" cy="13.5" r="1.6" class="glyph filled"/><text class="node-label" x="0" y="45" text-anchor="middle">SAT-1</text><text class="node-sub" x="0" y="60" text-anchor="middle">Smallsat edge node</text><text class="score good" x="31" y="-21" text-anchor="start">R=0.91</text></g>
+<g transform="translate(490 140)"><circle class="node-ring good" cx="0" cy="0" r="27"/><rect x="-5.5" y="-7" width="11" height="14" rx="1.5" class="glyph"/><rect x="-20" y="-5" width="11" height="10" class="glyph"/><rect x="9" y="-5" width="11" height="10" class="glyph"/><line x1="-9" y1="0" x2="-5.5" y2="0" class="glyph"/><line x1="5.5" y1="0" x2="9" y2="0" class="glyph"/><line x1="-14.5" y1="-5" x2="-14.5" y2="5" class="glyph"/><line x1="14.5" y1="-5" x2="14.5" y2="5" class="glyph"/><line x1="0" y1="7" x2="0" y2="12" class="glyph"/><circle cx="0" cy="13.5" r="1.6" class="glyph filled"/><text class="node-label" x="0" y="45" text-anchor="middle">SAT-2</text><text class="node-sub" x="0" y="60" text-anchor="middle">Smallsat edge node</text><text class="score good" x="31" y="-21" text-anchor="start">R=0.87</text></g>
+<g transform="translate(640 140)"><circle class="node-ring good" cx="0" cy="0" r="27"/><rect x="-5.5" y="-7" width="11" height="14" rx="1.5" class="glyph"/><rect x="-20" y="-5" width="11" height="10" class="glyph"/><rect x="9" y="-5" width="11" height="10" class="glyph"/><line x1="-9" y1="0" x2="-5.5" y2="0" class="glyph"/><line x1="5.5" y1="0" x2="9" y2="0" class="glyph"/><line x1="-14.5" y1="-5" x2="-14.5" y2="5" class="glyph"/><line x1="14.5" y1="-5" x2="14.5" y2="5" class="glyph"/><line x1="0" y1="7" x2="0" y2="12" class="glyph"/><circle cx="0" cy="13.5" r="1.6" class="glyph filled"/><text class="node-label" x="14" y="45" text-anchor="start">SAT-GW</text><text class="node-sub" x="14" y="60" text-anchor="start">Smallsat · fog gateway</text><text class="score good" x="31" y="-21" text-anchor="start">R=0.94</text><g transform="translate(-52 -44)"><rect class="chip" x="0" y="0" width="27" height="15" rx="3"/><text class="chip-t" x="13.3" y="11" text-anchor="middle">FOG</text></g></g>
+<g transform="translate(870 140)"><circle class="node-ring good" cx="0" cy="0" r="27"/><rect x="-5.5" y="-7" width="11" height="14" rx="1.5" class="glyph"/><rect x="-20" y="-5" width="11" height="10" class="glyph"/><rect x="9" y="-5" width="11" height="10" class="glyph"/><line x1="-9" y1="0" x2="-5.5" y2="0" class="glyph"/><line x1="5.5" y1="0" x2="9" y2="0" class="glyph"/><line x1="-14.5" y1="-5" x2="-14.5" y2="5" class="glyph"/><line x1="14.5" y1="-5" x2="14.5" y2="5" class="glyph"/><line x1="0" y1="7" x2="0" y2="12" class="glyph"/><circle cx="0" cy="13.5" r="1.6" class="glyph filled"/><text class="node-label" x="0" y="45" text-anchor="middle">SAT-3</text><text class="node-sub" x="0" y="60" text-anchor="middle">Smallsat edge node</text><text class="score good" x="31" y="-21" text-anchor="start">R=0.89</text></g>
+<g transform="translate(1090 140)"><circle class="node-ring bad" cx="0" cy="0" r="27"/><circle class="node-ring bad-inner" cx="0" cy="0" r="22"/><path d="M -14 -6 A 15 15 0 0 0 6 14" class="glyph"/><line x1="-14" y1="-6" x2="6" y2="14" class="glyph"/><line x1="-4" y1="4" x2="8" y2="-8" class="glyph"/><circle cx="9.5" cy="-9.5" r="2" class="glyph filled"/><line x1="-6" y1="10" x2="-10" y2="16" class="glyph"/><line x1="-14" y1="16" x2="-2" y2="16" class="glyph"/><text class="node-label" x="0" y="45" text-anchor="middle">UPLINK-X</text><text class="node-sub" x="0" y="60" text-anchor="middle">Spoofed uplink</text></g>
+<g transform="translate(300 335)"><circle class="node-ring good" cx="0" cy="0" r="27"/><circle cx="0" cy="0" r="4.5" class="glyph"/><line x1="-4.5" y1="-3.1" x2="-13" y2="-9" class="glyph"/><circle cx="-13" cy="-9" r="4" class="glyph"/><line x1="-4.5" y1="3.1" x2="-13" y2="9" class="glyph"/><circle cx="-13" cy="9" r="4" class="glyph"/><line x1="4.5" y1="-3.1" x2="13" y2="-9" class="glyph"/><circle cx="13" cy="-9" r="4" class="glyph"/><line x1="4.5" y1="3.1" x2="13" y2="9" class="glyph"/><circle cx="13" cy="9" r="4" class="glyph"/><text class="node-label" x="0" y="45" text-anchor="middle">UAS-1</text><text class="node-sub" x="0" y="60" text-anchor="middle">ISR sUAS</text><text class="score good" x="31" y="-21" text-anchor="start">R=0.88</text></g>
+<g transform="translate(300 445)"><circle class="node-ring good" cx="0" cy="0" r="27"/><path d="M 0 -15 L 0 13" class="glyph"/><path d="M -17 1 L 0 -4 L 17 1" class="glyph"/><path d="M -7 13 L 0 10 L 7 13" class="glyph"/><text class="node-label" x="0" y="45" text-anchor="middle">UAS-2</text><text class="node-sub" x="0" y="60" text-anchor="middle">Legacy payload (gateway)</text><text class="score good" x="31" y="-21" text-anchor="start">R=0.84</text><g transform="translate(-62 -8)"><rect class="chip" x="0" y="0" width="20" height="15" rx="3"/><text class="chip-t" x="10.2" y="11" text-anchor="middle">GW</text></g></g>
+<g transform="translate(520 458)"><circle class="node-ring forming" cx="0" cy="0" r="27"/><circle cx="0" cy="0" r="4.5" class="glyph"/><line x1="-4.5" y1="-3.1" x2="-13" y2="-9" class="glyph"/><circle cx="-13" cy="-9" r="4" class="glyph"/><line x1="-4.5" y1="3.1" x2="-13" y2="9" class="glyph"/><circle cx="-13" cy="9" r="4" class="glyph"/><line x1="4.5" y1="-3.1" x2="13" y2="-9" class="glyph"/><circle cx="13" cy="-9" r="4" class="glyph"/><line x1="4.5" y1="3.1" x2="13" y2="9" class="glyph"/><circle cx="13" cy="9" r="4" class="glyph"/><text class="node-label" x="0" y="45" text-anchor="middle">UAS-3</text><text class="node-sub" x="0" y="60" text-anchor="middle">Late joiner, capped tier</text><text class="score forming" x="-33" y="5" text-anchor="end">R=0.62</text></g>
+<g transform="translate(640 400)"><circle class="node-ring good" cx="0" cy="0" r="27"/><rect x="-12" y="-13" width="24" height="7.5" rx="1.5" class="glyph"/><rect x="-12" y="-3.5" width="24" height="7.5" rx="1.5" class="glyph"/><rect x="-12" y="6" width="24" height="7.5" rx="1.5" class="glyph"/><circle cx="7" cy="-9.2" r="1.3" class="glyph filled"/><circle cx="7" cy="0.3" r="1.3" class="glyph filled"/><circle cx="7" cy="9.8" r="1.3" class="glyph filled"/><text class="node-label" x="14" y="45" text-anchor="start">FUSION</text><text class="node-sub" x="14" y="60" text-anchor="start">Track fusion · fog gateway</text><text class="score good" x="31" y="-21" text-anchor="start">R=0.93</text><g transform="translate(-30 -46)"><rect class="chip" x="0" y="0" width="27" height="15" rx="3"/><text class="chip-t" x="13.3" y="11" text-anchor="middle">FOG</text></g></g>
+<g transform="translate(1010 330)"><circle class="node-ring bad" cx="0" cy="0" r="27"/><circle class="node-ring bad-inner" cx="0" cy="0" r="22"/><path d="M 0 -15 L 0 13" class="glyph"/><path d="M -17 1 L 0 -4 L 17 1" class="glyph"/><path d="M -7 13 L 0 10 L 7 13" class="glyph"/><text class="node-label" x="0" y="45" text-anchor="middle">UAS-4</text><text class="node-sub" x="0" y="60" text-anchor="middle">Credentialed, compromised</text><text class="score bad" x="-31" y="-21" text-anchor="end">R=0.12</text><g transform="translate(-51.2 68)"><rect class="badge-bg" x="0" y="0" width="102" height="17" rx="3"/><text class="badge-t" x="51.2" y="12.3" text-anchor="middle">TIER-GATED OUT</text></g></g>
+<g transform="translate(90 630)"><circle class="node-ring infra" cx="0" cy="0" r="27"/><path d="M -16 -3 L 0 -15 L 16 -3" class="glyph infra"/><rect x="-13" y="-3" width="26" height="16" class="glyph infra"/><line x1="-6" y1="13" x2="-6" y2="2" class="glyph infra"/><line x1="0" y1="13" x2="0" y2="2" class="glyph infra"/><line x1="6" y1="13" x2="6" y2="2" class="glyph infra"/><text class="node-label" x="-25" y="45" text-anchor="start">PKI / ICAM</text><text class="node-sub" x="-25" y="60" text-anchor="start">Reach-back authority</text></g>
+<g transform="translate(290 630)"><circle class="node-ring good" cx="0" cy="0" r="27"/><rect x="-13" y="-8" width="26" height="16" rx="2" class="glyph"/><line x1="0" y1="8" x2="0" y2="13" class="glyph"/><line x1="-7" y1="13" x2="7" y2="13" class="glyph"/><circle cx="14" cy="-9" r="3" class="glyph"/><path d="M 9 -1 A 5 5 0 0 1 19 -1" class="glyph"/><text class="node-label" x="0" y="45" text-anchor="middle">OPS</text><text class="node-sub" x="0" y="60" text-anchor="middle">Mission ops console</text><text class="score good" x="-31" y="-21" text-anchor="end">R=0.95</text><text class="hotl" x="0" y="76" text-anchor="middle">HUMAN-ON-THE-LOOP</text></g>
+<g transform="translate(640 635)"><circle class="node-ring good" cx="0" cy="0" r="27"/><rect x="-12" y="-13" width="24" height="7.5" rx="1.5" class="glyph"/><rect x="-12" y="-3.5" width="24" height="7.5" rx="1.5" class="glyph"/><rect x="-12" y="6" width="24" height="7.5" rx="1.5" class="glyph"/><circle cx="7" cy="-9.2" r="1.3" class="glyph filled"/><circle cx="7" cy="0.3" r="1.3" class="glyph filled"/><circle cx="7" cy="9.8" r="1.3" class="glyph filled"/><text class="node-label" x="0" y="45" text-anchor="middle">GND-GW</text><text class="node-sub" x="0" y="60" text-anchor="middle">Ground fog gateway</text><text class="score good" x="31" y="-21" text-anchor="start">R=0.92</text><g transform="translate(-52 -44)"><rect class="chip" x="0" y="0" width="27" height="15" rx="3"/><text class="chip-t" x="13.3" y="11" text-anchor="middle">FOG</text></g></g>
+<g transform="translate(820 635)"><circle class="node-ring good" cx="0" cy="0" r="27"/><line x1="0" y1="-11" x2="0" y2="12" class="glyph"/><line x1="-8" y1="12" x2="8" y2="12" class="glyph"/><path d="M 4 -10 A 12 12 0 0 1 4 10" class="glyph"/><path d="M 9 -13 A 17 17 0 0 1 9 13" class="glyph"/><circle cx="0" cy="-11" r="2" class="glyph filled"/><text class="node-label" x="0" y="45" text-anchor="middle">IOBT-1</text><text class="node-sub" x="0" y="60" text-anchor="middle">Ground sensor</text><text class="score good" x="31" y="-21" text-anchor="start">R=0.86</text></g>
+<g transform="translate(1000 635)"><circle class="node-ring forming" cx="0" cy="0" r="27"/><line x1="0" y1="-11" x2="0" y2="12" class="glyph"/><line x1="-8" y1="12" x2="8" y2="12" class="glyph"/><path d="M 4 -10 A 12 12 0 0 1 4 10" class="glyph"/><path d="M 9 -13 A 17 17 0 0 1 9 13" class="glyph"/><circle cx="0" cy="-11" r="2" class="glyph filled"/><text class="node-label" x="0" y="45" text-anchor="middle">IOBT-2</text><text class="node-sub" x="0" y="60" text-anchor="middle">Admitted at capped tier</text><text class="score forming" x="31" y="-21" text-anchor="start">R=0.55</text></g>
+<rect class="callout" x="898" y="424" width="290" height="80" rx="6"/>
+<text class="callout-h" x="910" y="441">AUTONOMOUS RESPONSE · NO REACH-BACK</text>
+<text class="callout-n" x="910" y="460">1</text>
+<text class="callout-t" x="924" y="460"><tspan class="leg-b">Detect</tspan> — track 97.5 m off vs 50 m bound</text>
+<text class="callout-n" x="910" y="476">2</text>
+<text class="callout-t" x="924" y="476"><tspan class="leg-b">Demote</tspan> — signed evidence lowers R</text>
+<text class="callout-n" x="910" y="492">3</text>
+<text class="callout-t" x="924" y="492"><tspan class="leg-b">Gate out</tspan> — loses data-sharing tier</text>
+<text class="legend-h" x="40" y="750">NODE STATE</text>
+<circle class="node-ring good" cx="200" cy="746" r="8"/>
+<text class="leg-text" x="216" y="750"><tspan class="leg-b">Trusted</tspan> — above required tier</text>
+<circle class="node-ring forming" cx="450" cy="746" r="8"/>
+<text class="leg-text" x="466" y="750"><tspan class="leg-b">Forming</tspan> — capped tier, accruing</text>
+<circle class="node-ring bad" cx="700" cy="746" r="8"/>
+<circle class="node-ring bad-inner" cx="700" cy="746" r="4.5"/>
+<text class="leg-text" x="716" y="750"><tspan class="leg-b">Compromised</tspan> — tier-gated out</text>
+<circle class="node-ring infra" cx="950" cy="746" r="8"/>
+<text class="leg-text" x="966" y="750"><tspan class="leg-b">Reach-back</tspan> — off the hot path</text>
+<text class="legend-h" x="40" y="784">NEEDLINES</text>
+<path class="edge track" d="M 192 780 L 236 780" marker-end="url(#arrow-track)"/>
+<text class="leg-text" x="246" y="784">Track / telemetry flow</text>
+<path class="edge fog" d="M 442 780 L 486 780"/>
+<text class="leg-text" x="496" y="784">Fog-tier reputation roll-up</text>
+<path class="edge inject" d="M 692 780 L 736 780" marker-end="url(#arrow-red)"/>
+<line class="cut" x1="712" y1="772" x2="712" y2="788"/>
+<text class="leg-text" x="746" y="784">Hostile input (severed)</text>
+<path class="edge reach" d="M 942 780 L 986 780"/>
+<text class="leg-text" x="996" y="784">Reach-back (contested)</text>
+<text class="legend-h" x="40" y="818">MARKERS</text>
+<circle class="node-ring good" cx="200" cy="814" r="8"/>
+<text class="leg-text" x="216" y="818"><tspan class="leg-b">Resident AT agent</tspan> — every ringed node</text>
+<g transform="translate(488 806)"><rect class="chip" x="0" y="0" width="20" height="15" rx="3"/><text class="chip-t" x="10.2" y="11" text-anchor="middle">GW</text></g>
+<text class="leg-text" x="520" y="818"><tspan class="leg-b">Bump-in-the-wire</tspan> gateway</text>
+<g transform="translate(718 806)"><rect class="chip" x="0" y="0" width="27" height="15" rx="3"/><text class="chip-t" x="13.3" y="11" text-anchor="middle">FOG</text></g>
+<text class="leg-text" x="756" y="818"><tspan class="leg-b">Fog-tier</tspan> gateway</text>
+<rect class="cohort" x="900" y="805" width="30" height="18" rx="5"/>
+<text class="leg-text" x="940" y="818"><tspan class="leg-b">Cohort boundary</tspan></text>
+<text class="footer" x="40" y="862">SBIR/STTR DATA RIGHTS — use and disclosure restricted per the cover-page legend. TekFive, Inc.</text>
+<text class="footer" x="40" y="882">DoDAF OV-1 operational-concept scene · illustrative — node set representative of the §4 demonstration; reputation values notional.</text></svg>

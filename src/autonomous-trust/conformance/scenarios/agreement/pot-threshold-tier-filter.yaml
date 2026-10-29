@@ -4,24 +4,18 @@ protocol: agreement
 name: pot-threshold-tier-filter
 byte_pinning: false
 description: |
-    Proof of Trust (PoT) parallel to `poa-threshold-rank-filter`.
-    Exercises AgreementByTrust's `threshold_tier` gate: voters whose
-    trust tier is below threshold have their vote forced to False in
-    finalize regardless of what they cast.
+    Proof of Trust (PoT) `threshold_tier` gate. A voter whose trust tier
+    is below the threshold is not eligible: its vote is dropped and it
+    does not count toward the eligible set (RD_13.1).
 
-    Setup: alice (tier 2) is the highest-tier voter (the "leader"
-    under PoT's leader-decides semantics — see trust-tiers.md §10);
-    bob (tier 1) is a peer; threshold_tier is 3. Alice votes approve.
-    Under unfiltered PoT leader-decides this would yield True; with
-    threshold_tier=3, alice's tier-2 vote is below threshold →
-    _count_vote forces it to False → _accumulate_votes looks up the
-    leader's vote at tier=2 and finalizes False.
+    Setup: alice (tier 2) and bob (tier 1, myself); threshold_tier is 3.
+    alice approves. Neither voter reaches tier 3, so there are no
+    eligible voters and PoT cannot approve: outcome false.
 
-    Companion to the PoA scenario; the two together pin that PoT
-    mirrors PoA's shape exactly but reads `voter.tier` instead of
-    `voter.rank`. A future change that flattens the two axes (e.g.
-    routing PoT through the same threshold field as PoA) would flip
-    this case relative to the PoA one and surface the regression.
+    Under the leader-decides rule PoT had before RD_13.1, the same case
+    was false for a different reason (alice's vote was forced to false).
+    The outcome is unchanged; the companion PoA scenario
+    `poa-threshold-rank-filter` no longer describes the same rule.
 
 participants:
   - id: alice
@@ -50,11 +44,9 @@ steps:
       blob: blob-x
       approval: true
     description: |
-        alice (tier 2, the highest-tier voter so "leader" under PoT)
-        approves blob-x. With threshold_tier=3 her vote is below
-        threshold and _count_vote forces it to False;
-        _accumulate_votes looks up the leader's vote at tier=2 and
-        gets False.
+        alice (tier 2) approves blob-x. With threshold_tier=3 she is
+        not eligible and her vote is dropped; with no eligible voters
+        finalize returns false.
 
 expected_state:
   agreement:

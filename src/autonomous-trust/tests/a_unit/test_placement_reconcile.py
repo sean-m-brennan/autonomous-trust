@@ -51,8 +51,8 @@ def _task(n):
 def _items(*ns):
     hist = TransactionHistory()
     for n in ns:
-        hist.record_half(_task(n), A, 0.6)
-        hist.record_half(_task(n), B, 0.8)
+        hist.record_half(_task(n), A, 600)
+        hist.record_half(_task(n), B, 800)
     return hist.ready_items()
 
 
@@ -67,8 +67,8 @@ def _placed(*batches):
 def _legacy(*ns):
     hist = TransactionHistory()
     for n in ns:
-        hist.update(_task(n), A, 0.6)
-        hist.update(_task(n), B, 0.8)
+        hist.update(_task(n), A, 600)
+        hist.update(_task(n), B, 800)
     return hist
 
 
@@ -176,8 +176,8 @@ class TestReconcileUnderPlacement:
     def test_an_uncertified_tail_is_cut_off(self):
         ours = _placed((1,))
         theirs = _placed((1,), (2,))
-        theirs.update(_task(9), A, 0.6)
-        theirs.update(_task(9), B, 0.8)        # written outside any placement
+        theirs.update(_task(9), A, 600)
+        theirs.update(_task(9), B, 800)        # written outside any placement
         res = ours.reconcile(_seg(theirs), certified={0, 1})
         assert res.status == ReconcileResult.EXTENDED
         assert _tasks(ours) == [_task(1), _task(2)]
@@ -185,8 +185,8 @@ class TestReconcileUnderPlacement:
     def test_an_uncertified_segment_cannot_pass_our_placed_end(self):
         ours = _placed((1,))
         theirs = copy.deepcopy(ours)
-        theirs.update(_task(9), A, 0.6)
-        theirs.update(_task(9), B, 0.8)
+        theirs.update(_task(9), A, 600)
+        theirs.update(_task(9), B, 800)
         res = ours.reconcile(_seg(theirs), certified=set())
         assert res.status == ReconcileResult.NONE
         assert len(ours) == 1
@@ -200,7 +200,7 @@ class TestReconcileUnderPlacement:
         assert _tasks(ours) == [_task(3), _task(4)]
         assert ours.next_index == 4 and ours.head_hash == theirs.head_hash
         # What we held below the gap cannot come back.
-        assert ours.record_half(_task(1), A, 0.6) == 'tombstoned'
+        assert ours.record_half(_task(1), A, 600) == 'tombstoned'
 
     def test_a_gap_without_a_certified_start_is_rejected(self):
         theirs = _placed((1,), (2,), (3, 4))
@@ -211,8 +211,8 @@ class TestReconcileUnderPlacement:
 
     def test_what_is_taken_leaves_the_pool(self):
         ours = TransactionHistory()
-        ours.record_half(_task(1), A, 0.6)
-        ours.record_half(_task(1), B, 0.8)
+        ours.record_half(_task(1), A, 600)
+        ours.record_half(_task(1), B, 800)
         theirs = _placed((1,))
         ours.reconcile(_seg(theirs), certified=_all(theirs))
         assert ours.pooled(_task(1)) is None
@@ -269,8 +269,8 @@ class TestProcessCatchUp:
 
     def test_dropped_entries_go_back_to_the_pool(self):
         rp, q, idents = _process()
-        rp.history.update(_task(7), A, 0.6, certificate={'x': 'y'})
-        rp.history.update(_task(7), B, 0.8, certificate={'x': 'y'})
+        rp.history.update(_task(7), A, 600, certificate={'x': 'y'})
+        rp.history.update(_task(7), B, 800, certificate={'x': 'y'})
         theirs = _signed(_placed((1,)), idents)
         res = rp._reconcile_into(q, '', _seg(theirs), 'peer')
         assert res.status == ReconcileResult.ADOPTED
@@ -305,7 +305,7 @@ class TestProcessCatchUp:
     def test_our_unpaired_pool_halves_are_handed_to_a_newcomer(self):
         rp, q, idents = _process()
         me = rp.identity.uuid
-        rp.history.record_half(_task(5), me, 0.7, certificate={'x': 'y'})
+        rp.history.record_half(_task(5), me, 700, certificate={'x': 'y'})
         first = idents[1]
         rp.handoff = {str(p.uuid): [0.0, 0] for p in rp.peers.all}
         sent = rp._hand_off_pending_halves(q, 100.0)

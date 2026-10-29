@@ -1,0 +1,72 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: pot-vote-replay-idempotent
+byte_pinning: false
+description: |
+    One voter, one vote. Under a counted rule a replayed approval would
+    stand in for a second voter, so finalize must count it once.
+
+    Setup: three voters at tier 1, all eligible under the default floor.
+    blob-x: alice approves, delivered three times. Counted once, 1 of 3,
+    so false. blob-y: alice and bob approve once each, 2 of 3, so true.
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+  - id: carol
+    role: voter
+
+fixtures:
+  impl: trust
+  tiers:
+    alice: 1
+    bob: 1
+    carol: 1
+  myself: carol
+  blobs:
+    blob-x:
+      originator: bob
+      payload: "replay-x"
+    blob-y:
+      originator: bob
+      payload: "replay-y"
+
+steps:
+  - id: 1
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    repeat: 3
+    description: |
+        alice approves blob-x, delivered three times.
+  - id: 2
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-y
+      approval: true
+    description: |
+        alice approves blob-y.
+  - id: 3
+    from: bob
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-y
+      approval: true
+    description: |
+        bob approves blob-y. 2 of 3.
+
+expected_state:
+  agreement:
+    blob-x:
+      outcome: false
+    blob-y:
+      outcome: true

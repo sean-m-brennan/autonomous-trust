@@ -20,6 +20,7 @@
 
 #include "identity/identity.h"   /* DEFAULT_MAX_PEERS */
 #include "network/net_presence.h"
+#include "utilities/numfmt.h"
 
 /* One tracked peer. `since` is when it joined the tracker: a peer is never
  * absent, and never owed a heartbeat, before it has been on the roster for the
@@ -44,7 +45,7 @@ static double _env_seconds(const char *name, double fallback)
     if (raw == NULL || raw[0] == '\0')
         return fallback;
     char *end = NULL;
-    double v = strtod(raw, &end);
+    double v = at_strtod(raw, &end);
     if (end == raw || *end != '\0' || !(v > 0.0))
         return fallback;
     return v;

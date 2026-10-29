@@ -635,3 +635,97 @@ def test_coordinator_capabilities_not_seeded(tmp_path, scenario_factory):
             pc = json.load(f, object_hook=config_json_decoder)
         listed = {str(u) for caps in pc._listing.values() for u in caps}
         assert coord_uuid not in listed, peer
+
+
+# ------------------------------------------------- hierarchical seeding
+
+
+def _hier(scenario_factory):
+    return scenario_factory(squad_size=4, swarm_size=35, sensor_count=3,
+                            hacked_sensors=2, include_command=True, rq86_count=3)
+
+
+def _load(path):
+    with path.open() as f:
+        return json.load(f, object_hook=config_json_decoder)
+
+
+def test_hierarchy_anchor_sees_gateway_at_field_address(tmp_path, scenario_factory):
+    """A C microdrone learns the gateway from the anchor's history, so the
+    anchor must hold the gateway at the one address the field can reach."""
+    from tools.seed_dod_cohort import seed_cohort
+    from examples.dod_mission.deploy.hierarchy import plan_layout, field_network
+    sc = _hier(scenario_factory)
+    lay = plan_layout(sc, 32)
+    seed_cohort(tmp_path, sc, force=True, seed_coordinator=True, max_cohort=32)
+    c2 = lay.cohorts[1]
+    peers = _load(tmp_path / c2.anchor / "etc/at/peers.cfg.json")
+    gw = next(p for p in peers.all if p.petname == c2.gateway)
+    assert gw.address == lay.ip(c2.gateway, field_network(2))
+    grp, _ = _load(tmp_path / c2.anchor / "etc/at/group.cfg.json")
+    assert lay.ip(c2.gateway, field_network(2)) in list(grp.addresses)
+
+
+def test_hierarchy_c_microdrones_get_field_identities_only(tmp_path, scenario_factory):
+    from tools.seed_dod_cohort import seed_cohort
+    from examples.dod_mission.deploy.hierarchy import plan_layout, field_network
+    sc = _hier(scenario_factory)
+    lay = plan_layout(sc, 32)
+    seed_cohort(tmp_path, sc, force=True, seed_coordinator=True, max_cohort=32)
+    c = lay.c_microdrones()[0]
+    d = tmp_path / c / "etc/at"
+    ident = json.loads((d / "identity.cfg.json").read_text())
+    assert "hex_seed" in ident["signature"]
+    assert ident["address"] == lay.ip(c, field_network(lay.cohort_of(c).index))
+    assert not (d / "group.cfg.json").exists()
+
+
+def test_hierarchy_command_members_see_gateway_at_command_address(tmp_path, scenario_factory):
+    from tools.seed_dod_cohort import seed_cohort
+    from examples.dod_mission.deploy.hierarchy import plan_layout, COMMAND_NETWORK
+    sc = _hier(scenario_factory)
+    lay = plan_layout(sc, 32)
+    seed_cohort(tmp_path, sc, force=True, seed_coordinator=True, max_cohort=32)
+    peers = _load(tmp_path / "coordinator" / "etc/at/peers.cfg.json")
+    gw = next(p for p in peers.all if p.petname == "rq86-1")
+    assert gw.address == lay.ip("rq86-1", COMMAND_NETWORK)
+    names = {p.petname for p in peers.all}
+    assert not any(n.startswith("microdrone-") for n in names)
+
+
+def test_hierarchy_gateway_holds_command_primary_and_field_child(tmp_path, scenario_factory):
+    from tools.seed_dod_cohort import seed_cohort
+    sc = _hier(scenario_factory)
+    seed_cohort(tmp_path, sc, force=True, seed_coordinator=True, max_cohort=32)
+    d = tmp_path / "rq86-1" / "etc/at"
+    primary, _ = _load(d / "group.cfg.json")
+    child_files = list(d.glob("group_child_*.cfg.json"))
+    assert len(child_files) == 1
+    child = _load(child_files[0])
+    assert primary.uuid != child.uuid
+    hyb = json.loads((d / "hybrid_net.cfg.json").read_text())
+    assert hyb["is_gateway"] is True and len(hyb["inners"]) == 2
+    assert hyb["group_routes"] == [{"group_uuid": str(child.uuid), "leg_index": 1}]
+    from autonomous_trust.core._python.network.hybrid import hybrid_config_from_json
+    assert len(hybrid_config_from_json(hyb).inners) == 2
+    net = _load(d / "network.cfg.json")
+    assert net._ip4_cidr.startswith("172.30.0.")
+
+
+def test_hierarchy_seeds_no_rank(tmp_path, scenario_factory):
+    """Admission is proof-of-authority: the highest-ranked voter decides. A
+    gateway stays out of admission, so ranking it above its field cohort
+    would leave every field proposal without a deciding vote."""
+    from tools.seed_dod_cohort import seed_cohort
+    sc = _hier(scenario_factory)
+    seed_cohort(tmp_path, sc, force=True, seed_coordinator=True, max_cohort=32)
+    assert _load(tmp_path / "rq86-2/etc/at/identity.cfg.json")._rank == 0
+    assert _load(tmp_path / "coordinator/etc/at/identity.cfg.json")._rank == 0
+
+
+def test_flat_seed_unchanged_without_cohort_size(tmp_path, scenario_factory):
+    from tools.seed_dod_cohort import seed_cohort
+    sc = scenario_factory(squad_size=2, swarm_size=2, sensor_count=2,
+                          hacked_sensors=1, include_command=False)
+    seeded = seed_cohort(tmp_path, sc, force=True)
+    assert not any((tmp_path / p / "etc/at/hybrid_net.cfg.json").exists() for p in seeded)

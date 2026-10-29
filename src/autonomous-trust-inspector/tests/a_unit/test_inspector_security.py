@@ -293,8 +293,14 @@ try:
 except (ImportError, ModuleNotFoundError):
     has_dash = False
 
+# Everything that imports dash_components needs the dash stack AND the built
+# async_update package, which reactjs/build.sh links in (gitignored, so a fresh
+# checkout or a reset sandbox lacks it until build.sh is rerun).
+requires_dash = pytest.mark.skipif(not has_dash,
+                                   reason='dash_components dependencies not available')
 
-@pytest.mark.skipif(not has_dash, reason='dash_components dependencies not available')
+
+@requires_dash
 class TestDashControlAuthGate:
     """The order-of-operations property: who consumes the first frame."""
 
@@ -665,6 +671,7 @@ class TestExposureValidation:
         assert not caplog.records, caplog.text
 
 
+@requires_dash
 class TestDashControlExposure:
     """The wiring: one value feeds the bind and the advertisement."""
 
@@ -787,6 +794,7 @@ async def _probe(url, token=None, origin=None):
         return getattr(rcvd, 'code', None) or getattr(err, 'code', None)
 
 
+@requires_dash
 @pytest.mark.asyncio
 async def test_live_listener_accepts_a_valid_token_and_registers_the_client():
     with _Listener(authenticator=TokenAuthenticator(GOOD_TOKEN)) as ctl:
@@ -798,6 +806,7 @@ async def test_live_listener_accepts_a_valid_token_and_registers_the_client():
         assert ctl.clients[0].auth_method == 'token'
 
 
+@requires_dash
 @pytest.mark.asyncio
 async def test_live_listener_refuses_a_bad_token():
     with _Listener(authenticator=TokenAuthenticator(GOOD_TOKEN)) as ctl:
@@ -806,6 +815,7 @@ async def test_live_listener_refuses_a_bad_token():
         assert ctl.clients == []
 
 
+@requires_dash
 @pytest.mark.asyncio
 async def test_live_listener_refuses_a_missing_token():
     with _Listener(authenticator=TokenAuthenticator(GOOD_TOKEN)) as ctl:
@@ -815,6 +825,7 @@ async def test_live_listener_refuses_a_missing_token():
         assert ctl.clients == []
 
 
+@requires_dash
 @pytest.mark.asyncio
 async def test_live_listener_refuses_a_disallowed_origin():
     """The Origin allowlist, which was unreachable code under the asyncio API."""
@@ -824,6 +835,7 @@ async def test_live_listener_refuses_a_disallowed_origin():
         assert ctl.clients == []
 
 
+@requires_dash
 @pytest.mark.asyncio
 async def test_live_listener_accepts_an_allowed_origin():
     with _Listener(authenticator=TokenAuthenticator(GOOD_TOKEN)) as ctl:
@@ -832,6 +844,7 @@ async def test_live_listener_accepts_an_allowed_origin():
         assert len(ctl.clients) == 1
 
 
+@requires_dash
 @pytest.mark.asyncio
 async def test_halt_closes_the_listener_and_unwinds_the_service():
     """Shutdown has to happen INSIDE the websocket loop while it still runs.
@@ -865,6 +878,7 @@ async def test_halt_closes_the_listener_and_unwinds_the_service():
         sock.bind(('127.0.0.1', port))
 
 
+@requires_dash
 @pytest.mark.asyncio
 async def test_live_listener_unauthenticated_default_still_accepts():
     """The default posture, end to end: no credential expected, and the first
@@ -875,6 +889,7 @@ async def test_live_listener_unauthenticated_default_still_accepts():
         assert ctl.clients[0].auth_method == 'none'
 
 
+@requires_dash
 class TestWebSocketOrigin:
     """`Origin` is read differently either side of the websockets asyncio
     rewrite, and `pyproject.toml` admits both."""

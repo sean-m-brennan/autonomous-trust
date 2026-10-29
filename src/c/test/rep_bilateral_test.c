@@ -54,11 +54,11 @@ DEFINE_TEST(test_the_bytes_are_pinned)
         "AT-HALF\0"
         "00000000-0000-4000-8000-000000000001"
         "|aaaaaaaa-0000-4000-8000-000000000001"
-        "|bbbbbbbb-0000-4000-8000-000000000002|0.75|task_outcome";
+        "|bbbbbbbb-0000-4000-8000-000000000002|750|task_outcome";
     uuid_t t, a, b;
     _u(T1, t); _u(A, a); _u(B, b);
     uint8_t got[HALF_DESIG_MAX];
-    size_t n = half_designation(t, a, b, 0.75, NULL, got, sizeof(got));
+    size_t n = half_designation(t, a, b, 750, NULL, got, sizeof(got));
     ck_assert_uint_eq(n, sizeof(want) - 1);
     ck_assert(memcmp(got, want, n) == 0);
 }
@@ -69,12 +69,12 @@ DEFINE_TEST(test_it_binds_the_counterparty_and_the_score)
     uuid_t t, a, b, c;
     _u(T1, t); _u(A, a); _u(B, b); _u(C, c);
     uint8_t base[HALF_DESIG_MAX], other[HALF_DESIG_MAX];
-    size_t n = half_designation(t, a, b, 0.5, NULL, base, sizeof(base));
-    size_t m = half_designation(t, a, c, 0.5, NULL, other, sizeof(other));
+    size_t n = half_designation(t, a, b, 500, NULL, base, sizeof(base));
+    size_t m = half_designation(t, a, c, 500, NULL, other, sizeof(other));
     ck_assert(n != m || memcmp(base, other, n) != 0);
-    m = half_designation(t, a, b, 0.25, NULL, other, sizeof(other));
+    m = half_designation(t, a, b, 250, NULL, other, sizeof(other));
     ck_assert(n != m || memcmp(base, other, n) != 0);
-    m = half_designation(t, a, b, 0.5, TX_CHANNEL_DEFAULT, other, sizeof(other));
+    m = half_designation(t, a, b, 500, TX_CHANNEL_DEFAULT, other, sizeof(other));
     ck_assert(n == m && memcmp(base, other, n) == 0);
 }
 END_TEST_DEFINITION()
@@ -85,9 +85,9 @@ DEFINE_TEST(test_halves_that_name_each_other_pair)
     ck_assert_ret_ok(tx_history_init(&h));
     uuid_t t, a, b;
     _u(T1, t); _u(A, a); _u(B, b);
-    ck_assert_int_eq(tx_history_record_signed_half(&h, t, a, 0.9, NULL, NULL, b, "s1"),
+    ck_assert_int_eq(tx_history_record_signed_half(&h, t, a, 900, NULL, NULL, b, "s1"),
                      TX_HALF_PENDING);
-    ck_assert_int_eq(tx_history_record_signed_half(&h, t, b, 0.7, NULL, NULL, a, "s2"),
+    ck_assert_int_eq(tx_history_record_signed_half(&h, t, b, 700, NULL, NULL, a, "s2"),
                      TX_HALF_READY);
     ck_assert_str_eq(tx_history_pool_half_sig(&h, t, a), "s1");
     ck_assert_str_eq(tx_history_pool_half_sig(&h, t, b), "s2");
@@ -102,10 +102,10 @@ DEFINE_TEST(test_a_half_the_held_one_does_not_name_is_refused)
     ck_assert_ret_ok(tx_history_init(&h));
     uuid_t t, a, b, c;
     _u(T1, t); _u(A, a); _u(B, b); _u(C, c);
-    tx_history_record_signed_half(&h, t, a, 0.9, NULL, NULL, b, "s1");
-    ck_assert_int_eq(tx_history_record_signed_half(&h, t, c, 0.0, NULL, NULL, a, "s3"),
+    tx_history_record_signed_half(&h, t, a, 900, NULL, NULL, b, "s1");
+    ck_assert_int_eq(tx_history_record_signed_half(&h, t, c, 0, NULL, NULL, a, "s3"),
                      TX_HALF_MISMATCH);
-    ck_assert_int_eq(tx_history_record_signed_half(&h, t, b, 0.7, NULL, NULL, a, "s2"),
+    ck_assert_int_eq(tx_history_record_signed_half(&h, t, b, 700, NULL, NULL, a, "s2"),
                      TX_HALF_READY);
     tx_history_free(&h);
 }
@@ -119,10 +119,10 @@ DEFINE_TEST(test_a_squatted_half_gives_way_to_the_half_it_names)
     ck_assert_ret_ok(tx_history_init(&h));
     uuid_t t, a, b, c;
     _u(T1, t); _u(A, a); _u(B, b); _u(C, c);
-    tx_history_record_signed_half(&h, t, c, 0.0, NULL, NULL, a, "s3");
-    ck_assert_int_eq(tx_history_record_signed_half(&h, t, a, 0.9, NULL, NULL, b, "s1"),
+    tx_history_record_signed_half(&h, t, c, 0, NULL, NULL, a, "s3");
+    ck_assert_int_eq(tx_history_record_signed_half(&h, t, a, 900, NULL, NULL, b, "s1"),
                      TX_HALF_PENDING);
-    ck_assert_int_eq(tx_history_record_signed_half(&h, t, b, 0.7, NULL, NULL, a, "s2"),
+    ck_assert_int_eq(tx_history_record_signed_half(&h, t, b, 700, NULL, NULL, a, "s2"),
                      TX_HALF_READY);
     ck_assert_ptr_null(tx_history_pool_half_sig(&h, t, c));
     tx_history_free(&h);
@@ -135,8 +135,8 @@ DEFINE_TEST(test_unnamed_halves_pair_as_they_always_did)
     ck_assert_ret_ok(tx_history_init(&h));
     uuid_t t, a, b;
     _u(T1, t); _u(A, a); _u(B, b);
-    tx_history_record_half(&h, t, a, 0.9, NULL, NULL);
-    ck_assert_int_eq(tx_history_record_half(&h, t, b, 0.7, NULL, NULL), TX_HALF_READY);
+    tx_history_record_half(&h, t, a, 900, NULL, NULL);
+    ck_assert_int_eq(tx_history_record_half(&h, t, b, 700, NULL, NULL), TX_HALF_READY);
     tx_history_free(&h);
 }
 END_TEST_DEFINITION()
@@ -147,8 +147,8 @@ DEFINE_TEST(test_a_placed_entry_keeps_its_signatures_outside_the_hash)
     ck_assert_ret_ok(tx_history_init(&h));
     uuid_t t, a, b;
     _u(T1, t); _u(A, a); _u(B, b);
-    tx_history_record_signed_half(&h, t, a, 0.9, NULL, NULL, b, "aa");
-    tx_history_record_signed_half(&h, t, b, 0.7, NULL, NULL, a, "bb");
+    tx_history_record_signed_half(&h, t, a, 900, NULL, NULL, b, "aa");
+    tx_history_record_signed_half(&h, t, b, 700, NULL, NULL, a, "bb");
     transaction_t ready[2];
     ck_assert_int_eq(tx_history_ready_items(&h, ready, 2), 1);
     ck_assert_int_eq(tx_history_apply_placed(&h, 0, ready, 1, NULL), TX_PLACE_APPLIED);
@@ -157,8 +157,8 @@ DEFINE_TEST(test_a_placed_entry_keeps_its_signatures_outside_the_hash)
     /* The same entry unsigned hashes the same. */
     tx_history_t plain;
     ck_assert_ret_ok(tx_history_init(&plain));
-    tx_history_record_half(&plain, t, a, 0.9, NULL, NULL);
-    tx_history_record_half(&plain, t, b, 0.7, NULL, NULL);
+    tx_history_record_half(&plain, t, a, 900, NULL, NULL);
+    tx_history_record_half(&plain, t, b, 700, NULL, NULL);
     ck_assert_int_eq(tx_history_ready_items(&plain, ready, 2), 1);
     ck_assert_int_eq(tx_history_apply_placed(&plain, 0, ready, 1, NULL),
                      TX_PLACE_APPLIED);
@@ -181,7 +181,7 @@ DEFINE_TEST(test_a_lone_half_keeps_its_name)
     ck_assert_ret_ok(tx_history_init(&h));
     uuid_t t, a, b, got;
     _u(T1, t); _u(A, a); _u(B, b);
-    tx_history_record_signed_half(&h, t, a, 0.9, NULL, NULL, b, "ef01");
+    tx_history_record_signed_half(&h, t, a, 900, NULL, NULL, b, "ef01");
     ck_assert(tx_history_pool_names(&h, t, a, got));
     ck_assert_int_eq(uuid_compare(got, b), 0);
     ck_assert_str_eq(tx_history_pool_half_sig(&h, t, a), "ef01");

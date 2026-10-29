@@ -46,6 +46,7 @@
 #include "reputation/tx_channel.h"             /* evidence channels */
 #include "reputation/reputation.h"              /* tx_pair_task_uuid */
 #include "utilities/send_retry.h"   /* at_send: keep a refused frame */
+#include "utilities/numfmt.h"
 
 /* Hand a sibling queue one of this process's frames, keeping it if the queue is
  * full (utilities/send_retry.h, ISSUES §2.14). Every negotiation frame is a
@@ -878,7 +879,10 @@ static bool _py_result_text(const json_t *j_result, char *out, size_t cap)
         return (size_t)snprintf(out, cap, "%lld",
                                 (long long)json_integer_value(j_result)) < cap;
     if (json_is_real(j_result))
-        return (size_t)snprintf(out, cap, "%.17g", json_real_value(j_result)) < cap;
+    {
+        char g17[AT_G17_LEN];
+        return at_strlcpy(out, at_fmt_g17(json_real_value(j_result), g17), cap) < cap;
+    }
     if (json_is_true(j_result) || json_is_false(j_result))
         return at_strlcpy(out, json_is_true(j_result) ? "True" : "False", cap) < cap;
     /* An object or array: hand it over as compact JSON rather than dropping
@@ -2547,7 +2551,7 @@ double negotiation_score_task_result_at(const char *cap_name,
         if (result_str != NULL && result_str[0] != '\0')
         {
             char *parse_end = NULL;
-            double parsed = strtod(result_str, &parse_end);
+            double parsed = at_strtod(result_str, &parse_end);
             /* Whole-string parse only: "42abc" is not 42. */
             if (parse_end != NULL && *parse_end == '\0')
                 result_num = parsed;

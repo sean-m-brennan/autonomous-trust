@@ -91,7 +91,7 @@ static inline void rps_sign_half(tx_history_t *h, const uuid_t task,
                                  const identity_t *other, double score)
 {
     uint8_t desig[HALF_DESIG_MAX];
-    size_t dlen = half_designation(task, scorer->uuid, other->uuid, score, NULL,
+    size_t dlen = half_designation(task, scorer->uuid, other->uuid, tx_score_to_milli(score), NULL,
                                    desig, sizeof(desig));
     ck_assert(dlen > 0);
     unsigned char sig[crypto_sign_BYTES];
@@ -122,8 +122,8 @@ static inline void rps_pair(tx_history_t *h, const uuid_t task,
     uuid_copy(t.p1_uuid, a->uuid);
     uuid_copy(t.p2_uuid, b->uuid);
     t.p1_set = t.p2_set = true;
-    t.p1_score = a_score;
-    t.p2_score = b_score;
+    t.p1_score_milli = tx_score_to_milli(a_score);
+    t.p2_score_milli = tx_score_to_milli(b_score);
     rps_place(h, &t, signers, n);
     rps_sign_half(h, task, a, b, a_score);
     rps_sign_half(h, task, b, a, b_score);

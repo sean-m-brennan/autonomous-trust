@@ -1,0 +1,62 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: poa-tied-leaders-split-vote
+byte_pinning: false
+description: |
+    Two voters tie for the PoA leader rank and split their votes. Tied
+    leaders combine by conjunction (RD_13.1 D7): every tied leader who
+    votes must approve, so any one of them can veto.
+
+    Before RD_13.1 the C side returned the first vote at the leader rank
+    and Python's dict lookup kept the last, so this split finalized
+    differently in the two runtimes.
+
+    Setup: alice and carol at rank 5 (tied leaders), bob at rank 0 and
+    myself. alice approves, then carol rejects. Expected outcome false.
+
+participants:
+  - id: alice
+    role: voter
+  - id: carol
+    role: voter
+  - id: bob
+    role: voter
+
+fixtures:
+  impl: authority
+  threshold_rank: 0
+  ranks:
+    alice: 5
+    carol: 5
+    bob: 0
+  myself: bob
+  blobs:
+    blob-x:
+      originator: alice
+      payload: "tied-leaders-split-payload"
+
+steps:
+  - id: 1
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: |
+        alice (rank 5, tied leader) approves.
+  - id: 2
+    from: carol
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: false
+    description: |
+        carol (rank 5, tied leader) rejects. The conjunction fails.
+
+expected_state:
+  agreement:
+    blob-x:
+      outcome: false

@@ -209,7 +209,7 @@ Paperwork, not engineering:
 - Letters of support from Air Force or Space Force programs, and Phase III
   partners. The GDMS letter was Navy-specific.
 - NV059 status for §B.14 and the feasibility-funding question.
-- OV-1 for an air/space fleet.
+- OV-1 for an air/space fleet. DONE 2026-10-28 as Volume 5 Figure 1 (`autonomoustrust_ov1_dv002.png`, regenerate with `gen_ov1_dv002.py`); check whether Volume 2 wants it too.
 
 ## Claims deliberately left out
 

@@ -220,7 +220,7 @@ static void _round(cohort_t *c, uuid_t task, char *task_str)
                          NULL, subject, 0.0);
     identity_t *voters[2] = { c->alice, c->bob };
     uint8_t desig[512];
-    size_t dlen = commit_designation(c->me->uuid, task, 0.9, NULL, desig,
+    size_t dlen = commit_designation(c->me->uuid, task, 900, NULL, desig,
                                      sizeof(desig));
     ck_assert(dlen > 0);
     for (int i = 0; i < 2; i++) {
@@ -302,7 +302,7 @@ static void _chain(identity_t *a, identity_t *b, int from, int n,
         snprintf(name, sizeof(name), "%s-%d", salt, i);
         uuid_t task;
         uuid_generate_sha1(task, a->uuid, name, strlen(name));
-        reputation_install_tx_pair(task, a->uuid, 0.8, b->uuid, 0.7);
+        reputation_install_tx_pair(task, a->uuid, 800, b->uuid, 700);
     }
 }
 

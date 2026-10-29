@@ -29,6 +29,7 @@ placement decides where it goes in the chain.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import queue
 import tempfile
@@ -55,7 +56,7 @@ from autonomous_trust.core.reputation.protocol import ReputationProtocol
 from autonomous_trust.core.reputation.reputation import (
     TransactionScore, SlashAttestation, SignedSlash,
     Checkpoint, SignedCheckpoint, evidence_to_dict, place_designation,
-    place_value_digest, placement_entry)
+    place_value_digest, placement_entry, score_to_milli)
 from autonomous_trust.core.reputation.placement import entry_to_dict
 from autonomous_trust.core.reputation.reputation import TransactionHistory
 from autonomous_trust.core.system import CfgIds, PackageHash
@@ -525,6 +526,27 @@ class _Participant:
                 raise AssertionError(f'{self.id}: unsupported expected_state key {key!r}')
 
 
+
+def _milli(score):
+    """A scenario's score (0.0..1.0, as an application gives one) as the
+    integer thousandths the wire and the chain carry. A value off the scale is
+    passed through still off it (thousandths when finite, else as it came;
+    the C adapter sends INT_MIN for the latter), so a scenario that sends 7.5
+    or NaN still reaches the gate that refuses it.
+    Mirrors the C adapter's _milli."""
+    try:
+        return score_to_milli(score)
+    except ValueError:
+        try:
+            value = float(score)
+        except (TypeError, ValueError):
+            return score
+        if not math.isfinite(value) or abs(value) > 1e6:
+            return value
+        # C's lround: half away from zero.
+        return int(math.copysign(math.floor(abs(value) * 1000 + 0.5), value))
+
+
 def _chain_half_pid(entry: dict, half: int, parties=None):
     """The participant id of one half of a chain entry: its `p1_id` / `p2_id`,
     else the scenario's `chain_parties` fixture ([p1, p2]), else None."""
@@ -609,9 +631,9 @@ def _write_chain(hist, spec, uuid_of, sign, member=None, parties=None) -> None:
         if entry.get('batch') is None:
             tk = uuid5(_NS, f"chain:{entry['task']}")
             hist.update(tk, _chain_half(entry, 1, entry['task'], uuid_of, parties),
-                        float(entry['p1']))
+                        _milli(entry['p1']))
             hist.update(tk, _chain_half(entry, 2, entry['task'], uuid_of, parties),
-                        float(entry['p2']))
+                        _milli(entry['p2']))
             i += 1
             continue
         group = []
@@ -621,9 +643,9 @@ def _write_chain(hist, spec, uuid_of, sign, member=None, parties=None) -> None:
         entries = [placement_entry(Transaction(
             uuid5(_NS, f"chain:{e['task']}"),
             p1_id=_chain_half(e, 1, e['task'], uuid_of, parties),
-            p1_score=float(e['p1']),
+            p1_score_milli=_milli(e['p1']),
             p2_id=_chain_half(e, 2, e['task'], uuid_of, parties),
-            p2_score=float(e['p2'])))
+            p2_score_milli=_milli(e['p2'])))
             for e in group]
         k = hist.next_index
         by = group[-1].get('placed_by')
@@ -638,7 +660,8 @@ def _write_chain(hist, spec, uuid_of, sign, member=None, parties=None) -> None:
         tx = hist._task_mapping.get(uuid5(_NS, f"chain:{entry['task']}"))
         if tx is None:
             continue
-        for scorer, score in ((tx.p1_id, tx.p1_score), (tx.p2_id, tx.p2_score)):
+        for scorer, score in ((tx.p1_id, tx.p1_score_milli),
+                              (tx.p2_id, tx.p2_score_milli)):
             tx.attach_certificate(scorer, sign(
                 by, commit_designation(scorer, tx.task_id, score)))
     for entry in spec:
@@ -649,8 +672,8 @@ def _write_chain(hist, spec, uuid_of, sign, member=None, parties=None) -> None:
         if tx is None or None in pids:
             continue
         pid_of = {str(uuid_of(p)): p for p in pids if uuid_of(p) is not None}
-        for scorer, other, score in ((tx.p1_id, tx.p2_id, tx.p1_score),
-                                     (tx.p2_id, tx.p1_id, tx.p2_score)):
+        for scorer, other, score in ((tx.p1_id, tx.p2_id, tx.p1_score_milli),
+                                     (tx.p2_id, tx.p1_id, tx.p2_score_milli)):
             pid = pid_of.get(str(scorer))
             if pid is None or other is None:
                 continue
@@ -984,11 +1007,11 @@ class ReputationAdapter:
                     participant.process.history.update(
                         tk, _chain_half(entry, 1, entry['task'], _ident_uuid,
                                         self._chain_parties),
-                        float(entry['p1']))
+                        _milli(entry['p1']))
                     participant.process.history.update(
                         tk, _chain_half(entry, 2, entry['task'], _ident_uuid,
                                         self._chain_parties),
-                        float(entry['p2']))
+                        _milli(entry['p2']))
 
             for entry in preset_tx_history.get(pid, []):
                 if entry.get('attested'):
@@ -1000,7 +1023,7 @@ class ReputationAdapter:
                         dig = entry.get('evidence_digest')
                         participant.process.history.append_attested(Transaction(
                             attest_task_id(vu, su, dig), p1_id=vu,
-                            p1_score=float(entry.get('p1_score', 0.0)),
+                            p1_score_milli=_milli(entry.get('p1_score', 0.0)),
                             p1_channel=entry.get('p1_channel'), attested=True,
                             subject_id=su, evidence_digest=dig,
                             attest_scope=entry.get('attest_scope')))
@@ -1022,20 +1045,20 @@ class ReputationAdapter:
                     names = entry.get('names')
                     participant.process.history.record_half(
                         task_uuid, identities[p1_id].uuid,
-                        float(entry.get('p1_score', 0.0)),
+                        _milli(entry.get('p1_score', 0.0)),
                         entry.get('p1_channel'),
                         counterparty=(identities[names].uuid
                                       if names in identities else None))
                     continue
                 participant.process.history.update(
                     task_uuid, identities[p1_id].uuid,
-                    float(entry.get('p1_score', 0.0)),
+                    _milli(entry.get('p1_score', 0.0)),
                     entry.get('p1_channel'))
                 if p2_id not in identities:
                     continue
                 participant.process.history.update(
                     task_uuid, identities[p2_id].uuid,
-                    float(entry.get('p2_score', 0.0)),
+                    _milli(entry.get('p2_score', 0.0)),
                     entry.get('p2_channel'))
 
             for other_pid, score in preset_reputations.get(pid, {}).items():
@@ -1352,7 +1375,8 @@ class ReputationAdapter:
         signer = participants[payload.get('half_forged_by', scorer_id)].impl.identity
         sig = None if payload.get('unsigned') else self._detached_sig(
             signer, half_designation(task_id, scorer.uuid, signed_name,
-                                     float(payload.get('half_score', score)),
+                                     _milli(payload['half_score'])
+                                     if 'half_score' in payload else score,
                                      payload.get('channel')))
         return (None if payload.get('unnamed') else str(named), sig)
 
@@ -1414,7 +1438,7 @@ class ReputationAdapter:
             ia = participants[a].impl.identity
             ib = participants[b].impl.identity
             task = uuid5(_NS, f'tx:{spec["task_id"]}')
-            sa, sb = float(spec['p1_score']), float(spec['p2_score'])
+            sa, sb = _milli(spec['p1_score']), _milli(spec['p2_score'])
             certs = None
             if not spec.get('uncertified'):
                 signers = spec.get('cosigners') or [
@@ -1433,13 +1457,14 @@ class ReputationAdapter:
                     ia, half_designation(task, ia.uuid, ib.uuid, sa)),
                 str(ib.uuid): self._detached_sig(
                     ib, half_designation(task, ib.uuid, ia.uuid, sb))}
-            tx = placement_entry(Transaction(task, p1_id=ia.uuid, p1_score=sa,
-                                             p2_id=ib.uuid, p2_score=sb,
+            tx = placement_entry(Transaction(task, p1_id=ia.uuid, p1_score_milli=sa,
+                                             p2_id=ib.uuid, p2_score_milli=sb,
                                              commit_sigs=certs,
                                              half_sigs=halves))
             if spec.get('swap'):
                 tx.p1_id, tx.p2_id = tx.p2_id, tx.p1_id
-                tx.p1_score, tx.p2_score = tx.p2_score, tx.p1_score
+                tx.p1_score_milli, tx.p2_score_milli = (tx.p2_score_milli,
+                                                        tx.p1_score_milli)
             out.append(tx)
         out.sort(key=lambda tx: str(tx.task_id).lower())
         if payload.get('unsorted'):
@@ -1513,29 +1538,29 @@ class ReputationAdapter:
             obj = to_json_string((int(payload.get('id1', 1)),
                                   int(payload.get('id2', 1)), proposer_uuid))
         elif function == ReputationProtocol.transaction:
-            id_tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
-            score = TransactionScore(
-                task_id=str(uuid5(_NS, f'tx:{payload.get("task_id", "default")}')),
-                score=float(payload.get('score', 1.0)),
-                # Lets a scenario drive the evidence channel across the wire and
-                # assert the C twin agrees on the closed set -- including that an
-                # unknown spelling is REFUSED by both (R+D.md §12.8). Absent
-                # keeps the pre-channel behavior.
-                channel=payload.get('channel'),
-            )
-            # A proposer asks for certification and names its group ('' is
-            # the primary). `certify: false` or `placing: false` builds the
-            # proposal a half-round build sent, which is dropped.
-            tup = (id_tup, score)
+            # The proposal's wire shape is a JSON object with named fields, the
+            # same body the C adapter builds, so one scenario puts identical
+            # bytes on the wire in both runtimes.
+            body = {'id1': int(payload['id1']), 'id2': int(payload['id2']),
+                    'peer_uuid': proposer_uuid,
+                    'score_milli': _milli(payload.get('score', 1.0))}
+            # The evidence channel goes through verbatim (R+D.md §12.8), so a
+            # scenario can send a bogus one and assert both twins refuse it.
+            # Absent means "task outcome", the pre-channel behavior.
+            if payload.get('channel') is not None:
+                body['channel'] = payload['channel']
+            # A proposer asks for certification and names its group ('' is the
+            # primary). `certify: false` or `placing: false` leaves one off, to
+            # stand for a half-round build's proposal, which is dropped.
             if payload.get('certify', True) is True:
-                tup = tup + (True,)
+                body['certify'] = True
             if payload.get('placing', True) is True:
-                if len(tup) < 3:
-                    tup = tup + (False,)
                 # `group: cohort` names the anchored cohort (RD_14.4 Phase 6).
-                tup = tup + (str(_COHORT_UUID)
-                             if payload.get('group') == 'cohort' else '',)
-            obj = to_json_string(tup)
+                body['group'] = (str(_COHORT_UUID)
+                                 if payload.get('group') == 'cohort' else '')
+            if payload.get('task_id') is not None:
+                body['task_uuid'] = str(uuid5(_NS, f'tx:{payload["task_id"]}'))
+            obj = to_json_string(body)
         elif function == ReputationProtocol.accepted:
             tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
             if payload.get('signed') is True:
@@ -1546,7 +1571,7 @@ class ReputationAdapter:
                 task_id = uuid5(_NS, f'tx:{payload.get("task_id", "default")}')
                 tup = tup + (self._detached_sig(
                     sender_identity, commit_designation(
-                        proposer_uuid, task_id, float(payload.get('score', 1.0)),
+                        proposer_uuid, task_id, _milli(payload.get('score', 1.0)),
                         payload.get('channel'))),)
             obj = to_json_string(tup)
         elif function == ReputationProtocol.committed:
@@ -1563,7 +1588,7 @@ class ReputationAdapter:
             # by `UUID` -- two entries for one task, so an arriving commit
             # could never complete a staged one.
             task_id = uuid5(_NS, f'tx:{payload.get("task_id", "default")}')
-            tup = (task_id, proposer_uuid, float(payload.get('score', 1.0)))
+            tup = (task_id, proposer_uuid, _milli(payload.get('score', 1.0)))
             if payload.get('channel') is not None:
                 tup = tup + (None, str(payload['channel']))
             if 'cosigners' in payload or 'forged_by' in payload:
@@ -1577,7 +1602,8 @@ class ReputationAdapter:
                 tup = tup + (self._cosignatures(
                     participants, payload, commit_designation(
                         proposer_uuid, task_id,
-                        float(payload.get('certified_score', tup[2])),
+                        _milli(payload['certified_score'])
+                        if 'certified_score' in payload else tup[2],
                         payload.get('channel'))),)
                 tup = tup + self._half_elements(participants, payload, to_id,
                                                 proposer_id, task_id, tup[2])
@@ -1614,7 +1640,9 @@ class ReputationAdapter:
                              getattr(self, '_chain_parties', None))
                 built = list(tmp)
                 if payload.get('tamper') and len(built) >= 2:
-                    built[1].p2_score = -1.0
+                    # Any other valid score: the link, not the range
+                    # check, is what must catch it. Mirrors the C adapter.
+                    built[1].p2_score_milli = (built[1].p2_score_milli + 1) % 1001
                 # from: N sends the chain from its Nth entry on, as a peer whose
                 # window has moved past the start would.
                 built = built[int(payload.get('from') or 0):]
@@ -1685,13 +1713,13 @@ class ReputationAdapter:
             target_pid = payload.get('target', from_id)
             target_uuid = (str(participants[target_pid].impl.identity.uuid)
                            if target_pid in participants else target_pid)
-            floor = float(payload.get('floor_score', 0.0))
+            floor = _milli(payload.get('floor_score', 0.0))
             epoch = int(payload.get('epoch', 1))
             reason = payload.get('reason',
                                  SlashAttestation.REASON_PEER_EXCLUDE)
             att = SlashAttestation(
                 slasher_uuid=str(proposer_uuid), target_uuid=target_uuid,
-                reason=reason, floor_score=floor, epoch=epoch)
+                reason=reason, floor_milli=floor, epoch=epoch)
             if function == ReputationProtocol.slash_sign:
                 # Co-signatures are SIGNED HERE, at scenario time, by the
                 # sending participant's own key -- not pinned as blobs -- so
@@ -1738,7 +1766,7 @@ class ReputationAdapter:
             att = AttestedScore(
                 verifier_uuid=str(participants[verifier_pid].impl.identity.uuid),
                 subject_uuid=subject_uuid,
-                score=float(payload.get('score', 0.3)),
+                score_milli=_milli(payload.get('score', 0.3)),
                 channel=payload.get('channel', 'probe'),
                 evidence_digest=payload.get('evidence_digest', 'ab' * 32),
                 attest_scope=payload.get('scope'))

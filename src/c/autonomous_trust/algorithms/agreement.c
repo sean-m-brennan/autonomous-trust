@@ -248,18 +248,28 @@ static bool _authority_accumulate(agreement_protocol_t *proto, int *ranks, bool 
         if (eff > leader_rank)
             leader_rank = eff;
     }
+    /* Voters tied at the leader rank are combined by conjunction: every
+     * tied leader who cast a vote must approve (RD_13.1 D7). Returning
+     * the first match made a split between tied leaders depend on arrival
+     * order, and Python kept the last, so the runtimes also disagreed. */
+    bool leader_voted = false;
+    bool result = true;
     for (int i = 0; i < count; i++)
     {
         if (ranks[i] == leader_rank)
-            return approvals[i];
+        {
+            leader_voted = true;
+            result = result && approvals[i];
+        }
     }
-    /* count == 0 case falls through here — a deliberate "no leader vote
-     * yet, so not approved" — approvals[0] is NEVER read unread. */
-    return false;
+    /* No vote at the leader rank (including count == 0) is a deliberate
+     * "no leader vote yet, so not approved". */
+    return leader_voted && result;
 }
 
-/* Trust (PoT) implementation — parallel to authority but reads
- * voter.tier instead of voter.rank. See doc/architecture/trust-tiers.md §10. */
+/* Trust (PoT) implementation: a majority of eligible voters, where
+ * eligibility is voter.tier at or above a threshold. See
+ * doc/architecture/trust-tiers.md §10 and RD_13.1. */
 
 static bool _trust_pre_verify(agreement_protocol_t *proto, merkle_blob_t *blob,
                               agreement_proof_t *proof, const uint8_t *sig, size_t sig_len)
@@ -273,58 +283,52 @@ static void _trust_prep_vote(agreement_protocol_t *proto)
     (void)proto;
 }
 
-/* Derive the effective threshold tier. Mirrors
- * _authority_effective_threshold exactly but on the tier axis. */
+/* Effective threshold tier: the explicit create-time value when
+ * non-negative, otherwise TRUST_DEFAULT_THRESHOLD_TIER. Mirrors Python
+ * AgreementByTrust.threshold_tier. */
 static int _trust_effective_threshold(const agreement_protocol_t *proto)
 {
     if (proto->state.trust.threshold_tier >= 0)
         return proto->state.trust.threshold_tier;
-    int n = proto->voter_count;
-    if (n <= 0)
-        return 0;
-    int *tiers = (int *)malloc(sizeof(int) * (size_t)n);
-    if (tiers == NULL)
-        return 0;
-    for (int i = 0; i < n; i++)
-        tiers[i] = proto->voters[i].tier;
-    qsort(tiers, (size_t)n, sizeof(int), _int_desc_cmp);
-    int cutoff_idx = (n / 3 > 1) ? (n / 3) : 1;
-    int result = tiers[cutoff_idx - 1];
-    free(tiers);
-    return result;
+    return TRUST_DEFAULT_THRESHOLD_TIER;
 }
 
 /* PoT _count_vote: emits (tier, approval) into the (ranks[], approvals[])
- * channel — the channel naming is `ranks` for historical reasons but
- * just carries whatever discriminator the impl uses. _trust_accumulate
- * reads voters[*].tier the same way _authority_accumulate reads .rank,
- * so the channel staying named `ranks` is harmless. */
+ * channel, which is named `ranks` for historical reasons and carries
+ * whatever discriminator the impl uses. Every vote is reported as cast;
+ * _trust_accumulate drops the ineligible ones, since it needs the
+ * threshold anyway to size the eligible set. */
 static void _trust_count_vote(agreement_protocol_t *proto, merkle_blob_t *blob,
                               agreement_proof_t *proof, agreement_voter_t *voter,
                               int *rank_out, bool *approval_out)
 {
+    (void)proto;
     (void)blob;
     *rank_out = voter->tier;
-    if (voter->tier >= _trust_effective_threshold(proto))
-        *approval_out = proof->approval;
-    else
-        *approval_out = false;
+    *approval_out = proof->approval;
 }
 
+/* PoT accumulate: a strict majority of the eligible voters (tier at or
+ * above the threshold) must have cast an approval. An eligible voter that
+ * did not vote counts against, a tie rejects, and zero eligible voters
+ * rejects. Ineligible votes are dropped. No single voter decides, however
+ * high its tier (RD_13.1). Mirrors Python AgreementByTrust._accumulate_votes. */
 static bool _trust_accumulate(agreement_protocol_t *proto, int *ranks, bool *approvals, int count)
 {
-    int leader_tier = -1;
+    int threshold = _trust_effective_threshold(proto);
+    int eligible = 0;
     for (int i = 0; i < proto->voter_count; i++)
     {
-        if (proto->voters[i].tier > leader_tier)
-            leader_tier = proto->voters[i].tier;
+        if (proto->voters[i].tier >= threshold)
+            eligible++;
     }
+    int yea = 0;
     for (int i = 0; i < count; i++)
     {
-        if (ranks[i] == leader_tier)
-            return approvals[i];
+        if (ranks[i] >= threshold && approvals[i])
+            yea++;
     }
-    return false;
+    return eligible > 0 && yea * 2 > eligible;
 }
 
 /* Stake implementation */
@@ -686,12 +690,16 @@ bool agreement_finalize(agreement_protocol_t *proto, merkle_blob_t *blob)
      * nothing that distinguishes a second delivery from a second voter, so
      * a replayed ballot used to be counted again. Under stake-weighted
      * accumulation that adds the voter's stake twice and flips the outcome
-     * at a tight margin; rank/tier accumulation reduces to the leader's
-     * verdict and was already insensitive.
+     * at a tight margin, and the same holds for trust (PoT), which counts
+     * a majority of eligible voters (RD_13.1). Rank accumulation (PoA)
+     * reduces to the leader's verdict and was already insensitive.
      *
      * Indexed by voter slot rather than by uuid string: the slot is already
      * resolved below, and voter_count is small and fixed for the round.
-     * Everything on this list cleared pre_verify at store time, so a
+     * The core does not check vote signatures (every pre_verify here
+     * returns true); authenticating each vote before agreement_verify is
+     * the caller's obligation, see agreement.h. The identity history meets
+     * it (identity_history_verify_object). Under that obligation a
      * duplicate here is a genuine second delivery from a real voter, not a
      * forged ballot squatting a voter's slot. */
     bool *counted = calloc((size_t)(proto->voter_count > 0 ? proto->voter_count : 1),

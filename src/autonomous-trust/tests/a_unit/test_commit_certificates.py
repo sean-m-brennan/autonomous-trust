@@ -44,6 +44,23 @@ from autonomous_trust.core.system import CfgIds
 from unittest.mock import MagicMock
 
 
+def _tx_body(id1, id2, proposer, score, certify=True, group=''):
+    """A `transaction` proposal in its wire shape: the JSON object with named
+    fields both runtimes send. `certify`/`group` of None leave the key off, as
+    a half-round build's proposal did."""
+    from autonomous_trust.core.config import to_json_string
+    body = {'id1': id1, 'id2': id2, 'peer_uuid': str(proposer),
+            'score_milli': score.score_milli, 'task_uuid': str(score.task_id)}
+    if getattr(score, 'channel', None):
+        body['channel'] = score.channel
+    if certify is not None:
+        body['certify'] = certify
+    if group is not None:
+        body['group'] = group
+    return to_json_string(body)
+
+
+
 def _ident(name, n):
     return Identity.initialize(name, name, '10.0.8.%d' % n)
 
@@ -98,8 +115,8 @@ def _sign_halves(chain, people):
         if tx.p1_id is None or tx.p2_id is None:
             continue
         a, b = by[str(tx.p1_id)], by[str(tx.p2_id)]
-        tx.attach_half_sig(a.uuid, _half(a, b, tx.task_id, tx.p1_score))
-        tx.attach_half_sig(b.uuid, _half(b, a, tx.task_id, tx.p2_score))
+        tx.attach_half_sig(a.uuid, _half(a, b, tx.task_id, tx.p1_score_milli))
+        tx.attach_half_sig(b.uuid, _half(b, a, tx.task_id, tx.p2_score_milli))
     return chain
 
 
@@ -151,15 +168,33 @@ class TestRetiredDeclarations:
 class TestDesignationAndEntry:
     def test_absent_and_default_channel_are_one_claim(self):
         a, t = uuid4(), uuid4()
-        assert commit_designation(a, t, 0.5) == \
-            commit_designation(a, t, 0.5, 'task_outcome')
-        assert commit_designation(a, t, 0.5) != commit_designation(a, t, 0.6)
+        assert commit_designation(a, t, 500) == \
+            commit_designation(a, t, 500, 'task_outcome')
+        assert commit_designation(a, t, 500) != commit_designation(a, t, 600)
+
+    def test_the_bytes_are_pinned(self):
+        # The C twin (rep_commit_cert_test.c) pins the same two literals.
+        from uuid import UUID
+        s = UUID('11111111-2222-4333-8444-555555555555')
+        t = UUID('aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee')
+        assert commit_designation(s, t, 900) == (
+            b'AT-COMMIT\x0011111111-2222-4333-8444-555555555555'
+            b'|aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee|900|task_outcome')
+        assert commit_designation(s, t, 300, 'probe') == (
+            b'AT-COMMIT\x0011111111-2222-4333-8444-555555555555'
+            b'|aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee|300|probe')
+
+    def test_a_score_off_the_scale_has_no_designation(self):
+        a, t = uuid4(), uuid4()
+        for bad in (0.9, 1001, -1, True):
+            with pytest.raises(ValueError):
+                commit_designation(a, t, bad)
 
     def test_a_certificate_changes_neither_the_hash_nor_the_plain_shape(self):
         t, a, b = uuid4(), uuid4(), uuid4()
         h = TransactionHistory()
-        h.update(t, a, 0.9)
-        h.update(t, b, 0.8)
+        h.update(t, a, 900)
+        h.update(t, b, 800)
         plain = list(h)[0]
         before = plain.entry_hash()
         assert 'commit_sigs' not in plain.to_dict()
@@ -170,15 +205,15 @@ class TestDesignationAndEntry:
     def test_update_keeps_a_certificate_beside_an_already_held_half(self):
         t, a = uuid4(), uuid4()
         h = TransactionHistory()
-        h.update(t, a, 0.9)
-        h.update(t, a, 0.9, certificate={'v': 'cd'})
+        h.update(t, a, 900)
+        h.update(t, a, 900, certificate={'v': 'cd'})
         assert h[t].certificate_of(a) == {'v': 'cd'}
 
     def test_the_evidence_document_keeps_both_certificates(self):
         t, a, b = uuid4(), uuid4(), uuid4()
         h = TransactionHistory()
-        h.update(t, a, 0.9, certificate={'v1': 'aa'})
-        h.update(t, b, 0.8, certificate={'v2': 'bb'})
+        h.update(t, a, 900, certificate={'v1': 'aa'})
+        h.update(t, b, 800, certificate={'v2': 'bb'})
         doc = evidence_to_dict(h)
         chain, _ = evidence_from_dict(doc)
         assert chain[0].entry_hash() == list(h)[0].entry_hash()
@@ -188,8 +223,8 @@ class TestDesignationAndEntry:
     def test_the_catchup_wire_keeps_them(self):
         t, a = uuid4(), uuid4()
         h = TransactionHistory()
-        h.update(t, a, 0.9, certificate={'v1': 'aa'})
-        h.update(t, uuid4(), 0.8)
+        h.update(t, a, 900, certificate={'v1': 'aa'})
+        h.update(t, uuid4(), 800)
         back = from_json_string(to_json_string(list(h)))
         assert back[0].certificate_of(a) == {'v1': 'aa'}
 
@@ -199,26 +234,26 @@ class TestCertificateCheck:
         p, a1, a2, o = four
         rp, _ = _node(o, _roster(o, four))
         t = uuid4()
-        one = {str(a1.uuid): _sign(a1, p, t, 0.9)}
-        two = dict(one, **{str(a2.uuid): _sign(a2, p, t, 0.9)})
-        assert not rp._commit_cert_ok(p.uuid, t, 0.9, None, one)
-        assert rp._commit_cert_ok(p.uuid, t, 0.9, None, two)
+        one = {str(a1.uuid): _sign(a1, p, t, 900)}
+        two = dict(one, **{str(a2.uuid): _sign(a2, p, t, 900)})
+        assert not rp._commit_cert_ok(p.uuid, t, 900, None, one)
+        assert rp._commit_cert_ok(p.uuid, t, 900, None, two)
 
     def test_the_scorers_own_signature_never_counts(self, four):
         p, a1, _, o = four
         rp, _ = _node(o, _roster(o, four))
         t = uuid4()
-        sigs = {str(a1.uuid): _sign(a1, p, t, 0.9),
-                str(p.uuid): _sign(p, p, t, 0.9)}
-        assert not rp._commit_cert_ok(p.uuid, t, 0.9, None, sigs)
+        sigs = {str(a1.uuid): _sign(a1, p, t, 900),
+                str(p.uuid): _sign(p, p, t, 900)}
+        assert not rp._commit_cert_ok(p.uuid, t, 900, None, sigs)
 
     def test_a_certificate_for_another_score_does_not_count(self, four):
         p, a1, a2, o = four
         rp, _ = _node(o, _roster(o, four))
         t = uuid4()
-        sigs = {str(a1.uuid): _sign(a1, p, t, 0.9),
-                str(a2.uuid): _sign(a2, p, t, 0.9)}
-        assert not rp._commit_cert_ok(p.uuid, t, 0.2, None, sigs)
+        sigs = {str(a1.uuid): _sign(a1, p, t, 900),
+                str(a2.uuid): _sign(a2, p, t, 900)}
+        assert not rp._commit_cert_ok(p.uuid, t, 200, None, sigs)
 
 
 class TestRound:
@@ -230,7 +265,7 @@ class TestRound:
               if m.function == ReputationProtocol.transaction]
         assert len(tx) == 1
         parts = from_json_string(tx[0].obj)
-        assert parts[2] is True and parts[3] == ''
+        assert parts['certify'] is True and parts['group'] == ''
 
     def test_end_to_end_commit_carries_a_certificate_others_accept(self, four):
         p, a1, a2, o = four
@@ -246,7 +281,7 @@ class TestRound:
         accepts = []
         for acc, q in ((acc1, q1), (acc2, q2)):
             acc.handle_transaction(q, _msg(ReputationProtocol.transaction,
-                                           ((7, 1, p.uuid), score, True, ''),
+                                           from_json_string(_tx_body(7, 1, p.uuid, score)),
                                            p))
             out = [m for m in _sent(q)
                    if m.function == ReputationProtocol.accepted]
@@ -267,7 +302,7 @@ class TestRound:
         assert len(parsed) == 8 and len(parsed[5]) == 2
         # Whom the half names, and the scorer's own signature over it.
         assert parsed[6] == str(o.uuid)
-        assert parsed[7] == _half(p, o, score.task_id, 0.9)
+        assert parsed[7] == _half(p, o, score.task_id, 900)
         # The half waits in the pool, beside its certificate, to be placed.
         assert prop.history.pooled(score.task_id).certificate_of(p.uuid) \
             == parsed[5]
@@ -294,7 +329,7 @@ class TestRound:
         acc, q = _node(a1, _roster(a1, four))
         score = TransactionScore(uuid4(), 0.9)
         acc.handle_transaction(q, _msg(ReputationProtocol.transaction,
-                                       ((7, 1, p.uuid), score, True, ''), a2))
+                                       from_json_string(_tx_body(7, 1, p.uuid, score)), a2))
         out = [m for m in _sent(q) if m.function == ReputationProtocol.accepted]
         assert len(from_json_string(out[0].obj)) == 3
 
@@ -315,9 +350,9 @@ def _certified_chain(signers_by_node, n, scorers):
     for _ in range(n):
         t = uuid4()
         for scorer in scorers:
-            sigs = {str(s.uuid): _sign(s, scorer, t, 0.9)
+            sigs = {str(s.uuid): _sign(s, scorer, t, 900)
                     for s in signers_by_node if s is not scorer}
-            h.update(t, scorer.uuid, 0.9, certificate=sigs)
+            h.update(t, scorer.uuid, 900, certificate=sigs)
     return _sign_halves(list(h), signers_by_node)
 
 
@@ -329,8 +364,8 @@ class TestCatchup:
         obs, _ = _node(o, _roster(o, four))
         h = TransactionHistory()
         t = uuid4()
-        h.update(t, p.uuid, 0.9)
-        h.update(t, a1.uuid, 0.9)
+        h.update(t, p.uuid, 900)
+        h.update(t, a1.uuid, 900)
         assert not obs._chain_certified(list(h), self.MSG)
 
     def test_a_certified_tail_is_accepted(self, four):
@@ -348,8 +383,8 @@ class TestCatchup:
         h = TransactionHistory()
         for _ in range(3):
             t = uuid4()
-            h.update(t, p.uuid, 0.9)
-            h.update(t, a1.uuid, 0.9)
+            h.update(t, p.uuid, 900)
+            h.update(t, a1.uuid, 900)
         chain = _sign_halves(list(h), four)
         obs._finalized = Checkpoint(proposer_uuid=p.uuid,
                                     root=window_root_of(chain[:2]), epoch=1,
@@ -367,8 +402,8 @@ class TestCatchup:
         h = TransactionHistory()
         for _ in range(2):
             t = uuid4()
-            h.update(t, p.uuid, 0.9)
-            h.update(t, a1.uuid, 0.9)
+            h.update(t, p.uuid, 900)
+            h.update(t, a1.uuid, 900)
         chain = _sign_halves(list(h), four)
         chain[1].half_sigs.pop(str(a1.uuid))
         obs._finalized = Checkpoint(proposer_uuid=p.uuid,
@@ -382,8 +417,8 @@ class TestCatchup:
         h = TransactionHistory()
         for _ in range(2):
             t = uuid4()
-            h.update(t, p.uuid, 0.9)
-            h.update(t, a1.uuid, 0.9)
+            h.update(t, p.uuid, 900)
+            h.update(t, a1.uuid, 900)
         obs._finalized = Checkpoint(proposer_uuid=p.uuid, root=b'00' * 32,
                                     epoch=1, first_index=0, count=2)
         assert not obs._chain_certified(list(h), self.MSG)
@@ -392,6 +427,6 @@ class TestCatchup:
         p, a1, _, o = four
         obs, _ = _node(o, _roster(o, four))
         t = uuid4()
-        obs.history.update(t, p.uuid, 0.9)
-        obs.history.update(t, a1.uuid, 0.9)
+        obs.history.update(t, p.uuid, 900)
+        obs.history.update(t, a1.uuid, 900)
         assert obs._chain_certified(list(obs.history), self.MSG)

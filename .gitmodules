@@ -9,3 +9,6 @@
 [submodule "src/c/third_party/ryu"]
 	path = src/c/third_party/ryu
 	url = https://github.com/ulfjack/ryu.git
+[submodule "src/c/third_party/jansson"]
+	path = src/c/third_party/jansson
+	url = https://github.com/akheron/jansson.git

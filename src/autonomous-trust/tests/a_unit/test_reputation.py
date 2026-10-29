@@ -80,7 +80,7 @@ class TestTransactionScoreRange:
         letting a peer raise inside the process loop."""
         from autonomous_trust.core import from_json_string, to_json_string
         good = TransactionScore(task_id=uuid4(), score=0.5)
-        payload = to_json_string(good).replace('0.5', '7.5')
+        payload = to_json_string(good).replace('500', '7500')
         with pytest.raises(ValueError):
             from_json_string(payload)
 
@@ -199,8 +199,8 @@ class TestTransactionScoreChannel:
         is provenance for the score rather than part of the committed fact.
         Pinned because adding it to the canonical bytes would silently change
         every entry hash in every resident chain and break C parity."""
-        tx = Transaction(task_id=uuid4(), p1_id=uuid4(), p1_score=0.9,
-                         p2_id=uuid4(), p2_score=0.5, index=0)
+        tx = Transaction(task_id=uuid4(), p1_id=uuid4(), p1_score_milli=900,
+                         p2_id=uuid4(), p2_score_milli=500, index=0)
         assert b'physical' not in tx._canonical_bytes()
         assert b'task_outcome' not in tx._canonical_bytes()
         assert b'channel' not in tx._canonical_bytes()
@@ -338,8 +338,8 @@ class TestChannelResponses:
             TransactionHistory, TX_CHANNEL_PHYSICAL)
         task, a, b = uuid4(), uuid4(), uuid4()
         hist = TransactionHistory()
-        hist.update(task, a, 0.9)
-        hist.update(task, b, 0.2, TX_CHANNEL_PHYSICAL)
+        hist.update(task, a, 900)
+        hist.update(task, b, 200, TX_CHANNEL_PHYSICAL)
         tx = list(hist)[0]
         assert tx.p2_channel == TX_CHANNEL_PHYSICAL
         assert tx.p1_channel is None       # absent, not defaulted in
@@ -359,8 +359,8 @@ class TestChannelResponses:
         def canon(channel):
             # Same ids every time, so the only difference is the channel.
             hist = TransactionHistory()
-            hist.update(task, a, 0.9)
-            hist.update(task, b, 0.2, channel)
+            hist.update(task, a, 900)
+            hist.update(task, b, 200, channel)
             return list(hist)[0]._canonical_bytes()
 
         assert canon(None) == canon(TX_CHANNEL_TASK_OUTCOME)
@@ -376,7 +376,7 @@ class TestChannelResponses:
         rather than merely mislabel it."""
         from autonomous_trust.core.reputation.reputation import Transaction
         with pytest.raises(ValueError):
-            Transaction(task_id=uuid4(), p1_id=uuid4(), p1_score=0.2,
+            Transaction(task_id=uuid4(), p1_id=uuid4(), p1_score_milli=200,
                         p1_channel='a_channel_from_the_future')
 
     def test_the_evidence_document_round_trips_the_reason(self):
@@ -387,8 +387,8 @@ class TestChannelResponses:
             TX_CHANNEL_SELF_CONSISTENCY)
         task, a, b = uuid4(), uuid4(), uuid4()
         hist = TransactionHistory()
-        hist.update(task, a, 0.9)
-        hist.update(task, b, 0.2, TX_CHANNEL_SELF_CONSISTENCY)
+        hist.update(task, a, 900)
+        hist.update(task, b, 200, TX_CHANNEL_SELF_CONSISTENCY)
         chain, _ = evidence_from_dict(evidence_to_dict(list(hist)))
         assert chain[0].p2_channel == TX_CHANNEL_SELF_CONSISTENCY
         assert chain[0].entry_hash() == list(hist)[0].entry_hash()
@@ -400,8 +400,8 @@ class TestChannelResponses:
             TransactionHistory, evidence_to_dict)
         task, a, b = uuid4(), uuid4(), uuid4()
         hist = TransactionHistory()
-        hist.update(task, a, 0.9)
-        hist.update(task, b, 0.2)
+        hist.update(task, a, 900)
+        hist.update(task, b, 200)
         entry = evidence_to_dict(list(hist))['chain'][0]
         assert 'p1_channel' not in entry and 'p2_channel' not in entry
 
@@ -470,29 +470,29 @@ class TestTransaction:
         assert len(tx) == 0
 
     def test_len_one(self):
-        tx = Transaction(task_id=uuid4(), p1_id=uuid4(), p1_score=0.5)
+        tx = Transaction(task_id=uuid4(), p1_id=uuid4(), p1_score_milli=500)
         assert len(tx) == 1
 
     def test_len_two(self):
-        tx = Transaction(task_id=uuid4(), p1_id=uuid4(), p1_score=0.5,
-                         p2_id=uuid4(), p2_score=0.8)
+        tx = Transaction(task_id=uuid4(), p1_id=uuid4(), p1_score_milli=500,
+                         p2_id=uuid4(), p2_score_milli=800)
         assert len(tx) == 2
 
     def test_add_first(self):
         tx = Transaction(task_id=uuid4())
         pid = uuid4()
-        tx.add(pid, 0.7)
+        tx.add(pid, 700)
         assert tx.p1_id == pid
-        assert tx.p1_score == 0.7
+        assert tx.p1_score_milli == 700
         assert len(tx) == 1
 
     def test_add_second(self):
         tx = Transaction(task_id=uuid4())
         p1, p2 = uuid4(), uuid4()
-        tx.add(p1, 0.7)
-        tx.add(p2, 0.9)
+        tx.add(p1, 700)
+        tx.add(p2, 900)
         assert tx.p2_id == p2
-        assert tx.p2_score == 0.9
+        assert tx.p2_score_milli == 900
         assert len(tx) == 2
 
 
@@ -505,8 +505,8 @@ class TestTransactionHistory:
         th = TransactionHistory()
         tid = uuid4()
         p1, p2 = uuid4(), uuid4()
-        th.update(tid, p1, 0.8)
-        th.update(tid, p2, 0.9)
+        th.update(tid, p1, 800)
+        th.update(tid, p2, 900)
         assert len(th) == 1
         assert th[tid].p1_id == p1
         assert th[tid].p2_id == p2
@@ -515,17 +515,17 @@ class TestTransactionHistory:
         th = TransactionHistory()
         tid = uuid4()
         p1, p2, p3 = uuid4(), uuid4(), uuid4()
-        th.update(tid, p1, 0.8)
-        th.update(tid, p2, 0.9)
-        th.update(tid, p3, 0.5)  # ignored since already 2 participants
+        th.update(tid, p1, 800)
+        th.update(tid, p2, 900)
+        th.update(tid, p3, 500)  # ignored since already 2 participants
         assert th[tid].p2_id == p2  # unchanged
 
     def test_by_peer(self):
         th = TransactionHistory()
         tid = uuid4()
         p1, p2 = uuid4(), uuid4()
-        th.update(tid, p1, 0.8)
-        th.update(tid, p2, 0.9)
+        th.update(tid, p1, 800)
+        th.update(tid, p2, 900)
         # Exactly once per side: indexing p1 again when p2 completed the tx
         # double-counted it in every by_peer() consumer.
         assert th.by_peer(p1) == [th[tid]]
@@ -535,8 +535,8 @@ class TestTransactionHistory:
         th = TransactionHistory()
         for _ in range(3):
             tid = uuid4()
-            th.update(tid, uuid4(), 0.5)
-            th.update(tid, uuid4(), 0.6)
+            th.update(tid, uuid4(), 500)
+            th.update(tid, uuid4(), 600)
         chain = th.era(1)
         assert len(chain) == 2
 
@@ -544,7 +544,7 @@ class TestTransactionHistory:
         th = TransactionHistory()
         tid = uuid4()
         p1, p2 = uuid4(), uuid4()
-        chain = [Transaction(tid, p1, 0.8, p2, 0.9, index=5)]
+        chain = [Transaction(tid, p1, 800, p2, 900, index=5)]
         th.catchup(chain)
         # catchup checks if index > len(chain), so with empty chain and index=5, it adds
         assert len(th) == 1
@@ -552,7 +552,7 @@ class TestTransactionHistory:
     def test_init_with_chain(self):
         tid = uuid4()
         p1, p2 = uuid4(), uuid4()
-        tx = Transaction(tid, p1, 0.8, p2, 0.9, index=0)
+        tx = Transaction(tid, p1, 800, p2, 900, index=0)
         th = TransactionHistory(_chain=[tx])
         assert len(th) == 1
         assert th[tid] is tx
@@ -572,8 +572,8 @@ class TestTransactionHistory:
         for _ in range(cap + 2):
             tid = uuid4()
             tids.append(tid)
-            th.update(tid, uuid4(), 0.7)
-            th.update(tid, shared, 0.3)
+            th.update(tid, uuid4(), 700)
+            th.update(tid, shared, 300)
         assert len(th) == cap
         # Oldest 2 task_ids were evicted from the task map.
         for tid in tids[:2]:
@@ -589,8 +589,8 @@ class TestTransactionHistory:
         th = TransactionHistory(max_chain_len=3)
         for i in range(5):
             tid = uuid4()
-            th.update(tid, uuid4(), 0.5)
-            th.update(tid, uuid4(), 0.6)
+            th.update(tid, uuid4(), 500)
+            th.update(tid, uuid4(), 600)
         # Indices in the resident chain should be 2, 3, 4 — preserved
         # across evictions so era() and catchup() remain coherent.
         assert [tx.index for tx in th._chain] == [2, 3, 4]
@@ -625,13 +625,13 @@ class TestTransactionHistory:
         # Fill the chain past cap so first_tid is evicted.
         for i in range(cap + 2):
             tid = first_tid if i == 0 else uuid4()
-            th.update(tid, uuid4(), 0.7)
-            th.update(tid, uuid4(), 0.3)
+            th.update(tid, uuid4(), 700)
+            th.update(tid, uuid4(), 300)
         assert first_tid in th._evicted_task_ids
         # Late "committed" for the evicted task — both sides.
         evicted_p1, evicted_p2 = uuid4(), uuid4()
-        th.update(first_tid, evicted_p1, 0.7)
-        th.update(first_tid, evicted_p2, 0.3)
+        th.update(first_tid, evicted_p1, 700)
+        th.update(first_tid, evicted_p2, 300)
         # The chain length must not exceed cap, the evicted task
         # must not be re-added, and _task_mapping must not be
         # poisoned with a half-completed orphan.
@@ -646,8 +646,8 @@ class TestTransactionHistory:
     def test_genesis_entry_has_empty_prev_hash(self):
         th = TransactionHistory()
         tid = uuid4()
-        th.update(tid, uuid4(), 0.7)
-        th.update(tid, uuid4(), 0.5)
+        th.update(tid, uuid4(), 700)
+        th.update(tid, uuid4(), 500)
         # The first committed entry chains from the empty genesis digest.
         assert th[tid].prev_hash in (b'', None)
 
@@ -655,8 +655,8 @@ class TestTransactionHistory:
         th = TransactionHistory()
         for _ in range(4):
             tid = uuid4()
-            th.update(tid, uuid4(), 0.7)
-            th.update(tid, uuid4(), 0.5)
+            th.update(tid, uuid4(), 700)
+            th.update(tid, uuid4(), 500)
         chain = list(th)
         for i in range(1, len(chain)):
             assert chain[i].prev_hash == chain[i - 1].entry_hash()
@@ -666,12 +666,12 @@ class TestTransactionHistory:
         th = TransactionHistory()
         for _ in range(4):
             tid = uuid4()
-            th.update(tid, uuid4(), 0.7)
-            th.update(tid, uuid4(), 0.5)
+            th.update(tid, uuid4(), 700)
+            th.update(tid, uuid4(), 500)
         assert th.verify_links() is True
         # Mutating a committed score changes that entry's hash, breaking
         # the link its successor recorded.
-        list(th)[1].p1_score = 0.99
+        list(th)[1].p1_score_milli = 990
         assert th.verify_links() is False
 
     def test_links_survive_eviction(self):
@@ -680,8 +680,8 @@ class TestTransactionHistory:
         th = TransactionHistory(max_chain_len=3)
         for _ in range(6):
             tid = uuid4()
-            th.update(tid, uuid4(), 0.7)
-            th.update(tid, uuid4(), 0.5)
+            th.update(tid, uuid4(), 700)
+            th.update(tid, uuid4(), 500)
         assert len(th) == 3
         assert th.verify_links() is True
 
@@ -689,8 +689,8 @@ class TestTransactionHistory:
         th = TransactionHistory()
         for _ in range(3):
             tid = uuid4()
-            th.update(tid, uuid4(), 0.7)
-            th.update(tid, uuid4(), 0.5)
+            th.update(tid, uuid4(), 700)
+            th.update(tid, uuid4(), 500)
         chain = list(th)
         assert TransactionHistory.verify_chain_links(chain) is True
         # A single-entry or empty segment trivially verifies.
@@ -703,17 +703,17 @@ class TestTransactionHistory:
         src = TransactionHistory()
         for _ in range(3):
             tid = uuid4()
-            src.update(tid, uuid4(), 0.7)
-            src.update(tid, uuid4(), 0.5)
+            src.update(tid, uuid4(), 700)
+            src.update(tid, uuid4(), 500)
         good = list(src)
         dst = TransactionHistory()
         dst.catchup(good)
         assert len(dst) == 3  # clean chain accepted
 
         bad = list(TransactionHistory(_chain=[
-            Transaction(t.task_id, t.p1_id, t.p1_score, t.p2_id,
-                        t.p2_score, t.index, t.prev_hash) for t in good]))
-        bad[1].p2_score = -1.0  # break the link to bad[2]
+            Transaction(t.task_id, t.p1_id, t.p1_score_milli, t.p2_id,
+                        t.p2_score_milli, t.index, t.prev_hash) for t in good]))
+        bad[1].p2_score_milli = 999  # break the link to bad[2]
         dst2 = TransactionHistory()
         dst2.catchup(bad)
         assert len(dst2) == 0  # tampered chain rejected wholesale
@@ -724,8 +724,8 @@ class TestTransactionHistory:
         th = TransactionHistory()
         for _ in range(3):
             tid = uuid4()
-            th.update(tid, uuid4(), 0.7)
-            th.update(tid, uuid4(), 0.5)
+            th.update(tid, uuid4(), 700)
+            th.update(tid, uuid4(), 500)
         wire = from_json_string(to_json_string(list(th)))
         assert isinstance(wire[1].prev_hash, bytes)
         assert TransactionHistory.verify_chain_links(wire) is True
@@ -738,8 +738,8 @@ class TestTransactionHistory:
     def _fill(th, n):
         for _ in range(n):
             tid = uuid4()
-            th.update(tid, uuid4(), 0.7)
-            th.update(tid, uuid4(), 0.5)
+            th.update(tid, uuid4(), 700)
+            th.update(tid, uuid4(), 500)
         return th
 
     def test_empty_window_root_is_hash_of_empty(self):
@@ -751,10 +751,10 @@ class TestTransactionHistory:
         # Same committed content -> same root; mutating any entry changes it.
         a = self._fill(TransactionHistory(), 5)
         b = TransactionHistory(_chain=[
-            Transaction(t.task_id, t.p1_id, t.p1_score, t.p2_id,
-                        t.p2_score, t.index, t.prev_hash) for t in list(a)])
+            Transaction(t.task_id, t.p1_id, t.p1_score_milli, t.p2_id,
+                        t.p2_score_milli, t.index, t.prev_hash) for t in list(a)])
         assert a.window_root() == b.window_root()
-        b._chain[2].p1_score = 0.123456789
+        b._chain[2].p1_score_milli = 123
         assert a.window_root() != b.window_root()
 
     def test_single_entry_root_matches_rfc6962_leaf(self):
@@ -821,8 +821,8 @@ class TestChainForkReconcile:
         th = TransactionHistory()
         for c in letters:
             t = ord(c) - ord('a')
-            th.update(self.tasks[c], self.p1, 0.3 + 0.02 * t)
-            th.update(self.tasks[c], self.p2, 0.9 - 0.02 * t)
+            th.update(self.tasks[c], self.p1, 300 + 20 * t)
+            th.update(self.tasks[c], self.p2, 900 - 20 * t)
         return th
 
     @staticmethod
@@ -860,7 +860,7 @@ class TestChainForkReconcile:
                                                      self.tasks['y']]
         x = res.dropped[0]
         assert x.p1_id == self.p1 and x.p2_id == self.p2
-        assert x.p1_score == pytest.approx(0.3 + 0.02 * (ord('x') - ord('a')))
+        assert x.p1_score_milli == 300 + 20 * (ord('x') - ord('a'))
         assert x.index == 2
         assert ours.catchup(self._wire(theirs)).dropped == []
         short = self._chain('ab')
@@ -920,14 +920,14 @@ class TestChainForkReconcile:
     def test_adoption_keeps_pending_work(self):
         ours, theirs = self._chain('abx'), self._chain('abcd')
         z, d = self.tasks['z'], self.tasks['d']
-        ours.update(z, self.p1, 0.4)
-        ours.update(d, self.p1, 0.3 + 0.02 * 3)
+        ours.update(z, self.p1, 400)
+        ours.update(d, self.p1, 300 + 20 * 3)
         res = ours.reconcile(self._wire(theirs))
         assert res.status == ReconcileResult.ADOPTED
         assert len(ours) == 4
         assert ours.window_root() == theirs.window_root()
         assert len(ours[d]) == 2 and len(ours[z]) == 1
-        ours.update(z, self.p2, 0.6)
+        ours.update(z, self.p2, 600)
         assert len(ours) == 5 and ours[z].index == 4
         assert ours.verify_links()
 
@@ -945,8 +945,8 @@ class TestFinalityNeedsQuorum:
         th = TransactionHistory()
         for c in letters:
             t = ord(c) - ord('a')
-            th.update(tasks[c], p1, 0.3 + 0.02 * t)
-            th.update(tasks[c], p2, 0.9 - 0.02 * t)
+            th.update(tasks[c], p1, 300 + 20 * t)
+            th.update(tasks[c], p2, 900 - 20 * t)
         stub = SimpleNamespace(history=th, _finalized=None,
                                _quorum_for_group=lambda g: 1,
                                _checkpoint_quorum=lambda g: 1)
@@ -1075,8 +1075,8 @@ class TestContriteTitForTat:
         the cooperate branch → max(0.51, peer_standing) = 0.8."""
         self_id, peer_id, task = uuid4(), uuid4(), uuid4()
         stub = _stub_proc(self_id)
-        stub.history.update(task, self_id, 0.8)  # self → p1, our rating of peer
-        stub.history.update(task, peer_id, 0.9)  # peer → p2, its rating of us
+        stub.history.update(task, self_id, 800)  # self → p1, our rating of peer
+        stub.history.update(task, peer_id, 900)  # peer → p2, its rating of us
         score = ReputationProcess._contrite_tit_for_tat(
             stub, SimpleNamespace(uuid=peer_id))
         assert score == pytest.approx(0.8, abs=0.001)
@@ -1088,8 +1088,8 @@ class TestContriteTitForTat:
         regressed."""
         self_id, peer_id, task = uuid4(), uuid4(), uuid4()
         stub = _stub_proc(self_id)
-        stub.history.update(task, peer_id, 0.9)  # peer → p1, its rating of us
-        stub.history.update(task, self_id, 0.8)  # self → p2, our rating of peer
+        stub.history.update(task, peer_id, 900)  # peer → p1, its rating of us
+        stub.history.update(task, self_id, 800)  # self → p2, our rating of peer
         score = ReputationProcess._contrite_tit_for_tat(
             stub, SimpleNamespace(uuid=peer_id))
         assert score == pytest.approx(0.8, abs=0.001)
@@ -1099,8 +1099,8 @@ class TestContriteTitForTat:
         we rate it 0.9, and its standing is ours of it, 0.9."""
         self_id, peer_id, task = uuid4(), uuid4(), uuid4()
         stub = _stub_proc(self_id)
-        stub.history.update(task, self_id, 0.9)
-        stub.history.update(task, peer_id, 0.8)
+        stub.history.update(task, self_id, 900)
+        stub.history.update(task, peer_id, 800)
         score = ReputationProcess._contrite_tit_for_tat(
             stub, SimpleNamespace(uuid=peer_id))
         assert score == pytest.approx(0.9, abs=0.001)
@@ -1112,10 +1112,10 @@ class TestContriteTitForTat:
         self_id, peer_id = uuid4(), uuid4()
         stub = _stub_proc(self_id)
         t1, t2 = uuid4(), uuid4()
-        stub.history.update(t1, self_id, 0.8)  # peer cooperated once
-        stub.history.update(t1, peer_id, 0.9)
-        stub.history.update(t2, self_id, 0.2)  # peer defects, peer_last
-        stub.history.update(t2, peer_id, 0.9)
+        stub.history.update(t1, self_id, 800)  # peer cooperated once
+        stub.history.update(t1, peer_id, 900)
+        stub.history.update(t2, self_id, 200)  # peer defects, peer_last
+        stub.history.update(t2, peer_id, 900)
         score = ReputationProcess._contrite_tit_for_tat(
             stub, SimpleNamespace(uuid=peer_id))
         # peer_standing = (0.8 + 0.2) / 2 = 0.5; my_standing = 0.9.
@@ -1128,10 +1128,10 @@ class TestContriteTitForTat:
         self_id, peer_id = uuid4(), uuid4()
         stub = _stub_proc(self_id)
         t1, t2 = uuid4(), uuid4()
-        stub.history.update(t1, self_id, 0.3)
-        stub.history.update(t1, peer_id, 0.2)   # the peer rates us low too
-        stub.history.update(t2, self_id, 0.4)   # peer_last < 0.5
-        stub.history.update(t2, peer_id, 0.2)
+        stub.history.update(t1, self_id, 300)
+        stub.history.update(t1, peer_id, 200)   # the peer rates us low too
+        stub.history.update(t2, self_id, 400)   # peer_last < 0.5
+        stub.history.update(t2, peer_id, 200)
         score = ReputationProcess._contrite_tit_for_tat(
             stub, SimpleNamespace(uuid=peer_id))
         # peer_standing = (0.3 + 0.4) / 2 = 0.35; my_standing = 0.2
@@ -1146,8 +1146,8 @@ class TestContriteTitForTat:
         self_id, peer_id, other = uuid4(), uuid4(), uuid4()
         stub = _stub_proc(self_id)
         t = uuid4()
-        stub.history.update(t, peer_id, 0.1)   # peer → p1
-        stub.history.update(t, other, 0.1)     # other → p2 (scores the peer)
+        stub.history.update(t, peer_id, 100)   # peer → p1
+        stub.history.update(t, other, 100)     # other → p2 (scores the peer)
         score = ReputationProcess._contrite_tit_for_tat(
             stub, SimpleNamespace(uuid=peer_id))
         # observed standing = other's score about peer = 0.1 (cp_rep cancels
@@ -1172,8 +1172,8 @@ class TestPrereputationPrior:
         self_id, peer_id = uuid4(), uuid4()
         stub = _stub_proc(self_id)
         t = uuid4()
-        stub.history.update(t, peer_id, 0.9)   # peer → p1
-        stub.history.update(t, self_id, 0.2)   # self → p2 (we score peer)
+        stub.history.update(t, peer_id, 900)   # peer → p1
+        stub.history.update(t, self_id, 200)   # self → p2 (we score peer)
         # self is excluded → no third-party observation → neutral.
         assert ReputationProcess._prereputation_prior(stub, peer_id) \
             == pytest.approx(0.2, abs=1e-9)
@@ -1187,8 +1187,8 @@ class TestPrereputationPrior:
         others = [uuid4() for _ in range(4)]
         for i, o in enumerate(others):
             t = uuid4()
-            stub.history.update(t, peer_id, 0.9)  # peer → p1
-            stub.history.update(t, o, 0.9)        # other scores peer 0.9
+            stub.history.update(t, peer_id, 900)  # peer → p1
+            stub.history.update(t, o, 900)        # other scores peer 0.9
         prior = ReputationProcess._prereputation_prior(stub, peer_id)
         # observed=0.9, n=4, k=3, neutral=0.2 → (4*0.9 + 3*0.2)/7 = 0.6.
         assert prior == pytest.approx((4 * 0.9 + 3 * 0.2) / 7, abs=0.001)
@@ -1199,8 +1199,8 @@ class TestPrereputationPrior:
         self_id, peer_id, other = uuid4(), uuid4(), uuid4()
         stub = _stub_proc(self_id)
         t = uuid4()
-        stub.history.update(t, peer_id, 0.9)
-        stub.history.update(t, other, 0.9)
+        stub.history.update(t, peer_id, 900)
+        stub.history.update(t, other, 900)
         assert ReputationProcess._prereputation_prior(stub, peer_id) == 0.2
 
 
@@ -1222,8 +1222,8 @@ class TestPureReputation:
         reps.update(self_id, 0.8)
         stub = _stub_proc(self_id, reputations=reps)
         t = uuid4()
-        stub.history.update(t, peer_id, 0.9)   # peer is p1
-        stub.history.update(t, self_id, 0.7)   # self is p2 (counterparty)
+        stub.history.update(t, peer_id, 900)   # peer is p1
+        stub.history.update(t, self_id, 700)   # self is p2 (counterparty)
         score = ReputationProcess._pure_reputation(
             stub, SimpleNamespace(uuid=peer_id))
         # One entry: the average is its score, whatever the weight (0.56
@@ -1239,9 +1239,9 @@ class TestPureReputation:
         reps.update(a, 0.8)
         reps.update(b, 0.2)
         stub = _stub_proc(self_id, reputations=reps)
-        for reporter, s in ((a, 0.9), (b, 0.3)):
+        for reporter, s in ((a, 900), (b, 300)):
             t = uuid4()
-            stub.history.update(t, peer_id, 0.5)
+            stub.history.update(t, peer_id, 500)
             stub.history.update(t, reporter, s)
         score = ReputationProcess._pure_reputation(
             stub, SimpleNamespace(uuid=peer_id))
@@ -1257,8 +1257,8 @@ class TestPureReputation:
         stub = _stub_proc(self_id, reputations=reps)
         for _ in range(4):
             t = uuid4()
-            stub.history.update(t, p, 0.9)
-            stub.history.update(t, q, 0.9)
+            stub.history.update(t, p, 900)
+            stub.history.update(t, q, 900)
         for _ in range(20):
             sp = ReputationProcess._pure_reputation(stub, SimpleNamespace(uuid=p))
             sq = ReputationProcess._pure_reputation(stub, SimpleNamespace(uuid=q))
@@ -1273,8 +1273,8 @@ class TestPureReputation:
         reps.update(a, 0.0)
         stub = _stub_proc(self_id, reputations=reps)
         t = uuid4()
-        stub.history.update(t, peer_id, 0.5)
-        stub.history.update(t, a, 0.9)
+        stub.history.update(t, peer_id, 500)
+        stub.history.update(t, a, 900)
         score = ReputationProcess._pure_reputation(
             stub, SimpleNamespace(uuid=peer_id))
         assert score == pytest.approx(stub.PREREP_NEUTRAL)
@@ -1286,8 +1286,8 @@ class TestPureReputation:
         self_id, peer_id = uuid4(), uuid4()
         stub = _stub_proc(self_id)  # empty reputations dict
         t = uuid4()
-        stub.history.update(t, peer_id, 0.9)
-        stub.history.update(t, self_id, 0.6)
+        stub.history.update(t, peer_id, 900)
+        stub.history.update(t, self_id, 600)
         score = ReputationProcess._pure_reputation(
             stub, SimpleNamespace(uuid=peer_id))
         # Counted, at the fallback weight: one entry, so its score.
@@ -1315,20 +1315,20 @@ class TestProposerHistoryBilateral:
 
         # Proposer's own paxos commit (was preceded by the now-removed
         # local forward_transaction write).
-        history.update(task, self_id, 0.9)
+        history.update(task, self_id, 900)
         # Peer's paxos commit for the same task arrives.
-        history.update(task, peer_id, 0.3)
+        history.update(task, peer_id, 300)
 
         tx = history[task]
         # Both slots filled and the two peers are distinct.
         assert {tx.p1_id, tx.p2_id} == {self_id, peer_id}
         # Score for self is 0.9, for peer is 0.3.
         if tx.p1_id == self_id:
-            assert tx.p1_score == pytest.approx(0.9)
-            assert tx.p2_score == pytest.approx(0.3)
+            assert tx.p1_score_milli == 900
+            assert tx.p2_score_milli == 300
         else:
-            assert tx.p2_score == pytest.approx(0.9)
-            assert tx.p1_score == pytest.approx(0.3)
+            assert tx.p2_score_milli == 900
+            assert tx.p1_score_milli == 300
 
     def test_committed_broadcast_writes_acceptor_history(self):
         """Phase 3 (Bug 5 fix): a peer receiving a `committed`
@@ -1368,7 +1368,7 @@ class TestProposerHistoryBilateral:
         # §2.16, shape 2), so it comes from the proposer it names.
         msg = SimpleNamespace(
             function=ReputationProtocol.committed,
-            obj=to_json_string((task, peer_id, 0.7, None, None, {'s': 'ab'},
+            obj=to_json_string((task, peer_id, 700, None, None, {'s': 'ab'},
                                 str(self_id), 'cd')),
             verified=True, from_whom=SimpleNamespace(uuid=peer_id, nickname='p'),
         )
@@ -1377,7 +1377,7 @@ class TestProposerHistoryBilateral:
         # Acceptor pooled the proposer's half, to be placed.
         tx = history.pooled(task)
         assert tx.p1_id == peer_id
-        assert tx.p1_score == pytest.approx(0.7)
+        assert tx.p1_score_milli == 700
         assert tx.p2_id is None  # only the proposer's slot is filled
 
         # Bouncing-back broadcast from self — should be skipped to
@@ -1409,7 +1409,7 @@ class TestProposerHistoryBilateral:
 
         # 1. Self's handle_accepted reaches majority -- pools
         #    (task, self, 0.9).  We simulate that with record_half.
-        history.record_half(task, self_id, 0.9)
+        history.record_half(task, self_id, 900)
         assert {history.pooled(task).p1_id,
                 history.pooled(task).p2_id} == {self_id, None}
 
@@ -1432,7 +1432,7 @@ class TestProposerHistoryBilateral:
             ReputationProcess._record_committed_half(stub, *a)
         msg = SimpleNamespace(
             function=ReputationProtocol.committed,
-            obj=to_json_string((task, peer_id, 0.3, None, None, {'s': 'ab'},
+            obj=to_json_string((task, peer_id, 300, None, None, {'s': 'ab'},
                                 str(self_id), 'cd')),
             verified=True, from_whom=SimpleNamespace(uuid=peer_id, nickname='p'),
         )
@@ -1493,12 +1493,12 @@ class TestConsensusByTier:
         peer, o1, o3 = uuid4(), uuid4(), uuid4()
         t1, t3 = uuid4(), uuid4()
         # tier-1 interaction: counterparty (o1) scores the peer 0.9.
-        stub.history.update(t1, peer, 0.5)   # peer side (p1)
-        stub.history.update(t1, o1, 0.9)     # counterparty scores peer (p2)
+        stub.history.update(t1, peer, 500)   # peer side (p1)
+        stub.history.update(t1, o1, 900)     # counterparty scores peer (p2)
         stub.task_tiers[str(t1)] = 1
         # tier-3 interaction: counterparty (o3) scores the peer 0.4.
-        stub.history.update(t3, peer, 0.5)
-        stub.history.update(t3, o3, 0.4)
+        stub.history.update(t3, peer, 500)
+        stub.history.update(t3, o3, 400)
         stub.task_tiers[str(t3)] = 3
         result = ReputationProcess._consensus_reputation_by_tier(stub, peer)
         # "trusted at tier 1 (0.92-ish), untrusted at tier 3 (0.41-ish)".
@@ -1512,8 +1512,8 @@ class TestConsensusByTier:
         stub = self._stub()
         peer, o1, o2 = uuid4(), uuid4(), uuid4()
         ta, tb = uuid4(), uuid4()
-        for task, other, sc in ((ta, o1, 1.0), (tb, o2, 0.0)):
-            stub.history.update(task, peer, 0.5)
+        for task, other, sc in ((ta, o1, 1000), (tb, o2, 0)):
+            stub.history.update(task, peer, 500)
             stub.history.update(task, other, sc)
             stub.task_tiers[str(task)] = 2
         result = ReputationProcess._consensus_reputation_by_tier(stub, peer)
@@ -1526,8 +1526,8 @@ class TestConsensusByTier:
         stub = self._stub()
         peer, other = uuid4(), uuid4()
         t = uuid4()
-        stub.history.update(t, peer, 0.5)
-        stub.history.update(t, other, 0.8)
+        stub.history.update(t, peer, 500)
+        stub.history.update(t, other, 800)
         # no task_tiers entry → bucket 0
         result = ReputationProcess._consensus_reputation_by_tier(stub, peer)
         assert set(result) == {0}

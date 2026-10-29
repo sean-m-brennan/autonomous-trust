@@ -144,25 +144,26 @@ class TestDesignationBytes:
         assert att.designation == (
             b'AT-SLASH\x00'
             b'11111111-1111-1111-1111-111111111111|'
-            b'22222222-2222-2222-2222-222222222222|peer_exclude|0.100000|7')
+            b'22222222-2222-2222-2222-222222222222|peer_exclude|100|7')
 
     def test_checkpoint_designation_pinned(self):
         ck = Checkpoint(
             proposer_uuid='11111111-1111-1111-1111-111111111111',
-            root=b'044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556',
+            root=b'f9bf077e5bfd8ef4cdf5fb0519b70ec51fb7df536515bf16c594a477ce6d5168',
             epoch=7, first_index=0, count=3)
         assert ck.designation == (
             b'AT-CKPT\x00'
             b'11111111-1111-1111-1111-111111111111|'
-            b'044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556'
+            b'f9bf077e5bfd8ef4cdf5fb0519b70ec51fb7df536515bf16c594a477ce6d5168'
             b'|7|0|3')
 
-    def test_floor_is_fixed_precision(self):
-        """The one field where a float formatting difference would silently
-        break interop: C uses %.6f, so Python must too."""
+    def test_floor_is_integer_thousandths(self):
+        """The floor is signed as its integer thousandths, so no libc's float
+        formatting reaches the signed bytes (doc/architecture/reputation.md,
+        "Integer scores"). C writes the same %d."""
         att = SlashAttestation(slasher_uuid='a', target_uuid='b',
                               reason='r', floor_score=0.1, epoch=1)
-        assert b'|0.100000|' in att.designation
+        assert b'|100|' in att.designation
 
 
 # --- signature verification -------------------------------------------------
@@ -520,7 +521,7 @@ class TestFinalizerCarriesSignatures:
         voter = _identity('voter')
         rp = _rep_process([voter])
         net_q = queue.Queue()
-        rp.history.update(uuid4(), uuid4(), 0.7)
+        rp.history.update(uuid4(), uuid4(), 700)
         rp.forward_checkpoint({CfgIds.network: net_q}, Checkpoint(None, b''))
         net_q.get_nowait()
         ck = rp._checkpoint

@@ -120,6 +120,11 @@ class Message(object):
     | size | process | function | data | signature  |
     =================================================
     """
+    # On a gateway, the uuid of the child cohort the sender belongs to (set by
+    # the network process on receipt; never on the wire). None for a frame
+    # from the primary cohort, a stranger, or on any node with no child group.
+    child_group = None
+
     def __init__(self, process, function, obj, to_whom=None, from_whom=None, encrypt=True, return_to=None,
                  trace_id=None):
         # Deferred import to break circular dependency:

@@ -32,7 +32,15 @@ if not getattr(coord, "HAS_DATA", False):
     pytest.skip("autonomous_trust.services.data unavailable",
                 allow_module_level=True)
 
-_pending = coord.DiagDataRcvr._pending_roster_subscriptions
+from examples.dod_mission.subscribe_policy import (  # noqa: E402
+    pending_roster_subscriptions as _pending, resub_due as _due)
+
+
+def test_coordinator_aliases_the_shared_helpers():
+    """The coordinator and the gateway relay subscribe by the same rules."""
+    rcvr = coord.DiagDataRcvr.__dict__
+    assert rcvr['_pending_roster_subscriptions'].__func__ is _pending
+    assert rcvr['_resub_due'].__func__ is _due
 
 
 class _Peer:
@@ -106,7 +114,6 @@ def test_skips_peers_without_uuid():
 # life of the run; at 100 peers that was ~1.4M undecryptable requests, each held
 # 30 s by its receiver. Retries now back off per peer, doubling to a cap.
 
-_due = coord.DiagDataRcvr._resub_due
 
 
 def _attempt_ticks(base, cap, ticks):

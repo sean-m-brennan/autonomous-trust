@@ -45,16 +45,17 @@
 
 /* tests/a_unit/test_placement_pool_persist.py PINNED, compact. */
 static const char PINNED[] =
-    "{\"schema\":1,\"pool\":[{\"task\":\"00000000-0000-4000-8000-000000000001\",\"ha"
-    "lves\":[{\"by\":\"aaaaaaaa-0000-4000-8000-000000000001\",\"score\":0.75,\"cert"
-    "\":{\"bbbbbbbb-0000-4000-8000-000000000002\":\"abcd\"}}]},{\"task\":\"00000000"
-    "-0000-4000-8000-000000000002\",\"halves\":[{\"by\":\"bbbbbbbb-0000-4000-8000"
-    "-000000000002\",\"score\":0.5,\"channel\":\"probe\"},{\"by\":\"aaaaaaaa-0000-400"
-    "0-8000-000000000001\",\"score\":0.25}]},{\"task\":\"a66df013-666a-5797-bd91-"
-    "108aa7b0ed44\",\"attested\":true,\"p1\":\"aaaaaaaa-0000-4000-8000-0000000000"
-    "01\",\"p1_score\":0.25,\"p1_channel\":\"probe\",\"subject\":\"bbbbbbbb-0000-4000"
-    "-8000-000000000002\",\"evidence_digest\":\"abababababababababababababababa"
-    "babababababababababababababababab\",\"attest_sigs\":{\"cccc\":\"ef01\"}}]}";
+    "{\"schema\":2,\"pool\":[{\"task\":\"00000000-0000-4000-8000-000000000001\""
+    ",\"halves\":[{\"by\":\"aaaaaaaa-0000-4000-8000-000000000001\",\"score_mill"
+    "i\":750,\"cert\":{\"bbbbbbbb-0000-4000-8000-000000000002\":\"abcd\"}}]},{\""
+    "task\":\"00000000-0000-4000-8000-000000000002\",\"halves\":[{\"by\":\"bbbb"
+    "bbbb-0000-4000-8000-000000000002\",\"score_milli\":500,\"channel\":\"probe"
+    "\"},{\"by\":\"aaaaaaaa-0000-4000-8000-000000000001\",\"score_milli\":250}]"
+    "},{\"task\":\"a66df013-666a-5797-bd91-108aa7b0ed44\",\"attested\":true,\"p"
+    "1\":\"aaaaaaaa-0000-4000-8000-000000000001\",\"p1_score_milli\":250,\"p1_c"
+    "hannel\":\"probe\",\"subject\":\"bbbbbbbb-0000-4000-8000-000000000002\",\""
+    "evidence_digest\":\"ababababababababababababababababababababababababababab"
+    "ababababab\",\"attest_sigs\":{\"cccc\":\"ef01\"}}]}";
 
 static const char T1[] = "00000000-0000-4000-8000-000000000001";
 static const char T2[] = "00000000-0000-4000-8000-000000000002";
@@ -75,7 +76,7 @@ static void _half(const char *task, const char *by, double score)
     uuid_t t, b;
     uuid_parse(task, t);
     uuid_parse(by, b);
-    ck_assert(reputation_record_half(t, b, score, NULL, NULL) >= 0);
+    ck_assert(reputation_record_half(t, b, tx_score_to_milli(score), NULL, NULL) >= 0);
 }
 
 static bool _pooled(const char *task)
@@ -116,8 +117,8 @@ DEFINE_TEST(test_what_was_placed_meanwhile_stays_out)
     uuid_parse(T2, t);
     uuid_parse(A, a);
     uuid_parse(B, b);
-    tx_history_record_half(&tmp, t, b, 0.5, NULL, NULL);
-    tx_history_record_half(&tmp, t, a, 0.25, NULL, NULL);
+    tx_history_record_half(&tmp, t, b, 500, NULL, NULL);
+    tx_history_record_half(&tmp, t, a, 250, NULL, NULL);
     transaction_t ready[1];
     ck_assert_int_eq(tx_history_ready_items(&tmp, ready, 1), 1);
     tx_history_apply_placed(&tmp, 0, ready, 1, NULL);

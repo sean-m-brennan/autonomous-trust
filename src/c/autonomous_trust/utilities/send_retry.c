@@ -31,6 +31,7 @@
 #include "utilities/send_retry.h"
 #include "utilities/message.h"
 #include "utilities/msg_registry.h"
+#include "utilities/numfmt.h"
 
 typedef struct {
     char          queue[PROC_NAME_LEN + 1];
@@ -63,7 +64,7 @@ static double _age_limit(void)
         const char *v = getenv(names[i]);
         if (v != NULL && *v != '\0') {
             char *end = NULL;
-            double d = strtod(v, &end);
+            double d = at_strtod(v, &end);
             if (end != v && d > 0.0)
                 return d;
         }

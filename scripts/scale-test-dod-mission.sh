@@ -350,7 +350,8 @@ regenerate_manifests() {
         --squad-size "$squad" \
         --swarm-size "$swarm" \
         --sensor-count "$sensor" \
-        --hacked-sensors "$hacked" >/dev/null
+        --hacked-sensors "$hacked" \
+        --rq86-count "${AT_RQ86_COUNT:-2}" >/dev/null
     # Simulator scenario regeneration is best-effort: it transitively
     # imports geopy + a few other deps that aren't strictly required
     # for `docker compose up` (the previous scenario.yaml stays bind-
@@ -359,7 +360,8 @@ regenerate_manifests() {
             --squad-size "$squad" \
             --swarm-size "$swarm" \
             --sensor-count "$sensor" \
-            --hacked-sensors "$hacked" >/dev/null 2>&1; then
+            --hacked-sensors "$hacked" \
+            --rq86-count "${AT_RQ86_COUNT:-2}" >/dev/null 2>&1; then
         warn "  simulator scenario regeneration failed (non-fatal)"
     fi
 }

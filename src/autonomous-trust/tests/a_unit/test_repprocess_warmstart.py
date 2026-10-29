@@ -37,6 +37,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from autonomous_trust.core.reputation.reputation import score_to_milli
 from autonomous_trust.core.config import Configuration
 from autonomous_trust.core.reputation.repprocess import ReputationProcess
 from autonomous_trust.core.reputation.reputation import (
@@ -140,8 +141,8 @@ def _build_evidence(proposer: Identity, cosigners, peer_uuids, count=3,
     for i in range(count):
         tid = UUID(int=i + 1)
         peer = peer_uuids[i % len(peer_uuids)]
-        history.update(tid, proposer.uuid, TX_SCORE)
-        history.update(tid, peer, TX_SCORE)
+        history.update(tid, proposer.uuid, score_to_milli(TX_SCORE))
+        history.update(tid, peer, score_to_milli(TX_SCORE))
     window = history._indexed_window()
     ckpt = Checkpoint(proposer_uuid=proposer.uuid, root=history.window_root(),
                       epoch=4, first_index=window[0].index if window else 0,
@@ -177,7 +178,7 @@ class TestEvidenceDocument:
         """A tx with no counterparty yet is not evidence of anything, so it
         stays out of the document rather than arriving un-indexed."""
         history = TransactionHistory()
-        history.update(UUID(int=1), uuid4(), 0.8)  # one-sided, no index
+        history.update(UUID(int=1), uuid4(), 800)  # one-sided, no index
         doc = evidence_to_dict(history, None)
         assert doc['chain'] == []
         assert doc['checkpoint'] is None
@@ -343,7 +344,7 @@ class TestClampedWarmStart:
         me = _identity('me')
         peer = _identity('peer-a')
         _, doc = _build_evidence(me, [me, peer], [peer.uuid], count=3)
-        doc['chain'][0]['p2_score'] = 1.0
+        doc['chain'][0]['p2_score_milli'] = 1000
         _write(cfg_root, doc)
         chain, _ = evidence_from_dict(doc)
         assert not TransactionHistory.verify_chain_links(chain)
@@ -479,8 +480,8 @@ class TestChildChainEvidence:
         chain = rp._chain_for_group(str(child_uuid))
         for i in range(4):
             tid = UUID(int=100 + i)
-            chain.update(tid, me.uuid, TX_SCORE)
-            chain.update(tid, peer.uuid, TX_SCORE)
+            chain.update(tid, me.uuid, score_to_milli(TX_SCORE))
+            chain.update(tid, peer.uuid, score_to_milli(TX_SCORE))
         rp._originate_checkpoint({CfgIds.network: queue.Queue()},
                                  str(child_uuid))
         # One file per chain, named for the group — mirroring the
@@ -521,13 +522,13 @@ class TestChildChainEvidence:
         rp = self._gateway(cfg_root, child_uuid, peers=[peer])
         for i in range(2):
             tid = UUID(int=200 + i)
-            rp.history.update(tid, me.uuid, TX_SCORE)
-            rp.history.update(tid, peer.uuid, TX_SCORE)
+            rp.history.update(tid, me.uuid, score_to_milli(TX_SCORE))
+            rp.history.update(tid, peer.uuid, score_to_milli(TX_SCORE))
         child = rp._chain_for_group(str(child_uuid))
         for i in range(2):
             tid = UUID(int=300 + i)
-            child.update(tid, me.uuid, TX_SCORE)
-            child.update(tid, peer.uuid, TX_SCORE)
+            child.update(tid, me.uuid, score_to_milli(TX_SCORE))
+            child.update(tid, peer.uuid, score_to_milli(TX_SCORE))
         q = {CfgIds.network: queue.Queue()}
         rp._originate_checkpoint(q, '')
         rp._originate_checkpoint(q, str(child_uuid))
@@ -545,13 +546,13 @@ class TestChildChainEvidence:
         rp = self._gateway(cfg_root, child_uuid, peers=[peer])
         for i in range(2):
             tid = UUID(int=400 + i)
-            rp.history.update(tid, me.uuid, TX_SCORE)
-            rp.history.update(tid, peer.uuid, TX_SCORE)
+            rp.history.update(tid, me.uuid, score_to_milli(TX_SCORE))
+            rp.history.update(tid, peer.uuid, score_to_milli(TX_SCORE))
         child = rp._chain_for_group(str(child_uuid))
         for i in range(2):
             tid = UUID(int=500 + i)
-            child.update(tid, me.uuid, TX_SCORE)
-            child.update(tid, peer.uuid, TX_SCORE)
+            child.update(tid, me.uuid, score_to_milli(TX_SCORE))
+            child.update(tid, peer.uuid, score_to_milli(TX_SCORE))
         q = {CfgIds.network: queue.Queue()}
         rp._maybe_checkpoint(q, 1000.0)              # takes the phase
         rp._maybe_checkpoint(q, rp._next_checkpoint_at)
@@ -562,8 +563,8 @@ class TestChildChainEvidence:
         rp._maybe_checkpoint(q, rp._next_checkpoint_at)
         assert rp._checkpoint_epochs == epochs
         # ...while a chain that HAS moved is, on its own.
-        child.update(UUID(int=999), me.uuid, TX_SCORE)
-        child.update(UUID(int=999), peer.uuid, TX_SCORE)
+        child.update(UUID(int=999), me.uuid, score_to_milli(TX_SCORE))
+        child.update(UUID(int=999), peer.uuid, score_to_milli(TX_SCORE))
         rp._maybe_checkpoint(q, rp._next_checkpoint_at)
         assert rp._checkpoint_epochs[str(child_uuid)] == \
             epochs[str(child_uuid)] + 1
@@ -579,8 +580,8 @@ class TestChildChainEvidence:
         chain = rp._chain_for_group(str(child_uuid))
         for i in range(20):
             tid = UUID(int=600 + i)
-            chain.update(tid, me.uuid, TX_SCORE)
-            chain.update(tid, peer.uuid, TX_SCORE)
+            chain.update(tid, me.uuid, score_to_milli(TX_SCORE))
+            chain.update(tid, peer.uuid, score_to_milli(TX_SCORE))
         ckpt = Checkpoint(proposer_uuid=me.uuid, root=chain.window_root(),
                           epoch=3, first_index=0, count=20,
                           group_uuid=str(child_uuid))
@@ -619,8 +620,8 @@ class TestChildChainEvidence:
         chain = rp._chain_for_group(str(child_uuid))
         for i in range(20):
             tid = UUID(int=900 + i)
-            chain.update(tid, me.uuid, TX_SCORE)
-            chain.update(tid, peer.uuid, TX_SCORE)
+            chain.update(tid, me.uuid, score_to_milli(TX_SCORE))
+            chain.update(tid, peer.uuid, score_to_milli(TX_SCORE))
         ckpt = Checkpoint(proposer_uuid=me.uuid, root=chain.window_root(),
                           epoch=1, first_index=0, count=20,
                           group_uuid=str(child_uuid))
@@ -652,8 +653,8 @@ class TestChildChainEvidence:
         chain = rp._chain_for_group(str(child_uuid))
         for i in range(20):
             tid = UUID(int=700 + i)
-            chain.update(tid, me.uuid, TX_SCORE)
-            chain.update(tid, peer.uuid, TX_SCORE)
+            chain.update(tid, me.uuid, score_to_milli(TX_SCORE))
+            chain.update(tid, peer.uuid, score_to_milli(TX_SCORE))
         # Honestly signed, but for the PRIMARY chain (group_uuid '')...
         ckpt = Checkpoint(proposer_uuid=me.uuid, root=chain.window_root(),
                           epoch=3, first_index=0, count=20)
@@ -688,8 +689,8 @@ class TestChildChainEvidence:
         task_ids = []
         for i in range(4):
             tid = UUID(int=800 + i)
-            chain.update(tid, me.uuid, TX_SCORE)
-            chain.update(tid, peer.uuid, 0.1)
+            chain.update(tid, me.uuid, score_to_milli(TX_SCORE))
+            chain.update(tid, peer.uuid, 100)
             task_ids.append(tid)
         rp._checkpoints[str(child_uuid)] = Checkpoint(
             proposer_uuid=me.uuid, root=chain.window_root(), epoch=1,
@@ -724,8 +725,8 @@ class TestPeriodicCheckpoint:
         rp = _make_rep_process(identity=me, peers=[peer])
         for i in range(3):
             tid = UUID(int=i + 1)
-            rp.history.update(tid, me.uuid, 0.9)
-            rp.history.update(tid, peer.uuid, 0.9)
+            rp.history.update(tid, me.uuid, 900)
+            rp.history.update(tid, peer.uuid, 900)
         return rp
 
     def test_proposes_when_due(self, cfg_root):
@@ -758,8 +759,8 @@ class TestPeriodicCheckpoint:
         rp._maybe_checkpoint(queues, rp._next_checkpoint_at)
         assert rp._checkpoint.epoch == first_epoch
         # ...but a new commit makes the window worth attesting again.
-        rp.history.update(UUID(int=99), rp.identity.uuid, 0.9)
-        rp.history.update(UUID(int=99), uuid4(), 0.9)
+        rp.history.update(UUID(int=99), rp.identity.uuid, 900)
+        rp.history.update(UUID(int=99), uuid4(), 900)
         rp._maybe_checkpoint(queues, rp._next_checkpoint_at)
         assert rp._checkpoint.epoch == first_epoch + 1
 
@@ -802,8 +803,8 @@ class TestEvidencePersistence:
         rp.history.apply_placed(0, [_roster_of([me, peer])])
         for i in range(20):
             tid = UUID(int=i + 1)
-            rp.history.update(tid, me.uuid, TX_SCORE)
-            rp.history.update(tid, peer.uuid, TX_SCORE)
+            rp.history.update(tid, me.uuid, score_to_milli(TX_SCORE))
+            rp.history.update(tid, peer.uuid, score_to_milli(TX_SCORE))
         window = rp.history._indexed_window()
         ckpt = Checkpoint(proposer_uuid=me.uuid, root=rp.history.window_root(),
                           epoch=2, first_index=window[0].index,
@@ -829,8 +830,8 @@ class TestEvidencePersistence:
         rp = _make_rep_process(identity=me, peers=[peer])
         for i in range(2):
             tid = UUID(int=i + 1)
-            rp.history.update(tid, me.uuid, 0.9)
-            rp.history.update(tid, peer.uuid, 0.9)
+            rp.history.update(tid, me.uuid, 900)
+            rp.history.update(tid, peer.uuid, 900)
         window = rp.history._indexed_window()
         ckpt = Checkpoint(proposer_uuid=me.uuid, root=rp.history.window_root(),
                           epoch=1, first_index=window[0].index,
@@ -854,8 +855,8 @@ class TestEvidencePersistence:
                            str(tmp_path / 'nonexistent'))
         me = _identity('me')
         rp = _make_rep_process(identity=me)
-        rp.history.update(UUID(int=1), me.uuid, 0.9)
-        rp.history.update(UUID(int=1), uuid4(), 0.9)
+        rp.history.update(UUID(int=1), me.uuid, 900)
+        rp.history.update(UUID(int=1), uuid4(), 900)
         ckpt = Checkpoint(proposer_uuid=me.uuid, root=rp.history.window_root(),
                           epoch=1, first_index=0, count=1)
         rp._store_checkpoint(ckpt, {})  # must not raise

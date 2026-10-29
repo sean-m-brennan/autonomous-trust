@@ -17,6 +17,7 @@
 #include "calibration/calibration.h"
 #include "calibration/conformal.h"
 #include "utilities/util.h"   /* at_strlcpy */
+#include "utilities/numfmt.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -461,7 +462,7 @@ static size_t _result_values(const char *result_str, double *out, size_t cap)
         return 0;
 
     char *end = NULL;
-    double bare = strtod(result_str, &end);
+    double bare = at_strtod(result_str, &end);
     if (end != NULL && end != result_str)
     {
         while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')

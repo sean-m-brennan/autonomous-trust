@@ -52,6 +52,7 @@
 
 #include "prequential/prequential.h"
 #include "prequential/scoring.h"
+#include "utilities/numfmt.h"
 
 /* Loss and weight comparisons. Tight enough that a different formula fails,
  * loose enough that the last ulp of an `exp` does not decide a run: both
@@ -229,14 +230,14 @@ static int _run_competence(at_prequential_estimator_t *est, json_t *event,
         && fabs(got - AT_PREQ_NEUTRAL_COMPETENCE) > 0.0)
     {
         snprintf(err, err_len,
-                 "event %d: expected exactly the neutral multiplier, got %.17g",
-                 index, got);
+                 "event %d: expected exactly the neutral multiplier, got %s",
+                 index, AT_G17(got));
         return -1;
     }
     if (fabs(got - want) > PREQ_TOL)
     {
-        snprintf(err, err_len, "event %d: competence %.17g, expected %.17g",
-                 index, got, want);
+        snprintf(err, err_len, "event %d: competence %s, expected %s",
+                 index, AT_G17(got), AT_G17(want));
         return -1;
     }
     return 0;
@@ -260,8 +261,8 @@ static int _run_weight(at_prequential_estimator_t *est, json_t *event,
     if (got != want)
     {
         snprintf(err, err_len,
-                 "event %d: authored %d x %.17g composed to weight %d, "
-                 "expected %d", index, authored, competence, got, want);
+                 "event %d: authored %d x %s composed to weight %d, "
+                 "expected %d", index, authored, AT_G17(competence), got, want);
         return -1;
     }
     return 0;
@@ -313,8 +314,8 @@ static int _run_aggregate(at_prequential_estimator_t *est, json_t *event,
             if (fabs(got[i] - w) > PREQ_TOL)
             {
                 snprintf(err, err_len,
-                         "event %d: aggregate %s[%d] is %.17g, expected %.17g",
-                         index, keys[k], i, got[i], w);
+                         "event %d: aggregate %s[%d] is %s, expected %s",
+                         index, keys[k], i, AT_G17(got[i]), AT_G17(w));
                 return -1;
             }
         }
@@ -345,8 +346,8 @@ static int _run_aggregate(at_prequential_estimator_t *est, json_t *event,
             if (fabs(agg.contributors[i].weight - w) > PREQ_TOL)
             {
                 snprintf(err, err_len,
-                         "event %d: aggregate weight[%d] is %.17g, expected "
-                         "%.17g", index, i, agg.contributors[i].weight, w);
+                         "event %d: aggregate weight[%d] is %s, expected "
+                         "%s", index, i, AT_G17(agg.contributors[i].weight), AT_G17(w));
                 return -1;
             }
         }
@@ -398,8 +399,8 @@ static int _run_regret(at_prequential_estimator_t *est, json_t *event,
         if (want != NULL
             && fabs(dbl_got[k] - json_number_value(want)) > PREQ_TOL)
         {
-            snprintf(err, err_len, "event %d: %s %.17g, expected %.17g", index,
-                     dbl_keys[k], dbl_got[k], json_number_value(want));
+            snprintf(err, err_len, "event %d: %s %s, expected %s", index,
+                     dbl_keys[k], AT_G17(dbl_got[k]), AT_G17(json_number_value(want)));
             return -1;
         }
     }
@@ -414,9 +415,9 @@ static int _run_regret(at_prequential_estimator_t *est, json_t *event,
             if (!(r.peers[p].realized < r.peers[p].bound))
             {
                 snprintf(err, err_len,
-                         "event %d: realized regret %.17g against %s is not "
-                         "below the bound %.17g", index, r.peers[p].realized,
-                         r.peers[p].peer, r.peers[p].bound);
+                         "event %d: realized regret %s against %s is not "
+                         "below the bound %s", index, AT_G17(r.peers[p].realized),
+                         r.peers[p].peer, AT_G17(r.peers[p].bound));
                 return -1;
             }
         }
@@ -462,8 +463,8 @@ static int _run_peer_regret(at_prequential_estimator_t *est, json_t *event,
         json_t *want = json_object_get(event, keys[k]);
         if (want != NULL && fabs(got[k] - json_number_value(want)) > PREQ_TOL)
         {
-            snprintf(err, err_len, "event %d: %s %s %.17g, expected %.17g",
-                     index, peer, keys[k], got[k], json_number_value(want));
+            snprintf(err, err_len, "event %d: %s %s %s, expected %s",
+                     index, peer, keys[k], AT_G17(got[k]), AT_G17(json_number_value(want)));
             return -1;
         }
     }
