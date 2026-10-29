@@ -89,8 +89,20 @@ file(CONFIGURE OUTPUT ${_at_jansson_wrap}/jansson.h CONTENT
 
 # -Wno-error: this tree's strict flags reach the subproject, and upstream
 # jansson does not build under them (as for Ryu, suppress rather than patch).
+# The rest silence warnings checked to be false positives: error.c's strncpy
+# bounds fit the 80-byte source field, load.c never writes past buffer[4]
+# (utf8_check_first returns at most 4), and value.c's switches have defaults.
+# The stringop warnings are gcc's, so each is added only where it exists.
 target_compile_options(jansson PRIVATE -Wno-error -Wno-float-equal
-    -fvisibility=hidden -include ${_at_jansson_wrap}/jansson.h)
+    -Wno-switch-enum -fvisibility=hidden -include ${_at_jansson_wrap}/jansson.h)
+include(CheckCCompilerFlag)
+foreach(_at_flag stringop-truncation stringop-overflow)
+    string(MAKE_C_IDENTIFIER "AT_CC_HAS_W${_at_flag}" _at_var)
+    check_c_compiler_flag(-W${_at_flag} ${_at_var})
+    if(${_at_var})
+        target_compile_options(jansson PRIVATE -Wno-${_at_flag})
+    endif()
+endforeach()
 
 # --- what the devel package installs ----------------------------------------
 # The same renaming for code built against an installed libautonomous_trust:
