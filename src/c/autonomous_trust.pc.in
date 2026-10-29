@@ -6,7 +6,7 @@ Name: autonomous_trust
 Description: Autonomous Trust C library
 URL: https://github.com/sean-m-brennan/autonomous-trust
 Version: @AT_PC_VERSION@
-Requires: libsodium jansson uuid libprotobuf-c
+Requires: libsodium@AT_PC_JANSSON_REQUIRES@ uuid libprotobuf-c
 Libs: -L${libdir} -lautonomous_trust
-Libs.private: -lpthread -lm
-Cflags: -fms-extensions -I${includedir} -I${includedir}/autonomous_trust -I${includedir}/autonomous_trust/core/protobuf
+Libs.private: @AT_PC_JANSSON_LIBS_PRIVATE@-lpthread -lm
+Cflags: -fms-extensions @AT_PC_JANSSON_CFLAGS@-I${includedir} -I${includedir}/autonomous_trust -I${includedir}/autonomous_trust/core/protobuf

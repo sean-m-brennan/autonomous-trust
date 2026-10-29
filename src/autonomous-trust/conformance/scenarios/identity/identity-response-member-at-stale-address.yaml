@@ -8,10 +8,12 @@ description: |
     responding member. The cohort seeder writes a hostname placeholder into the
     shared group map for a seeded member, and the member then advertises its
     runtime address. The member is still in the group by UUID, and its response
-    is signed by that identity, so the asker backfills it (and refreshes the
-    map entry to the advertised address). Before, the gate compared addresses
-    only, so a seeded member's identity was never backfilled and every unicast
-    frame it sent the asker was dropped as undecryptable.
+    is signed by that identity, so the asker backfills it. The map entry keeps
+    "member-host": it is the asker's record of how to reach the member, and a
+    dual-homed gateway advertises an address only one of its cohorts can
+    reach. Before, the gate compared addresses only, so a seeded member's
+    identity was never backfilled and every unicast frame it sent the asker
+    was dropped as undecryptable.
 
     Twin of identity-resync-backfill, with member's map entry replaced by the
     placeholder "member-host".

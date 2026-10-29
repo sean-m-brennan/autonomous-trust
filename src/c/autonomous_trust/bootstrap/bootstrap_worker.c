@@ -21,6 +21,7 @@
 #include <time.h>
 
 #include "bootstrap/bootstrap_worker.h"
+#include "utilities/numfmt.h"
 
 /* splitmix64 — a small, fast, fully-deterministic PRNG. The conformance pin
  * only requires that a seeded run cover all three caps (not that the C and
@@ -48,7 +49,7 @@ static double _read_float_env(const char *name, double dflt)
     if (v == NULL || v[0] == '\0')
         return dflt;
     char *end = NULL;
-    double parsed = strtod(v, &end);
+    double parsed = at_strtod(v, &end);
     return (end != NULL && *end == '\0') ? parsed : dflt;
 }
 

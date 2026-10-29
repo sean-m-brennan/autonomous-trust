@@ -37,6 +37,10 @@ from autonomous_trust.core._python.identity.join_policy import (
 _HERE = os.path.dirname(os.path.abspath(__file__))
 EXAMPLE = os.path.join(_HERE, '..', '..', '..', '..', 'config', 'cfg',
                        'join_policy.example.json')
+# config/ sits at the repo root, outside the tree the test container mounts.
+_needs_example = pytest.mark.skipif(
+    not os.path.exists(EXAMPLE),
+    reason='config/cfg/join_policy.example.json not present')
 
 
 def _write(tmp_path, doc):
@@ -51,11 +55,14 @@ def test_absent_is_inert(monkeypatch):
     assert not INERT.enabled and not INERT.anchors
 
 
+@_needs_example
 def test_the_example_lists_the_recommended_three():
     policy = load_join_policy(EXAMPLE)
     assert policy.enabled
     assert policy.anchors == {'verified_contact', 'zta', 'operator'}
     assert (policy.told_tier, policy.own_evidence_min) == (1, 3)
+    assert policy.burst_k == 3
+    assert policy.anchored_cohort_min == 1
 
 
 def test_the_phase_four_bounds():
@@ -78,14 +85,12 @@ def test_the_phase_five_burst():
                                 'burst_budget_factor': 1})
     assert (policy.burst_k, policy.burst_interval_sec,
             policy.burst_budget_factor) == (2, 0.5, 1)
-    assert load_join_policy(EXAMPLE).burst_k == 3
 
 
 def test_the_phase_six_cohort_min():
     assert INERT.anchored_cohort_min == 1
     assert parse_join_policy({'version': 1,
                               'anchored_cohort_min': 2}).anchored_cohort_min == 2
-    assert load_join_policy(EXAMPLE).anchored_cohort_min == 1
 
 
 @pytest.mark.parametrize('doc, why', [

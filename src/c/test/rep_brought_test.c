@@ -167,8 +167,8 @@ static void _own(int n, double ours, const char *channel)
     for (int i = 0; i < n; i++) {
         uuid_t task;
         uuid_generate(task);
-        reputation_install_tx_pair_tagged(task, me->uuid, ours, channel,
-                                          them->uuid, 0.9, NULL);
+        reputation_install_tx_pair_tagged(task, me->uuid, tx_score_to_milli(ours), channel,
+                                          them->uuid, 900, NULL);
     }
 }
 
@@ -178,7 +178,7 @@ static void _told(int n, double told)
     for (int i = 0; i < n; i++) {
         uuid_t task;
         uuid_generate(task);
-        reputation_install_tx_pair(task, other->uuid, told, them->uuid, 0.9);
+        reputation_install_tx_pair(task, other->uuid, tx_score_to_milli(told), them->uuid, 900);
     }
 }
 
@@ -406,7 +406,7 @@ DEFINE_TEST(test_brought_reads_our_scores_not_the_peers)
     for (int i = 0; i < 3; i++) {
         uuid_t task;
         uuid_generate(task);
-        reputation_install_tx_pair(task, me->uuid, 0.3, them->uuid, 1.0);
+        reputation_install_tx_pair(task, me->uuid, 300, them->uuid, 1000);
     }
     _sweep(proc, -1.0);
     double v = 0.0;

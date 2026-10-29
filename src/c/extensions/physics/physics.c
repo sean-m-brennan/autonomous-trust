@@ -24,6 +24,7 @@
 
 #include "physics/physics.h"
 #include "utilities/util.h"   /* at_strlcpy */
+#include "utilities/numfmt.h"
 
 #define AT_PHYSICS_ENV "AT_PHYSICS"
 
@@ -930,7 +931,7 @@ static bool _parse_claim(const char *result_str, claim_t *out)
         /* Not JSON. A bare decimal is the other shape a `report results`
          * payload carries; whole-string parse only, so "42abc" is not 42. */
         char *end = NULL;
-        double d = strtod(result_str, &end);
+        double d = at_strtod(result_str, &end);
         if (end == NULL || *end != '\0' || end == result_str || !isfinite(d))
             return false;
         out->values[0] = d;

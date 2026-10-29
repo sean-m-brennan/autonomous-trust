@@ -151,6 +151,7 @@ def main(argv=None):
     parser.add_argument("--no-mq800", action="store_true")
     parser.add_argument("--no-jet", action="store_true")
     parser.add_argument("--no-command", action="store_true")
+    parser.add_argument("--rq86-count", type=int, default=2)
     args = parser.parse_args(argv)
 
     cfg = generate(Path(args.output), scenario_kwargs=dict(
@@ -161,6 +162,7 @@ def main(argv=None):
         include_mq800=not args.no_mq800,
         include_jet=not args.no_jet,
         include_command=not args.no_command,
+        rq86_count=args.rq86_count,
     ))
     print(f"Wrote {args.output}  ({len(cfg.peers)} peers)")
 

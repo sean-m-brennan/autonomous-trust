@@ -40,6 +40,23 @@ from autonomous_trust.core._python.reputation.reputation import (
 from tests.a_unit.test_late_joiner_caps_resync import _new_identity
 from tests.a_unit.test_repprocess import _make_rep_process
 
+
+def _tx_body(id1, id2, proposer, score, certify=True, group=''):
+    """A `transaction` proposal in its wire shape: the JSON object with named
+    fields both runtimes send. `certify`/`group` of None leave the key off, as
+    a half-round build's proposal did."""
+    from autonomous_trust.core.config import to_json_string
+    body = {'id1': id1, 'id2': id2, 'peer_uuid': str(proposer),
+            'score_milli': score.score_milli, 'task_uuid': str(score.task_id)}
+    if getattr(score, 'channel', None):
+        body['channel'] = score.channel
+    if certify is not None:
+        body['certify'] = certify
+    if group is not None:
+        body['group'] = group
+    return to_json_string(body)
+
+
 ON = JoinPolicy(enabled=True, anchors=frozenset({'verified_contact'}))
 
 
@@ -121,8 +138,8 @@ def test_the_cohort_has_its_own_chain_and_quorum():
 def _proposal(rp, sender, group):
     rp._detached_sig = lambda *a, **k: 'ab'
     msg = Message(CfgIds.reputation, ReputationProtocol.transaction,
-                  to_yaml_string(((100, 1, sender.uuid),
-                                  TransactionScore(uuid4(), 0.8), True, group)),
+                  _tx_body(100, 1, sender.uuid,
+                           TransactionScore(uuid4(), 0.8), True, group),
                   from_whom=sender)
     msg.verified = True
     net_q = queue.Queue()
@@ -155,7 +172,7 @@ def test_the_scorers_read_the_cohort_chain():
     rp, ally, other, cohort = _setup()
     chain = rp._chain_for_group(str(cohort.uuid))
     for _ in range(3):
-        _pair_on(chain, rp.identity.uuid, 0.9, ally.uuid, 0.9)
+        _pair_on(chain, rp.identity.uuid, 900, ally.uuid, 900)
     assert rp._own_count(ally.uuid) == 3
     rp.reputations.update(ally.uuid, 0.9)
     rp._compute_reputation(ally.uuid, None, None, respond=False)
@@ -170,6 +187,6 @@ def test_the_prior_does_not_read_catchup_marks_on_the_cohort_chain():
     third = uuid4()
     rp.reputations.update(third, 0.5)
     chain = rp._chain_for_group(str(cohort.uuid))
-    _pair_on(chain, third, 0.9, ally.uuid, 0.9)
+    _pair_on(chain, third, 900, ally.uuid, 900)
     rp._catchup_marks = {'': {0, 1, 2, 3}}
     assert rp._prereputation_prior(ally.uuid) > rp.PREREP_NEUTRAL

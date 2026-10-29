@@ -32,6 +32,20 @@ from ..structures.merkle import MerkleTree
 TX_SCORE_MIN = 0.0
 TX_SCORE_MAX = 1.0
 
+#: Scores travel, are signed and are hashed as integer thousandths, 0..1000
+#: for 0.0..1.0 (doc/architecture/reputation.md, "Integer scores"). Text for
+#: a double depends on the libc that prints and parses it: uClibc-ng, the libc
+#: of SPARC LEON3 Linux, misreads about a quarter of three-decimal values, and
+#: a node that converts differently signs and hashes different bytes. An
+#: integer has one spelling everywhere. Floats stop at the API: a producer
+#: hands TransactionScore 0.0..1.0, it is rounded once (score_to_milli), and
+#: everything after that holds the integer. The reputation algebra divides by
+#: TX_SCORE_SCALE where it does arithmetic. Mirrors TX_SCORE_SCALE in the C
+#: twin's reputation.h.
+TX_SCORE_SCALE = 1000
+TX_SCORE_MILLI_MIN = 0
+TX_SCORE_MILLI_MAX = TX_SCORE_SCALE
+
 
 def validate_tx_score(score, where: str = 'TransactionScore'):
     """Return `score` as a float in [0, 1], or raise ValueError.
@@ -49,6 +63,8 @@ def validate_tx_score(score, where: str = 'TransactionScore'):
     against NaN is false), which is worth knowing because NaN is the value that
     would otherwise poison an average irrecoverably.
     """
+    if isinstance(score, bool):
+        raise ValueError('%s: score must be a number, got %r' % (where, score))
     try:
         value = float(score)
     except (TypeError, ValueError):
@@ -58,6 +74,41 @@ def validate_tx_score(score, where: str = 'TransactionScore'):
                          '(NaN is rejected here too)'
                          % (where, score, TX_SCORE_MIN, TX_SCORE_MAX))
     return value
+
+
+def score_to_milli(score, where: str = 'TransactionScore') -> int:
+    """`score` (0.0..1.0, validated as :func:`validate_tx_score` does) as
+    integer thousandths, rounded half away from zero.
+
+    Computed as C's ``lround(score * 1000.0)`` is, so both runtimes round the
+    same double to the same integer: the product is one IEEE multiply, and the
+    half test compares that product with its floor exactly. ``floor(x + 0.5)``
+    would not do: the addition itself can round (0.49999999999999994 + 0.5 is
+    1.0)."""
+    product = validate_tx_score(score, where) * float(TX_SCORE_SCALE)
+    whole = math.floor(product)
+    return int(whole) + (1 if product - whole >= 0.5 else 0)
+
+
+def validate_tx_milli(milli, where: str = 'TransactionScore') -> int:
+    """Return `milli` as an int in [0, 1000], or raise ValueError.
+
+    The wire form is an integer and nothing else: a float is refused even when
+    it is integral, so a value from a node that predates integer scores (which
+    sent 0.8) can never be read as 0.8 thousandths, or 1.0 as one. Bools are
+    refused too, since Python counts True as 1."""
+    if isinstance(milli, bool) or not isinstance(milli, int):
+        raise ValueError('%s: score must be an integer number of thousandths, '
+                         'got %r' % (where, milli))
+    if not TX_SCORE_MILLI_MIN <= milli <= TX_SCORE_MILLI_MAX:
+        raise ValueError('%s: score %r is outside 0..%d thousandths'
+                         % (where, milli, TX_SCORE_MILLI_MAX))
+    return milli
+
+
+def milli_to_score(milli) -> float:
+    """Integer thousandths as the 0.0..1.0 double the algebra computes with."""
+    return milli / float(TX_SCORE_SCALE)
 
 
 #: Evidence channels (R+D.md §12.8, doc/verification_oracle.md "Keep the
@@ -465,16 +516,22 @@ class TransactionScore(Configuration):
     every transaction exercised, and per-capability weighting stays local.
     """
 
-    def __init__(self, task_id, score, capability_name: str = None,
+    def __init__(self, task_id, score=None, capability_name: str = None,
                  channel: str = None, subject_uuid=None,
-                 competence: float = None):
+                 competence: float = None, score_milli=None):
         self.task_id = task_id
-        # Enforced, not assumed (doc/architecture/reputation.md). This constructor is also the wire-side
-        # entry point -- `from_json_string` reconstructs via `cls(**kwargs)` --
-        # so a peer sending an out-of-range score raises here. Handlers on the
-        # remote path therefore CATCH this and drop the message: an exception a
-        # remote can trigger inside the process loop is its own problem.
-        self.score = validate_tx_score(score)
+        # Exactly one of `score` (what a producer passes: 0.0..1.0) and
+        # `score_milli` (what the wire carries: 0..1000; `from_json_string`
+        # reconstructs via `cls(**kwargs)`). Both are enforced, not assumed
+        # (doc/architecture/reputation.md): a peer sending an out-of-range or
+        # non-integer score raises here, so handlers on the remote path CATCH
+        # this and drop the message -- an exception a remote can trigger
+        # inside the process loop is its own problem.
+        if (score is None) == (score_milli is None):
+            raise ValueError('TransactionScore: give exactly one of score '
+                             '(0.0..1.0) and score_milli (0..1000)')
+        self.score_milli = (score_to_milli(score) if score_milli is None
+                            else validate_tx_milli(score_milli))
         # Optional: name of the Capability whose execution produced this
         # TS. Used by _pure_reputation to look up transaction_weight at
         # scoring time (Slice 3). None means "unknown / legacy" — weight
@@ -502,12 +559,17 @@ class TransactionScore(Configuration):
         self.competence = (None if competence is None or float(competence) <= 0.0
                            else float(competence))
 
+    @property
+    def score(self) -> float:
+        """The score as 0.0..1.0, for reading. Signed and hashed bytes use
+        :attr:`score_milli`."""
+        return milli_to_score(self.score_milli)
+
     def to_dict(self):
         # `subject_uuid` is process-local provenance, not part of the score:
         # the committed wire form pairs p1/p2 by task_id and has never carried
         # a subject. Dropping it here is the same discipline as Group.to_dict
-        # dropping `_previous_keys` and Identity dropping `_rank_adjustment`,
-        # and it keeps every byte-pinned TransactionScore vector valid.
+        # dropping `_previous_keys` and Identity dropping `_rank_adjustment`.
         d = super().to_dict()
         d.pop('subject_uuid', None)
         # `competence` likewise: a learned weight is this node's measurement of
@@ -517,13 +579,14 @@ class TransactionScore(Configuration):
         return d
 
 
-def commit_designation(scorer, task_id, score, channel=None) -> bytes:
+def commit_designation(scorer, task_id, score_milli, channel=None) -> bytes:
     """The bytes an acceptor signs to certify ONE half of an ordinary commit
     (doc/architecture/reputation.md, "Commit certificates"): that `scorer` put
     this score, on this channel, for this task, to a round the signer accepted.
 
     Domain-separated like every other co-signed designation in this module.
-    ``%.17g`` and lowercase uuids, as the C twin's ``commit_designation``. The
+    The score is its integer thousandths and the uuids lowercase, as the C
+    twin's ``commit_designation``. The
     channel is normalized, so an absent channel and an explicit
     :data:`TX_CHANNEL_DEFAULT` are one claim with one signature, exactly as they
     are one entry hash.
@@ -538,11 +601,11 @@ def commit_designation(scorer, task_id, score, channel=None) -> bytes:
     return (b'AT-COMMIT\x00'
             + str(scorer).lower().encode()
             + b'|' + str(task_id).lower().encode()
-            + b'|' + format(float(score), '.17g').encode()
+            + b'|' + str(validate_tx_milli(score_milli, 'designation')).encode()
             + b'|' + str(chan).encode())
 
 
-def half_designation(task_id, scorer, counterparty, score, channel=None) -> bytes:
+def half_designation(task_id, scorer, counterparty, score_milli, channel=None) -> bytes:
     """The bytes a SCORER signs over its own half (R+D.md §14.2;
     doc/architecture/reputation.md, "Signed halves"): that `scorer` gave
     `counterparty` this score, on this channel, for this task.
@@ -550,8 +613,8 @@ def half_designation(task_id, scorer, counterparty, score, channel=None) -> byte
     A commit certificate is the acceptors' word that a round ran; this is the
     scorer's own, and nobody else can make it. It names the counterparty, so a
     half pairs only with the half of the peer it names, and that peer's half
-    must name it back. Same encoding as :func:`commit_designation`: ``%.17g``,
-    lowercase uuids, the channel normalized. Index and link are not covered,
+    must name it back. Same encoding as :func:`commit_designation`: integer
+    thousandths, lowercase uuids, the channel normalized. Index and link are not covered,
     for the reason attestation gives: they differ per node until chains
     reconcile. Mirrors C half_designation."""
     chan = channel if channel else TX_CHANNEL_DEFAULT
@@ -559,7 +622,7 @@ def half_designation(task_id, scorer, counterparty, score, channel=None) -> byte
             + str(task_id).lower().encode()
             + b'|' + str(scorer).lower().encode()
             + b'|' + str(counterparty).lower().encode()
-            + b'|' + format(float(score), '.17g').encode()
+            + b'|' + str(validate_tx_milli(score_milli, 'designation')).encode()
             + b'|' + str(chan).encode())
 
 
@@ -567,8 +630,9 @@ def half_designation(task_id, scorer, counterparty, score, channel=None) -> byte
 # reputation.md, "Agreeing on an order").
 PLACE_BATCH_MAX = 32
 
-# The persisted pool's schema (TransactionHistory.pool_to_dict).
-POOL_SCHEMA = 1
+# The persisted pool's schema (TransactionHistory.pool_to_dict). 2: scores
+# are integer thousandths (`score_milli`); a schema-1 pool is refused.
+POOL_SCHEMA = 2
 
 
 def placement_entry(tx: 'Transaction') -> 'Transaction':
@@ -585,7 +649,7 @@ def placement_entry(tx: 'Transaction') -> 'Transaction':
     if (not out.attested and out.p1_id is not None and out.p2_id is not None
             and str(out.p2_id).lower() < str(out.p1_id).lower()):
         out.p1_id, out.p2_id = out.p2_id, out.p1_id
-        out.p1_score, out.p2_score = out.p2_score, out.p1_score
+        out.p1_score_milli, out.p2_score_milli = out.p2_score_milli, out.p1_score_milli
         out.p1_channel, out.p2_channel = out.p2_channel, out.p1_channel
     return out
 
@@ -635,8 +699,8 @@ class Transaction(Configuration):
     producer predating channels meant.
     """
 
-    def __init__(self, task_id: UUID, p1_id: UUID = None, p1_score: float = None,
-                 p2_id: UUID = None, p2_score: float = None, index: int = None,
+    def __init__(self, task_id: UUID, p1_id: UUID = None, p1_score_milli: int = None,
+                 p2_id: UUID = None, p2_score_milli: int = None, index: int = None,
                  prev_hash: bytes = None, p1_channel: str = None,
                  p2_channel: str = None, attested: bool = False,
                  subject_id: UUID = None, evidence_digest: str = None,
@@ -648,9 +712,14 @@ class Transaction(Configuration):
                  half_sigs: dict = None, names: dict = None):
         self.task_id = task_id
         self.p1_id = p1_id
-        self.p1_score = p1_score
+        # Each side's score, integer thousandths (0..1000; TX_SCORE_SCALE),
+        # None for a side not yet filled. Validated here because this is also
+        # the catch-up and persistence reader (`cls(**kwargs)`).
+        self.p1_score_milli = (None if p1_score_milli is None
+                               else validate_tx_milli(p1_score_milli, 'Transaction'))
         self.p2_id = p2_id
-        self.p2_score = p2_score
+        self.p2_score_milli = (None if p2_score_milli is None
+                               else validate_tx_milli(p2_score_milli, 'Transaction'))
         self.index = index
         # Evidence channel of each side's score. Validated, so an unknown
         # spelling cannot reach the canonical bytes and fork the chain: the
@@ -859,34 +928,35 @@ class Transaction(Configuration):
         An ordinary entry is about each side, scored by the other. An attested
         entry is about its subject only, scored by the verifier in p1; the
         verifier itself is the author, not a subject, and gains nothing from it.
+        The score is the 0.0..1.0 double the folds compute with.
         Mirrors transaction_score_about."""
         if self.attested:
-            if (self.subject_id is not None and self.p1_score is not None
+            if (self.subject_id is not None and self.p1_score_milli is not None
                     and str(self.subject_id) == str(peer_uuid)):
-                return float(self.p1_score), self.p1_id
+                return milli_to_score(self.p1_score_milli), self.p1_id
             return None
         if self.p1_id is None or self.p2_id is None:
             return None
         if str(self.p1_id) == str(peer_uuid):
-            score, author = self.p2_score, self.p2_id
+            milli, author = self.p2_score_milli, self.p2_id
         elif str(self.p2_id) == str(peer_uuid):
-            score, author = self.p1_score, self.p1_id
+            milli, author = self.p1_score_milli, self.p1_id
         else:
             return None
-        if score is None:
+        if milli is None:
             return None
-        return float(score), author
+        return milli_to_score(milli), author
 
     def _canonical_bytes(self) -> bytes:
         """Deterministic, language-agnostic serialization of the entry's
-        identifying content (everything EXCEPT prev_hash). Floats use
-        ``%.17g`` (round-trip-exact for IEEE-754 doubles and identical to
-        C's ``snprintf("%.17g", …)``); UUIDs use the canonical lowercase
+        identifying content (everything EXCEPT prev_hash). Scores are their
+        integer thousandths in decimal, so no libc's float conversion is
+        involved; UUIDs use the canonical lowercase
         hyphenated form (== C's ``uuid_unparse_lower``); None is ``null``.
         Keep this in lockstep with ``transaction_canonical_bytes`` in
         ``src/c/autonomous_trust/reputation/reputation.c``.
 
-        ``task_id|p1_id|p1_score|p2_id|p2_score|index``, with
+        ``task_id|p1_id|p1_score_milli|p2_id|p2_score_milli|index``, with
         ``|p1_channel|p2_channel`` APPENDED only when at least one side
         carries a channel other than :data:`TX_CHANNEL_DEFAULT` (R+D.md
         §12.8). The condition is what makes covering the channel a
@@ -910,14 +980,11 @@ class Transaction(Configuration):
         def _u(x):
             return 'null' if x is None else str(x)
 
-        def _f(x):
-            return 'null' if x is None else format(float(x), '.17g')
-
         def _i(x):
             return 'null' if x is None else str(int(x))
 
-        fields = [_u(self.task_id), _u(self.p1_id), _f(self.p1_score),
-                  _u(self.p2_id), _f(self.p2_score), _i(self.index)]
+        fields = [_u(self.task_id), _u(self.p1_id), _i(self.p1_score_milli),
+                  _u(self.p2_id), _i(self.p2_score_milli), _i(self.index)]
         c1 = self.p1_channel or TX_CHANNEL_DEFAULT
         c2 = self.p2_channel or TX_CHANNEL_DEFAULT
         if self.attested or c1 != TX_CHANNEL_DEFAULT or c2 != TX_CHANNEL_DEFAULT:
@@ -951,10 +1018,11 @@ class Transaction(Configuration):
         prev = self.prev_hash if self.prev_hash else b''
         return MerkleTree.get_hash(self._canonical_bytes() + prev)
 
-    def add(self, peer_id: UUID, score: float, channel: str = None):
+    def add(self, peer_id: UUID, score_milli: int, channel: str = None):
+        score_milli = validate_tx_milli(score_milli, 'Transaction')
         if self.p1_id is None:
             self.p1_id = peer_id
-            self.p1_score = score
+            self.p1_score_milli = score_milli
             self.p1_channel = (None if channel is None
                                else validate_tx_channel(channel, 'Transaction'))
         elif self.p2_id is None and peer_id != self.p1_id:
@@ -964,7 +1032,7 @@ class Transaction(Configuration):
             # a self-transaction that CTFT's `p1==peer && p2==self` check
             # silently rejects.
             self.p2_id = peer_id
-            self.p2_score = score
+            self.p2_score_milli = score_milli
             self.p2_channel = (None if channel is None
                                else validate_tx_channel(channel, 'Transaction'))
 
@@ -1152,7 +1220,7 @@ class TransactionHistory(Mapping):
     def __getitem__(self, key):
         return self._task_mapping[key]
 
-    def update(self, task_id: UUID, peer_id: UUID, score: float,
+    def update(self, task_id: UUID, peer_id: UUID, score_milli: int,
                channel: str = None, certificate: dict = None):
         if task_id not in self._task_mapping:
             # Refuse to reanimate a task we already committed and
@@ -1186,7 +1254,7 @@ class TransactionHistory(Mapping):
             # `_peer_mapping[p1_id]` (which would inflate by_peer() results
             # and skew downstream peer-tx counts).
             return
-        tx.add(peer_id, score, channel)
+        tx.add(peer_id, score_milli, channel)
         if certificate and peer_id is not None:
             tx.attach_certificate(peer_id, certificate)
         # Index only the side just added. `_map_peers` indexes BOTH sides, so
@@ -1216,7 +1284,9 @@ class TransactionHistory(Mapping):
             return False
         if tx.subject_id is None or str(tx.subject_id) == str(tx.p1_id):
             return False
-        if tx.p1_score is None or not 0.0 <= float(tx.p1_score) <= 1.0:
+        try:
+            validate_tx_milli(tx.p1_score_milli)
+        except ValueError:
             return False
         if not is_attestable_channel(tx.p1_channel):
             return False
@@ -1230,7 +1300,7 @@ class TransactionHistory(Mapping):
     def append_attested(self, tx: Transaction, certificate: dict = None) -> bool:
         """Commit a verifier-attested entry. Returns False, and changes
         nothing, unless `tx` is well-formed: attested, the verifier in p1 with
-        a score in [0, 1] on an attestable channel, p2 unset, a subject other
+        a score in 0..1000 on an attestable channel, p2 unset, a subject other
         than the verifier, a valid evidence digest, the derived task id, and a
         task id this history has never held. The quorum is the CALLER's to
         check; this is the chain's half of the rule. Mirrors
@@ -1270,7 +1340,7 @@ class TransactionHistory(Mapping):
         while len(self._pool) > self.max_chain_len:
             self._pool.popitem(last=False)
 
-    def record_half(self, task_id: UUID, peer_id: UUID, score: float,
+    def record_half(self, task_id: UUID, peer_id: UUID, score_milli: int,
                     channel: str = None, certificate: dict = None,
                     counterparty=None, half_sig: str = None) -> str:
         """Put a committed half in the pool. Returns 'pending' (the task has
@@ -1326,7 +1396,7 @@ class TransactionHistory(Mapping):
                     self._pool[task_id] = tx
                 else:
                     return 'mismatch'
-        tx.add(peer_id, score, channel)
+        tx.add(peer_id, score_milli, channel)
         if certificate:
             tx.attach_certificate(peer_id, certificate)
         if half_sig:
@@ -1380,11 +1450,11 @@ class TransactionHistory(Mapping):
                 items.append(entry_to_dict(tx))
                 continue
             halves = []
-            for uid, score, chan in ((tx.p1_id, tx.p1_score, tx.p1_channel),
-                                     (tx.p2_id, tx.p2_score, tx.p2_channel)):
+            for uid, milli, chan in ((tx.p1_id, tx.p1_score_milli, tx.p1_channel),
+                                     (tx.p2_id, tx.p2_score_milli, tx.p2_channel)):
                 if uid is None:
                     continue
-                half = {'by': str(uid), 'score': float(score)}
+                half = {'by': str(uid), 'score_milli': int(milli)}
                 if chan:
                     half['channel'] = str(chan)
                 cert = tx.certificate_of(uid)
@@ -1421,16 +1491,13 @@ class TransactionHistory(Mapping):
                     continue
                 task = UUID(str(item['task']))
                 for half in item.get('halves') or []:
-                    score = half['score']
-                    if isinstance(score, bool) or not isinstance(score, (int, float)) \
-                            or not 0.0 <= float(score) <= 1.0:
-                        continue
+                    milli = validate_tx_milli(half['score_milli'], 'pool')
                     cert = half.get('cert')
                     cert = ({str(k): str(v) for k, v in cert.items()}
                             if isinstance(cert, dict) else None)
                     names = half.get('names')
                     sig = half.get('sig')
-                    self.record_half(task, UUID(str(half['by'])), float(score),
+                    self.record_half(task, UUID(str(half['by'])), milli,
                                      half.get('channel') or None, cert,
                                      counterparty=(UUID(str(names)) if names
                                                    else None),
@@ -1825,10 +1892,10 @@ class TransactionHistory(Mapping):
             if tx.attested:
                 back += bool(self.pool_attested(tx, tx.attest_sigs))
                 continue
-            for uid, score, chan in ((tx.p1_id, tx.p1_score, tx.p1_channel),
-                                     (tx.p2_id, tx.p2_score, tx.p2_channel)):
+            for uid, milli, chan in ((tx.p1_id, tx.p1_score_milli, tx.p1_channel),
+                                     (tx.p2_id, tx.p2_score_milli, tx.p2_channel)):
                 if uid is not None and tx.certificate_of(uid):
-                    self.record_half(tx.task_id, uid, score, chan,
+                    self.record_half(tx.task_id, uid, milli, chan,
                                      certificate=tx.certificate_of(uid),
                                      counterparty=tx.counterparty_of(uid),
                                      half_sig=tx.half_sig_of(uid))
@@ -1992,12 +2059,20 @@ class SlashAttestation(Configuration):
     REASON_REHABILITATE = 'rehabilitate'
 
     def __init__(self, slasher_uuid: UUID, target_uuid: UUID,
-                 reason: str, floor_score: float, epoch: int = 0,
-                 evidence_ref=None, nonce: bytes = None, signature=None):
+                 reason: str, floor_score: float = None, epoch: int = 0,
+                 evidence_ref=None, nonce: bytes = None, signature=None,
+                 floor_milli: int = None):
         self.slasher_uuid = slasher_uuid
         self.target_uuid = target_uuid
         self.reason = reason
-        self.floor_score = floor_score
+        # The floor, integer thousandths: `floor_score` (0.0..1.0) from a
+        # proposer, `floor_milli` off the wire, exactly one of them.
+        if (floor_score is None) == (floor_milli is None):
+            raise ValueError('SlashAttestation: give exactly one of '
+                             'floor_score and floor_milli')
+        self.floor_milli = (score_to_milli(floor_score, 'SlashAttestation')
+                            if floor_milli is None
+                            else validate_tx_milli(floor_milli, 'SlashAttestation'))
         self.epoch = epoch
         self.evidence_ref = evidence_ref
         self.nonce = nonce
@@ -2006,16 +2081,21 @@ class SlashAttestation(Configuration):
     @property
     def designation(self) -> bytes:
         """Canonical, domain-separated bytes the slasher signs and every
-        co-signer / verifier re-derives. Float is fixed-precision so the
-        bytes match the C twin (the one byte-pinning hazard). Excludes
+        co-signer / verifier re-derives. The floor is its integer
+        thousandths, as in the C twin. Excludes
         ``signature`` (self-reference) and ``evidence_ref`` (large,
         verified separately)."""
         return (b'AT-SLASH\x00'
                 + str(self.slasher_uuid).encode()
                 + b'|' + str(self.target_uuid).encode()
                 + b'|' + str(self.reason).encode()
-                + b'|' + ('%.6f' % float(self.floor_score)).encode()
+                + b'|' + str(int(self.floor_milli)).encode()
                 + b'|' + str(self.epoch).encode())
+
+    @property
+    def floor_score(self) -> float:
+        """The floor as 0.0..1.0, for applying it."""
+        return milli_to_score(self.floor_milli)
 
     def key(self):
         """Dedup / sig-accumulation key: a slash is identified by its
@@ -2048,10 +2128,21 @@ class AttestedScore(Configuration):
 
     def __init__(self, verifier_uuid=None, subject_uuid=None, score: float = None,
                  channel: str = TX_CHANNEL_PROBE, evidence_digest: str = None,
-                 group_uuid: str = '', attest_scope: str = None):
+                 group_uuid: str = '', attest_scope: str = None,
+                 score_milli: int = None):
         self.verifier_uuid = verifier_uuid
         self.subject_uuid = subject_uuid
-        self.score = score
+        # Integer thousandths, as TransactionScore: `score` (0.0..1.0) from the
+        # application, `score_milli` off the wire. An unusable value is kept
+        # as None, and well_formed() refuses it, so a bad proposal from a peer
+        # is dropped rather than raised inside the process loop.
+        try:
+            self.score_milli = (validate_tx_milli(score_milli, 'AttestedScore')
+                                if score_milli is not None
+                                else None if score is None
+                                else score_to_milli(score, 'AttestedScore'))
+        except ValueError:
+            self.score_milli = None
         self.channel = channel
         self.evidence_digest = evidence_digest
         self.group_uuid = group_uuid or ''
@@ -2066,14 +2157,14 @@ class AttestedScore(Configuration):
 
     def well_formed(self) -> bool:
         """The shape every node checks before anything else: two distinct
-        parties, a score in [0, 1], an attestable channel, a valid digest."""
+        parties, a score in 0..1000 thousandths, an attestable channel, a
+        valid digest."""
         try:
-            score = float(self.score)
-        except (TypeError, ValueError):
+            validate_tx_milli(self.score_milli)
+        except ValueError:
             return False
         return (self.verifier_uuid is not None and self.subject_uuid is not None
                 and str(self.verifier_uuid) != str(self.subject_uuid)
-                and 0.0 <= score <= 1.0
                 and is_attestable_channel(self.channel)
                 and valid_evidence_digest(self.evidence_digest)
                 and (not self.attest_scope
@@ -2083,13 +2174,13 @@ class AttestedScore(Configuration):
     def designation(self) -> bytes:
         """Canonical, domain-separated bytes each co-signer signs. Excludes the
         chain position (index, prev_hash), which differs per node until the
-        chains reconcile. ``%.17g`` and lowercase uuids, as the C twin's
-        _attest_designation."""
+        chains reconcile. Integer thousandths and lowercase uuids, as the C
+        twin's _attest_designation."""
         out = (b'AT-ATTEST\x00'
                + str(self.verifier_uuid).lower().encode()
                + b'|' + str(self.subject_uuid).lower().encode()
                + b'|' + str(self.task_id).encode()
-               + b'|' + format(float(self.score), '.17g').encode()
+               + b'|' + str(int(self.score_milli)).encode()
                + b'|' + str(self.channel).encode()
                + b'|' + str(self.evidence_digest).encode())
         # The scope (64 hex) and the group (a uuid) each appear only when
@@ -2102,7 +2193,7 @@ class AttestedScore(Configuration):
 
     def to_transaction(self) -> Transaction:
         return Transaction(self.task_id, p1_id=UUID(str(self.verifier_uuid)),
-                           p1_score=float(self.score), p1_channel=self.channel,
+                           p1_score_milli=self.score_milli, p1_channel=self.channel,
                            attested=True, subject_id=UUID(str(self.subject_uuid)),
                            evidence_digest=self.evidence_digest,
                            attest_scope=self.attest_scope)
@@ -2110,9 +2201,15 @@ class AttestedScore(Configuration):
     @classmethod
     def of_transaction(cls, tx: Transaction, group_uuid: str = '') -> 'AttestedScore':
         return cls(verifier_uuid=str(tx.p1_id), subject_uuid=str(tx.subject_id),
-                   score=tx.p1_score, channel=tx.p1_channel,
+                   score_milli=tx.p1_score_milli, channel=tx.p1_channel,
                    evidence_digest=tx.evidence_digest, group_uuid=group_uuid,
                    attest_scope=getattr(tx, 'attest_scope', None))
+
+
+    @property
+    def score(self) -> 'float | None':
+        """The score as 0.0..1.0, for reading."""
+        return None if self.score_milli is None else milli_to_score(self.score_milli)
 
 
 class SignedAttestation(Configuration):
@@ -2226,7 +2323,9 @@ class SignedCheckpoint(Configuration):
 #
 # Schema is pinned so a future shape change is a refusal to rebuild (which
 # degrades to capped restoration) rather than a misparse.
-EVIDENCE_SCHEMA = '1'
+# '2': scores are integer thousandths (`p1_score_milli`); a '1' document is
+# refused, and restoration falls back to capped as for any unusable evidence.
+EVIDENCE_SCHEMA = '2'
 EVIDENCE_FILE = 'reputation-history'
 # Per-(target, slasher) slash high-water marks. Separate from the chain
 # evidence deliberately: the evidence is an optimization of trust that a node
@@ -2263,9 +2362,9 @@ def evidence_to_dict(chain, signed_checkpoint=None, attest_certs=None,
         entries.append({
             'task_id': str(tx.task_id),
             'p1_id': None if tx.p1_id is None else str(tx.p1_id),
-            'p1_score': None if tx.p1_score is None else float(tx.p1_score),
+            'p1_score_milli': tx.p1_score_milli,
             'p2_id': None if tx.p2_id is None else str(tx.p2_id),
-            'p2_score': None if tx.p2_score is None else float(tx.p2_score),
+            'p2_score_milli': tx.p2_score_milli,
             'index': int(tx.index),
             'prev_hash': _hex_str(tx.prev_hash),
         })
@@ -2394,15 +2493,11 @@ def evidence_from_dict(doc):
             raw = entry.get(key)
             return None if raw is None else UUID(str(raw))
 
-        def _score(key):
-            raw = entry.get(key)
-            return None if raw is None else float(raw)
-
         prev = entry.get('prev_hash') or ''
         chain.append(Transaction(
             task_id=UUID(str(entry['task_id'])),
-            p1_id=_uuid('p1_id'), p1_score=_score('p1_score'),
-            p2_id=_uuid('p2_id'), p2_score=_score('p2_score'),
+            p1_id=_uuid('p1_id'), p1_score_milli=entry.get('p1_score_milli'),
+            p2_id=_uuid('p2_id'), p2_score_milli=entry.get('p2_score_milli'),
             index=int(entry['index']),
             prev_hash=prev.encode('ascii') if prev else b'',
             p1_channel=entry.get('p1_channel'),
@@ -2464,7 +2559,8 @@ def evidence_from_dict(doc):
 # and the group sizes both quorums are counted against. Written once, when a
 # quorum-signed checkpoint first covers the entry; never rewritten. See
 # doc/architecture/reputation.md, "Verifier-attested scores".
-ATTESTED_RECORD_SCHEMA = '1'
+# '2': its entry's scores are integer thousandths.
+ATTESTED_RECORD_SCHEMA = '2'
 ATTESTED_DIR = 'attested'
 
 

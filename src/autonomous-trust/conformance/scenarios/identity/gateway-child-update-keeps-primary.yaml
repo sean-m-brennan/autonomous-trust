@@ -1,0 +1,52 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: gateway-child-update-keeps-primary
+byte_pinning: false
+description: |
+    A group update from a cohort a gateway bridges is news about that cohort,
+    never a merge candidate for the gateway's primary group.
+
+    gw's primary group is itself and boss; it also holds a child group, the
+    cohort below it, which lists anchor. anchor sends gw an update for a group
+    of five. Between two primaries the size rule would have gw adopt it: five
+    beats two. Applied here, it replaced the gateway's command cohort with the
+    field cohort, and the command cohort then carried every field member.
+
+    The network process tags a frame whose sender is in a child cohort and not
+    in the primary with that child's uuid (Message.child_group / C
+    net_msg_t.child_group); the harness delivers straight to identity, so its
+    adapters apply the same tag. A tagged update for a group other than the
+    child changes nothing, and the primary keeps its two members.
+
+participants:
+  - id: gw
+    role: border_guard
+  - id: boss
+    role: group_member
+  - id: anchor
+    role: group_member
+
+fixtures:
+  groups:
+    anchor:
+      uuid: "0c000000-0000-4000-8000-0000000000a5"
+      size: 5
+  cohort_tree:
+    nodes:
+      gw:
+        members: [boss]
+        child_group: [anchor]
+
+steps:
+  - id: 1
+    from: anchor
+    to: gw
+    function: group_key_update
+    payload: {}
+    description: anchor, a child-cohort member, sends gw a larger, different group.
+
+expected_state:
+  gw:
+    group_size: 2
+    child_group_count: 1

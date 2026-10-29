@@ -1,0 +1,93 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: pot-below-threshold-excluded
+byte_pinning: false
+description: |
+    A vote from a voter below threshold_tier is dropped: it is neither a
+    nay nor part of the eligible set (RD_13.1 D3). Before RD_13.1 it was
+    forced to false.
+
+    Setup: threshold_tier 3. alice (tier 4) and bob (tier 3) are the only
+    eligible voters; carol, dave and erin (tier 1) are not. alice and bob
+    approve, the three tier-1 voters reject. 2 of 2 eligible approve, so
+    the outcome is true.
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+  - id: carol
+    role: voter
+  - id: dave
+    role: voter
+  - id: erin
+    role: voter
+
+fixtures:
+  impl: trust
+  threshold_tier: 3
+  tiers:
+    alice: 4
+    bob: 3
+    carol: 1
+    dave: 1
+    erin: 1
+  myself: erin
+  blobs:
+    blob-x:
+      originator: carol
+      payload: "below-threshold-excluded-payload"
+
+steps:
+  - id: 1
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: |
+        alice (tier 4, eligible) approves.
+  - id: 2
+    from: bob
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: |
+        bob (tier 3, eligible) approves.
+  - id: 3
+    from: carol
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: false
+    description: |
+        carol (tier 1, below threshold) rejects. Dropped.
+  - id: 4
+    from: dave
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: false
+    description: |
+        dave (tier 1, below threshold) rejects. Dropped.
+  - id: 5
+    from: erin
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: false
+    description: |
+        erin (tier 1, below threshold) rejects. Dropped.
+
+expected_state:
+  agreement:
+    blob-x:
+      outcome: true

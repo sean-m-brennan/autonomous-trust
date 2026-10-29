@@ -259,6 +259,35 @@ typedef struct net_transport_s {
                                      net_channel_t channel,
                                      const uint8_t *wire, size_t wire_len,
                                      int port, size_t except_leg);
+
+    /**
+     * @brief Optional: how many legs this transport sends on.
+     *
+     * A frame names its sender's address, and a node on several networks has
+     * one address per network: each side reaches it only at the address it
+     * holds there. With more than one leg, net_proc serializes a broadcast or
+     * group frame once per leg, naming that leg's address (@ref leg_address),
+     * and sends it with @ref send_on_leg. NULL for single-leg transports.
+     */
+    size_t (*leg_count)(const net_transport_ctx_t *ctx);
+
+    /**
+     * @brief Optional: this node's own address on leg @p leg_index, without
+     *        a prefix length. Returns 0 and fills @p out, or -1 when the leg
+     *        has no address of its own (the frame then names the identity
+     *        address). NULL for single-leg transports.
+     */
+    int (*leg_address)(const net_transport_ctx_t *ctx, size_t leg_index,
+                       char *out, size_t out_len);
+
+    /**
+     * @brief Optional: the address a unicast to @p target names as its
+     *        sender: this node's own address on the leg @p target routes to.
+     *        Returns 0 and fills @p out, or -1 to name the identity address.
+     *        NULL for single-leg transports.
+     */
+    int (*address_for_target)(const net_transport_ctx_t *ctx, const char *target,
+                              char *out, size_t out_len);
 } net_transport_t;
 
 /**

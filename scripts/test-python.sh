@@ -43,7 +43,21 @@ esac
 export AUTONOMOUS_TRUST_BACKEND=python
 
 extra_args="--ignore=tests/b_integration/test_two_node.py"
+# Run every package even after a failure, then exit non-zero if any failed.
+# The loop used to discard each status, so the script exited 0 on failures.
+failed=()
 for pkg in autonomous-trust autonomous-trust-oracle autonomous-trust-zta autonomous-trust-rendezvous autonomous-trust-first-contact autonomous-trust-dtn autonomous-trust-services autonomous-trust-inspector autonomous-trust-evaluation autonomous-trust-simulator autonomous-trust-operator; do
   pkg_dir="$here/src/$pkg"
-  (cd "$pkg_dir" && ./run-tests.sh $extra_args $@)
+  rc=0
+  (cd "$pkg_dir" && ./run-tests.sh $extra_args "$@") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    failed+=("$pkg (exit $rc)")
+  fi
 done
+
+if [ "${#failed[@]}" -ne 0 ]; then
+  echo
+  echo "test-python.sh: ${#failed[@]} package(s) failed:"
+  printf '  %s\n' "${failed[@]}"
+  exit 1
+fi

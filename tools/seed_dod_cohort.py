@@ -453,7 +453,8 @@ def _peer_view_of(ident: Identity) -> Identity:
 def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
                 force: bool = False,
                 c_nodes: frozenset[str] = frozenset(),
-                seed_coordinator: bool = False) -> list[str]:
+                seed_coordinator: bool = False,
+                max_cohort: int | None = None) -> list[str]:
     """Write seeded state under ``out_root``. Returns the list of seeded
     peer names (squad-*/microdrone-*/jet-*).
 
@@ -462,6 +463,10 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
     (no Python-format group/peers/reputation in their own dir — they cold-join
     for the group key via the live handshake) while still being registered, at
     seed tier, in every *other* peer's view so the cohort recognises them at t=0.
+
+    ``max_cohort`` seeds a two-tier hierarchy instead (see _seed_hierarchy);
+    ``c_nodes`` is then ignored, because the layout decides which microdrones
+    run C.
     """
     seeded = [name for name in scenario.peers.keys() if is_seeded(name)]
     if not seeded:
@@ -495,6 +500,9 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
                   f"regenerated. To fully reset, delete the dir as the owner "
                   f"(e.g. a root `docker run --rm -v ...:/s alpine rm -rf /s`).")
     out_root.mkdir(parents=True, exist_ok=True)
+    if max_cohort:
+        return _seed_hierarchy(out_root, scenario, force, seed_coordinator,
+                               max_cohort)
 
     # Phase 1: per-peer identities (load existing on re-run unless --force).
     # Gateways get a seeded identity too so their UUID/address is stable
@@ -673,6 +681,178 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
     return seeded
 
 
+# --- Hierarchical seeding ---------------------------------------------------
+# The coordinator's compose address (generate_compose: .2 simulator, .3
+# coordinator, peers from BASE_PEER_OCTET).
+COORDINATOR_IP = f"{SUBNET_BASE}.3"
+
+
+def _view_at(identity: Identity, address: str) -> Identity:
+    """A seed-tier peer view of ``identity`` at ``address``. A dual-homed
+    gateway is seen by each cohort at that cohort's subnet address, which is
+    the only one its members can reach."""
+    view = _peer_view_of(identity)
+    view.address = address
+    return view
+
+
+def _hybrid_cfg(layout, gateway: str, child_uuid) -> dict:
+    """A gateway's hybrid_net.cfg.json: leg 0 on the command subnet (also the
+    default), leg 1 on its field subnet, with the field group routed there."""
+    from examples.dod_mission.deploy.hierarchy import (
+        COMMAND_NETWORK, field_network, field_subnet)
+    from examples.dod_mission.deploy.generate_compose import SUBNET
+    coh = layout.cohort_of(gateway)
+    cmd_ip = layout.ip(gateway, COMMAND_NETWORK)
+    fld_ip = layout.ip(gateway, field_network(coh.index))
+    return {"typename": "hybrid_net",
+            "inners": [
+                {"kind": "udp_net_4", "match_cidr": SUBNET, "is_default": True,
+                 "net_cfg": {"ip4_cidr": f"{cmd_ip}/24"}},
+                {"kind": "udp_net_4", "match_cidr": field_subnet(coh.index),
+                 "net_cfg": {"ip4_cidr": f"{fld_ip}/24"}}],
+            "is_gateway": True,
+            "group_routes": [{"group_uuid": str(child_uuid), "leg_index": 1}]}
+
+
+def _seed_evidence_for(members: list[str], roster: list[str],
+                       identities: dict[str, Identity]):
+    """One cohort's shared evidence window and the identities that can co-sign
+    it, sized as the flat seeder sizes its own."""
+    cap = TransactionHistory().max_chain_len
+    rounds, _ = _seed_evidence_rounds(len(members), cap)
+    signers = [identities[m] for m in roster if _can_sign(identities[m])]
+    history = _seed_evidence_chain(members, identities, rounds, roster, signers)
+    while rounds > 1 and history.next_index > len(history):
+        rounds -= 1
+        history = _seed_evidence_chain(members, identities, rounds, roster, signers)
+    if len(signers) <= (len(roster) - 1) // 2:
+        print(f"  warning: only {len(signers)} of {len(roster)} identities in "
+              f"this cohort can sign (C-node views are public-only); its seeded "
+              f"reputations will restore clamped to tier 1.")
+    return history, signers
+
+
+def _write_member(cfg_dir: Path, me: Identity, group: Group, views: list[Identity],
+                  history: TransactionHistory, signers: list[Identity]) -> None:
+    """A fully seeded member: peers, its primary group with its own starting
+    history, seed reputation, evidence and capabilities for every view."""
+    peers = Peers()
+    for v in views:
+        peers.add(v)
+    _save_json(cfg_dir / "peers.cfg.json", peers)
+    own_history = IdentityHistory(me, peers, queue.Queue()).to_dict()
+    _save_json(cfg_dir / "group.cfg.json", (group, own_history))
+    _save_json(cfg_dir / "reputation.cfg.json",
+               Reputations(current={v.uuid: SEED_REPUTATION for v in views}))
+    _write_seed_evidence(cfg_dir, me, history, signers)
+    pc = PeerCapabilities()
+    for v in views:
+        if v.petname != COORDINATOR_NAME:
+            pc.register(v.uuid, SEEDED_PEER_CAPABILITIES)
+    _save_json(cfg_dir / "peer-capabilities.cfg.json", pc)
+
+
+def _seed_hierarchy(out_root: Path, scenario: DoDMissionScenario, force: bool,
+                    seed_coordinator: bool, max_cohort: int) -> list[str]:
+    """Seed one command cohort over N field cohorts (deploy/hierarchy.py).
+
+    The command group (coordinator, squad, jet-1 and the rq86 gateways; the
+    command node cold-joins) is seeded in full to each of its members, and is
+    each gateway's primary group. Field group k (its anchor microdrone, its C
+    microdrones and its gateway) is seeded in full to the anchor; C microdrones
+    get identities only and learn the cohort from the anchor's history when it
+    admits them. Gateway k holds field group k as a child group and runs the
+    hybrid transport, one leg per subnet. Every address is the layout's, and a
+    gateway appears to each cohort at that cohort's own subnet address.
+
+    No rank is seeded. Admission is proof-of-authority, decided by the
+    highest-ranked voter, and gateways stay out of admission
+    (AT_BORDER_GUARD=0), so a gateway ranked above its field cohort would leave
+    every field proposal without a deciding vote.
+    """
+    from autonomous_trust.core._python.network.network import Network
+    from examples.dod_mission.deploy.hierarchy import (
+        COMMAND_NETWORK, field_network, plan_layout)
+    layout = plan_layout(scenario, max_cohort)
+    gateways = [c.gateway for c in layout.cohorts]
+    c_nodes = frozenset(layout.c_microdrones())
+    command = [p for p in layout.command if is_seeded(p) or is_gateway(p)]
+    if seed_coordinator:
+        command.insert(0, COORDINATOR_NAME)
+
+    def cmd_ip(name):
+        return COORDINATOR_IP if name == COORDINATOR_NAME else layout.ip(name, COMMAND_NETWORK)
+
+    def cfg_dir(name):
+        return out_root / name / "etc" / "at"
+
+    # Identities. A C node's stored address is the one it binds, so it is the
+    # layout's field address; a Python node re-resolves its own at runtime.
+    identities: dict[str, Identity] = {}
+    field_seeded: dict[int, list[str]] = {}
+    for c in layout.cohorts:
+        field_seeded[c.index] = [m for m in c.members
+                                 if m == c.anchor or m in c_nodes]
+    for name in command + [m for ms in field_seeded.values() for m in ms]:
+        ident_file = cfg_dir(name) / "identity.cfg.json"
+        if name in c_nodes:
+            k = layout.cohort_of(name).index
+            c_json, identities[name] = _read_or_init_c_identity(
+                ident_file, name, layout.ip(name, field_network(k)), force)
+            ident_file.parent.mkdir(parents=True, exist_ok=True)
+            with ident_file.open("w") as f:
+                json.dump(c_json, f, indent=2)
+        else:
+            identities[name] = _read_or_init_identity(ident_file, name, force)
+            _save_json(ident_file, identities[name])
+
+    # Command cohort.
+    cmd_group = Group.initialize({identities[n].uuid: cmd_ip(n) for n in command},
+                                 GROUP_NICKNAME)
+    cmd_history, cmd_signers = _seed_evidence_for(command, command, identities)
+    cmd_views = {n: _view_at(identities[n], cmd_ip(n)) for n in command}
+    for name in command:
+        if name in gateways:
+            continue   # written below, with its field cohort
+        _write_member(cfg_dir(name), identities[name], cmd_group,
+                      [v for n, v in cmd_views.items() if n != name],
+                      cmd_history, cmd_signers)
+
+    # Field cohorts and their gateways.
+    for c in layout.cohorts:
+        net = field_network(c.index)
+        members = field_seeded[c.index]
+        roster = members + [c.gateway]
+        fld_group = Group.initialize(
+            {identities[n].uuid: layout.ip(n, net) for n in roster}, f"field{c.index}")
+        fld_history, fld_signers = _seed_evidence_for(members, roster, identities)
+        fld_views = {n: _view_at(identities[n], layout.ip(n, net)) for n in roster}
+        _write_member(cfg_dir(c.anchor), identities[c.anchor], fld_group,
+                      [v for n, v in fld_views.items() if n != c.anchor],
+                      fld_history, fld_signers)
+
+        gw = c.gateway
+        gw_dir = cfg_dir(gw)
+        _write_member(gw_dir, identities[gw], cmd_group,
+                      [v for n, v in cmd_views.items() if n != gw]
+                      + [fld_views[n] for n in members],
+                      cmd_history, cmd_signers)
+        # A bare Group: _load_child_groups takes no history from it.
+        _save_json(gw_dir / f"group_child_field{c.index}.cfg.json", fld_group)
+        _write_seed_evidence(gw_dir, identities[gw], fld_history, fld_signers,
+                             group_uuid=str(fld_group.uuid))
+        with (gw_dir / "hybrid_net.cfg.json").open("w") as f:
+            json.dump(_hybrid_cfg(layout, gw, fld_group.uuid), f, indent=2)
+        # Pinned to the command address: a node on two networks would otherwise
+        # take whichever interface discovery finds first as its own address.
+        _save_json(gw_dir / "network.cfg.json",
+                   Network(f"{cmd_ip(gw)}/24", None, None,
+                           Network.multicast_v4_address, Network.multicast_v6_address))
+
+    return command + [m for ms in field_seeded.values() for m in ms]
+
+
 def _microdrones_sorted(scenario):
     """microdrone-* peer names ordered by numeric suffix (microdrone-2 <
     microdrone-10) so a "first N" SPEC selects a stable, obvious prefix."""
@@ -727,6 +907,13 @@ def main(argv=None) -> int:
                         "(pair with AT_COMPOSE_SEED_COORDINATOR=1 so compose "
                         "mounts its state). Its capabilities are learned at "
                         "runtime.")
+    p.add_argument("--cohort-size", type=int, default=None, metavar="N",
+                   help="Seed a two-tier hierarchy: a command cohort over one "
+                        "field cohort per RQ-86 gateway, each of at most N "
+                        "nodes. The layout then decides which microdrones run "
+                        "C, and --c-microdrones is ignored. Pair with "
+                        "AT_COHORT_SIZE=N for generate_compose.")
+    p.add_argument("--rq86-count", type=int, default=2)
     p.add_argument("--c-microdrones", metavar="SPEC", nargs="?",
                    const="all", default=None,
                    help="Seed microdrone-* peers as C at_demo nodes (C-format "
@@ -748,10 +935,20 @@ def main(argv=None) -> int:
         include_mq800=not args.no_mq800,
         include_jet=not args.no_jet,
         include_command=not args.no_command,
+        rq86_count=args.rq86_count,
     )
-    c_nodes = _resolve_c_microdrones(scenario, args.c_microdrones)
+    if args.cohort_size:
+        from examples.dod_mission.deploy.hierarchy import plan_layout
+        layout = plan_layout(scenario, args.cohort_size)
+        c_nodes = frozenset(layout.c_microdrones())
+        for c in layout.cohorts:
+            print(f"  Cohort {c.index}: {len(c.members) + 1} nodes, gateway "
+                  f"{c.gateway}, anchor {c.anchor}")
+    else:
+        c_nodes = _resolve_c_microdrones(scenario, args.c_microdrones)
     seeded = seed_cohort(args.out, scenario, force=args.force, c_nodes=c_nodes,
-                         seed_coordinator=args.seed_coordinator)
+                         seed_coordinator=args.seed_coordinator,
+                         max_cohort=args.cohort_size)
     n_skipped = len(scenario.peers) - len(seeded)
     print(f"Seeded {len(seeded)} peers under {args.out} "
           f"({n_skipped} peers left to cold-bootstrap)")

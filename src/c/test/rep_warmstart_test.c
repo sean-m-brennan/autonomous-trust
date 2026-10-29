@@ -46,8 +46,8 @@ static void _fill_pair(tx_history_t *hist, const uuid_t p1, const uuid_t p2,
     {
         uuid_t task;
         uuid_generate(task);
-        tx_history_update(hist, task, p1, score, NULL);
-        tx_history_update(hist, task, p2, score, NULL);
+        tx_history_update(hist, task, p1, tx_score_to_milli(score), NULL);
+        tx_history_update(hist, task, p2, tx_score_to_milli(score), NULL);
     }
 }
 
@@ -96,7 +96,7 @@ DEFINE_TEST(test_evidence_roundtrip_preserves_chain_and_checkpoint)
     json_t *first = json_array_get(chain, 0);
     ck_assert_ptr_nonnull(json_object_get(first, "task_id"));
     ck_assert_ptr_nonnull(json_object_get(first, "p1_id"));
-    ck_assert_ptr_nonnull(json_object_get(first, "p2_score"));
+    ck_assert_ptr_nonnull(json_object_get(first, "p2_score_milli"));
     ck_assert_ptr_nonnull(json_object_get(first, "prev_hash"));
 
     tx_history_t back;
@@ -133,7 +133,7 @@ DEFINE_TEST(test_evidence_omits_uncommitted_entries)
     uuid_t task, peer;
     uuid_generate(task);
     uuid_generate(peer);
-    tx_history_update(&hist, task, peer, 0.8, NULL);   /* one-sided */
+    tx_history_update(&hist, task, peer, 800, NULL);   /* one-sided */
 
     json_t *doc = NULL;
     ck_assert_ret_ok(reputation_evidence_to_json(&hist, NULL, &doc));
@@ -173,7 +173,7 @@ DEFINE_TEST(test_evidence_broken_hash_link_is_refused)
     /* Raise a committed score in the file. That changes the entry's hash, so
      * its successor's prev_hash no longer matches: tamper-evident. */
     json_t *entry = json_array_get(json_object_get(doc, "chain"), 0);
-    json_object_set_new(entry, "p2_score", json_real(1.0));
+    json_object_set_new(entry, "p2_score_milli", json_integer(1000));
 
     tx_history_t back;
     ck_assert_ret_ok(tx_history_init(&back));

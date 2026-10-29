@@ -42,7 +42,8 @@ from .protocol import ReputationProtocol
 from .reputation import (PLACE_BATCH_MAX, ROSTER_OPS, AttestedScore,
                          Transaction, TransactionHistory, place_designation,
                          place_value_digest, roster_digest,
-                         roster_members_norm, roster_n_min_norm, roster_task_id)
+                         roster_members_norm, roster_n_min_norm, roster_task_id,
+                         milli_to_score, validate_tx_milli)
 
 #: Persisted acceptor state, one file per chain (doc/architecture/reputation.md).
 PLACEMENT_FILE = 'reputation-placement'
@@ -93,7 +94,7 @@ def entry_to_dict(tx: Transaction) -> dict:
         return d
     if tx.attested:
         d.update({'attested': True, 'p1': str(tx.p1_id),
-                  'p1_score': float(tx.p1_score),
+                  'p1_score_milli': int(tx.p1_score_milli),
                   'p1_channel': tx.p1_channel or '',
                   'subject': str(tx.subject_id),
                   'evidence_digest': str(tx.evidence_digest)})
@@ -102,10 +103,10 @@ def entry_to_dict(tx: Transaction) -> dict:
         if tx.attest_sigs:
             d['attest_sigs'] = {str(k): _hex(v) for k, v in tx.attest_sigs.items()}
         return d
-    for side, uid, score, chan in (('p1', tx.p1_id, tx.p1_score, tx.p1_channel),
-                                   ('p2', tx.p2_id, tx.p2_score, tx.p2_channel)):
+    for side, uid, milli, chan in (('p1', tx.p1_id, tx.p1_score_milli, tx.p1_channel),
+                                   ('p2', tx.p2_id, tx.p2_score_milli, tx.p2_channel)):
         d[side] = str(uid)
-        d[side + '_score'] = float(score)
+        d[side + '_score_milli'] = int(milli)
         if chan:
             d[side + '_channel'] = str(chan)
         cert = tx.certificate_of(uid)
@@ -125,13 +126,7 @@ def entry_from_dict(d) -> Transaction:
         raise ValueError('entry is not an object')
 
     def _score(key):
-        v = d.get(key)
-        if isinstance(v, bool) or not isinstance(v, (int, float)):
-            raise ValueError('%s is not a number' % key)
-        v = float(v)
-        if not 0.0 <= v <= 1.0:
-            raise ValueError('%s out of range' % key)
-        return v
+        return validate_tx_milli(d.get(key), key)
 
     def _sigs(key):
         v = d.get(key)
@@ -157,7 +152,8 @@ def entry_from_dict(d) -> Transaction:
                            roster_digest=digest, roster_members=members,
                            roster_n_min=roster_n_min_norm(r.get('n_min')))
     if d.get('attested') is True:
-        return Transaction(task, p1_id=UUID(str(d['p1'])), p1_score=_score('p1_score'),
+        return Transaction(task, p1_id=UUID(str(d['p1'])),
+                           p1_score_milli=_score('p1_score_milli'),
                            p1_channel=d.get('p1_channel') or None, attested=True,
                            subject_id=UUID(str(d['subject'])),
                            evidence_digest=str(d['evidence_digest']),
@@ -174,8 +170,8 @@ def entry_from_dict(d) -> Transaction:
             if not isinstance(sig, str):
                 raise ValueError('%s_sig is not a string' % side)
             half_sigs[str(uid)] = sig
-    return Transaction(task, p1_id=p1, p1_score=_score('p1_score'),
-                       p2_id=p2, p2_score=_score('p2_score'),
+    return Transaction(task, p1_id=p1, p1_score_milli=_score('p1_score_milli'),
+                       p2_id=p2, p2_score_milli=_score('p2_score_milli'),
                        p1_channel=d.get('p1_channel') or None,
                        p2_channel=d.get('p2_channel') or None,
                        commit_sigs=certs or None, half_sigs=half_sigs or None)
@@ -464,8 +460,8 @@ class PlacementMixin:
                 return 'entry %s is not bilateral' % str(tx.task_id)[:8]
             if str(tx.p1_id).lower() > str(tx.p2_id).lower():
                 return 'entry %s halves out of order' % str(tx.task_id)[:8]
-            for uid, score, chan in ((tx.p1_id, tx.p1_score, tx.p1_channel),
-                                     (tx.p2_id, tx.p2_score, tx.p2_channel)):
+            for uid, score, chan in ((tx.p1_id, tx.p1_score_milli, tx.p1_channel),
+                                     (tx.p2_id, tx.p2_score_milli, tx.p2_channel)):
                 if not self._commit_cert_ok(uid, tx.task_id, score, chan,
                                             tx.certificate_of(uid), group):
                     return 'half %s of %s is not certified' % (
@@ -688,7 +684,7 @@ class PlacementMixin:
                     'Attested score committed: verifier=%s subject=%s '
                     'score=%.2f channel=%s signers=%d (index %d)',
                     str(tx.p1_id)[:8], str(tx.subject_id)[:8],
-                    float(tx.p1_score), tx.p1_channel,
+                    milli_to_score(tx.p1_score_milli), tx.p1_channel,
                     len(chain.attest_certs.get(tx.task_id) or {}), k + i)
             self._fold_committed_tx(tx.task_id, chain)
             for uid in (tx.p1_id, tx.p2_id, tx.subject_id if tx.attested else None):

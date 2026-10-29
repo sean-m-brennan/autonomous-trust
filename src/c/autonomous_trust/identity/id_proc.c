@@ -52,6 +52,7 @@
 #include "group_file.h"
 #include "join_policy.h"
 #include "anchored_cohort.h"
+#include "utilities/numfmt.h"
 
 /* Operator-attended signal helpers (ethne D8/Q9); defined below _build_announcement
  * but used earlier in handle_welcoming_committee. */
@@ -1584,6 +1585,139 @@ static void _log_group_update_sent(const process_t *proc, size_t members)
                   kfp, (long long)g->key_epoch, carries_key, members);
 }
 
+/* ---- the primary never spans the gateway ----
+ * Every path that sets or merges the primary group (an update, a welcomer's
+ * history, partition recovery, choosing among histories) was written for a node
+ * in one cohort. On a gateway each was a way for the field cohort to become the
+ * primary, and finding them one at a time did not converge. So every primary
+ * adopt refuses a group that would make it span the gateway: invariant G
+ * (doc/architecture/network-wire-format.md) checked on the result. */
+
+/* Whether @p grp lists @p addr under a member other than @p me. */
+static bool _lists_for_other(const group_t *grp, const char *me, const char *addr)
+{
+    bool found = false;
+    map_key_t key;
+    data_t *val;
+    map_entries_for_each((map_t *)&grp->address_map, key, val)
+        string_t a = NULL;
+        if (!found && strcasecmp((const char *)key, me) != 0
+            && data_string_ptr(val, &a) == 0 && a != NULL
+            && strcmp((const char *)a, addr) == 0)
+            found = true;
+    map_end_for_each
+    return found;
+}
+
+/* Whether one of our child groups lists @p addr under someone other than us. */
+static bool _child_holds_address(const process_t *proc, const char *addr)
+{
+    if (proc->protocol.child_groups == NULL || addr == NULL || addr[0] == '\0')
+        return false;
+    char me[UUID_STRING_LEN + 1] = "";
+    const identity_t *self = identity_self_identity(proc);
+    if (self != NULL)
+        uuid_unparse_lower(self->uuid, me);
+    bool held = false;
+    map_key_t key;
+    data_t *val;
+    map_entries_for_each(proc->protocol.child_groups, key, val)
+        void *gp = NULL;
+        if (!held && data_object_ptr(val, &gp) == 0 && gp != NULL
+            && _lists_for_other((const group_t *)gp, me, addr))
+            held = true;
+    map_end_for_each
+    return held;
+}
+
+/* The same question for a group still in its JSON form. */
+static bool _json_group_spans_gateway(const process_t *proc, const char *uuid_str,
+                                      json_t *addr_map)
+{
+    if (proc->protocol.child_groups == NULL
+        || map_size(proc->protocol.child_groups) == 0)
+        return false;
+    data_t *val = NULL;
+    if (uuid_str != NULL
+        && map_get(proc->protocol.child_groups, (map_key_t)uuid_str, &val) == 0
+        && val != NULL)
+        return true;
+    if (addr_map == NULL || !json_is_object(addr_map))
+        return false;
+    const char *k;
+    json_t *v;
+    json_object_foreach(addr_map, k, v)
+        if (_child_holds_address(proc, json_string_value(v)))
+            return true;
+    return false;
+}
+
+bool identity_rejoin_due(long elapsed_us, long *last_us, long *interval_us,
+                         long init_us, long cap_us)
+{
+    if (elapsed_us - *last_us < *interval_us)
+        return false;
+    *last_us = elapsed_us;
+    if (elapsed_us >= init_us) {
+        *interval_us *= 2;
+        if (*interval_us > cap_us)
+            *interval_us = cap_us;
+    }
+    return true;
+}
+
+long identity_join_wait_us(long init_us)
+{
+    const char *raw = getenv("AT_JOIN_PATIENCE_SEC");
+    if (raw == NULL || raw[0] == '\0')
+        return init_us;
+    double secs = at_strtod(raw, NULL);
+    long patience_us = secs > 0 ? (long)(secs * 1000000.0) : 0;
+    return patience_us > init_us ? patience_us : init_us;
+}
+
+bool identity_group_spans_gateway(const process_t *proc, const group_t *grp)
+{
+    if (proc == NULL || grp == NULL || proc->protocol.child_groups == NULL
+        || map_size(proc->protocol.child_groups) == 0)
+        return false;
+    char u[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(grp->uuid, u);
+    data_t *val = NULL;
+    if (map_get(proc->protocol.child_groups, (map_key_t)u, &val) == 0 && val != NULL)
+        return true;
+    bool spans = false;
+    map_key_t key;
+    data_t *v;
+    map_entries_for_each((map_t *)&grp->address_map, key, v)
+        string_t a = NULL;
+        if (!spans && data_string_ptr(v, &a) == 0 && a != NULL
+            && _child_holds_address(proc, (const char *)a))
+            spans = true;
+    map_end_for_each
+    return spans;
+}
+
+/* Whether @p addr sits in a cohort this gateway bridges and not in its primary
+ * group: a peer the primary group's update must not reach. Always false on a
+ * leaf node, which holds no child groups. */
+static bool _peer_beyond_gateway(const process_t *proc, const char *addr)
+{
+    if (proc->protocol.child_groups == NULL || addr == NULL || addr[0] == '\0'
+        || _group_has_address((group_t *)&proc->protocol.group, addr))
+        return false;
+    bool beyond = false;
+    map_key_t key;
+    data_t *val;
+    map_entries_for_each(proc->protocol.child_groups, key, val)
+        void *gp = NULL;
+        if (!beyond && data_object_ptr(val, &gp) == 0 && gp != NULL
+            && _group_has_address((group_t *)gp, addr))
+            beyond = true;
+    map_end_for_each
+    return beyond;
+}
+
 static int _update_group(const process_t *proc, directory_t *queues)
 {
     (void)queues; /* network emission uses messaging_send by queue name */
@@ -1615,6 +1749,12 @@ static int _update_group(const process_t *proc, directory_t *queues)
     _log_group_update_sent(proc, proc->protocol.num_peers);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
+        /* A group stops at the gateway: a peer in a cohort we gateway, and not
+         * in our group, is not sent it. The command group, key and all, reached
+         * field nodes; one that had not yet joined took it, and the two cohorts
+         * merged. Mirrors Python _update_group. */
+        if (_peer_beyond_gateway(proc, proc->protocol.peers[i].address))
+            continue;
         generic_msg_t update = {0};
         update.type = NET_MESSAGE;
         strncpy(update.info.net_msg.process, "identity", PROC_NAME_LEN);
@@ -1716,6 +1856,11 @@ static void _confirm_group_membership(process_t *proc, directory_t *queues,
         map_init(&proc->protocol.group.address_map);
     char new_uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(new_peer->uuid, new_uuid_str);
+    if (_child_holds_address(proc, new_peer->address)) {
+        log_debug(proc->logger, "Identity: not adding %s to the primary: a member "
+                  "of a cohort we gateway\n", new_peer->nickname);
+        return;
+    }
     if (group_add_address(&proc->protocol.group, new_uuid_str, (char *)new_peer->address) == 0)
     {
         /* Local-process broadcast of the updated group (Python: _record_group). */
@@ -3376,6 +3521,12 @@ static int _merge_to_mesh(process_t *proc, directory_t *queues)
             adopt_cand = false;                         /* candidate younger -> keep ours */
         else
             adopt_cand = (strcmp(cand_u, mine_u) < 0);  /* equal/unknown age -> uuid tiebreak */
+        if (adopt_cand && identity_group_spans_gateway(proc, &adopted_group)) {
+            probes_counter("id.group", "gateway_span_refused", NULL);
+            log_warn(proc->logger, "Identity: refusing merge candidate %s: it lists "
+                     "a member of a cohort we gateway\n", cand_u);
+            adopt_cand = false;
+        }
         if (adopt_cand) {
             memcpy(&proc->protocol.group, &adopted_group, sizeof(group_t));
             peers_write_unlock(proc);
@@ -4681,6 +4832,8 @@ static void _clear_confirmations(const process_t *proc, const char *peer_uuid)
     pthread_mutex_unlock(&id_state.lock);
 }
 
+static group_t *_child_group_for(const process_t *proc, const net_msg_t *nmsg);
+
 static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     if (proc->protocol.phase != 3)
@@ -4817,6 +4970,21 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
         }
     }
     peers_read_unlock(proc);
+
+    group_t *child = _child_group_for(proc, nmsg);
+    if (child != NULL) {
+        /* Confirmed by a member of a cohort we gateway: a peer of that cohort.
+         * It joins our peer list and the child's map, never our primary's; the
+         * cohort's own members propagate its key. Mirrors Python. */
+        if (!already)
+            _add_peer(proc, queues, &new_peer, false);
+        if (reached) {
+            group_add_address(child, uuid_str, new_peer.address);
+            identity_propagate_child_groups(proc, queues);
+            _clear_confirmations(proc, uuid_str);
+        }
+        return true;
+    }
 
     if (!already) {
         /* First time we hear of this peer via confirm: record it
@@ -5082,6 +5250,121 @@ size_t identity_replay_held_access_requests(process_t *proc, directory_t *queues
   requires \valid(msg);
   requires proc->logger == \null || \valid(proc->logger);
 */
+/* The child group a received message is news about: the cohort net_proc found
+ * its sender in (net_msg_t.child_group), or NULL for the primary cohort and on
+ * a leaf node.
+ *
+ * An untagged message is placed here by its sender's address. net_proc learns
+ * the child groups from this process, so a frame that lands between this
+ * process adopting a child and net_proc hearing of it arrives untagged; at
+ * startup that was the anchor's first update, which then replaced the primary
+ * with the child. Mirrors Python IdentityProcess._child_group_for. */
+static group_t *_child_group_for(const process_t *proc, const net_msg_t *nmsg)
+{
+    if (proc->protocol.child_groups == NULL)
+        return NULL;
+    data_t *val = NULL;
+    void *gp = NULL;
+    if (nmsg->child_group[0] != '\0') {
+        if (map_get(proc->protocol.child_groups, (map_key_t)nmsg->child_group, &val) != 0
+            || val == NULL || data_object_ptr(val, &gp) != 0)
+            return NULL;
+        return (group_t *)gp;
+    }
+    const char *addr = nmsg->from_whom.address;
+    if (addr[0] == '\0' || _group_has_address((group_t *)&proc->protocol.group, addr))
+        return NULL;
+    group_t *found = NULL;
+    map_key_t key;
+    map_entries_for_each(proc->protocol.child_groups, key, val)
+        gp = NULL;
+        if (found == NULL && data_object_ptr(val, &gp) == 0 && gp != NULL
+            && _group_has_address((group_t *)gp, addr))
+            found = (group_t *)gp;
+    map_end_for_each
+    return found;
+}
+
+/* A group update from a child cohort, applied to that child.
+ *
+ * The size rule that settles a merge between two primaries does not apply
+ * here: a child group is the cohort this gateway was given to bridge, so an
+ * update for it brings membership and keys, and a different group arriving
+ * from that cohort changes nothing. Applied to the primary, a larger field
+ * cohort won the size rule and replaced the command cohort. Rotation is gated
+ * as for the primary: a higher epoch only from a verified message. Mirrors
+ * Python IdentityProcess._apply_child_update. Consumes @p payload. */
+static bool _apply_child_update(const process_t *proc, directory_t *queues,
+                                const net_msg_t *nmsg, group_t *child,
+                                json_t *payload)
+{
+    char child_uuid[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(child->uuid, child_uuid);
+    const char *theirs_uuid = json_string_value(json_object_get(payload, "uuid"));
+    if (theirs_uuid == NULL || strcasecmp(theirs_uuid, child_uuid) != 0) {
+        log_debug(proc->logger, "Identity: ignoring group %s from child cohort %s: "
+                  "not the group we bridge\n", theirs_uuid ? theirs_uuid : "?",
+                  child_uuid);
+        json_decref(payload);
+        return true;
+    }
+    json_t *j_epoch = json_object_get(payload, "key_epoch");
+    int64_t theirs_epoch = (j_epoch != NULL && json_is_integer(j_epoch))
+                           ? json_integer_value(j_epoch) : 0;
+    json_t *j_encr = json_object_get(payload, "encryptor");
+    json_t *j_po = j_encr ? json_object_get(j_encr, "public_only") : NULL;
+    const char *seed_hex = j_encr
+        ? json_string_value(json_object_get(j_encr, "hex_seed")) : NULL;
+    bool carries_key = !((j_po == NULL) ? true : json_boolean_value(j_po))
+                       && seed_hex != NULL;
+    if (theirs_epoch > child->key_epoch && !nmsg->verified) {
+        log_warn(proc->logger, "Identity: rejecting unverified child group key "
+                 "rotation from %s\n", nmsg->from_whom.nickname);
+        json_decref(payload);
+        return true;
+    }
+    bool changed = false;
+    if (nmsg->verified && carries_key && theirs_epoch >= child->key_epoch) {
+        group_t theirs = {0};
+        memcpy(theirs.uuid, child->uuid, sizeof(uuid_t));
+        theirs.key_epoch = theirs_epoch;
+        if (encryptor_init_from_private(&theirs.encryptor,
+                                        (const unsigned char *)seed_hex,
+                                        strlen(seed_hex)) == 0
+            && group_rotation_refusal(child, &theirs) == NULL
+            && group_accept_rotation(child, &theirs)) {
+            log_info(proc->logger, "Identity: adopted rotated key for child group "
+                     "%s, epoch %lld\n", child_uuid, (long long)child->key_epoch);
+            changed = true;
+        }
+    }
+    json_t *j_addr_map = json_object_get(payload, "address_map");
+    size_t theirs_size = (j_addr_map != NULL && json_is_object(j_addr_map))
+                         ? json_object_size(j_addr_map) : 0;
+    if (theirs_size > map_size(&child->address_map)) {
+        bool owns_private = !sodium_is_zero(child->encryptor.private,
+                                            crypto_box_SECRETKEYBYTES);
+        if (owns_private || carries_key) {
+            if (!owns_private)
+                (void)encryptor_init_from_private(&child->encryptor,
+                                                  (const unsigned char *)seed_hex,
+                                                  strlen(seed_hex));
+            const char *k;
+            json_t *v;
+            json_object_foreach(j_addr_map, k, v) {
+                const char *addr = json_string_value(v);
+                if (k != NULL && addr != NULL)
+                    group_add_address(child, k, addr);
+            }
+            changed = true;
+        }
+    }
+    json_decref(payload);
+    if (changed)
+        identity_propagate_child_groups(proc, queues);
+    return true;
+}
+
 static bool handle_group_update(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     if (proc->protocol.phase != 3)
@@ -5109,6 +5392,24 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
                  "Identity: refusing group update from %s: our group speaks "
                  "proto and theirs names no format\n", nmsg->from_whom.nickname);
         probes_counter("id.group", "formatless_refused", NULL);
+        json_decref(payload);
+        return true;
+    }
+
+    group_t *child = _child_group_for(proc, nmsg);
+    if (child != NULL)
+        return _apply_child_update(proc, queues, nmsg, child, payload);
+    /* A group stops at the gateway: its primary changes only through its own
+     * members. A field joiner not yet in our child map is in neither group,
+     * and its larger field group won the size rule. Never on a leaf node.
+     * Mirrors Python _unplaced_at_gateway. */
+    if (proc->protocol.child_groups != NULL
+        && map_size(proc->protocol.child_groups) > 0
+        && !_group_has_address((group_t *)&proc->protocol.group,
+                               nmsg->from_whom.address)) {
+        log_debug(proc->logger, "Identity: ignoring group update from %s: a "
+                  "gateway takes its primary only from its own members\n",
+                  nmsg->from_whom.nickname);
         json_decref(payload);
         return true;
     }
@@ -5358,6 +5659,14 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
         }
     }
 
+    if (adopt && _json_group_spans_gateway(proc, theirs_uuid_str, j_addr_map))
+    {
+        probes_counter("id.group", "gateway_span_refused", NULL);
+        log_warn(proc->logger, "Identity: refusing group update from %s: it lists a "
+                 "member of a cohort we gateway\n", nmsg->from_whom.nickname);
+        json_decref(payload);
+        return true;
+    }
     if (adopt)
     {
         /* Conform to Python handle_group_update's refuse branch
@@ -6818,6 +7127,59 @@ static bool _group_has_address(group_t *group, const char *addr)
  * dod-coordinator-partition-nonconvergence.md (layer 3).
  ****************************/
 /* Frama-C: skipped — JSON + messaging stubs. */
+/* How many of @p map's member uuids are absent from the @p have array. */
+static int _missing_from(map_t *map, json_t *have)
+{
+    int missing = 0;
+    map_key_t key;
+    data_t *val;
+    map_entries_for_each(map, key, val)
+        (void)val;
+        bool found = false;
+        size_t i;
+        json_t *h;
+        json_array_foreach(have, i, h)
+            if (!found && json_is_string(h)
+                && strcasecmp(json_string_value(h), (const char *)key) == 0)
+                found = true;
+        if (!found)
+            missing++;
+    map_end_for_each
+    return missing;
+}
+
+/* Broadcast one identity-resync query naming @p grp; @p have is copied. */
+static void _send_resync_query(const process_t *proc, const group_t *grp,
+                               json_t *have, int missing)
+{
+    char group_uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(grp->uuid, group_uuid_str);
+    json_t *payload = json_object();
+    if (payload == NULL) return;
+    json_object_set_new(payload, "group_uuid", json_string(group_uuid_str));
+    json_object_set_new(payload, "have", json_deep_copy(have));
+
+    generic_msg_t query = {0};
+    query.type = NET_MESSAGE;
+    strncpy(query.info.net_msg.process, "identity", PROC_NAME_LEN);
+    query.info.net_msg.function = ID_IDENTITY_QUERY;
+    query.info.net_msg.encrypt = false;       /* may lack peer crypto material */
+    /* to_whom left zeroed → network-layer broadcast */
+    strncpy(query.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    net_msg_pack_json(&query.info.net_msg, payload);
+    json_decref(payload);
+    /* Bare on purpose (this resync repeats every ~20 s): ISSUES §2.40. */
+    messaging_send("network", NET_MESSAGE, &query, false);
+    net_msg_free_obj(&query.info.net_msg);
+
+    char miss_str[16];
+    snprintf(miss_str, sizeof(miss_str), "%d", missing);
+    probes_counter("peer.set", "identity_resync_query", miss_str);
+    log_debug(proc->logger,
+              "Identity resync: querying group %s for %d missing member "
+              "identity/ies\n", group_uuid_str, missing);
+}
+
 void identity_periodic_identity_resync(const process_t *proc)
 {
     if (proc == NULL) return;
@@ -6855,37 +7217,27 @@ void identity_periodic_identity_resync(const process_t *proc)
      * uuid-count vs address-count is 1:1 per member; an occasional over-query
      * is harmless (responders skip via the have-list). */
     int have_count = (int)json_array_size(have);
-    if (have_count >= group_size) {
-        json_decref(have);
-        return;
+    if (have_count < group_size)
+        _send_resync_query(proc, &proc->protocol.group, have, group_size - have_count);
+
+    /* A query names one group, and only its members answer, so a gateway asks
+     * each child cohort too: a field peer that joined before its gateway was up
+     * is found only by a query naming the field cohort. A child is checked by
+     * its members' uuids, since our peers span every group we hold. Mirrors
+     * Python _periodic_identity_resync. */
+    if (proc->protocol.child_groups != NULL) {
+        map_key_t key;
+        data_t *val;
+        map_entries_for_each(proc->protocol.child_groups, key, val)
+            void *gp = NULL;
+            if (data_object_ptr(val, &gp) == 0 && gp != NULL) {
+                int missing = _missing_from(&((group_t *)gp)->address_map, have);
+                if (missing > 0)
+                    _send_resync_query(proc, (const group_t *)gp, have, missing);
+            }
+        map_end_for_each
     }
-
-    char group_uuid_str[UUID_STRING_LEN + 1];
-    uuid_unparse_lower(proc->protocol.group.uuid, group_uuid_str);
-    json_t *payload = json_object();
-    if (payload == NULL) { json_decref(have); return; }
-    json_object_set_new(payload, "group_uuid", json_string(group_uuid_str));
-    json_object_set_new(payload, "have", have);  /* steals the reference */
-
-    generic_msg_t query = {0};
-    query.type = NET_MESSAGE;
-    strncpy(query.info.net_msg.process, "identity", PROC_NAME_LEN);
-    query.info.net_msg.function = ID_IDENTITY_QUERY;
-    query.info.net_msg.encrypt = false;       /* may lack peer crypto material */
-    /* to_whom left zeroed → network-layer broadcast */
-    strncpy(query.info.net_msg.return_to, "identity", PROC_NAME_LEN);
-    net_msg_pack_json(&query.info.net_msg, payload);
-    json_decref(payload);
-    /* Bare on purpose (this resync repeats every ~20 s): ISSUES §2.40. */
-    messaging_send("network", NET_MESSAGE, &query, false);
-    net_msg_free_obj(&query.info.net_msg);
-
-    char miss_str[16];
-    snprintf(miss_str, sizeof(miss_str), "%d", group_size - have_count);
-    probes_counter("peer.set", "identity_resync_query", miss_str);
-    log_debug(proc->logger,
-              "Identity resync: querying group for %d missing member "
-              "identity/ies\n", group_size - have_count);
+    json_decref(have);
 }
 
 /****************************
@@ -7030,17 +7382,35 @@ static bool handle_identity_response(const process_t *proc, directory_t *queues,
         : json_string_value(json_object_get(payload, "from_address"));
 
     /* Only backfill identities for actual group members. Membership is by
-     * UUID: the map is keyed by member uuid, and an entry can hold a stale
-     * address, e.g. the hostname placeholder the cohort seeder writes for a
-     * member that then advertises its runtime IP. The signature check above
-     * ties the identity to that uuid, so a stranger still cannot enter.
-     * Address membership is kept for a map keyed by address. Mirrors Python
-     * handle_identity_response. */
+     * UUID: the map is keyed by member uuid, and an entry need not match the
+     * address a member advertises, e.g. the hostname placeholder the cohort
+     * seeder writes for a member that then advertises its runtime IP. The
+     * signature check above ties the identity to that uuid, so a stranger
+     * still cannot enter. Address membership is kept for a map keyed by
+     * address. The entry itself is not rewritten from the advertised address:
+     * it is this cohort's record of how to reach the member, and a dual-homed
+     * gateway advertises an address only one of its cohorts can reach. Mirrors
+     * Python handle_identity_response. */
     group_t *group = &((process_t *)proc)->protocol.group;
     char member_key[UUID_STRING_LEN + 1];
     uuid_unparse_lower(parsed.uuid, member_key);
     data_t *entry = NULL;
     bool is_member = map_get(&group->address_map, member_key, &entry) == 0;
+    /* A gateway's members include its child cohorts': a field peer that joined
+     * before its gateway was up missed the confirm broadcast, and this is how
+     * the gateway learns it, so its relay can subscribe. Mirrors Python. */
+    if (!is_member && proc->protocol.child_groups != NULL) {
+        map_key_t ck;
+        data_t *cv;
+        map_entries_for_each(proc->protocol.child_groups, ck, cv)
+            void *gp = NULL;
+            data_t *ce = NULL;
+            if (!is_member && data_object_ptr(cv, &gp) == 0 && gp != NULL
+                && (map_get(&((group_t *)gp)->address_map, member_key, &ce) == 0
+                    || _group_has_address((group_t *)gp, addr)))
+                is_member = true;
+        map_end_for_each
+    }
     if (!is_member && !_group_has_address(group, addr)) {
         probes_counter("peer.set", "identity_response_not_in_group", "1");
         json_decref(payload);
@@ -7054,15 +7424,6 @@ static bool handle_identity_response(const process_t *proc, directory_t *queues,
         return true;
     }
 
-    /* Refresh a stale map entry to the verified address (addr may point into
-     * payload, so before it is released; group_add_address copies it). */
-    bool refreshed = false;
-    if (is_member && addr != NULL && addr[0] != '\0') {
-        string_t cur = NULL;
-        if (data_string_ptr(entry, &cur) != 0 || cur == NULL
-            || strcmp(cur, addr) != 0)
-            refreshed = group_add_address(group, member_key, addr) == 0;
-    }
     json_decref(payload);
 
     /* Add to peers if not already present. Mirrors
@@ -7109,10 +7470,6 @@ static bool handle_identity_response(const process_t *proc, directory_t *queues,
     } else {
         probes_counter("peer.set", "identity_response_redundant", "1");
     }
-    /* Push the refreshed map to the local processes (Python: _record_group),
-     * after the backfill so a failure here cannot cost it. */
-    if (refreshed)
-        _update_group(proc, queues);
     return true;
 }
 
@@ -9392,6 +9749,13 @@ static bool _adopt_group_from_histories(process_t *proc,
     }
     pthread_mutex_unlock(&id_state.lock);
 
+    if (have_group && identity_group_spans_gateway(proc, &adopted_group)) {
+        probes_counter("id.group", "gateway_span_refused", NULL);
+        log_warn(logger, "Identity: refusing a history's group as primary: it lists "
+                 "a member of a cohort we gateway\n");
+        map_free(&adopted_group.address_map);
+        have_group = false;
+    }
     if (have_group) {
         char gid_str[UUID_STRING_LEN + 1];
         uuid_unparse_lower(adopted_group.uuid, gid_str);
@@ -9582,11 +9946,16 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
         long INIT_TIMEOUT_US = 5L * 1000000L;  /* Python init_timeout=5s */
         const char *init_override = getenv("AT_INIT_TIMEOUT_SEC");
         if (init_override != NULL && init_override[0] != '\0') {
-            double secs = strtod(init_override, NULL);
+            double secs = at_strtod(init_override, NULL);
             if (secs > 0)
                 INIT_TIMEOUT_US = (long)(secs * 1000000.0);
         }
         const long GRACE_US        = 1L * 1000000L;  /* Python grace=1s */
+        /* Ask again until admitted: every 2 s within the init timeout, then
+         * doubling to 30 s for as long as AT_JOIN_PATIENCE_SEC allows (see
+         * identity_rejoin_due). */
+        const long WAIT_US = identity_join_wait_us(INIT_TIMEOUT_US);
+        long rejoin_last_us = 0, rejoin_interval_us = 2L * 1000000L;
         struct timeval start_tv, now_tv;
         gettimeofday(&start_tv, NULL);
         long first_seen_us = -1;
@@ -9601,7 +9970,7 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
             gettimeofday(&now_tv, NULL);
             long elapsed_us = (now_tv.tv_sec - start_tv.tv_sec) * 1000000L
                             + (now_tv.tv_usec - start_tv.tv_usec);
-            if (elapsed_us > INIT_TIMEOUT_US)
+            if (elapsed_us > WAIT_US)
                 break;
 
             pthread_mutex_lock(&id_state.lock);
@@ -9614,6 +9983,10 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
                 else if (elapsed_us - first_seen_us >= GRACE_US)
                     break;
             }
+            else if (identity_rejoin_due(elapsed_us, &rejoin_last_us,
+                                         &rejoin_interval_us, INIT_TIMEOUT_US,
+                                         30L * 1000000L))
+                (void)_announce_identity(proc, queues);
 
             /* Pump inbound messages so handle_receive_history can run. */
             messaging_recv_release(&pump);   /* the previous pass's */

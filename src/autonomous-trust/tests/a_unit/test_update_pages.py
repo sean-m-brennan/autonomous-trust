@@ -65,7 +65,7 @@ def _staged(me, other):
     rp, q = _node(me, [other])
     hist = TransactionHistory()
     for i in range(ENTRIES):
-        t, a, b = uuid4(), 0.3 + 0.01 * i, 0.9 - 0.01 * i
+        t, a, b = uuid4(), 300 + 10 * i, 900 - 10 * i
         hist.apply_placed(hist.next_index, [placement_entry(Transaction(
             t, me.uuid, a, other.uuid, b,
             half_sigs={str(me.uuid): _half(me, other, t, a),

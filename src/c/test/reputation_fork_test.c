@@ -47,8 +47,8 @@ static void _fork_chain(tx_history_t *h, const char *letters)
     for (const char *c = letters; *c; c++)
     {
         int t = *c - 'a';
-        ck_assert_ret_ok(tx_history_update(h, g_tasks[t], g_fp1, 0.3 + 0.02 * t, NULL));
-        ck_assert_ret_ok(tx_history_update(h, g_tasks[t], g_fp2, 0.9 - 0.02 * t, NULL));
+        ck_assert_ret_ok(tx_history_update(h, g_tasks[t], g_fp1, 300 + 20 * t, NULL));
+        ck_assert_ret_ok(tx_history_update(h, g_tasks[t], g_fp2, 900 - 20 * t, NULL));
     }
 }
 
@@ -192,8 +192,8 @@ DEFINE_TEST(test_tx_fork_adoption_keeps_pending_work)
     _fork_chain(&ours, "abx");
     _fork_chain(&theirs, "abcd");
     uuid_t *z = &g_tasks['z' - 'a'], *d = &g_tasks['d' - 'a'];
-    ck_assert_ret_ok(tx_history_update(&ours, *z, g_fp1, 0.4, NULL));
-    ck_assert_ret_ok(tx_history_update(&ours, *d, g_fp1, 0.3 + 0.02 * 3, NULL));
+    ck_assert_ret_ok(tx_history_update(&ours, *z, g_fp1, 400, NULL));
+    ck_assert_ret_ok(tx_history_update(&ours, *d, g_fp1, 300 + 20 * 3, NULL));
 
     tx_reconcile_result_t res = _reconcile_from(&ours, &theirs, -1);
     ck_assert_int_eq(res.status, TX_RECONCILE_ADOPTED);
@@ -201,7 +201,7 @@ DEFINE_TEST(test_tx_fork_adoption_keeps_pending_work)
     ck_assert_int_eq(ours.chain_len, 5);     /* four committed, z pending, d once */
     ck_assert(_same_root(&ours, &theirs));
 
-    ck_assert_ret_ok(tx_history_update(&ours, *z, g_fp2, 0.6, NULL));
+    ck_assert_ret_ok(tx_history_update(&ours, *z, g_fp2, 600, NULL));
     ck_assert_int_eq(tx_history_len(&ours), 5);
     transaction_t out;
     ck_assert_ret_ok(tx_history_by_task(&ours, *z, &out));
@@ -281,7 +281,7 @@ DEFINE_TEST(test_tx_fork_hands_back_what_it_dropped)
     ck_assert(uuid_compare(res.dropped_entries[1].task_uuid, g_tasks['y' - 'a']) == 0);
     ck_assert(res.dropped_entries[0].p1_set && res.dropped_entries[0].p2_set);
     ck_assert(uuid_compare(res.dropped_entries[0].p1_uuid, g_fp1) == 0);
-    ck_assert_double_eq_tol(res.dropped_entries[0].p1_score, 0.3 + 0.02 * ('x' - 'a'), 1e-12);
+    ck_assert_int_eq(res.dropped_entries[0].p1_score_milli, 300 + 20 * ('x' - 'a'));
     ck_assert_int_eq(res.dropped_entries[0].index, 2);
     tx_reconcile_result_free(&res);
     ck_assert(res.dropped_entries == NULL);

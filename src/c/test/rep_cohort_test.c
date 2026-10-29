@@ -233,7 +233,7 @@ static bool _proposal(identity_t *sender, const char *group)
     json_object_set_new(p, "id1", json_integer(100));
     json_object_set_new(p, "id2", json_integer(1));
     json_object_set_new(p, "peer_uuid", json_string(su));
-    json_object_set_new(p, "score", json_real(0.8));
+    json_object_set_new(p, "score_milli", json_integer(800));
     json_object_set_new(p, "task_uuid", json_string(tu));
     json_object_set_new(p, "certify", json_true());
     json_object_set_new(p, "group", json_string(group));
@@ -286,8 +286,8 @@ DEFINE_TEST(test_the_scorers_read_the_cohort_chain)
     for (int i = 0; i < 3; i++) {
         uuid_t task;
         uuid_generate(task);
-        reputation_install_tx_pair_in(g_cohort, task, me->uuid, 0.9,
-                                      ally->uuid, 0.9);
+        reputation_install_tx_pair_in(g_cohort, task, me->uuid, 900,
+                                      ally->uuid, 900);
     }
     reputation_install_peer_reputation(ally->uuid, 0.9);
     reputation_install_coop_mode(ally->uuid, true);

@@ -955,11 +955,12 @@ class TestIdentityResync:
                                       self._id_response(member, signer=other))
         assert proc.peers.find_by_uuid(member.uuid) is None
 
-    def test_response_backfills_member_seeded_at_placeholder_address(self):
-        """The cohort seeder writes a hostname placeholder (here 'captain') into
-        the shared group map, while the member advertises its runtime IP. The
-        member is known by UUID, so its signed identity is backfilled and the
-        group entry is refreshed to the verified address."""
+    def test_response_backfills_member_without_rewriting_its_map_entry(self):
+        """The group map holds 'captain' for this member, which advertises
+        10.0.0.10. The member is known by UUID, so its signed identity is
+        backfilled, but the map entry stays: it is this cohort's record of how
+        to reach the member, and a dual-homed gateway advertises an address
+        that only one of its cohorts can reach."""
         me = _new_identity('coord', '10.0.0.3')
         member = _new_identity('captain', '10.0.0.10')
         grp = Group.initialize({str(me.uuid): me.address,
@@ -971,9 +972,9 @@ class TestIdentityResync:
         proc.handle_identity_response(_build_queues(), self._id_response(member))
 
         assert proc.peers.find_by_uuid(member.uuid) is not None
-        assert '10.0.0.10' in list(proc.group.addresses)
-        assert 'captain' not in list(proc.group.addresses)
-        proc._record_group.assert_called()
+        assert 'captain' in list(proc.group.addresses)      # map entry untouched
+        assert '10.0.0.10' not in list(proc.group.addresses)
+        proc._record_group.assert_not_called()
 
     def test_response_rejects_unknown_uuid_at_unknown_address(self):
         """UUID membership does not open the door to strangers: an identity

@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <math.h>
 #include <time.h>
 #include <unistd.h>
@@ -57,6 +58,7 @@
 
 #include "utilities/util.h"
 #include "../scenario_engine.h"
+#include "utilities/numfmt.h"
 
 typedef struct {
     identity_t *full;
@@ -152,6 +154,26 @@ static rp_snap_t g_snaps[SCE_MAX_PARTICIPANTS];
 
 static sce_run_ctx_t *g_active_ctx = NULL;
 static json_t *g_fixtures = NULL;        /* borrowed; lifetime is the scenario */
+
+/* A scenario's score (0.0..1.0, as an application gives one) as the integer
+ * thousandths the wire and the chain carry. A value off the scale stays off it
+ * (thousandths, rounded half away from zero, when finite; INT_MIN otherwise),
+ * so a scenario that sends 7.5 or NaN still reaches the gate that refuses it.
+ * Mirrors the Python adapter's _milli. */
+static int _rp_milli(double score)
+{
+    if (tx_score_in_range(score))
+        return tx_score_to_milli(score);
+    if (!isfinite(score) || fabs(score) > 1e6)
+        return INT_MIN;
+    return (int)lround(score * (double)TX_SCORE_SCALE);
+}
+
+/* _rp_milli of a JSON number, or @p dflt (a score) when @p j is not one. */
+static int _rp_milli_json(const json_t *j, double dflt)
+{
+    return _rp_milli(json_is_number(j) ? json_number_value(j) : dflt);
+}
 
 static rp_snap_t *_snap_find(const char *id)
 {
@@ -561,9 +583,9 @@ static void _write_chain(sce_run_ctx_t *ctx, tx_history_t *hist, json_t *spec)
             _chain_half_uuid(ctx, ce, 1, task, p1u);
             _chain_half_uuid(ctx, ce, 2, task, p2u);
             tx_history_update(hist, tk, p1u,
-                              json_number_value(json_object_get(ce, "p1")), NULL);
+                              _rp_milli_json(json_object_get(ce, "p1"), 0.0), NULL);
             tx_history_update(hist, tk, p2u,
-                              json_number_value(json_object_get(ce, "p2")), NULL);
+                              _rp_milli_json(json_object_get(ce, "p2"), 0.0), NULL);
             i++;
             continue;
         }
@@ -580,8 +602,8 @@ static void _write_chain(sce_run_ctx_t *ctx, tx_history_t *hist, json_t *spec)
             _uuid5("chain:", t != NULL ? t : "", raw.task_uuid);
             _chain_half_uuid(ctx, e, 1, t != NULL ? t : "", raw.p1_uuid);
             _chain_half_uuid(ctx, e, 2, t != NULL ? t : "", raw.p2_uuid);
-            raw.p1_score = json_number_value(json_object_get(e, "p1"));
-            raw.p2_score = json_number_value(json_object_get(e, "p2"));
+            raw.p1_score_milli = _rp_milli_json(json_object_get(e, "p1"), 0.0);
+            raw.p2_score_milli = _rp_milli_json(json_object_get(e, "p2"), 0.0);
             raw.p1_set = raw.p2_set = true;
             raw.index = -1;
             placement_entry(&raw, &entries[m++]);
@@ -629,8 +651,8 @@ static void _attach_spec_certs(sce_run_ctx_t *ctx, json_t *arr, json_t *spec)
         _uuid5("chain:", task, tk);
         _chain_half_uuid(ctx, spec_e, 1, task, pu[0]);
         _chain_half_uuid(ctx, spec_e, 2, task, pu[1]);
-        double ps[2] = { json_number_value(json_object_get(spec_e, "p1")),
-                         json_number_value(json_object_get(spec_e, "p2")) };
+        int ps[2] = { _rp_milli_json(json_object_get(spec_e, "p1"), 0.0),
+                      _rp_milli_json(json_object_get(spec_e, "p2"), 0.0) };
         json_t *named = json_pack("{s:O}", "cosigners", by);
         json_t *all = json_object();
         for (int k = 0; k < 2; k++)
@@ -686,8 +708,8 @@ static void _attach_spec_half_sigs(sce_run_ctx_t *ctx, json_t *arr, json_t *spec
             continue;
         uuid_t tk;
         _uuid5("chain:", task, tk);
-        double ps[2] = { json_number_value(json_object_get(spec_e, "p1")),
-                         json_number_value(json_object_get(spec_e, "p2")) };
+        int ps[2] = { _rp_milli_json(json_object_get(spec_e, "p1"), 0.0),
+                      _rp_milli_json(json_object_get(spec_e, "p2"), 0.0) };
         const char *forger = json_string_value(json_object_get(spec_e, "half_forged_by"));
         json_t *all = json_object();
         for (int k = 0; k < 2; k++)
@@ -901,8 +923,7 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
             if (!json_is_object(e)) continue;
             int64_t e_id1 = json_integer_value(json_object_get(e, "id1"));
             int64_t e_id2 = json_integer_value(json_object_get(e, "id2"));
-            json_t *s_j = json_object_get(e, "score");
-            double score = json_is_number(s_j) ? json_number_value(s_j) : 1.0;
+            int score = _rp_milli_json(json_object_get(e, "score"), 1.0);
             const char *slug = json_string_value(json_object_get(e, "task_id"));
             uuid_t task_uuid;
             _uuid5("tx:", slug != NULL ? slug : "default", task_uuid);
@@ -958,7 +979,7 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
                         json_object_get(e, "subject")));
                     if (vu != NULL && su != NULL)
                         reputation_install_tx_attested_scoped(*vu,
-                            json_number_value(json_object_get(e, "p1_score")),
+                            _rp_milli_json(json_object_get(e, "p1_score"), 0.0),
                             json_string_value(json_object_get(e, "p1_channel")),
                             *su,
                             json_string_value(json_object_get(e, "evidence_digest")),
@@ -969,10 +990,8 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
                 if (slug == NULL || p1_id == NULL) continue;
                 json_t *p1s_j = json_object_get(e, "p1_score");
                 json_t *p2s_j = json_object_get(e, "p2_score");
-                double p1_score = json_is_real(p1s_j) ? json_real_value(p1s_j)
-                    : json_is_integer(p1s_j) ? (double)json_integer_value(p1s_j) : 0.0;
-                double p2_score = json_is_real(p2s_j) ? json_real_value(p2s_j)
-                    : json_is_integer(p2s_j) ? (double)json_integer_value(p2s_j) : 0.0;
+                int p1_score = _rp_milli_json(p1s_j, 0.0);
+                int p2_score = _rp_milli_json(p2s_j, 0.0);
 
                 uuid_t task_uuid;
                 _uuid5("tx:", slug, task_uuid);
@@ -1048,8 +1067,8 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
                 _chain_half_uuid(ctx, lc_e, 1, task, p1u);
                 _chain_half_uuid(ctx, lc_e, 2, task, p2u);
                 reputation_install_tx_pair(tk,
-                    p1u, json_number_value(json_object_get(lc_e, "p1")),
-                    p2u, json_number_value(json_object_get(lc_e, "p2")));
+                    p1u, _rp_milli_json(json_object_get(lc_e, "p1"), 0.0),
+                    p2u, _rp_milli_json(json_object_get(lc_e, "p2"), 0.0));
             }
     }
 
@@ -1326,13 +1345,13 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
 #define RP_SIG_HEX_LEN (crypto_sign_BYTES * 2)
 
 static size_t _rp_slash_designation(const char *slasher, const char *target,
-                                    const char *reason, double floor,
+                                    const char *reason, int floor_milli,
                                     int64_t epoch, uint8_t *out, size_t cap)
 {
     static const char tag[] = "AT-SLASH";
     size_t tag_len = sizeof(tag);   /* includes the NUL separator */
     int n = snprintf((char *)out + tag_len, cap - tag_len,
-                     "%s|%s|%s|%.6f|%lld", slasher, target, reason, floor,
+                     "%s|%s|%s|%d|%lld", slasher, target, reason, floor_milli,
                      (long long)epoch);
     if (n < 0 || (size_t)n >= cap - tag_len)
         return 0;
@@ -1391,7 +1410,7 @@ static bool _rp_sign_as(sce_run_ctx_t *ctx, const char *pid,
 static void _rp_half_elements(sce_run_ctx_t *ctx, json_t *payload,
                               const char *to_id, const char *scorer_id,
                               const char *task_slug, const uuid_t task,
-                              double score, const char *channel, json_t *body)
+                              int score, const char *channel, json_t *body)
 {
     const char *names = json_string_value(json_object_get(payload, "names"));
     json_t *held = json_object_get(json_object_get(g_fixtures, "tx_history"), to_id);
@@ -1412,7 +1431,7 @@ static void _rp_half_elements(sce_run_ctx_t *ctx, json_t *payload,
     const uuid_t *signed_name = signed_pid != NULL ? _uuid_of(ctx, signed_pid) : named;
     const char *forger = json_string_value(json_object_get(payload, "half_forged_by"));
     json_t *hs_j = json_object_get(payload, "half_score");
-    double signed_score = json_is_number(hs_j) ? json_number_value(hs_j) : score;
+    int signed_score = json_is_number(hs_j) ? _rp_milli(json_number_value(hs_j)) : score;
     if (scorer == NULL || named == NULL || signed_name == NULL)
         return;
     if (!json_is_true(json_object_get(payload, "unnamed")))
@@ -1641,8 +1660,8 @@ static int _rp_place_value(sce_run_ctx_t *ctx, json_t *payload, json_t **out_val
         uuid_copy(tx->p1_uuid, *ua);
         uuid_copy(tx->p2_uuid, *ub);
         tx->p1_set = tx->p2_set = true;
-        tx->p1_score = json_number_value(json_object_get(e, "p1_score"));
-        tx->p2_score = json_number_value(json_object_get(e, "p2_score"));
+        tx->p1_score_milli = _rp_milli_json(json_object_get(e, "p1_score"), 0.0);
+        tx->p2_score_milli = _rp_milli_json(json_object_get(e, "p2_score"), 0.0);
         const char *pa = a, *pb = b;
         char sa[UUID_STRING_LEN + 1], sb[UUID_STRING_LEN + 1];
         uuid_unparse_lower(tx->p1_uuid, sa);
@@ -1655,8 +1674,8 @@ static int _rp_place_value(sce_run_ctx_t *ctx, json_t *payload, json_t **out_val
             transaction_t t = *tx;
             uuid_copy(tx->p1_uuid, t.p2_uuid);
             uuid_copy(tx->p2_uuid, t.p1_uuid);
-            tx->p1_score = t.p2_score;
-            tx->p2_score = t.p1_score;
+            tx->p1_score_milli = t.p2_score_milli;
+            tx->p2_score_milli = t.p1_score_milli;
             pa = b;
             pb = a;
         }
@@ -1667,9 +1686,9 @@ static int _rp_place_value(sce_run_ctx_t *ctx, json_t *payload, json_t **out_val
         uuid_unparse_lower(tx->p2_uuid, sb);
         json_object_set_new(d, "task", json_string(task_str));
         json_object_set_new(d, "p1", json_string(sa));
-        json_object_set_new(d, "p1_score", json_real(tx->p1_score));
+        json_object_set_new(d, "p1_score_milli", json_integer(tx->p1_score_milli));
         json_object_set_new(d, "p2", json_string(sb));
-        json_object_set_new(d, "p2_score", json_real(tx->p2_score));
+        json_object_set_new(d, "p2_score_milli", json_integer(tx->p2_score_milli));
         if (!json_is_true(json_object_get(e, "uncertified")))
         {
             json_t *named = json_object_get(e, "cosigners");
@@ -1690,7 +1709,7 @@ static int _rp_place_value(sce_run_ctx_t *ctx, json_t *payload, json_t **out_val
                 uint8_t desig[512];
                 size_t dlen = commit_designation(side == 0 ? tx->p1_uuid : tx->p2_uuid,
                                                  tx->task_uuid,
-                                                 side == 0 ? tx->p1_score : tx->p2_score,
+                                                 side == 0 ? tx->p1_score_milli : tx->p2_score_milli,
                                                  NULL, desig, sizeof(desig));
                 json_object_set_new(d, side == 0 ? "p1_cert" : "p2_cert",
                                     _rp_cosignatures(ctx, who, desig, dlen, NULL));
@@ -1706,7 +1725,7 @@ static int _rp_place_value(sce_run_ctx_t *ctx, json_t *payload, json_t **out_val
                 size_t dlen = half_designation(tx->task_uuid,
                                                side == 0 ? tx->p1_uuid : tx->p2_uuid,
                                                side == 0 ? tx->p2_uuid : tx->p1_uuid,
-                                               side == 0 ? tx->p1_score : tx->p2_score,
+                                               side == 0 ? tx->p1_score_milli : tx->p2_score_milli,
                                                NULL, desig, sizeof(desig));
                 char sig[RP_SIG_HEX_LEN + 1] = {0};
                 if (_rp_sign_as(ctx, side == 0 ? pa : pb, desig, dlen, sig))
@@ -1863,7 +1882,7 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                     }
                 }
             }
-            double sc = json_is_number(s_j) ? json_number_value(s_j) : 1.0;
+            int sc = _rp_milli_json(s_j, 1.0);
             if (slug != NULL)
             {
                 uuid_t task_uuid;
@@ -1882,7 +1901,7 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     }
     else if (strcmp(function, REP_PROTO_TX) == 0)
     {
-        double score = 1.0;
+        int score = _rp_milli(1.0);   /* thousandths, as the wire carries */
         const char *task_slug = NULL;
         /* Evidence channel (R+D.md §12.8), passed through VERBATIM and
          * deliberately unvalidated here: a scenario needs to be able to send a
@@ -1893,9 +1912,7 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         const char *channel = NULL;
         if (payload && json_is_object(payload))
         {
-            json_t *s_j = json_object_get(payload, "score");
-            if (json_is_real(s_j))    score = json_real_value(s_j);
-            else if (json_is_integer(s_j)) score = (double)json_integer_value(s_j);
+            score = _rp_milli_json(json_object_get(payload, "score"), 1.0);
             json_t *t_j = json_object_get(payload, "task_id");
             if (json_is_string(t_j)) task_slug = json_string_value(t_j);
             json_t *c_j = json_object_get(payload, "channel");
@@ -1905,7 +1922,7 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_object_set_new(body, "id1", json_integer(id1));
         json_object_set_new(body, "id2", json_integer(id2));
         json_object_set_new(body, "peer_uuid", json_string(proposer_str));
-        json_object_set_new(body, "score", json_real(score));
+        json_object_set_new(body, "score_milli", json_integer(score));
         /* Omitted when the scenario says nothing, which is how a receiver reads
          * "task outcome" -- so every pre-channel scenario keeps its meaning. */
         if (channel)
@@ -1939,14 +1956,12 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     {
         /* Phase 3 — (task_uuid, peer_uuid, score).  Mirrors the
          * commit-broadcast payload built by handle_accepted. */
-        double score = 1.0;
+        int score = _rp_milli(1.0);   /* thousandths, as the wire carries */
         const char *task_slug = NULL;
         const char *channel = NULL;
         if (payload && json_is_object(payload))
         {
-            json_t *s_j = json_object_get(payload, "score");
-            if (json_is_real(s_j))    score = json_real_value(s_j);
-            else if (json_is_integer(s_j)) score = (double)json_integer_value(s_j);
+            score = _rp_milli_json(json_object_get(payload, "score"), 1.0);
             json_t *t_j = json_object_get(payload, "task_id");
             if (json_is_string(t_j)) task_slug = json_string_value(t_j);
             json_t *c_j = json_object_get(payload, "channel");
@@ -1954,7 +1969,7 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         }
         body = json_object();
         json_object_set_new(body, "peer_uuid", json_string(proposer_str));
-        json_object_set_new(body, "score", json_real(score));
+        json_object_set_new(body, "score_milli", json_integer(score));
         /* The evidence channel is part of the committed fact (R+D.md §12.8),
          * so a scenario can drive one; omitted when the scenario names none,
          * which keeps every pre-channel vector byte-identical. */
@@ -1978,8 +1993,8 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                 /* certified_score: cut over a DIFFERENT score than the one
                  * committed (the binding's negative control). */
                 json_t *cs_j = json_object_get(payload, "certified_score");
-                double cert_score = json_is_number(cs_j)
-                    ? json_number_value(cs_j) : score;
+                int cert_score = json_is_number(cs_j)
+                    ? _rp_milli(json_number_value(cs_j)) : score;
                 uint8_t desig[512];
                 size_t dlen = commit_designation(*proposer_uuid, task_uuid,
                                                  cert_score, channel, desig,
@@ -2091,8 +2106,12 @@ static int _build_inbound(sce_run_ctx_t *ctx,
             if (arr != NULL && tamper != NULL && json_is_true(tamper)
                 && json_array_size(arr) >= 2)
             {
+                /* Any other valid score: the link, not the range check, is
+                 * what must catch it. Mirrors the Python adapter. */
                 json_t *e1 = json_array_get(arr, 1);
-                json_object_set_new(e1, "p2_score", json_real(-1.0));
+                json_int_t was = json_integer_value(json_object_get(e1, "p2_score_milli"));
+                json_object_set_new(e1, "p2_score_milli",
+                                    json_integer((was + 1) % (TX_SCORE_SCALE + 1)));
             }
             /* from: N sends the chain from its Nth entry on, as a peer whose
              * window has moved past the start would. */
@@ -2228,7 +2247,7 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         const char *digest =
             "abababababababababababababababababababababababababababababababab";
         const char *scope = NULL;
-        double score = 0.3;
+        int score = _rp_milli(0.3);
         if (payload && json_is_object(payload))
         {
             json_t *j = json_object_get(payload, "verifier");
@@ -2242,7 +2261,7 @@ static int _build_inbound(sce_run_ctx_t *ctx,
             j = json_object_get(payload, "evidence_digest");
             if (json_is_string(j)) digest = json_string_value(j);
             j = json_object_get(payload, "score");
-            if (json_is_number(j)) score = json_number_value(j);
+            if (json_is_number(j)) score = _rp_milli(json_number_value(j));
         }
         const uuid_t *vu = _uuid_of(ctx, verifier_pid);
         const uuid_t *su = _uuid_of(ctx, subject_pid);
@@ -2259,12 +2278,12 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         uuid_t tk;
         tx_attest_task_uuid(*vu, *su, digest, tk);
         uuid_unparse_lower(tk, t_str);
-        /* "AT-ATTEST\0" verifier|subject|task|%.17g|channel|digest[|scope] */
+        /* "AT-ATTEST\0" verifier|subject|task|score_milli|channel|digest[|scope] */
         uint8_t desig[RP_DESIG_MAX];
         static const char tag[] = "AT-ATTEST";
         size_t dlen = 0;
         int n = snprintf((char *)desig + sizeof(tag), sizeof(desig) - sizeof(tag),
-                         "%s|%s|%s|%.17g|%s|%s%s%s", v_str, s_str, t_str, score,
+                         "%s|%s|%s|%d|%s|%s%s%s", v_str, s_str, t_str, score,
                          channel, digest, scope != NULL ? "|" : "",
                          scope != NULL ? scope : "");
         if (n > 0 && (size_t)n < sizeof(desig) - sizeof(tag))
@@ -2284,9 +2303,9 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         }
         else
         {
-            body = json_pack("{s:s, s:s, s:f, s:s, s:s, s:s}",
+            body = json_pack("{s:s, s:s, s:i, s:s, s:s, s:s}",
                              "verifier_uuid", v_str, "subject_uuid", s_str,
-                             "score", score, "channel", channel,
+                             "score_milli", score, "channel", channel,
                              "evidence_digest", digest, "group_uuid", "");
             if (scope != NULL)
                 json_object_set_new(body, "attest_scope", json_string(scope));
@@ -2302,17 +2321,15 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         /* Slashing — plain JSON objects (per-implementation shape;
          * byte_pinning:false checks state equivalence). target resolves a
          * participant pid -> uuid; floor_score/epoch come from the step
-         * payload. C's handlers read target_uuid/floor_score/epoch. */
+         * payload. C's handlers read target_uuid/floor_milli/epoch. */
         const char *target_pid = from_id;
-        double floor = 0.0;
+        int floor = 0;   /* thousandths */
         int64_t epoch = 1;
         if (payload && json_is_object(payload))
         {
             json_t *t = json_object_get(payload, "target");
             if (json_is_string(t)) target_pid = json_string_value(t);
-            json_t *f = json_object_get(payload, "floor_score");
-            if (json_is_real(f)) floor = json_real_value(f);
-            else if (json_is_integer(f)) floor = (double)json_integer_value(f);
+            floor = _rp_milli_json(json_object_get(payload, "floor_score"), 0.0);
             json_t *e = json_object_get(payload, "epoch");
             if (json_is_integer(e)) epoch = json_integer_value(e);
         }
@@ -2338,7 +2355,7 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                                             floor, epoch, desig, sizeof(desig));
         body = json_object();
         json_object_set_new(body, "target_uuid", json_string(target_uuid));
-        json_object_set_new(body, "floor_score", json_real(floor));
+        json_object_set_new(body, "floor_milli", json_integer(floor));
         json_object_set_new(body, "epoch", json_integer(epoch));
         json_object_set_new(body, "reason", json_string(reason));
         json_object_set_new(body, "slasher_uuid", json_string(proposer_str));
@@ -2415,10 +2432,10 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                 if (p1u == NULL || p2u == NULL)
                     continue;
                 tx_history_update(&tmp, task_uuid, *p1u,
-                                  json_number_value(json_object_get(e, "p1_score")),
+                                  _rp_milli_json(json_object_get(e, "p1_score"), 0.0),
                                   json_string_value(json_object_get(e, "p1_channel")));
                 tx_history_update(&tmp, task_uuid, *p2u,
-                                  json_number_value(json_object_get(e, "p2_score")),
+                                  _rp_milli_json(json_object_get(e, "p2_score"), 0.0),
                                   json_string_value(json_object_get(e, "p2_channel")));
             }
         }

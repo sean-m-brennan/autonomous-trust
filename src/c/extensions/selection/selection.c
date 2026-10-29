@@ -145,7 +145,7 @@ bool at_selection_parse(const json_t *doc, at_selection_model_t *out,
         {
             at_sel_cap_t *c = &out->caps[out->num_caps];
             if (strlen(name) > AT_SEL_NAME_LEN)
-                return _fail(err, errlen, "capability %s: name too long", name);
+                return _fail(err, errlen, "capability %.64s...: name too long", name);
             at_strlcpy(c->name, name, sizeof(c->name));
             if (!_policy(spec, &out->def, &c->policy, name, err, errlen))
                 return false;

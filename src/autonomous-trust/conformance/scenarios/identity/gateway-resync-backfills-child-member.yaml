@@ -1,0 +1,57 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: gateway-resync-backfills-child-member
+byte_pinning: false
+description: |
+    A gateway backfills, through identity resync, a member of a cohort it
+    bridges.
+
+    A field peer that joined its cohort before the cohort's gateway was up
+    never reached the gateway's peer list: it missed the confirm broadcast.
+    Identity resync is the recovery path, but it answered only for the
+    primary group's members, so the gateway refused the field peer's signed
+    response as "not in our group" and its relay never subscribed to it. At 96
+    nodes that kept the MQ-800's readings inside its cohort.
+
+    Here gw's primary group is gw alone, and its child cohort lists member.
+    gw's query names member's cohort (a gateway's resync also queries each
+    child cohort it lacks identities for), member answers, and gw records it
+    as a peer.
+
+participants:
+  - id: gw
+    role: group_member
+  - id: member
+    role: group_member
+
+fixtures:
+  groups:
+    member:
+      uuid: "0c000000-0000-4000-8000-0000000000b7"
+      size: 1
+  cohort_tree:
+    nodes:
+      gw:
+        child_group: [member]
+
+steps:
+  - id: 1
+    from: gw
+    to: member
+    function: peer_identity_query
+    payload:
+      group_uuid: "0c000000-0000-4000-8000-0000000000b7"
+      have: []
+
+  - id: 2
+    from: member
+    to: gw
+    function: peer_identity_response
+    in_response_to: 1
+    payload: {}
+
+expected_state:
+  gw:
+    peer_count: 1
+    child_group_count: 1

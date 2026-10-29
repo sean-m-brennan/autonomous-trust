@@ -230,8 +230,9 @@ static size_t _slash_desig(const char *slasher, const char *target,
 {
     static const char tag[] = "AT-SLASH";
     size_t tag_len = sizeof(tag);
-    int n = snprintf((char *)out + tag_len, cap - tag_len, "%s|%s|%s|%.6f|%lld",
-                     slasher, target, reason, floor, (long long)epoch);
+    int n = snprintf((char *)out + tag_len, cap - tag_len, "%s|%s|%s|%d|%lld",
+                     slasher, target, reason, tx_score_to_milli(floor),
+                     (long long)epoch);
     ck_assert(n > 0 && (size_t)n < cap - tag_len);
     memcpy(out, tag, tag_len);
     return tag_len + (size_t)n;
@@ -315,7 +316,7 @@ static json_t *_slash_payload(const char *slasher, const char *target,
     json_object_set_new(p, "slasher_uuid", json_string(slasher));
     json_object_set_new(p, "target_uuid", json_string(target));
     json_object_set_new(p, "reason", json_string(reason));
-    json_object_set_new(p, "floor_score", json_real(floor));
+    json_object_set_new(p, "floor_milli", json_integer(tx_score_to_milli(floor)));
     json_object_set_new(p, "epoch", json_integer(epoch));
     return p;
 }
@@ -330,11 +331,11 @@ DEFINE_TEST(test_slash_designation_bytes_pinned)
     size_t dlen = _slash_desig("11111111-1111-1111-1111-111111111111",
                                "22222222-2222-2222-2222-222222222222",
                                "peer_exclude", 0.1, 7, desig, sizeof(desig));
-    /* Tag, then a NUL, then the pipe-joined fields; the float fixed at 6dp. */
+    /* Tag, then a NUL, then the pipe-joined fields; the floor in thousandths. */
     static const char expected[] =
         "AT-SLASH\0"
         "11111111-1111-1111-1111-111111111111|"
-        "22222222-2222-2222-2222-222222222222|peer_exclude|0.100000|7";
+        "22222222-2222-2222-2222-222222222222|peer_exclude|100|7";
     ck_assert_uint_eq(dlen, sizeof(expected) - 1);
     ck_assert_mem_eq(desig, expected, dlen);
     _end();
@@ -345,12 +346,12 @@ DEFINE_TEST(test_checkpoint_designation_bytes_pinned)
 {
     uint8_t desig[512];
     size_t dlen = _ckpt_desig("11111111-1111-1111-1111-111111111111",
-                              "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556",
+                              "f9bf077e5bfd8ef4cdf5fb0519b70ec51fb7df536515bf16c594a477ce6d5168",
                               7, 0, 3, desig, sizeof(desig));
     static const char expected[] =
         "AT-CKPT\0"
         "11111111-1111-1111-1111-111111111111|"
-        "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556|7|0|3";
+        "f9bf077e5bfd8ef4cdf5fb0519b70ec51fb7df536515bf16c594a477ce6d5168|7|0|3";
     ck_assert_uint_eq(dlen, sizeof(expected) - 1);
     ck_assert_mem_eq(desig, expected, dlen);
     _end();
@@ -708,7 +709,7 @@ DEFINE_TEST(test_checkpoint_final_unattested_root_refused)
     char alice_u[UUID_STRING_LEN + 1];
     _uuid_str(alice->uuid, alice_u);
     const char *root =
-        "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556";
+        "f9bf077e5bfd8ef4cdf5fb0519b70ec51fb7df536515bf16c594a477ce6d5168";
     json_t *p = json_object();
     json_object_set_new(p, "proposer_uuid", json_string(alice_u));
     json_object_set_new(p, "root", json_string(root));
@@ -744,7 +745,7 @@ DEFINE_TEST(test_checkpoint_final_with_quorum_stores_root)
     _uuid_str(bob->uuid, bob_u);
     _uuid_str(carol->uuid, carol_u);
     const char *root =
-        "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556";
+        "f9bf077e5bfd8ef4cdf5fb0519b70ec51fb7df536515bf16c594a477ce6d5168";
 
     uint8_t desig[512];
     size_t dlen = _ckpt_desig(alice_u, root, 4, 0, 3, desig, sizeof(desig));
@@ -802,7 +803,7 @@ DEFINE_TEST(test_originated_round_tallies_a_peer_ack_to_quorum)
     /* A window worth attesting; a checkpoint over nothing is skipped upstream. */
     uuid_t task;
     uuid_generate(task);
-    reputation_install_tx_pair(task, me->uuid, 0.8, bob->uuid, 0.8);
+    reputation_install_tx_pair(task, me->uuid, 800, bob->uuid, 800);
 
     char me_u[UUID_STRING_LEN + 1], bob_u[UUID_STRING_LEN + 1];
     _uuid_str(me->uuid, me_u);
@@ -864,7 +865,7 @@ DEFINE_TEST(test_cosign_of_a_child_group_round_uses_the_proposers_chain_name)
 
     uuid_t task;
     uuid_generate(task);
-    reputation_install_tx_pair(task, me->uuid, 0.8, gateway->uuid, 0.8);
+    reputation_install_tx_pair(task, me->uuid, 800, gateway->uuid, 800);
 
     char gw_u[UUID_STRING_LEN + 1];
     _uuid_str(gateway->uuid, gw_u);
@@ -920,7 +921,7 @@ DEFINE_TEST(test_a_proposers_emitted_final_is_accepted_by_a_member)
 
     uuid_t task;
     uuid_generate(task);
-    reputation_install_tx_pair(task, me->uuid, 0.8, bob->uuid, 0.8);
+    reputation_install_tx_pair(task, me->uuid, 800, bob->uuid, 800);
     char me_u[UUID_STRING_LEN + 1], bob_u[UUID_STRING_LEN + 1];
     _uuid_str(me->uuid, me_u);
     _uuid_str(bob->uuid, bob_u);
@@ -974,8 +975,8 @@ static void _fork_tasks(void) { for (int i = 0; i < 8; i++) uuid_generate(g_ft[i
 static void _stage_local(const identity_t *p1, const identity_t *p2, const char *letters)
 {
     for (const char *c = letters; *c; c++)
-        reputation_install_tx_pair(g_ft[*c - 'a'], p1->uuid, 0.3 + 0.02 * (*c - 'a'),
-                                   p2->uuid, 0.9 - 0.02 * (*c - 'a'));
+        reputation_install_tx_pair(g_ft[*c - 'a'], p1->uuid, 300 + 20 * (*c - 'a'),
+                                   p2->uuid, 900 - 20 * (*c - 'a'));
 }
 
 static json_t *_peer_chain(const identity_t *p1, const identity_t *p2, const char *letters)
@@ -985,9 +986,9 @@ static json_t *_peer_chain(const identity_t *p1, const identity_t *p2, const cha
     for (const char *c = letters; *c; c++)
     {
         ck_assert_ret_ok(tx_history_update(&h, g_ft[*c - 'a'], p1->uuid,
-                                           0.3 + 0.02 * (*c - 'a'), NULL));
+                                           300 + 20 * (*c - 'a'), NULL));
         ck_assert_ret_ok(tx_history_update(&h, g_ft[*c - 'a'], p2->uuid,
-                                           0.9 - 0.02 * (*c - 'a'), NULL));
+                                           900 - 20 * (*c - 'a'), NULL));
         /* Each scorer signs its own half (R+D.md §14.2): a checkpoint does
          * not excuse a missing one. */
         rps_sign_half(&h, g_ft[*c - 'a'], p1, p2, 0.3 + 0.02 * (*c - 'a'));

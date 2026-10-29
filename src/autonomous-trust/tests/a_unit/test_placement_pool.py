@@ -38,7 +38,7 @@ def _task(n):
     return UUID('00000000-0000-4000-8000-%012d' % n)
 
 
-_SCORES = {A: 0.6, B: 0.8, C: 0.5}
+_SCORES = {A: 600, B: 800, C: 500}
 
 
 def _ready(hist, n, first=B, second=A):
@@ -49,18 +49,18 @@ def _ready(hist, n, first=B, second=A):
 class TestRecordHalf:
     def test_one_half_is_pending_and_two_are_ready(self):
         hist = TransactionHistory()
-        assert hist.record_half(_task(1), A, 0.8) == 'pending'
-        assert hist.record_half(_task(1), B, 0.6) == 'ready'
+        assert hist.record_half(_task(1), A, 800) == 'pending'
+        assert hist.record_half(_task(1), B, 600) == 'ready'
 
     def test_the_same_scorer_again_is_a_duplicate(self):
         hist = TransactionHistory()
-        hist.record_half(_task(1), A, 0.8)
-        assert hist.record_half(_task(1), A, 0.8) == 'dup'
+        hist.record_half(_task(1), A, 800)
+        assert hist.record_half(_task(1), A, 800) == 'dup'
 
     def test_a_third_half_is_a_duplicate(self):
         hist = TransactionHistory()
         _ready(hist, 1)
-        assert hist.record_half(_task(1), C, 0.5) == 'dup'
+        assert hist.record_half(_task(1), C, 500) == 'dup'
 
     def test_the_pool_is_not_the_chain(self):
         hist = TransactionHistory()
@@ -74,7 +74,7 @@ class TestRecordHalf:
         hist = TransactionHistory()
         _ready(hist, 1)
         assert hist.apply_placed(0, hist.ready_items()) == 'applied'
-        assert hist.record_half(_task(1), A, 0.8) == 'placed'
+        assert hist.record_half(_task(1), A, 800) == 'placed'
 
     def test_an_evicted_task_is_tombstoned(self):
         hist = TransactionHistory(max_chain_len=1)
@@ -82,17 +82,17 @@ class TestRecordHalf:
         hist.apply_placed(0, hist.ready_items())
         _ready(hist, 2)
         hist.apply_placed(1, hist.ready_items())
-        assert hist.record_half(_task(1), C, 0.5) == 'tombstoned'
+        assert hist.record_half(_task(1), C, 500) == 'tombstoned'
 
     def test_a_certificate_is_kept_with_its_half(self):
         hist = TransactionHistory()
-        hist.record_half(_task(1), A, 0.8, certificate={'v': 'sig'})
+        hist.record_half(_task(1), A, 800, certificate={'v': 'sig'})
         assert hist.pooled(_task(1)).certificate_of(A) == {'v': 'sig'}
 
     def test_the_pool_keeps_the_newest_chain_length_of_tasks(self):
         hist = TransactionHistory(max_chain_len=2)
         for n in (1, 2, 3):
-            hist.record_half(_task(n), A, 0.8)
+            hist.record_half(_task(n), A, 800)
         assert hist.pooled(_task(1)) is None
         assert hist.pooled(_task(3)) is not None
 
@@ -101,7 +101,7 @@ class TestReadyItems:
     def test_ready_items_are_by_task_and_skip_pending(self):
         hist = TransactionHistory()
         _ready(hist, 3)
-        hist.record_half(_task(2), A, 0.8)
+        hist.record_half(_task(2), A, 800)
         _ready(hist, 1)
         assert [e.task_id for e in hist.ready_items()] == [_task(1), _task(3)]
 
@@ -117,13 +117,13 @@ class TestReadyItems:
         _ready(one, 1, first=B, second=A)
         _ready(two, 1, first=A, second=B)
         e1, e2 = one.ready_items()[0], two.ready_items()[0]
-        assert (e1.p1_id, e1.p1_score, e1.p2_id) == (A, 0.6, B)
+        assert (e1.p1_id, e1.p1_score_milli, e1.p2_id) == (A, 600, B)
         assert e1._canonical_bytes() == e2._canonical_bytes()
 
 
 def _attested(verifier=A, subject=B, digest='ab' * 32):
     return Transaction(attest_task_id(verifier, subject, digest),
-                       p1_id=verifier, p1_score=0.3, p1_channel='probe',
+                       p1_id=verifier, p1_score_milli=300, p1_channel='probe',
                        attested=True, subject_id=subject,
                        evidence_digest=digest)
 

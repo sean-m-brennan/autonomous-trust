@@ -148,6 +148,20 @@ int at_socket_set_nonblock(int sock);
  */
 int at_socket_listener_opts(int sock);
 
+/**
+ * @brief inet_pton, with glibc's strictness on every libc.
+ *
+ * glibc (and Python's ipaddress) refuse an IPv4 octet with a leading zero,
+ * because inet_aton would read "010" as octal 8; uClibc-ng's inet_pton takes
+ * it as decimal 10. A node on such a libc would then accept, and route on, an
+ * address the rest of the fleet rejects. This rejects it everywhere, in a
+ * plain IPv4 address and in the dotted tail of an IPv6 one.
+ *
+ * @return As inet_pton: 1 on success, 0 if @p src does not parse, -1 for a
+ *         bad @p af.
+ */
+int at_inet_pton(int af, const char *src, void *dst);
+
 /** @} */ /* end of internal_utilities */
 
 #endif /* AT_SOCKET_HELPERS_H */

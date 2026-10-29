@@ -38,7 +38,7 @@ steps:
     to: bob
     function: checkpoint propose
     payload:
-      root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+      root: "f9bf077e5bfd8ef4cdf5fb0519b70ec51fb7df536515bf16c594a477ce6d5168"
       epoch: 7
       first_index: 0
       count: 3
@@ -52,7 +52,7 @@ steps:
     in_response_to: 1
     no_propagate: true
     payload:
-      root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+      root: "f9bf077e5bfd8ef4cdf5fb0519b70ec51fb7df536515bf16c594a477ce6d5168"
       epoch: 7
       first_index: 0
       count: 3

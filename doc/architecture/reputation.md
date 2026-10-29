@@ -50,6 +50,48 @@ All four thresholds honor environment overrides, read once at startup, and the
 inspector dashboard reads the same cut-off variable, so its displayed line
 tracks a re-adjusted backend rather than a compiled-in assumption.
 
+### Integer scores
+
+A transaction score crosses the wire, is signed and is hashed as an integer
+number of thousandths, 0 to 1000 for 0.0 to 1.0 (`TX_SCORE_SCALE` in both
+runtimes). The arithmetic that turns scores into a reputation still works in
+doubles. Only the bytes two nodes have to agree on are integers.
+
+The reason is the C library on the smallest targets. Those bytes used to be the
+score's `%.17g` text, and producing and reading that text is the libc's job.
+glibc rounds both directions correctly. uClibc-ng, the libc of SPARC V8 / LEON3
+Linux, does not: it misreads about a quarter of three-decimal values, and prints
+0.1 + 0.2 as a string that does not parse back to the same double. A node on
+such a libc builds different canonical bytes for the same entry, so its entry
+hashes, window roots and every signature over a score disagree with the rest of
+the group, and it refuses their valid data. An integer has one spelling on
+every libc. Doubles that remain on the wire, such as a reputation carried as a
+cross-check, are formatted and parsed by correctly rounded code, never the
+libc: Ryu (`utilities/numfmt.h`) and, inside the vendored jansson, David Gay's
+dtoa (the fork parses with it too, and keeps its state per thread). The C core refuses to start if a self-test finds a conversion it
+depends on is not exact (`AT_ALLOW_INEXACT_FLOAT=1` overrides it, loudly).
+
+Floats stop at the producer. An application still hands `TransactionScore` a
+value from 0.0 to 1.0. It is validated as before (an off-scale value is
+refused, not clamped) and rounded once, half away from zero, as C's
+`lround(score * 1000.0)` rounds it. Python's `score_to_milli` reproduces that
+bit for bit. From there on everything holds the integer: the proposal, the
+round's signatures, the `committed` broadcast, the chain entry, the placement
+value, the pool and evidence files, and the slash floor. A score off the
+wire must be a JSON integer from 0 to 1000. A real is refused even when it is
+integral, so a value from a build that predates this (which sent `0.8`) is
+never misread as thousandths.
+
+The field names changed with the type (`score` became `score_milli`,
+`p1_score` became `p1_score_milli`, `floor_score` became `floor_milli`), and
+the persisted documents bumped their schemas: the pool to 2, the evidence
+document and the attested record to "2". This was a hard cutover. A node from
+before it and a node after it do not interoperate, and the older node's stored
+chain and pool are refused on load and rebuilt, the same safe outcome as any
+other unusable evidence. Every pinned window root in the corpus was regenerated
+from Python and reproduced independently by C, natively and big-endian under
+qemu-sparc.
+
 ### Where a score came from
 
 A score says how well a peer did, and it does not, on its own, say how we know.
@@ -1367,12 +1409,13 @@ canonical form that carries it still loads, and the key is ignored.
 **What is signed.** One certificate per half, so two per entry, because the two
 halves are committed by two rounds:
 
-    "AT-COMMIT\0" scorer "|" task "|" %.17g score "|" channel
+    "AT-COMMIT\0" scorer "|" task "|" score_milli "|" channel
 
-Lowercase uuids, and the channel normalized, so an absent channel and an
-explicit `task_outcome` are one claim with one signature, as they are one entry
-hash. Byte-identical in both runtimes (`commit_designation`), and pinned by a C
-unit test against Python's bytes.
+The score is its integer thousandths ("Integer scores"), the uuids lowercase,
+and the channel normalized, so an absent channel and an explicit
+`task_outcome` are one claim with one signature, as they are one entry
+hash. Byte-identical in both runtimes (`commit_designation`), and pinned by a
+unit test on each side against the same literal.
 
 The group is not covered. An acceptor is never told which of a gateway's chains
 the round lands in, and a group's uuid changes when a merge absorbs it, which
@@ -1441,7 +1484,7 @@ entry about an honest node that the node never agreed to.
 **Every ordinary half is signed by its scorer.** The scorer signs its own half
 and nothing else:
 
-    "AT-HALF\0" task "|" scorer "|" counterparty "|" %.17g score "|" channel
+    "AT-HALF\0" task "|" scorer "|" counterparty "|" score_milli "|" channel
 
 Lowercase uuids and the channel normalized, as `commit_designation`. Index and
 link are not covered, for the reason attestation gives: they differ per node

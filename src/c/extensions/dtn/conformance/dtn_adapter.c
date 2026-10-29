@@ -39,7 +39,7 @@
 
 #define FAILF(...)                                                        \
     do {                                                                  \
-        char _d[320];                                                     \
+        char _d[640];                                                     \
         snprintf(_d, sizeof(_d), __VA_ARGS__);                            \
         at_case_result_set_fail(out, 0, "AssertionError", _d);            \
         return;                                                           \

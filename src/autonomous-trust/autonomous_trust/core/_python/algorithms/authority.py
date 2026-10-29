@@ -56,7 +56,13 @@ class AgreementByAuthority(AgreementProtocol, ABC):
         # behavior; previously this path raised KeyError, which surfaced
         # as a cross-language asymmetry in the
         # agreement/poa-leader-abstains conformance scenario.
+        #
+        # Voters tied at the leader rank are combined by conjunction: every
+        # tied leader who cast a vote must approve (RD_13.1 D7). A dict
+        # lookup kept the last such vote and C kept the first, so a split
+        # between tied leaders depended on runtime and arrival order.
         if not self.voters:
             return False
         leader = max(voter.effective_rank for voter in self.voters)
-        return dict(votes).get(leader, False)
+        at_leader = [approval for rank, approval in votes if rank == leader]
+        return bool(at_leader) and all(at_leader)

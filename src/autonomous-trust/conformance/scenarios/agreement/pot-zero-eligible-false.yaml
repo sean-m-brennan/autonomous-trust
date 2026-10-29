@@ -1,0 +1,66 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: pot-zero-eligible-false
+byte_pinning: false
+description: |
+    With no eligible voters PoT cannot approve. This also pins the default
+    floor: no threshold_tier is given, so the floor is tier 1, and voters
+    at tier 0 are not eligible.
+
+    Setup: three voters at tier 0. All three approve. Zero eligible, so
+    the outcome is false.
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+  - id: carol
+    role: voter
+
+fixtures:
+  impl: trust
+  tiers:
+    alice: 0
+    bob: 0
+    carol: 0
+  myself: carol
+  blobs:
+    blob-x:
+      originator: alice
+      payload: "zero-eligible-payload"
+
+steps:
+  - id: 1
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: |
+        alice (tier 0) approves. Below the default floor.
+  - id: 2
+    from: bob
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: |
+        bob (tier 0) approves. Below the default floor.
+  - id: 3
+    from: carol
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: |
+        carol (tier 0) approves. Below the default floor.
+
+expected_state:
+  agreement:
+    blob-x:
+      outcome: false

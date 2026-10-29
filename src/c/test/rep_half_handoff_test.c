@@ -167,7 +167,7 @@ static void _commit_half_by(process_t *proc, identity_t *scorer,
     uuid_t task;
     ck_assert_int_eq(uuid_parse(task_str, task), 0);
     uint8_t desig[512];
-    size_t dlen = commit_designation(scorer->uuid, task, score, channel, desig,
+    size_t dlen = commit_designation(scorer->uuid, task, tx_score_to_milli(score), channel, desig,
                                      sizeof(desig));
     ck_assert(dlen > 0);
     unsigned char sig[crypto_sign_BYTES];
@@ -178,13 +178,13 @@ static void _commit_half_by(process_t *proc, identity_t *scorer,
     json_t *p = json_object();
     json_object_set_new(p, "task_uuid", json_string(task_str));
     json_object_set_new(p, "peer_uuid", json_string(who));
-    json_object_set_new(p, "score", json_real(score));
+    json_object_set_new(p, "score_milli", json_integer(tx_score_to_milli(score)));
     if (channel != NULL)
         json_object_set_new(p, "channel", json_string(channel));
     json_object_set_new(p, "certificate", json_pack("{s:s}", by, hex));
     /* Whom the half names, and its scorer's own signature (R+D.md §14.2). */
     uint8_t hd[HALF_DESIG_MAX];
-    size_t hlen = half_designation(task, scorer->uuid, names->uuid, score,
+    size_t hlen = half_designation(task, scorer->uuid, names->uuid, tx_score_to_milli(score),
                                    channel, hd, sizeof(hd));
     ck_assert(hlen > 0);
     ck_assert(crypto_sign_detached(sig, NULL, hd, hlen,
@@ -286,7 +286,7 @@ DEFINE_TEST(test_a_half_committed_before_a_join_reaches_the_joiner)
         ck_assert_str_eq(json_string_value(json_object_get(p, "task_uuid")), c.t);
         ck_assert_str_eq(json_string_value(json_object_get(p, "peer_uuid")), me);
         ck_assert_str_eq(json_string_value(json_object_get(p, "channel")), "probe");
-        ck_assert(json_real_value(json_object_get(p, "score")) > 0.89);
+        ck_assert_int_eq(json_integer_value(json_object_get(p, "score_milli")), 900);
         ck_assert_ptr_null(json_object_get(p, "group_uuid"));
     }
     _clear_frames();

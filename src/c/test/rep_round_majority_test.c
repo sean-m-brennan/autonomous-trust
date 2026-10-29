@@ -214,7 +214,7 @@ static void _accept_as(process_t *proc, identity_t *voter, const uuid_t task,
         uuid_t scorer;
         ck_assert_int_eq(uuid_parse(g_req_peer_uuid, scorer), 0);
         uint8_t desig[512];
-        size_t dlen = commit_designation(scorer, task, 0.9, NULL, desig,
+        size_t dlen = commit_designation(scorer, task, 900, NULL, desig,
                                          sizeof(desig));
         ck_assert(dlen > 0);
         unsigned char sig[crypto_sign_BYTES];
@@ -247,7 +247,7 @@ static void _send_tx(process_t *proc, identity_t *proposer, int64_t id1,
     json_object_set_new(p, "id1", json_integer(id1));
     json_object_set_new(p, "id2", json_integer(slot));
     json_object_set_new(p, "peer_uuid", json_string(proposer_str));
-    json_object_set_new(p, "score", json_real(0.8));
+    json_object_set_new(p, "score_milli", json_integer(800));
     json_object_set_new(p, "task_uuid", json_string(task_str));
     json_object_set_new(p, "certify", json_true());
     json_object_set_new(p, "group", json_string(group));

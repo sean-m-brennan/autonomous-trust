@@ -163,7 +163,7 @@ static void _accept(process_t *proc, identity_t *voter, const uuid_t task,
     uuid_t me;
     ck_assert_int_eq(uuid_parse(g_req_peer_uuid, me), 0);
     uint8_t desig[512];
-    size_t dlen = commit_designation(me, task, 0.9, NULL, desig, sizeof(desig));
+    size_t dlen = commit_designation(me, task, 900, NULL, desig, sizeof(desig));
     ck_assert(dlen > 0);
     unsigned char sig[crypto_sign_BYTES];
     ck_assert(crypto_sign_detached(sig, NULL, desig, dlen,
@@ -475,7 +475,7 @@ DEFINE_TEST(test_a_parked_half_expires_or_is_forgotten)
     uuid_generate(c.task);
     uuid_unparse_lower(c.task, c.task_str);
     _park(&c);
-    reputation_install_tx_single(c.task, c.me->uuid, 0.9);
+    reputation_install_tx_single(c.task, c.me->uuid, 900);
     _retry_uncommitted_halves(c.proc, LATER(8));
     ck_assert_uint_eq(g_tx_count, 0);
     ck_assert_uint_eq(reputation_awaiting_commit_count(), 0);
@@ -491,7 +491,7 @@ DEFINE_TEST(test_a_half_already_in_the_chain_is_forgotten)
     cohort_t c;
     _cohort(&c);
     _propose(&c);
-    reputation_install_tx_single(c.task, c.me->uuid, 0.9);
+    reputation_install_tx_single(c.task, c.me->uuid, 900);
 
     g_tx_count = 0;
     _retry_uncommitted_halves(c.proc, LATER(1));

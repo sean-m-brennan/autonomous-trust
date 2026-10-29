@@ -1,0 +1,77 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: pot-majority-tie-rejects
+byte_pinning: false
+description: |
+    PoT needs a strict majority of eligible voters; a tie rejects.
+
+    Setup: four voters, all at tier 1 or above (default floor, all
+    eligible). alice and bob approve, carol and dave reject. 2 of 4 is
+    not more than half, so the outcome is false.
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+  - id: carol
+    role: voter
+  - id: dave
+    role: voter
+
+fixtures:
+  impl: trust
+  tiers:
+    alice: 3
+    bob: 2
+    carol: 2
+    dave: 1
+  myself: dave
+  blobs:
+    blob-x:
+      originator: alice
+      payload: "tie-payload"
+
+steps:
+  - id: 1
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: |
+        alice (tier 3) approves.
+  - id: 2
+    from: bob
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: |
+        bob (tier 2) approves.
+  - id: 3
+    from: carol
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: false
+    description: |
+        carol (tier 2) rejects.
+  - id: 4
+    from: dave
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: false
+    description: |
+        dave (tier 1) rejects. 2 of 4: a tie.
+
+expected_state:
+  agreement:
+    blob-x:
+      outcome: false

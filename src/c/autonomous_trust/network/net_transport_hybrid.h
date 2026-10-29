@@ -162,6 +162,20 @@ int hybrid_group_route_lookup(const hybrid_config_t *cfg,
 int hybrid_route(const hybrid_config_t *cfg, const char *target,
                  logger_t *logger);
 
+/** This node's own address on leg @p leg_index: the leg's configured
+ *  ip4_cidr without its prefix length. Returns 0 and fills @p out, or -1 when
+ *  the index is out of range or the leg has no address of its own. Pure;
+ *  exposed for unit tests. */
+int hybrid_leg_address(const hybrid_config_t *cfg, size_t leg_index,
+                       char *out, size_t out_len);
+
+/** The sender address a frame to @p target names: this node's own address on
+ *  the leg hybrid_route() picks for it. Returns 0 and fills @p out, or -1 when
+ *  no leg routes @p target or that leg has no address of its own. Pure;
+ *  exposed for unit tests. */
+int hybrid_envelope_address(const hybrid_config_t *cfg, const char *target,
+                            char *out, size_t out_len);
+
 extern const net_transport_t hybrid_net_transport;
 
 /* JSON serialization — referenced from the generated config_table_priv.h. */

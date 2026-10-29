@@ -55,8 +55,8 @@ static void _fill_pair(tx_history_t *hist, const uuid_t p1, const uuid_t p2,
     {
         uuid_t task;
         uuid_generate(task);
-        tx_history_update(hist, task, p1, score, NULL);
-        tx_history_update(hist, task, p2, score, NULL);
+        tx_history_update(hist, task, p1, tx_score_to_milli(score), NULL);
+        tx_history_update(hist, task, p2, tx_score_to_milli(score), NULL);
     }
 }
 
@@ -163,7 +163,7 @@ DEFINE_TEST(edited_score_is_detectable)
 
     json_t *doc = _answer_doc(&hist, peer_str);
     json_t *entry = json_array_get(json_object_get(doc, "chain"), 0);
-    json_object_set_new(entry, "p2_score", json_real(0.01));
+    json_object_set_new(entry, "p2_score_milli", json_integer(10));
     ck_assert(!_root_reproduces(doc));
     json_decref(doc);
     tx_history_free(&hist);

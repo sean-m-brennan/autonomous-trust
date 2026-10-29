@@ -66,8 +66,8 @@ static void _place(tx_history_t *h, const int *ns, int n)
     {
         uuid_t t;
         _task(ns[i], t);
-        tx_history_record_half(pool, t, A, 0.6, NULL, NULL);
-        tx_history_record_half(pool, t, B, 0.8, NULL, NULL);
+        tx_history_record_half(pool, t, A, 600, NULL, NULL);
+        tx_history_record_half(pool, t, B, 800, NULL, NULL);
     }
     transaction_t items[PLACE_BATCH_MAX];
     int m = tx_history_ready_items(pool, items, PLACE_BATCH_MAX);
@@ -82,9 +82,9 @@ static void _legacy(tx_history_t *h, int n)
 {
     uuid_t t;
     _task(n, t);
-    tx_history_update(h, t, A, 0.6, NULL);
+    tx_history_update(h, t, A, 600, NULL);
     tx_history_attach_commit_cert(h, t, A, CERT);
-    tx_history_update(h, t, B, 0.8, NULL);
+    tx_history_update(h, t, B, 800, NULL);
     tx_history_attach_commit_cert(h, t, B, CERT);
 }
 
@@ -292,7 +292,7 @@ DEFINE_TEST(test_a_certified_placement_carries_us_across_a_gap)
     ck_assert_str_eq(ours->head_hash, theirs->head_hash);
     uuid_t t1;
     _task(1, t1);
-    ck_assert_int_eq(tx_history_record_half(ours, t1, A, 0.6, NULL, NULL),
+    ck_assert_int_eq(tx_history_record_half(ours, t1, A, 600, NULL, NULL),
                      TX_HALF_TOMBSTONED);
     json_decref(far);
     tx_history_destroy(theirs);
@@ -322,8 +322,8 @@ DEFINE_TEST(test_what_is_taken_leaves_the_pool)
     tx_history_t *ours = _hist(), *theirs = _hist();
     uuid_t t1;
     _task(1, t1);
-    tx_history_record_half(ours, t1, A, 0.6, NULL, NULL);
-    tx_history_record_half(ours, t1, B, 0.8, NULL, NULL);
+    tx_history_record_half(ours, t1, A, 600, NULL, NULL);
+    tx_history_record_half(ours, t1, B, 800, NULL, NULL);
     _place(theirs, (int[]){ 1 }, 1);
     json_t *arr = _seg(theirs, 0);
     tx_reconcile_result_t res;

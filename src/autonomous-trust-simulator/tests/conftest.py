@@ -44,6 +44,23 @@ def pytest_configure(config):
     os.environ['AUTONOMOUS_TRUST_BACKEND'] = backend
 
 
+def pytest_collection_finish(session):
+    """Drop a sys.path entry left behind by a failed ``import cv2``.
+
+    OpenCV's bootstrap puts its own package directory on sys.path and leaves it
+    there when the import fails part-way (e.g. libxcb.so.1 missing). That
+    directory holds a ``typing`` package, so every later spawn/forkserver child
+    inherits the path, imports cv2/typing in place of the stdlib and dies on
+    startup (test_appalachian_inprocess). Test modules that import the video
+    code under try/except (test_video, test_noise) trigger it at collection.
+    """
+    if 'cv2' in sys.modules:
+        return  # cv2 loaded; its path entry is legitimate
+    sys.path[:] = [p for p in sys.path
+                   if not (os.path.basename(p) == 'cv2'
+                           and os.path.isfile(os.path.join(p, '__init__.py')))]
+
+
 @pytest.fixture(scope='session')
 def backend(request):
     """Expose the selected backend name for tests that need it."""

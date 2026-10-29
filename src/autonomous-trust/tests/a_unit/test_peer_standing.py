@@ -42,6 +42,7 @@ from unittest.mock import MagicMock
 import pytest
 from types import SimpleNamespace
 
+from autonomous_trust.core.reputation.reputation import score_to_milli
 from autonomous_trust.core.reputation.repprocess import ReputationProcess
 from autonomous_trust.core.reputation.reputation import TransactionHistory
 from autonomous_trust.core._python.identity.identity import Identity
@@ -244,15 +245,15 @@ class TestUnwind:
         me = rp.identity.uuid
         for i in range(n_before):
             tid = UUID(int=i + 1)
-            rp.history.update(tid, me, TX_SCORE)
-            rp.history.update(tid, peer, TX_SCORE)
+            rp.history.update(tid, me, score_to_milli(TX_SCORE))
+            rp.history.update(tid, peer, score_to_milli(TX_SCORE))
         _stand(rp, peer, STANDING_PROVED, None, 10.0)
         rp._apply_peer_standings({})
         anchor = rp._peer_proved_index['%s|zta' % peer]
         for i in range(n_after):
             tid = UUID(int=1000 + i)
-            rp.history.update(tid, me, TX_SCORE)
-            rp.history.update(tid, peer, TX_SCORE)
+            rp.history.update(tid, me, score_to_milli(TX_SCORE))
+            rp.history.update(tid, peer, score_to_milli(TX_SCORE))
         return anchor
 
     def test_the_anchor_is_the_chain_position_at_proof_time(self):
@@ -491,15 +492,15 @@ def test_a_finding_never_raises_a_peer_known_through_others():
     rp.reputations.update(other, 0.9)
     for _ in range(4):
         tid = uuid4()
-        rp.history.update(tid, other, 0.9)
-        rp.history.update(tid, them, 0.9)
+        rp.history.update(tid, other, 900)
+        rp.history.update(tid, them, 900)
     assert them not in rp.reputations
     rp._compute_reputation(them, MagicMock(), MagicMock())
     first = rp.reputations.current[them]
     # The evidence's mean, not the prior shrunk toward neutral (0.60).
     assert abs(first - 0.9) < 0.01
     tid = uuid4()
-    rp.history.update(tid, other, 0.3)      # `other` scores `them` 0.3
-    rp.history.update(tid, them, 0.9)
+    rp.history.update(tid, other, 300)      # `other` scores `them` 0.3
+    rp.history.update(tid, them, 900)
     rp._compute_reputation(them, MagicMock(), MagicMock())
     assert rp.reputations.current[them] < first

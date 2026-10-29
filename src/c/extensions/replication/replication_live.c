@@ -54,6 +54,7 @@
 #include "replication/replication.h"
 #include "replication/sampling.h"
 #include "utilities/util.h"              /* at_strlcpy */
+#include "utilities/numfmt.h"
 
 #define REPL_GROUPS_MAX 8
 #define REPL_TOMBSTONES 64
@@ -111,7 +112,7 @@ static double _now(void)
 static double _hold_seconds(void)
 {
     const char *raw = getenv("AT_REP_COMMIT_TIMEOUT_SEC");
-    double commit = raw != NULL && raw[0] != '\0' ? atof(raw) : 15.0;
+    double commit = raw != NULL && raw[0] != '\0' ? at_strtod(raw, NULL) : 15.0;
     return 2.0 * (commit > 0.0 ? commit : 15.0);
 }
 
@@ -387,7 +388,7 @@ static void _adjudicate_locked(const process_t *proc, repl_group_t *g)
         snprintf(res[i].peer, sizeof(res[i].peer), "%c", 'a' + i);
         const char *t = g->side[i].has_result ? g->side[i].result : "";
         char *end = NULL;
-        double v = strtod(t, &end);
+        double v = at_strtod(t, &end);
         res[i].is_number = t[0] != '\0' && end != NULL && *end == '\0';
         res[i].num = v;
         at_strlcpy(res[i].text, t, sizeof(res[i].text));

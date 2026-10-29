@@ -21,6 +21,8 @@
  *  @{
  */
 
+#include <stdint.h>
+
 #include "array.h"
 #include "data.h"
 #include "utilities/exception.h"
@@ -32,7 +34,11 @@ typedef struct
     smrt_ptr_t;
     map_key_t key;
     data_t *value;
-    size_t hash;
+    /* The full 64-bit hash, not size_t: on a 32-bit target size_t would
+     * truncate it, and every index recomputed from the stored value on a
+     * resize or a deletion would then disagree with the one a lookup
+     * computes from the key (2/3 of 2000 keys lost on SPARC). */
+    uint64_t hash;
 } map_item_t;
 
 #define MAP_HASHKEY_BYTES 16  /* matches MAP_HASHKEY_BYTES from libsodium */

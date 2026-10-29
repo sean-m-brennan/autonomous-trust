@@ -110,7 +110,7 @@ catch-up sub-protocol is *verifiable* rather than merely social.
  appended, `TransactionHistory` sets `tx.prev_hash` to the running head digest and
  advances `_head_hash = tx.entry_hash()`. `entry_hash` is
  `blake2b(canonical_bytes ‖ prev_hash)` over a language-agnostic serialization
- (pipe-joined fields, `%.17g` floats, lowercase-hyphenated UUIDs). `verify_chain_links`
+ (pipe-joined fields, scores as integer thousandths, lowercase-hyphenated UUIDs). `verify_chain_links`
  rejects any segment whose adjacent `prev_hash`/`entry_hash` linkage is broken, and
  `catchup()` runs it before replaying a received segment, so a peer (or a corrupted
  transfer) cannot slip an altered committed entry past the sync. C twin:

@@ -451,8 +451,8 @@ def _seed_window_and_checkpoint(rp, n=4):
     task_ids = []
     for _ in range(n):
         tid, p1, p2 = uuid4(), uuid4(), uuid4()
-        rp.history.update(tid, p1, 0.7)
-        rp.history.update(tid, p2, 0.5)
+        rp.history.update(tid, p1, 700)
+        rp.history.update(tid, p2, 500)
         task_ids.append(tid)
     rp._checkpoint = Checkpoint(
         proposer_uuid=rp.identity.uuid, root=rp.history.window_root(),
