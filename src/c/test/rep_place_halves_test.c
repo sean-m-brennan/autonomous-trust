@@ -149,8 +149,8 @@ static void _offer(process_t *proc, bool certify, bool name_group)
     uuid_generate(t);
     uuid_unparse_lower(t, task);
     uuid_unparse_lower(p[0]->uuid, by);
-    json_t *tx = json_pack("{s:I, s:I, s:s, s:f, s:s}", "id1", (json_int_t)7000,
-                           "id2", (json_int_t)1, "peer_uuid", by, "score", 0.9,
+    json_t *tx = json_pack("{s:I, s:I, s:s, s:i, s:s}", "id1", (json_int_t)7000,
+                           "id2", (json_int_t)1, "peer_uuid", by, "score_milli", 900,
                            "task_uuid", task);
     if (certify)
         json_object_set_new(tx, "certify", json_true());

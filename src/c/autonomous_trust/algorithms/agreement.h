@@ -100,9 +100,15 @@ typedef enum {
 #define AUTHORITY_THRESHOLD_DERIVE (-1)
 
 /* Pass to agreement_by_trust_create's @c threshold_tier arg to select
- * dynamic top-1/3 derivation from the current voter set (mirrors PoA;
- * see trust.py:32-40). Any negative value works. */
+ * the default threshold, TRUST_DEFAULT_THRESHOLD_TIER. Any negative value
+ * works. */
 #define TRUST_THRESHOLD_DERIVE (-1)
+
+/* PoT's default eligibility floor: tier 1, reputation >= 0.50 in the
+ * reputation tier floors. Mirrors Python
+ * AgreementByTrust.DEFAULT_THRESHOLD_TIER; a change here MUST land in
+ * Python at the same time. */
+#define TRUST_DEFAULT_THRESHOLD_TIER 1
 
 typedef struct agreement_protocol_s agreement_protocol_t;
 
@@ -154,7 +160,7 @@ struct agreement_protocol_s {
         } work;
         /** @brief Valid when @c type == @ref AGREEMENT_TRUST. */
         struct {
-            int threshold_tier;                            /**< Minimum tier that counts. -1 = derive top-1/3. */
+            int threshold_tier;                            /**< Minimum tier that may vote. -1 = TRUST_DEFAULT_THRESHOLD_TIER. */
         } trust;
     } state;
 };
@@ -249,12 +255,15 @@ int agreement_by_authority_create(agreement_voter_t *myself,
 /**
  * Construct an AGREEMENT_TRUST (PoT) protocol.
  *
- * Parallel to agreement_by_authority_create but reads voter.tier
- * instead of voter.rank. Pass a non-negative @p threshold_tier to pin
- * the cutoff explicitly, or @ref TRUST_THRESHOLD_DERIVE (-1) to let
- * the protocol derive the threshold dynamically from the current
- * voter set as the top-1/3 cutoff. Mirrors Python
- * AgreementByTrust (trust.py); see doc/architecture/trust-tiers.md §10.
+ * A voter is eligible when its tier is at or above the threshold. The
+ * blob is approved when more than half of the eligible voters cast an
+ * approval. An eligible voter that does not vote counts against, a tie
+ * rejects, and below-threshold votes are dropped. There is no leader:
+ * the rule holds while fewer than half of the eligible voters are
+ * Byzantine (RD_13.1). Pass a non-negative @p threshold_tier to pin the
+ * floor explicitly, or @ref TRUST_THRESHOLD_DERIVE (-1) for
+ * @ref TRUST_DEFAULT_THRESHOLD_TIER. Mirrors Python AgreementByTrust
+ * (trust.py); see doc/architecture/trust-tiers.md §10.
  */
 int agreement_by_trust_create(agreement_voter_t *myself,
                               agreement_voter_t *others, int other_count,
@@ -334,6 +343,18 @@ int agreement_prove(agreement_protocol_t *proto, merkle_blob_t *blob,
   disjoint behaviors;
   complete behaviors;
 */
+/**
+ * Store a vote on @p blob for agreement_finalize to count.
+ *
+ * Caller obligation: authenticate the vote before calling. The C core
+ * does not check @p sig against the voter's key (every built-in
+ * pre_verify accepts it), and agreement_finalize trusts that each stored
+ * proof's uuid names the voter that signed it. The identity history
+ * meets this through identity_history_verify_object. Python's
+ * AgreementProtocol.finalize checks signatures itself, so a new C caller
+ * outside the identity history must add the check, or move it into the
+ * core (RD_13.1 D8).
+ */
 bool agreement_verify(agreement_protocol_t *proto, merkle_blob_t *blob,
                       agreement_proof_t *proof, const uint8_t *sig, size_t sig_len);
 

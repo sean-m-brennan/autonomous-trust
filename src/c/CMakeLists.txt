@@ -301,14 +301,68 @@ else()
     message(FATAL_ERROR "Required dependency libsodium not found.")
 endif()
 
-# jansson
-find_path(LIBJANSSON_INCLUDE_DIR jansson.h HINTS ${CONDA_ROOT})
-find_library(LIBJANSSON_LIBRARY NAMES jansson HINTS ${CONDA_ROOT})
-include_directories(${LIBJANSSON_INCLUDE_DIR})
-if(LIBJANSSON_LIBRARY)
-    message("-- Found libjansson at ${LIBJANSSON_LIBRARY}")
+# Ryu (shortest-decimal d2s) for JCS number formatting.  Pulled in as a
+# git submodule under third_party/ryu/; the upstream repo's C sources live
+# in its `ryu/` subdir, so source paths read `third_party/ryu/ryu/...`.
+# Includes go via `ryu/ryu.h` — the include-dir at `third_party/ryu/`
+# lets that resolve to `third_party/ryu/ryu/ryu.h`.
+#
+# Build target defined here at top level so both the conformance runner
+# and the jcs_test target can link against it.
+#
+# The library itself also carries Ryu: utilities/numfmt.c formats ("%.17g")
+# and parses doubles with d2fixed.c's d2exp and s2d.c instead of libc, whose
+# results are not correctly rounded on every target (uClibc-ng, on SPARC).
+# The objects are compiled once, position-independent, into at_ryu_obj and
+# linked into both libautonomous_trust builds as well as at_ryu.
+add_library(at_ryu_obj OBJECT
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu/ryu/d2s.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu/ryu/d2fixed.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu/ryu/s2d.c
+)
+set_target_properties(at_ryu_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(at_ryu_obj PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu
+)
+# Ryu emits a few unused-variable warnings on some compilers; suppress
+# rather than patch the submodule.
+target_compile_options(at_ryu_obj PRIVATE -O2 -Wno-error -Wno-unused-function)
+add_library(at_ryu STATIC $<TARGET_OBJECTS:at_ryu_obj>)
+target_include_directories(at_ryu PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu
+)
+
+# numfmt.c is the one library source that includes Ryu's headers
+set_source_files_properties(autonomous_trust/utilities/numfmt.c PROPERTIES
+    INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu)
+
+# jansson: the vendored submodule by default (cmake/vendored-jansson.cmake
+# says why). AT_SYSTEM_JANSSON links the system libjansson instead, whose
+# number conversions are then the libc's: fine on glibc, wrong on uClibc-ng,
+# and the float self-test refuses to start where they are wrong.
+option(AT_SYSTEM_JANSSON "Link the system libjansson instead of the vendored copy" OFF)
+if(AT_SYSTEM_JANSSON)
+    set(AT_PC_JANSSON_REQUIRES " jansson")
+    set(AT_PC_JANSSON_CFLAGS "")
+    set(AT_PC_JANSSON_LIBS_PRIVATE "")
+    find_path(LIBJANSSON_INCLUDE_DIR jansson.h HINTS ${CONDA_ROOT})
+    find_library(LIBJANSSON_LIBRARY NAMES jansson HINTS ${CONDA_ROOT})
+    include_directories(${LIBJANSSON_INCLUDE_DIR})
+    if(LIBJANSSON_LIBRARY)
+        message("-- Found libjansson at ${LIBJANSSON_LIBRARY}")
+    else()
+        message(FATAL_ERROR "Required dependency libjansson not found.")
+    endif()
 else()
-    message(FATAL_ERROR "Required dependency libjansson not found.")
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/vendored-jansson.cmake)
+    set(LIBJANSSON_LIBRARY ${AT_JANSSON_TARGET})
+    # <jansson.h> must find the wrapper first: ahead of any system copy, and
+    # ahead of jansson's own build dir, which holds an unrenamed jansson.h
+    # beside the jansson_config.h the wrapper needs. Each BEFORE prepends,
+    # so the wrapper goes last.
+    include_directories(BEFORE ${AT_JANSSON_CONFIG_DIR})
+    include_directories(BEFORE ${AT_JANSSON_WRAPPER_DIR})
+    message("-- Using vendored jansson from ${AT_JANSSON_SOURCE_DIR}")
 endif()
 
 # protobuf
@@ -577,6 +631,8 @@ set(libsrc
     autonomous_trust/utilities/at_jansson.c
     autonomous_trust/utilities/b64.c
     autonomous_trust/utilities/clock.c
+    autonomous_trust/utilities/float_selftest.c
+    autonomous_trust/utilities/numfmt.c
     autonomous_trust/utilities/err_str.c
     autonomous_trust/utilities/exception.c
     autonomous_trust/utilities/freshness.c
@@ -633,6 +689,8 @@ set(libhdr
     autonomous_trust/structures/map.h
     autonomous_trust/structures/merkle.h
     autonomous_trust/utilities/clock.h
+    autonomous_trust/utilities/float_selftest.h
+    autonomous_trust/utilities/numfmt.h
     autonomous_trust/utilities/exception.h
     autonomous_trust/utilities/logger.h
     autonomous_trust/utilities/message.h
@@ -753,8 +811,11 @@ function(protoc_c_gen _proto _full_proto _dir)
         OUTPUT ${PROTO_BINARY_DIR}/${_dir}/${_base}.pb-c.h ${_pb_c_src}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${PROTO_BINARY_DIR}
         COMMAND ${Protobuf_PROTOC_EXECUTABLE} --c_out ${PROTO_BINARY_DIR} -I${PROTOBUF_INCLUDE_DIR} -I${PROTO_SOURCE_DIR} ${_full_proto}
+        # unpack casts trip -Wcast-align on 32-bit targets; see the script
+        COMMAND ${CMAKE_COMMAND} -DPB_C_SRC=${_pb_c_src} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/pb-c-unpack-align.cmake
         COMMENT "Building protocol buffer C sources from ${_proto}"
         DEPENDS ${_full_proto} ${LIBPROTOBUF_C_LIBRARY} ${LIBPROTOBUF_LIBRARY} # ${PROTOC_C_EXE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/cmake/pb-c-unpack-align.cmake
         VERBATIM
     )
     set(proto_c_src ${proto_c_src} ${_pb_c_src} PARENT_SCOPE)
@@ -805,25 +866,8 @@ add_custom_target(proto_python DEPENDS ${proto_py_src})
 
 
 
-# Ryu (shortest-decimal d2s) for JCS number formatting.  Pulled in as a
-# git submodule under third_party/ryu/; the upstream repo's C sources live
-# in its `ryu/` subdir, so source paths read `third_party/ryu/ryu/...`.
-# Includes go via `ryu/ryu.h` — the include-dir at `third_party/ryu/`
-# lets that resolve to `third_party/ryu/ryu/ryu.h`.
-#
-# Build target defined here at top level so both the conformance runner
-# and the jcs_test target can link against it.
-add_library(at_ryu STATIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu/ryu/d2s.c
-)
-target_include_directories(at_ryu PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu
-)
-# Ryu emits a few unused-variable warnings on some compilers; suppress
-# rather than patch the submodule.
-target_compile_options(at_ryu PRIVATE -O2 -Wno-error -Wno-unused-function)
-
-add_library(autonomous_trust SHARED ${libsrc} ${libhdr} ${proto_c_src} ${table_hdrs})
+add_library(autonomous_trust SHARED ${libsrc} ${libhdr} ${proto_c_src} ${table_hdrs}
+    $<TARGET_OBJECTS:at_ryu_obj>)
 set_target_properties(autonomous_trust PROPERTIES COMPILE_FLAGS "${lib_compile_flags}")
 # The shared library names its own dependencies. It used to leave them to each
 # final executable (a .so may carry unresolved symbols), which Apple's linker
@@ -835,7 +879,8 @@ target_sources(autonomous_trust PUBLIC ${libsrc}
     BASE_DIRS ${CMAKE_CURRENT_BINARY_DIR} FILES ${genhdr}
     )
 
-add_library(autonomous_trust_static STATIC ${libsrc} ${libhdr} ${proto_c_src} ${table_hdrs})
+add_library(autonomous_trust_static STATIC ${libsrc} ${libhdr} ${proto_c_src} ${table_hdrs}
+    $<TARGET_OBJECTS:at_ryu_obj>)
 set_target_properties(autonomous_trust_static PROPERTIES
     OUTPUT_NAME autonomous_trust
     COMPILE_FLAGS "${lib_compile_flags}"
@@ -1490,6 +1535,18 @@ add_executable(hybrid_route_test test/hybrid_route_test.c)
 set_source_files_properties(test/hybrid_route_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(hybrid_route_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME hybrid_route_test COMMAND $<TARGET_FILE:hybrid_route_test>)
+add_executable(net_leg_address_test test/net_leg_address_test.c)
+set_source_files_properties(test/net_leg_address_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_leg_address_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME net_leg_address_test COMMAND $<TARGET_FILE:net_leg_address_test>)
+add_executable(gateway_update_scope_test test/gateway_update_scope_test.c)
+set_source_files_properties(test/gateway_update_scope_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(gateway_update_scope_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME gateway_update_scope_test COMMAND $<TARGET_FILE:gateway_update_scope_test>)
+add_executable(join_retry_test test/join_retry_test.c)
+set_source_files_properties(test/join_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(join_retry_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME join_retry_test COMMAND $<TARGET_FILE:join_retry_test>)
 
 # IPv6 CIDR matching — split into its own binary to stay under the
 # RUN_TESTS 9-arg cap in test_setup.h.
@@ -1821,11 +1878,20 @@ set(CPACK_COMPONENT_CORE_DESCRIPTION
     "Autonomous Trust C library: shared and static libraries, headers, pkg-config file")
 set(CPACK_DEBIAN_CORE_PACKAGE_NAME autonomous-trust-devel)
 set(CPACK_DEBIAN_CORE_PACKAGE_SHLIBDEPS ON)
+# jansson only when linked from the system: the vendored copy is inside
+# libautonomous_trust (cmake/vendored-jansson.cmake).
+if(AT_SYSTEM_JANSSON)
+    set(_at_deb_jansson "libjansson-dev, ")
+    set(_at_rpm_jansson "jansson-devel, ")
+else()
+    set(_at_deb_jansson "")
+    set(_at_rpm_jansson "")
+endif()
 set(CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
-    "libsodium-dev, libjansson-dev, uuid-dev, libprotobuf-c-dev")
+    "libsodium-dev, ${_at_deb_jansson}uuid-dev, libprotobuf-c-dev")
 set(CPACK_RPM_CORE_PACKAGE_NAME autonomous-trust-devel)
 set(CPACK_RPM_CORE_PACKAGE_REQUIRES
-    "libsodium-devel, jansson-devel, libuuid-devel, protobuf-c-devel")
+    "libsodium-devel, ${_at_rpm_jansson}libuuid-devel, protobuf-c-devel")
 
 # Extensions. Each requires the core package (and the packages of the
 # extensions it depends on) at exactly this version: an extension uses the

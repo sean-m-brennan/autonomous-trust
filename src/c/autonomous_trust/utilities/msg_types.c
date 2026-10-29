@@ -323,6 +323,9 @@ int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr
      * older peer of this serializer stays compatible. */
     json_object_set_new(root, "verified", json_boolean(msg->verified));
     json_object_set_new(root, "has_signature", json_boolean(msg->has_signature));
+    /* Which child cohort the sender belongs to (gateways only); absent = none. */
+    if (msg->child_group[0] != '\0')
+        json_object_set_new(root, "child_group", json_string(msg->child_group));
 
     char uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(msg->from_whom.uuid, uuid_str);
@@ -669,6 +672,9 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
     net_msg->verified = json_boolean_value(json_object_get(root, "verified"));
     net_msg->has_signature =
         json_boolean_value(json_object_get(root, "has_signature"));
+    const char *cg = json_string_value(json_object_get(root, "child_group"));
+    if (cg != NULL)
+        snprintf(net_msg->child_group, sizeof(net_msg->child_group), "%s", cg);
 
     const char *ret = json_string_value(json_object_get(root, "return_to"));
     if (ret)

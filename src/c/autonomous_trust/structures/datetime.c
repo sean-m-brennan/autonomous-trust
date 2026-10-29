@@ -177,6 +177,13 @@ int offset_to_str(float offset, char *str)
     long total = lroundf(offset * 3600.0f);
     char sign = (total < 0) ? '-' : '+';
     total = labs(total);
+    /* Python rejects a UTC offset of 24h or more, and bounding it is what
+     * keeps the hours to two digits (and the string inside the buffer). */
+    if (total >= 24L * 3600L)
+    {
+        str[0] = '\0';
+        return -1;
+    }
     int hours = (int)(total / 3600);
     int minutes = (int)((total % 3600) / 60);
     int seconds = (int)(total % 60);

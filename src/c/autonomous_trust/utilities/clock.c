@@ -22,6 +22,12 @@
 #include <strings.h>
 #include <sys/timex.h>
 
+/* uClibc-ng has no ntp_adjtime; adjtimex is the same syscall, and with
+ * modes = 0 the same read-only query. */
+#ifdef __UCLIBC__
+#define ntp_adjtime adjtimex
+#endif
+
 #include "utilities/clock.h"
 #include "utilities/logger.h"
 

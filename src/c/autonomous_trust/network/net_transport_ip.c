@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <stddef.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -61,14 +62,14 @@ int net_transport_ip_bind_source(int sock, const char *address, int domain,
         struct sockaddr_in6 src = {0};
         src.sin6_family = AF_INET6;
         src.sin6_port = 0;
-        if (inet_pton(AF_INET6, address, &src.sin6_addr) != 1)
+        if (at_inet_pton(AF_INET6, address, &src.sin6_addr) != 1)
             return -1;
         err = bind(sock, (struct sockaddr *)&src, sizeof(src));
     } else {
         struct sockaddr_in src = {0};
         src.sin_family = AF_INET;
         src.sin_port = 0;
-        if (inet_pton(AF_INET, address, &src.sin_addr) != 1)
+        if (at_inet_pton(AF_INET, address, &src.sin_addr) != 1)
             return -1;
         err = bind(sock, (struct sockaddr *)&src, sizeof(src));
     }
@@ -246,17 +247,21 @@ int net_transport_ip_join_mcast(int sock, bool ipv6, const char *mcast_address,
         return -1;
     }
 
+    /* ai_addr is a struct sockaddr *, which promises only 2-byte alignment;
+     * copy the family-specific struct out instead of casting to it. */
     if (ipv6) {
         struct ipv6_mreq mreq6;
-        memcpy(&mreq6.ipv6mr_multiaddr,
-               &((struct sockaddr_in6 *)res->ai_addr)->sin6_addr,
-               sizeof(mreq6.ipv6mr_multiaddr));
+        struct sockaddr_in6 sa6;
+        memcpy(&sa6, res->ai_addr, sizeof(sa6));
+        mreq6.ipv6mr_multiaddr = sa6.sin6_addr;
         mreq6.ipv6mr_interface = 0;
         err = setsockopt(sock, IPPROTO_IPV6, IPV6_JOIN_GROUP,
                          &mreq6, sizeof(mreq6));
     } else {
         struct ip_mreq mreq4;
-        mreq4.imr_multiaddr = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+        struct sockaddr_in sa4;
+        memcpy(&sa4, res->ai_addr, sizeof(sa4));
+        mreq4.imr_multiaddr = sa4.sin_addr;
         mreq4.imr_interface.s_addr = htonl(INADDR_ANY);
         err = setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
                          &mreq4, sizeof(mreq4));
@@ -278,7 +283,7 @@ int net_transport_resolve_host(const char *host, bool ipv6, void *out)
     if (host == NULL || out == NULL)
         return EXCEPTION(EINVAL);
     int family = ipv6 ? AF_INET6 : AF_INET;
-    if (inet_pton(family, host, out) == 1)
+    if (at_inet_pton(family, host, out) == 1)
         return 0;
 
     struct addrinfo hints;
@@ -287,11 +292,12 @@ int net_transport_resolve_host(const char *host, bool ipv6, void *out)
     struct addrinfo *res = NULL;
     if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL)
         return EXCEPTION(EINVAL);
+    /* Offset arithmetic rather than a cast: ai_addr is only 2-byte aligned */
     if (ipv6)
-        memcpy(out, &((struct sockaddr_in6 *)res->ai_addr)->sin6_addr,
+        memcpy(out, (const char *)res->ai_addr + offsetof(struct sockaddr_in6, sin6_addr),
                sizeof(struct in6_addr));
     else
-        memcpy(out, &((struct sockaddr_in *)res->ai_addr)->sin_addr,
+        memcpy(out, (const char *)res->ai_addr + offsetof(struct sockaddr_in, sin_addr),
                sizeof(struct in_addr));
     freeaddrinfo(res);
     return 0;

@@ -43,6 +43,11 @@ A unicast goes to the first leg whose matcher takes the target
 CIDR leg for an address inside it, else the first default leg). A broadcast
 goes out on every leg, and succeeds if any leg takes it.
 
+A frame names as its sender the address this node holds on the leg it leaves
+on, not the identity address, which is on one network only. Each side of a
+gateway reaches it at its own side's address, and C does the same
+(``net_transport_t.leg_address``).
+
 Each leg is a transport of its own kind, sharing this process's view of peers
 and group, its inbound queues, statistics and exclusions, so its receivers
 deliver straight into the queues this process drains.
@@ -61,7 +66,8 @@ import threading
 from dataclasses import dataclass, field
 from uuid import UUID
 
-from .netprocess import NetworkProcess, NetworkProtocol, TransmissionError
+from .netprocess import (NetworkProcess, NetworkProtocol, TransmissionError,
+                         sent_from_address)
 from ..extensions import transport_class
 from ..system import CfgIds
 
@@ -379,6 +385,39 @@ class HybridNetworkProcess(NetworkProcess):
                 errors.append('[%d] %s' % (idx, err))
         if errors and len(errors) == len(self.legs):
             raise TransmissionError('Hybrid: broadcast failed on every leg: ' + '; '.join(errors))
+
+    # --- the sender address each leg names -------------------------------
+    # A gateway's identity address is on one network only. A frame leaving on
+    # another names the address this node holds THERE, the one that network's
+    # members can reach and already attribute to us; naming the identity
+    # address made them take the gateway for a member that had moved, and
+    # readdress it out of reach.
+
+    @staticmethod
+    def _leg_address(leg):
+        addr = getattr(leg, 'my_address', None)
+        if not addr:
+            addr = getattr(getattr(leg, 'net_cfg', None), 'ip4', None)
+        return addr or None
+
+    def _envelope_address(self, target):
+        idx = hybrid_route(self.hybrid_cfg, target)
+        return self._leg_address(self.legs[idx]) if idx >= 0 else None
+
+    def _send_any_message(self, message):
+        """A broadcast on every leg, each naming that leg's own address; fails
+        only when every leg fails, as :meth:`send_any` does."""
+        errors, sent = [], b''
+        for idx, leg in enumerate(self.legs):
+            frame = sent_from_address(message, self._leg_address(leg))
+            try:
+                sent = bytes(frame)
+                leg.send_any(sent)
+            except (TransmissionError, OSError) as err:
+                errors.append('[%d] %s' % (idx, err))
+        if errors and len(errors) == len(self.legs):
+            raise TransmissionError('Hybrid: broadcast failed on every leg: ' + '; '.join(errors))
+        return sent
 
     def send_on_leg(self, leg_index, msg):
         """A broadcast on one leg only (C's send_on_leg)."""

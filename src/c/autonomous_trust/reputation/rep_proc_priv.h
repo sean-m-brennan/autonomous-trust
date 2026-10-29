@@ -147,7 +147,7 @@ void reputation_set_update_page_bytes(size_t bytes);
  *  for handle_accepted: its score, @p task_uuid's evidence @p channel (NULL or
  *  "" for the default), and whom our half names, @p subject (NULL for none,
  *  R+D.md §14.2). The conformance `proposals` fixture. */
-void reputation_install_proposal(int64_t id1, int64_t id2, double score,
+void reputation_install_proposal(int64_t id1, int64_t id2, int score_milli,
                                  const uuid_t task_uuid, const char *channel,
                                  const uuid_t subject);
 /** Bind our staged round (@p id1, @p id2) to @p group_uuid, as
@@ -182,14 +182,14 @@ int reputation_install_chain_json(const json_t *arr);
 
 /** Put a committed half in the primary chain's pool, as a commit does under
  *  ordered placement. Returns tx_history_record_half's status. */
-int reputation_record_half(const uuid_t task, const uuid_t scorer, double score,
+int reputation_record_half(const uuid_t task, const uuid_t scorer, int score_milli,
                            const char *channel, const char *cert_json);
 
 /** reputation_record_half_on for a half that names @p counterparty (NULL for
  *  none) and carries its scorer's signature @p half_sig (may be NULL), R+D.md
  *  §14.2. Returns tx_history_record_signed_half's status. */
 int reputation_record_named_half_on(const char *chain_key, const uuid_t task,
-                                    const uuid_t scorer, double score,
+                                    const uuid_t scorer, int score_milli,
                                     const char *channel, const char *cert_json,
                                     const uuid_t counterparty,
                                     const char *half_sig);
@@ -197,7 +197,7 @@ int reputation_record_named_half_on(const char *chain_key, const uuid_t task,
 /** reputation_record_half on chain @p chain_key ("" is the primary, else a
  *  child group's uuid), creating the child chain on first use. */
 int reputation_record_half_on(const char *chain_key, const uuid_t task,
-                              const uuid_t scorer, double score,
+                              const uuid_t scorer, int score_milli,
                               const char *channel, const char *cert_json);
 
 /** Take @p members ([[uuid, signing key hex], ...]) as the roster in force on
@@ -331,31 +331,31 @@ void reputation_force_checkpoint(const process_t *proc,
 void reputation_install_task_weight(const uuid_t task_uuid, int weight);
 
 /** Pre-install a bilateral Transaction (@p task_uuid) in
- *  rep_state.history: p1_uuid scored at @p p1_score, p2_uuid at
- *  @p p2_score. Drives `tx_history_update` twice under the same task
+ *  rep_state.history: p1_uuid scored at @p p1_score_milli, p2_uuid at
+ *  @p p2_score_milli (thousandths). Drives `tx_history_update` twice under the same task
  *  so both `_peer_mapping` entries get populated, matching how
  *  handle_committed builds bilateral history. Conformance hook only. */
 void reputation_install_tx_pair(const uuid_t task_uuid,
-                                const uuid_t p1_uuid, double p1_score,
-                                const uuid_t p2_uuid, double p2_score);
+                                const uuid_t p1_uuid, int p1_score_milli,
+                                const uuid_t p2_uuid, int p2_score_milli);
 
 /** reputation_install_tx_pair with each half's evidence channel (NULL for the
  *  default). The conformance `tx_history` fixture's p1_channel / p2_channel. */
 void reputation_install_tx_pair_tagged(const uuid_t task_uuid,
-                                       const uuid_t p1_uuid, double p1_score,
+                                       const uuid_t p1_uuid, int p1_score_milli,
                                        const char *p1_channel,
-                                       const uuid_t p2_uuid, double p2_score,
+                                       const uuid_t p2_uuid, int p2_score_milli,
                                        const char *p2_channel);
 
 /** reputation_install_tx_pair on the chain @p group_uuid resolves to (the
  *  anchored cohort's, RD_14.4 Phase 6; the primary for any other). */
 void reputation_install_tx_pair_in(const char *group_uuid,
                                    const uuid_t task_uuid,
-                                   const uuid_t p1_uuid, double p1_score,
-                                   const uuid_t p2_uuid, double p2_score);
+                                   const uuid_t p1_uuid, int p1_score_milli,
+                                   const uuid_t p2_uuid, int p2_score_milli);
 
 /** Pre-install ONE SIDE of a Transaction (@p task_uuid): @p peer_uuid scored
- *  at @p score, the counterparty slot left open.
+ *  at @p score_milli, the counterparty slot left open.
  *
  *  Exists so a single-step scenario can drive the arrival that COMPLETES the
  *  entry and then assert on the committed window -- which a two-step scenario
@@ -386,7 +386,7 @@ size_t reputation_attest_cosig_count(void);
 /* Commit a verifier-attested entry directly (test/conformance hook): the
  * chain's half of the rule, without the quorum round. Returns
  * tx_history_append_attested's result. */
-int reputation_install_tx_attested(const uuid_t verifier_uuid, double score,
+int reputation_install_tx_attested(const uuid_t verifier_uuid, int score_milli,
                                    const char *channel,
                                    const uuid_t subject_uuid,
                                    const char *evidence_digest);
@@ -403,7 +403,7 @@ bool reputation_attest_conflicted(const char *a, const char *b);
 /** @ref reputation_install_tx_attested with an attest scope (NULL for none)
  *  and its quorum certificate as JSON text (NULL for none). */
 int reputation_install_tx_attested_scoped(const uuid_t verifier_uuid,
-                                          double score, const char *channel,
+                                          int score_milli, const char *channel,
                                           const uuid_t subject_uuid,
                                           const char *evidence_digest,
                                           const char *scope,
@@ -413,7 +413,7 @@ int reputation_install_tx_attested_scoped(const uuid_t verifier_uuid,
  *  attestation waits to be placed, without the quorum round. Returns
  *  tx_history_pool_attested's result. */
 int reputation_install_pooled_attested(const uuid_t verifier_uuid,
-                                       double score, const char *channel,
+                                       int score_milli, const char *channel,
                                        const uuid_t subject_uuid,
                                        const char *evidence_digest);
 
@@ -431,7 +431,7 @@ void reputation_test_store_checkpoint(const process_t *proc, const char *propose
                                       int first_index, int count,
                                       const char *chain_key, json_t *sigs);
 void reputation_install_tx_single(const uuid_t task_uuid,
-                                  const uuid_t peer_uuid, double score);
+                                  const uuid_t peer_uuid, int score_milli);
 
 /** Pre-install a peer's reputation in rep_state.reputations.
  *  Conformance scenarios use this to set the counterparty's reputation

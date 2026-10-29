@@ -28,6 +28,7 @@ from uuid import uuid4
 
 import pytest
 
+from autonomous_trust.core.reputation.reputation import score_to_milli
 from autonomous_trust.core.config import Configuration
 from autonomous_trust.core._python.identity.join_policy import (
     AnchoredSet, JoinPolicy)
@@ -57,8 +58,8 @@ def _rp(policy=ON):
 def _pair(rp, a, a_score, b, b_score, a_channel=None):
     """One bilateral entry: `a` gave `b` a_score, `b` gave `a` b_score."""
     task = uuid4()
-    rp.history.update(task, a, a_score, a_channel)
-    rp.history.update(task, b, b_score)
+    rp.history.update(task, a, score_to_milli(a_score), a_channel)
+    rp.history.update(task, b, score_to_milli(b_score))
     return task
 
 

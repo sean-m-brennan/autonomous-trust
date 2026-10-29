@@ -1,0 +1,48 @@
+# Buildroot defconfig for a SPARC V8 / LEON3 sysroot.
+# Based on Buildroot 2026.02.x (LTS)
+#
+# Not a bootable image: this builds only what the C core links against, so the
+# conformance corpus can run big-endian under qemu-sparc (DV002 Volume 2, O5 /
+# Task 4.5.5). See embedded/test-conformance-sparc.sh.
+#
+# Buildroot can no longer build its own sparc32 toolchain (uClibc-ng vs gcc
+# PR98784), so this uses Bootlin's prebuilt sparcv8 uClibc-ng toolchain. It is
+# the first sparcv8 release built with SSP, which the C core's
+# -fstack-protector needs; its gcc 15 is why this is not on 2024.02 like the
+# Pi image.
+
+# Target
+BR2_sparc=y
+BR2_sparc_leon3=y
+
+# Toolchain: Bootlin sparcv8--uclibc--stable-2026.08-1
+BR2_TOOLCHAIN_EXTERNAL=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM=y
+BR2_TOOLCHAIN_EXTERNAL_DOWNLOAD=y
+BR2_TOOLCHAIN_EXTERNAL_URL="https://toolchains.bootlin.com/downloads/releases/toolchains/sparcv8/tarballs/sparcv8--uclibc--stable-2026.08-1.tar.xz"
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_PREFIX="$(ARCH)-linux"
+BR2_TOOLCHAIN_EXTERNAL_GCC_15=y
+BR2_TOOLCHAIN_EXTERNAL_HEADERS_5_10=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_UCLIBC=y
+BR2_TOOLCHAIN_EXTERNAL_WCHAR=y
+BR2_TOOLCHAIN_EXTERNAL_LOCALE=y
+BR2_TOOLCHAIN_EXTERNAL_HAS_THREADS=y
+BR2_TOOLCHAIN_EXTERNAL_HAS_THREADS_NPTL=y
+BR2_TOOLCHAIN_EXTERNAL_HAS_THREADS_DEBUG=y
+BR2_TOOLCHAIN_EXTERNAL_HAS_SSP=y
+BR2_TOOLCHAIN_EXTERNAL_CXX=y
+BR2_TOOLCHAIN_EXTERNAL_OPENMP=y
+
+# System: no init, no shell, no rootfs image
+BR2_INIT_NONE=y
+BR2_SYSTEM_BIN_SH_NONE=y
+# BR2_PACKAGE_BUSYBOX is not set
+# BR2_TARGET_ROOTFS_TAR is not set
+
+# Libraries the C core needs. Not jansson: the C core builds its own copy
+# (src/c/cmake/vendored-jansson.cmake), whose number conversions do not go
+# through uClibc-ng's printf and strtod.
+BR2_PACKAGE_LIBSODIUM=y
+BR2_PACKAGE_UTIL_LINUX=y
+BR2_PACKAGE_UTIL_LINUX_LIBUUID=y
+BR2_PACKAGE_PROTOBUF_C=y

@@ -24,6 +24,7 @@
 #include "bootstrap/bootstrap_capabilities.h"
 #include "processes/capabilities.h"   /* DECLARE_CAPABILITY */
 #include "utilities/util.h"           /* at_strlcpy */
+#include "utilities/numfmt.h"
 
 const char *const BOOTSTRAP_CAPABILITY_NAMES[BOOTSTRAP_CAPABILITY_COUNT] = {
     "at.handshake",
@@ -116,7 +117,7 @@ double time_attest_tolerance(void)
     if (raw == NULL || raw[0] == '\0')
         return AT_DEFAULT_TIME_ATTEST_TOLERANCE_SEC;
     char *end = NULL;
-    double value = strtod(raw, &end);
+    double value = at_strtod(raw, &end);
     /* Reject trailing garbage, non-finite, and non-positive alike: a
      * tolerance of 0 or below would score every peer 0.5 forever, which is
      * a quieter failure than falling back to the documented default. */

@@ -372,10 +372,28 @@ class TestAuthorityAccumulateLeaderAbstains:
         assert proto._accumulate_votes([(5, True), (0, False)]) is True
         assert proto._accumulate_votes([(5, False), (0, True)]) is False
 
+    def test_tied_leaders_split_rejects_in_either_order(self):
+        # RD_13.1 D7: tied leaders combine by conjunction. A dict lookup
+        # kept the last vote at the leader rank, so the outcome flipped
+        # with arrival order (and C, which kept the first, disagreed).
+        proto = self._build_protocol([5, 5, 0])
+        assert proto._accumulate_votes([(5, True), (5, False)]) is False
+        assert proto._accumulate_votes([(5, False), (5, True)]) is False
+
+    def test_tied_leaders_all_approve(self):
+        proto = self._build_protocol([5, 5, 0])
+        assert proto._accumulate_votes([(5, True), (5, True), (0, False)]) is True
+
+    def test_tied_leader_abstains_other_decides(self):
+        # Conjunction is over tied leaders who VOTED; one tied leader's
+        # silence does not veto.
+        proto = self._build_protocol([5, 5, 0])
+        assert proto._accumulate_votes([(5, True)]) is True
+
 
 class TestAgreementByTrust:
-    """PoT mirrors PoA in shape but reads voter.tier. These tests pin
-    the contract from the PoA side translated to trust tiers.
+    """PoT is a strict majority of eligible voters (tier >= threshold),
+    with abstention counted against and no leader (RD_13.1).
     See doc/architecture/trust-tiers.md §10."""
 
     def _build_protocol(self, voter_tiers, threshold_tier=None):
@@ -403,46 +421,69 @@ class TestAgreementByTrust:
         proto = self._build_protocol([4, 2, 1], threshold_tier=5)
         assert proto.threshold_tier == 5
 
-    def test_derived_threshold_top_third(self):
-        # 6 voters, top 1/3 = 2 -> cutoff_idx = 1 -> second-highest tier
+    def test_derived_threshold_is_default_floor(self):
+        # No top-third derivation any more: the default is a fixed floor,
+        # whatever the tier distribution.
         proto = self._build_protocol([4, 4, 3, 2, 1, 0])
-        assert proto.threshold_tier == 4
+        assert proto.threshold_tier == 1
+        assert proto.threshold_tier == proto.DEFAULT_THRESHOLD_TIER
 
-    def test_count_vote_below_threshold_forces_false(self):
+    def test_count_vote_reports_cast_vote(self):
+        # _count_vote no longer filters; eligibility is applied in
+        # _accumulate_votes, which needs the threshold for the eligible set.
         proto = self._build_protocol([2, 1], threshold_tier=3)
-        # Look up the tier-2 voter regardless of ordering inside
-        # protocol.voters (AgreementProtocol stores others + [myself]).
         voter = next(v for v in proto.voters if v.tier == 2)
-        proof = MagicMock(approval=True)
-        result = proto._count_vote(MagicMock(), proof, voter)
-        # Below threshold (2 < 3): forced to False
-        assert result == (2, False)
+        assert proto._count_vote(MagicMock(), MagicMock(approval=True), voter) == (2, True)
+        assert proto._count_vote(MagicMock(), MagicMock(approval=False), voter) == (2, False)
 
-    def test_count_vote_at_or_above_threshold_keeps_approval(self):
-        proto = self._build_protocol([3, 1], threshold_tier=3)
-        voter = next(v for v in proto.voters if v.tier == 3)
-        proof_yes = MagicMock(approval=True)
-        proof_no = MagicMock(approval=False)
-        assert proto._count_vote(MagicMock(), proof_yes, voter) == (3, True)
-        assert proto._count_vote(MagicMock(), proof_no, voter) == (3, False)
+    def test_climbed_top_tier_is_outvoted(self):
+        # The case RD_13.1 exists for: the unique top-tier voter rejects,
+        # three of the other four eligible voters approve.
+        proto = self._build_protocol([4, 2, 2, 1, 1])
+        votes = [(4, False), (2, True), (2, True), (1, True)]
+        assert proto._accumulate_votes(votes) is True
 
-    def test_accumulate_leader_decides(self):
-        proto = self._build_protocol([4, 2])
-        # Leader (tier 4) approves; lower-tier voter rejects → True
-        assert proto._accumulate_votes([(4, True), (2, False)]) is True
-        # Leader rejects → False regardless of others
-        assert proto._accumulate_votes([(4, False), (2, True)]) is False
+    def test_top_tier_alone_cannot_approve(self):
+        proto = self._build_protocol([4, 2, 2, 1, 1])
+        assert proto._accumulate_votes([(4, True)]) is False
 
-    def test_accumulate_leader_absent_returns_false(self):
-        # Mirrors PoA's leader-abstain regression coverage: when the
-        # highest-tier voter didn't cast, finalize must return False
-        # (not raise KeyError).
-        proto = self._build_protocol([4, 2])
-        assert proto._accumulate_votes([(2, True)]) is False
+    def test_tie_rejects(self):
+        proto = self._build_protocol([3, 2, 2, 1])
+        assert proto._accumulate_votes([(3, True), (2, True), (2, False), (1, False)]) is False
+
+    def test_abstention_counts_against(self):
+        # 2 of 5 eligible approve, the rest silent: not a majority.
+        proto = self._build_protocol([1, 1, 1, 1, 1])
+        assert proto._accumulate_votes([(1, True), (1, True)]) is False
+        assert proto._accumulate_votes([(1, True), (1, True), (1, True)]) is True
+
+    def test_below_threshold_votes_dropped_not_nay(self):
+        # Two eligible voters (tier >= 3) both approve; the tier-1 nays
+        # neither count against nor enlarge the eligible set.
+        proto = self._build_protocol([3, 3, 1, 1, 1], threshold_tier=3)
+        votes = [(3, True), (3, True), (1, False), (1, False), (1, False)]
+        assert proto._accumulate_votes(votes) is True
+        # Below-threshold approvals do not help either.
+        assert proto._accumulate_votes([(3, True), (1, True), (1, True)]) is False
+
+    def test_zero_eligible_returns_false(self):
+        proto = self._build_protocol([2, 1], threshold_tier=3)
+        assert proto._accumulate_votes([(2, True), (1, True)]) is False
 
     def test_accumulate_no_votes_returns_false(self):
         proto = self._build_protocol([4, 2])
         assert proto._accumulate_votes([]) is False
+
+    def test_finalize_replayed_vote_counts_once(self):
+        # Through finalize: a replayed approval must not stand in for a
+        # second voter. 3 eligible voters, one approves twice -> 1/3.
+        proto = self._build_protocol([1, 1, 1])
+        voter = proto.voters[0]
+        blob = ConcreteBlob(uuid4())
+        proof = MagicMock(uuid=voter.uuid, approval=True)
+        proto.verify(blob, proof, b'sig')
+        proto.verify(blob, proof, b'sig')
+        assert proto.finalize(blob) is False
 
     def test_finalize_originator_short_circuits(self):
         # AgreementProtocol.finalize returns True without consulting

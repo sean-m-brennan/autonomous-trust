@@ -252,7 +252,8 @@ def _unicast_node(order):
     proc._hold_for_admission.return_value = False
     proc._wire_format_for_addr.return_value = 'json'
     proc.send_peer.side_effect = lambda msg, addr: order.append(('transport', msg, addr))
-    for name in ('_unicast', '_unicast_carrier', '_also_unicast'):
+    for name in ('_unicast', '_unicast_carrier', '_also_unicast',
+                 '_as_sent_from', '_envelope_address'):
         setattr(proc, name, getattr(NetworkProcess, name).__get__(proc))
     return proc
 
@@ -296,7 +297,8 @@ def _fanout_node():
     proc._presence = MagicMock()
     proc.group = types.SimpleNamespace(
         name='own', encrypt=lambda wire, grp: b'sealed-by-' + grp.name.encode())
-    for name in ('_send_broadcast_message', '_send_group_message', '_fanout'):
+    for name in ('_send_broadcast_message', '_send_group_message', '_fanout',
+                 '_send_any_message', '_as_sent_from', '_envelope_address'):
         setattr(proc, name, getattr(NetworkProcess, name).__get__(proc))
     return proc
 

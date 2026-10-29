@@ -47,6 +47,7 @@
 #include "physics/physics.h"
 #include "reputation/tx_channel.h"
 #include "utilities/compiler.h"   /* AT_PRINTF_FORMAT */
+#include "utilities/numfmt.h"
 
 /* Verdict -> the name the scenario spells, and the (score, channel) it must
  * carry. Asserting all three catches a runtime that returned the right number
@@ -111,7 +112,8 @@ static bool _result_text(json_t *result, char *buf, size_t len)
     {
         /* 17 significant digits round-trips a double exactly, so the value
          * this runtime checks is the value the fixture wrote. */
-        snprintf(buf, len, "%.17g", json_real_value(result));
+        char g17[AT_G17_LEN];
+        snprintf(buf, len, "%s", at_fmt_g17(json_real_value(result), g17));
         return true;
     }
     char *dumped = json_dumps(result, JSON_COMPACT | JSON_ENCODE_ANY);

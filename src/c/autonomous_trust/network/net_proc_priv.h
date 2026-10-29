@@ -297,6 +297,14 @@ bool net_wire_verb_admitted(const char *process, const char *function,
 int net_proc_test_route_on_path(const net_wire_msg_t *wmsg, process_t *proc,
                                 logger_t *logger, net_route_path_t path);
 
+/** @brief The child cohort @p address belongs to, when it is on the far side
+ *  of a gateway boundary from our primary group: fills @p out with that
+ *  group's uuid (hyphenated, lowercase) and returns true. Otherwise leaves
+ *  @p out empty and returns false; always false on a leaf node. Mirrors Python
+ *  NetworkProcess._child_group_of. */
+bool net_child_group_of(const process_t *proc, const char *address,
+                        char *out, size_t out_len);
+
 /** @brief net_encrypt_and_send, exposed for tests (the send path's hooks). */
 int net_proc_test_encrypt_and_send(const identity_t *myself, const group_t *grp,
                                    const net_wire_msg_t *msg,

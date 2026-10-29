@@ -84,7 +84,7 @@ except ImportError:
 # Sibling modules (dashed package layout — same trick as coordinator.py)
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
-from scenario import DoDMissionScenario  # noqa: E402
+from scenario import DoDMissionScenario, scenario_from_env  # noqa: E402
 
 sys.path.insert(0, str(_HERE / "generators"))
 from isr import OverheadISRGenerators, MicrodroneGenerators  # noqa: E402
@@ -102,6 +102,7 @@ from contradictory_isr import (  # noqa: E402
     DEFAULT_ACTIVATE_AT,
 )
 from forged_identity import create_forged_identity_sensor  # noqa: E402
+from gateway_relay import GatewayRelay, field_producers_from_env  # noqa: E402
 from autonomous_trust.core import LOG_FORMAT, LOG_DATEFMT
 
 
@@ -185,6 +186,9 @@ class DoDDataProcess(DataProcess, metaclass=ProcMeta,
                          dependencies)
         self.generators = kwargs.get('generators')
         self.t0_epoch = float(kwargs.get('t0_epoch') or time.time())
+        # On a hierarchy gateway, readings its GatewayRelay worker carried up
+        # from the field cohort; they go out beside this node's own.
+        self.relay_queue = kwargs.get('relay_queue')
         # DataProcess.__init__ sets ``self.active`` from
         # ``self.name in configurations`` — i.e. only when a DataConfig
         # has been written.  Our generators don't need a DataConfig
@@ -192,7 +196,7 @@ class DoDDataProcess(DataProcess, metaclass=ProcMeta,
         # force-enable when there's a bundle attached.  Without this,
         # the parent process() loop skips acquire() and the data
         # stream is silent.
-        if self.generators is not None:
+        if self.generators is not None or self.relay_queue is not None:
             self.active = True
 
     _logged_first_acquire = False
@@ -200,14 +204,28 @@ class DoDDataProcess(DataProcess, metaclass=ProcMeta,
     _logged_first_tx_submit = False
     _last_batch_id: Optional[str] = None
 
+    def _drain_relay(self, limit=64):
+        """Readings a co-resident GatewayRelay queued since the last tick, at
+        most ``limit`` batches of them."""
+        out = []
+        q = getattr(self, 'relay_queue', None)
+        while q is not None and limit > 0:
+            try:
+                out.extend(q.get_nowait())
+            except Exception:  # queue.Empty, or a closed manager proxy
+                break
+            limit -= 1
+        return out
+
     def acquire(self):
+        relayed = self._drain_relay()
         if self.generators is None:
             if not DoDDataProcess._logged_first_acquire:
                 self.logger.info(
                     "DoDDataProcess.acquire: no generator bundle attached "
                     "(role has no continuous data source)")
                 DoDDataProcess._logged_first_acquire = True
-            return None
+            return relayed or None
         t = timedelta(seconds=time.time() - self.t0_epoch)
         readings = self.generators.tick(t)
         if not DoDDataProcess._logged_first_acquire:
@@ -218,7 +236,7 @@ class DoDDataProcess(DataProcess, metaclass=ProcMeta,
                 self.active, len(self.clients))
             DoDDataProcess._logged_first_acquire = True
         if not readings:
-            return None
+            return relayed or None
         if not DoDDataProcess._logged_first_emit and self.clients:
             self.logger.info(
                 "DoDDataProcess: emitting first batch of %d readings to "
@@ -240,7 +258,9 @@ class DoDDataProcess(DataProcess, metaclass=ProcMeta,
         # Stash the task_id for process() to pick up after the
         # parent's broadcast loop runs.
         self._last_batch_id = batch_id
-        return emitted
+        # Relayed readings follow unstamped: the batch id names only what this
+        # node produced, which is all its "I delivered" score vouches for.
+        return emitted + relayed
 
     def process(self, queues, signal):
         """Override the parent loop so we can submit a
@@ -415,9 +435,18 @@ class DoDMissionParticipant(AutonomousTrust):
 
         self.generators = self._build_generators()
 
+        # A hierarchy gateway (AT_GATEWAY_FIELD_PEERS) also relays its field
+        # cohort's readings: GatewayRelay subscribes to the field producers and
+        # hands what arrives to the data source through this queue.
+        field_producers = field_producers_from_env()
+        relay_queue = self.queue_type() if field_producers else None
         self.add_worker(DoDDataProcess,
                         generators=self.generators,
-                        t0_epoch=self._t0_epoch)
+                        t0_epoch=self._t0_epoch,
+                        relay_queue=relay_queue)
+        if field_producers:
+            self.add_worker(GatewayRelay, relay_queue=relay_queue,
+                            field_producers=field_producers)
 
         logger.info("Participant %s initialized: role=%s, generators=%s, "
                     "compromised=%s, forgery_mode=%s",
@@ -738,15 +767,7 @@ def main():
 
     # Build the scenario from the same env-var knobs the coordinator uses,
     # so all peers agree on the peer roster (squad_size, swarm_size, ...).
-    scenario = DoDMissionScenario(
-        squad_size=int(os.environ.get("AT_SQUAD_SIZE", "4")),
-        swarm_size=int(os.environ.get("AT_SWARM_SIZE", "4")),
-        sensor_count=int(os.environ.get("AT_SENSOR_COUNT", "3")),
-        hacked_sensors=int(os.environ.get("AT_HACKED_SENSORS", "2")),
-        include_mq800=os.environ.get("AT_INCLUDE_MQ800", "1") != "0",
-        include_jet=os.environ.get("AT_INCLUDE_JET", "1") != "0",
-        include_command=os.environ.get("AT_INCLUDE_COMMAND", "1") != "0",
-    )
+    scenario = scenario_from_env()
 
     if setup_mode:
         # Signature: generate_worker_config(cfg_dir, proc_name, cfg_class, defaults).

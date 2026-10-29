@@ -59,7 +59,7 @@ def _committed(rp, task):
     """Our half of ``task`` reached the pool, as a certified commit puts it
     there. (Mock peers cannot sign, so the certificate is not built here; the
     co-signing round is pinned by the conformance corpus.)"""
-    rp.history.record_half(task, rp.identity.uuid, 0.9)
+    rp.history.record_half(task, rp.identity.uuid, 900)
 
 
 class TestUncommittedHalvesAreReProposed:
@@ -106,7 +106,7 @@ class TestUncommittedHalvesAreReProposed:
         rp._start_paxos(queues, TransactionScore(task, 0.9))
         alice = rp.protocol.peers.all[0]
         rp.history.apply_placed(0, [placement_entry(Transaction(
-            task, rp.identity.uuid, 0.9, alice.uuid, 0.8))])
+            task, rp.identity.uuid, 900, alice.uuid, 800))])
         assert rp._retry_uncommitted_halves(queues, _later(1)) == 0
         assert str(task) not in rp.awaiting_commit
 
@@ -129,7 +129,7 @@ def _catch_up(rp, queues, n):
     wakes what is parked, as _reconcile_into does on EXTENDED."""
     alice, bob = rp.protocol.peers.all[:2]
     rp.history.apply_placed(rp.history.next_index, [
-        placement_entry(Transaction(uuid4(), alice.uuid, 0.8, bob.uuid, 0.7))
+        placement_entry(Transaction(uuid4(), alice.uuid, 800, bob.uuid, 700))
         for _ in range(n)])
     rp._wake_parked(alice.nickname)
 

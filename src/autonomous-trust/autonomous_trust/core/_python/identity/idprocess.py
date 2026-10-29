@@ -84,6 +84,18 @@ PERSIST_TIER_FLOOR = 1
 SUBTREE_ROSTER_MAX_NODES = 4096
 
 
+def _border_guard_default() -> bool:
+    """Whether this node takes part in admission (proposes, votes, welcomes),
+    from AT_BORDER_GUARD: "0", "false" or "no" keep it out; anything else, or
+    unset, keeps it in.
+
+    A dual-homed gateway hears the field cohort's request_access on its field
+    leg, and as a border guard it would propose that joiner into its PRIMARY
+    group, which is the command cohort. Out of admission it still caches the
+    announcement and learns of the joiner from the confirm broadcast."""
+    return os.environ.get('AT_BORDER_GUARD', '1').strip().lower() not in ('0', 'false', 'no')
+
+
 def aggregate_subtree_roster(top_gateway_uuid, fetch, max_nodes=SUBTREE_ROSTER_MAX_NODES):
     """Breadth-first flatten of a gateway's subtree into a deduped, sorted
     member roster — the requestor side of the recursive enumeration.
@@ -152,6 +164,17 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
     Zero trust in this stage
     """
     init_timeout = 5
+    # A joiner re-broadcasts request_access while it waits to be admitted:
+    # every rejoin_interval seconds within init_timeout, then doubling to
+    # rejoin_interval_cap for as long as join_patience allows. One broadcast
+    # was all a joiner used to send; on a loaded host a large share of UDP
+    # sends is dropped at the sender while the kernel reports success, and in
+    # a large deployment a cohort's admitter can come up minutes after its
+    # members. join_patience (AT_JOIN_PATIENCE_SEC; 0 = init_timeout) is for a
+    # node that expects a cohort to admit it, so that it does not found a group
+    # of its own first.
+    rejoin_interval = 2.0
+    rejoin_interval_cap = 30.0
     init_extra = 2
     vote_timeout = 0.5  # seconds to wait for additional votes after own vote cast
     enc = encoding
@@ -203,7 +226,7 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
         else:
             raise RuntimeError('Invalid identity history implementation: %s' % impl)
         self.messages: list[Message] = []
-        self.border_guard_mode = True
+        self.border_guard_mode = _border_guard_default()
         # Two-phase admission (doc/architecture/identity-protocol.md). A member receiving a
         # `confirm` broadcast holds the peer PROVISIONAL — known in
         # self.peers/history for reputation/routing, but the group key is NOT
@@ -560,6 +583,120 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
         if peer_idents:
             self._populate_peers_from_history(queues, list(peer_idents))
         self._record_child_groups(queues)
+
+    # ---- the primary never spans the gateway -----------------------------
+    # Every path that sets or merges the primary group (an update, a welcomer's
+    # history, partition recovery, choosing among histories) was written for a
+    # node in one cohort. On a gateway each was a way for the field cohort to
+    # become the primary, and finding them one at a time did not converge. So
+    # the primary refuses any group that would make it span the gateway:
+    # invariant G (doc/architecture/network-wire-format.md) checked on the
+    # result instead of on each path. Never on a leaf node.
+
+    @property
+    def group(self):
+        return self.__dict__.get('_primary_group')
+
+    @group.setter
+    def group(self, value):
+        if value is not None and self._spans_gateway(value):
+            _probes.counter('id.group', 'gateway_span_refused')
+            self.logger.warning('Refusing group %s as primary: it lists a member of a '
+                                'cohort we gateway', getattr(value, 'uuid', '?'))
+            return
+        self.__dict__['_primary_group'] = value
+
+    def _child_held_addresses(self) -> set:
+        """Every address our child groups list, except our own entries."""
+        children = self.__dict__.get('child_groups') or {}
+        me = str(getattr(getattr(self, 'identity', None), 'uuid', ''))
+        held = set()
+        for child in children.values():
+            for uuid, addr in dict(getattr(child, '_address_map', {}) or {}).items():
+                if str(uuid) != me:
+                    held.add(addr)
+        return held
+
+    def _spans_gateway(self, group) -> bool:
+        """Whether ``group`` as our primary would span the gateway: it is one
+        of our child groups, or lists an address one of them holds. Always
+        False on a leaf node."""
+        children = self.__dict__.get('child_groups') or {}
+        if not children:
+            return False
+        if str(getattr(group, 'uuid', '')) in children:
+            return True
+        held = self._child_held_addresses()
+        return any(addr in held for addr in group.addresses)
+
+    def _child_group_for(self, message):
+        """The child group a received message is news about: the cohort the
+        network process found its sender in (Message.child_group), or None for
+        the primary cohort and on a leaf node.
+
+        An untagged message is placed here by its sender's address. The network
+        process learns the child groups from this process, so a frame that lands
+        between this process adopting a child and the network process hearing of
+        it arrives untagged; at startup that was the anchor's first update, which
+        then replaced the primary with the child."""
+        children = getattr(self, 'child_groups', None) or {}
+        if not children:
+            return None
+        tag = getattr(message, 'child_group', None)
+        if isinstance(tag, str):
+            return children.get(tag)
+        addr = getattr(getattr(message, 'from_whom', None), 'address', None)
+        if not isinstance(addr, str) or not addr or self.group is None \
+                or addr in set(self.group.addresses):
+            return None
+        return next((c for c in children.values() if addr in set(c.addresses)), None)
+
+    def _unplaced_at_gateway(self, message) -> bool:
+        """Whether this node is a gateway and the message's sender is a member
+        of none of its groups. Always False on a leaf node."""
+        if not (getattr(self, 'child_groups', None) or {}) or self.group is None:
+            return False
+        addr = getattr(getattr(message, 'from_whom', None), 'address', None)
+        return not (isinstance(addr, str) and addr in set(self.group.addresses))
+
+    def _apply_child_update(self, queues, child, theirs, message):
+        """A group update from a child cohort, applied to that child.
+
+        The size rule that settles a merge between two primaries does not apply
+        here: a child group is the cohort this gateway was given to bridge, so
+        an update for it brings membership and keys, and a different group
+        arriving from that cohort changes nothing. Applied to the primary, a
+        larger field cohort won the size rule and replaced the command cohort.
+        Rotation is gated as for the primary: a higher epoch only from a
+        verified message."""
+        key = str(child.uuid)
+        if theirs is None or str(theirs.uuid) != key:
+            self.logger.debug('Ignoring group %s from child cohort %s: not the group we bridge',
+                              getattr(theirs, 'uuid', '?'), key[:8])
+            return True
+        verified = bool(getattr(message, 'verified', False))
+        carries_key = bool(getattr(theirs, 'owns_private_key', False))
+        if theirs.key_epoch > child.key_epoch and not verified:
+            self.logger.warning('Rejecting unverified child group key rotation from %s',
+                                message.from_whom)
+            return True
+        changed = False
+        if (verified and carries_key and theirs.key_epoch >= child.key_epoch
+                and child.rotation_refusal(theirs) is None and child.accept_rotation(theirs)):
+            self.logger.info('Adopted rotated key for child group %s, epoch %d',
+                             key[:8], child.key_epoch)
+            changed = True
+        if len(theirs.addresses) > len(child.addresses):
+            if child.owns_private_key:
+                child.adopt_membership(theirs)
+            elif carries_key:
+                self.child_groups[key] = theirs
+            else:
+                return True
+            changed = True
+        if changed:
+            self._record_child_groups(queues)
+        return True
 
     def _load_child_groups(self, queues):
         """Seed-assisted dual membership: adopt any child-group config
@@ -1731,6 +1868,17 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
         with self.lock:
             self.phase = 2
 
+    def _join_patience(self) -> float:
+        """How long a joiner waits for a cohort to admit it before founding a
+        group of its own (AT_JOIN_PATIENCE_SEC; 0 leaves init_timeout)."""
+        value = getattr(self, 'join_patience', None)
+        if value is None:
+            try:
+                value = float(os.environ.get('AT_JOIN_PATIENCE_SEC', '0') or 0)
+            except ValueError:
+                value = 0.0
+        return max(0.0, float(value))
+
     def choose_group(self, queues):
         """
         Await incoming histories, choose from among them
@@ -1742,10 +1890,15 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
             with self.lock:
                 self.choosing = True
             # Wait adaptively: exit early once histories arrive, with a short
-            # grace period for additional histories; fall back to init_timeout.
+            # grace period for additional histories; fall back to init_timeout,
+            # or to join_patience when that is longer. Until something arrives,
+            # ask again (see rejoin_interval).
             grace = 1  # seconds to wait after first history arrives
             history_seen_at = None
-            while (now() - start).seconds <= self.init_timeout:
+            patience = max(float(self.init_timeout), self._join_patience())
+            interval = self.rejoin_interval
+            last_asked = start
+            while (now() - start).total_seconds() <= patience:
                 with self.lock:
                     has_histories = len(self.histories) > 0
                 if has_histories:
@@ -1753,6 +1906,11 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
                         history_seen_at = now()
                     elif (now() - history_seen_at).total_seconds() >= grace:
                         break
+                elif (now() - last_asked).total_seconds() >= interval:
+                    self._broadcast_request_access(queues)
+                    last_asked = now()
+                    if (last_asked - start).total_seconds() >= self.init_timeout:
+                        interval = min(interval * 2, self.rejoin_interval_cap)
                 time.sleep(self.cadence)
             try:
                 if not self._adopt_from_histories(queues):
@@ -2252,6 +2410,8 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
         message = Message(self.name, IdentityProtocol.accept, msg_str, to_whom=blob.identity,
                           from_whom=self.identity, encrypt=False)
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
+        self.logger.debug('Welcome queued for %s at %s',
+                          blob.identity.nickname, blob.identity.address)
 
         # send group key + history + my peer set so the new peer can decrypt future
         # group messages AND populate identities for the peers I already admitted
@@ -2736,6 +2896,17 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
         # design — see idprocess.py:1042 / [[project_group_key_sync]]).
         grp_msg = to_json_string(group.to_canonical())  # to self.handle_group_update()
         recipients = list(self.peers.hierarchy[level].values())
+        # A group stops at the gateway: a peer in a cohort we gateway, and not in
+        # this group, is not sent it. A gateway's peers include its field cohort,
+        # and the command group, key and all, reached field nodes; one that had
+        # not yet joined took it, and the two cohorts merged. A leaf node holds
+        # no child groups and sends to every peer, as before.
+        children = list((getattr(self, 'child_groups', None) or {}).values())
+        if children:
+            members = set(group.addresses)
+            recipients = [p for p in recipients
+                          if p.address in members
+                          or not any(p.address in set(c.addresses) for c in children)]
         # Name the key the update carries, so the wire can be compared with
         # what each side's identity and network hold. INFO when the key or
         # epoch changed since the last update sent, debug otherwise:
@@ -2869,6 +3040,10 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
             return
         if level is None:
             level = self.peers.mid_level
+        if identity.address in self._child_held_addresses():
+            self.logger.debug('Not adding %s to the primary: a member of a cohort we gateway',
+                              getattr(identity, 'nickname', '?'))
+            return
         self.group.add_address(identity.uuid, identity.address)
         self._record_group(queues)
         # DEFERRED DESIGN: adopting the new peer's group key when
@@ -3174,6 +3349,19 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
                          peer_uuid=str(peer.uuid),
                          peer_addr=getattr(peer, 'address', None),
                          source='handle_confirm_peer')
+            child = self._child_group_for(message)
+            if child is not None:
+                # Confirmed by a member of a cohort we gateway: a peer of that
+                # cohort. It joins our peer list and the child's map, never our
+                # primary's; the cohort's own members propagate its key.
+                if first_add:
+                    self._add_peer(queues, peer, confirmed=False)
+                if reached:
+                    child.add_address(peer.uuid, peer.address)
+                    self._record_child_groups(queues)
+                    with self.lock:
+                        self._provisional_confirmations.pop(peer_key, None)
+                return True
             if first_add:
                 # Record the peer (history/peers/caps); propagate the group
                 # key only if the quorum is already satisfied.
@@ -3573,24 +3761,34 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
         if self.phase != 3 or self.group is None or self.choosing:
             return
         try:
-            group_size = len(list(self.group.addresses))
             have = {str(p.uuid) for p in self.peers.all}
             have.add(str(self.identity.uuid))
-            # We have an Identity for (at least) every group member -> nothing
-            # to do. uuid-count vs address-count is 1:1 per member; an
-            # occasional over-query is harmless (responders skip via `have`).
-            if len(have) >= group_size:
-                return
-            payload = to_json_string({'group_uuid': str(self.group.uuid),
-                                      'have': sorted(have)})
-            query = Message(self.name, IdentityProtocol.id_query, payload,
-                            to_whom=Network.broadcast, encrypt=False)
-            queues[CfgIds.network].put(query, block=True, timeout=self.q_cadence)
-            _probes.counter('peer.set', 'identity_resync_query',
-                            str(group_size - len(have)))
-            self.logger.debug(
-                'Identity resync: querying group for %d missing member '
-                'identity/ies', group_size - len(have))
+            # A query names one group, and only its members answer, so a
+            # gateway asks its primary and each child cohort separately: a
+            # field peer that joined before its gateway was up is found only by
+            # a query naming the field cohort.
+            for grp in [self.group] + list((getattr(self, 'child_groups', None) or {}).values()):
+                group_size = len(list(grp.addresses))
+                # We have an Identity for (at least) every group member ->
+                # nothing to do. uuid-count vs address-count is 1:1 per member;
+                # an occasional over-query is harmless (responders skip via
+                # `have`). A child is checked by its members' uuids, since our
+                # peers span every group we hold.
+                if grp is self.group:
+                    missing = group_size - len(have)
+                else:
+                    missing = len({str(k) for k in grp._address_map} - have)
+                if missing <= 0:
+                    continue
+                payload = to_json_string({'group_uuid': str(grp.uuid),
+                                          'have': sorted(have)})
+                query = Message(self.name, IdentityProtocol.id_query, payload,
+                                to_whom=Network.broadcast, encrypt=False)
+                queues[CfgIds.network].put(query, block=True, timeout=self.q_cadence)
+                _probes.counter('peer.set', 'identity_resync_query', str(missing))
+                self.logger.debug(
+                    'Identity resync: querying group %s for %d missing member '
+                    'identity/ies', str(grp.uuid)[:8], missing)
         except Full:
             _probes.counter('peer.set', 'identity_resync_q_full')
             self.logger.error('_periodic_identity_resync: Network queue full')
@@ -3664,14 +3862,24 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
             addr = (getattr(ident, 'address', None)
                     or payload.get('from_address'))
             # Membership is by UUID: the group map is keyed by member uuid, and
-            # an entry can hold a stale address, e.g. the hostname placeholder
-            # the cohort seeder writes for a member that then advertises its
-            # runtime IP. The signature check above ties the identity to that
-            # uuid, so a stranger still cannot enter. Address membership is
-            # kept for a map keyed by address.
+            # an entry need not match the address a member advertises, e.g. the
+            # hostname placeholder the cohort seeder writes for a member that
+            # then advertises its runtime IP. The signature check above ties
+            # the identity to that uuid, so a stranger still cannot enter.
+            # Address membership is kept for a map keyed by address. The entry
+            # itself is not rewritten from the advertised address: it is this
+            # cohort's record of how to reach the member, and a dual-homed
+            # gateway advertises an address only one of its cohorts can reach.
             member_key = next((k for k in self.group._address_map
                                if str(k) == str(ident.uuid)), None)
-            if member_key is None and (
+            # A gateway's members include its child cohorts': a field peer that
+            # joined before its gateway was up missed the confirm broadcast, and
+            # this is how the gateway learns it, so its relay can subscribe.
+            in_child = any(
+                str(ident.uuid) in {str(k) for k in child._address_map}
+                or (addr is not None and addr in set(child.addresses))
+                for child in (getattr(self, 'child_groups', None) or {}).values())
+            if member_key is None and not in_child and (
                     addr is None or addr not in list(self.group.addresses)):
                 # Only backfill identities for actual group members.
                 _probes.counter('peer.set', 'identity_response_not_in_group')
@@ -3696,12 +3904,6 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
                     '%s', getattr(ident, 'nickname', str(ident.uuid)))
             else:
                 _probes.counter('peer.set', 'identity_response_redundant')
-            # Refresh a stale map entry to the verified address, after the
-            # backfill so a failure to persist the group cannot cost it.
-            if member_key is not None and addr is not None \
-                    and self.group._address_map.get(member_key) != addr:
-                self.group.add_address(member_key, addr)
-                self._record_group(queues)
         except Exception as err:
             _probes.counter('peer.set', 'identity_response_exc')
             self.report_exception(err, 'handle_identity_response')
@@ -4225,6 +4427,17 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
                     return True
                 group = (Group.from_canonical(decoded)
                          if isinstance(decoded, dict) else decoded)
+            child = self._child_group_for(message)
+            if child is not None:
+                return self._apply_child_update(queues, child, group, message)
+            if self._unplaced_at_gateway(message):
+                # A group stops at the gateway: its primary changes only through
+                # its own members. A field joiner not yet in our child map is in
+                # neither group, and its larger field group won the size rule.
+                self.logger.debug('Ignoring group update from %s: a gateway takes its '
+                                  'primary only from its own members',
+                                  getattr(message.from_whom, 'nickname', '?'))
+                return True
             mine, theirs = self.group, group
             if mine is None or theirs is None:
                 return True
@@ -4327,6 +4540,12 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
                         adopt = theirs.created < mine.created
                     else:
                         adopt = str(theirs.uuid) < str(mine.uuid)
+            if adopt and self._spans_gateway(theirs):
+                _probes.counter('id.group', 'gateway_span_refused')
+                self.logger.warning('Refusing group update from %s: it lists a member of '
+                                    'a cohort we gateway',
+                                    getattr(message.from_whom, 'nickname', '?'))
+                return True
             if adopt:
                 if mine.uuid == theirs.uuid and mine.owns_private_key:
                     # OUR OWN group while we hold its key: a membership update

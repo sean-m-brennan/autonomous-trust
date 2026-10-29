@@ -577,6 +577,27 @@ bool identity_join_pending(const char *group_uuid);
 /** Seed a child cohort this node gateways (C twin of Python child_groups
  *  seeding). @p gateway_uuid names the deeper gateway to recurse into for that
  *  child group (NULL for a 2-level gateway). Returns 0 on success. */
+/** Whether @p grp as our primary group would span the gateway: it is one of
+ *  our child groups, or lists an address one of them holds (our own entries
+ *  aside). Every primary adopt checks it, so invariant G holds on the result
+ *  whichever path got there. Always false on a leaf node. Mirrors Python
+ *  IdentityProcess._spans_gateway. */
+bool identity_group_spans_gateway(const process_t *proc, const group_t *grp);
+
+/** Whether a joiner still waiting to be admitted should re-broadcast
+ *  request_access at @p elapsed_us into its wait. When it should, records the
+ *  ask in @p last_us and, once @p init_us has passed, doubles @p interval_us up
+ *  to @p cap_us. A single broadcast was all a joiner used to send; on a loaded
+ *  host a large share of UDP sends is dropped at the sender while the kernel
+ *  reports success. Mirrors Python IdentityProcess.choose_group. */
+bool identity_rejoin_due(long elapsed_us, long *last_us, long *interval_us,
+                         long init_us, long cap_us);
+
+/** How long a joiner waits to be admitted before founding a group of its own:
+ *  @p init_us, or AT_JOIN_PATIENCE_SEC when that is longer. Mirrors Python
+ *  IdentityProcess._join_patience. */
+long identity_join_wait_us(long init_us);
+
 int identity_add_child_group(process_t *proc, group_t *group,
                              const char *gateway_uuid);
 

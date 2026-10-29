@@ -1073,4 +1073,4 @@ steps:
 expected_state:
   dave:
     committed_tx_count: 200
-    window_root: b2a3f9bd03c25506f773a385ce0a1aff1b2b4e742712d7e005e3f703568a83f9
+    window_root: ee58e50ec3325d761923413d11e94ad9a37a2a995365ea1893b826d5a6d1f47e

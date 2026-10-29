@@ -116,7 +116,7 @@ static json_t *_sig(identity_t *signer, const uuid_t scorer, const uuid_t task,
                     double score)
 {
     uint8_t desig[512];
-    size_t dlen = commit_designation(scorer, task, score, NULL, desig,
+    size_t dlen = commit_designation(scorer, task, tx_score_to_milli(score), NULL, desig,
                                      sizeof(desig));
     ck_assert(dlen > 0);
     unsigned char sig[crypto_sign_BYTES];
@@ -133,32 +133,32 @@ static json_t *_sig(identity_t *signer, const uuid_t scorer, const uuid_t task,
 
 DEFINE_TEST(test_the_designation_matches_python_byte_for_byte)
 {
-    /* Python: commit_designation(UUID('1111...'), UUID('aaaa...'), 0.9) and
-     * (..., 0.3, 'probe'). A drift here would make every certificate one
+    /* Python: commit_designation(UUID('1111...'), UUID('aaaa...'), 900) and
+     * (..., 300, 'probe'). A drift here would make every certificate one
      * runtime cuts unverifiable in the other. */
     uuid_t s, t;
     ck_assert_int_eq(uuid_parse("11111111-2222-4333-8444-555555555555", s), 0);
     ck_assert_int_eq(uuid_parse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", t), 0);
     static const char want1[] =
         "AT-COMMIT\0" "11111111-2222-4333-8444-555555555555|"
-        "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee|0.90000000000000002|task_outcome";
+        "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee|900|task_outcome";
     static const char want2[] =
         "AT-COMMIT\0" "11111111-2222-4333-8444-555555555555|"
-        "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee|0.29999999999999999|probe";
+        "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee|300|probe";
     uint8_t out[512];
-    size_t n = commit_designation(s, t, 0.9, NULL, out, sizeof(out));
+    size_t n = commit_designation(s, t, 900, NULL, out, sizeof(out));
     ck_assert_uint_eq(n, sizeof(want1) - 1);
     ck_assert_mem_eq(out, want1, n);
     /* An absent channel and the explicit default are one claim. */
     uint8_t out_d[512];
-    size_t nd = commit_designation(s, t, 0.9, "task_outcome", out_d, sizeof(out_d));
+    size_t nd = commit_designation(s, t, 900, "task_outcome", out_d, sizeof(out_d));
     ck_assert_uint_eq(nd, n);
     ck_assert_mem_eq(out_d, out, n);
-    n = commit_designation(s, t, 0.3, "probe", out, sizeof(out));
+    n = commit_designation(s, t, 300, "probe", out, sizeof(out));
     ck_assert_uint_eq(n, sizeof(want2) - 1);
     ck_assert_mem_eq(out, want2, n);
     /* Too small a buffer is refused, never truncated. */
-    ck_assert_uint_eq(commit_designation(s, t, 0.9, NULL, out, 20), 0);
+    ck_assert_uint_eq(commit_designation(s, t, 900, NULL, out, 20), 0);
 }
 END_TEST_DEFINITION()
 
@@ -204,11 +204,11 @@ DEFINE_TEST(test_a_certificate_needs_its_half_and_travels_with_the_entry)
     ck_assert_ret_ok(tx_history_init(&h));
     uuid_t t, a, b, stranger;
     uuid_generate(t); uuid_generate(a); uuid_generate(b); uuid_generate(stranger);
-    tx_history_update(&h, t, a, 0.9, NULL);
+    tx_history_update(&h, t, a, 900, NULL);
     /* Not a half this history holds: refused. */
     ck_assert_int_eq(tx_history_attach_commit_cert(&h, t, stranger, "{\"v\":\"aa\"}"), -1);
     ck_assert_ret_ok(tx_history_attach_commit_cert(&h, t, a, "{\"v\":\"aa\"}"));
-    tx_history_update(&h, t, b, 0.8, NULL);
+    tx_history_update(&h, t, b, 800, NULL);
     ck_assert_ret_ok(tx_history_attach_commit_cert(&h, t, b, "{\"w\":\"bb\"}"));
     ck_assert_str_eq(tx_history_commit_cert(&h, t, a), "{\"v\":\"aa\"}");
 
@@ -245,8 +245,8 @@ DEFINE_TEST(test_a_certificate_needs_its_half_and_travels_with_the_entry)
     /* Entries without certificates keep their old shape. */
     tx_history_t plain;
     ck_assert_ret_ok(tx_history_init(&plain));
-    tx_history_update(&plain, t, a, 0.9, NULL);
-    tx_history_update(&plain, t, b, 0.8, NULL);
+    tx_history_update(&plain, t, a, 900, NULL);
+    tx_history_update(&plain, t, b, 800, NULL);
     ck_assert_ret_ok(tx_history_era_to_json(&plain, 0, 1, &arr));
     ck_assert_ptr_null(json_object_get(json_array_get(arr, 0), "commit_sigs"));
     json_decref(arr);
@@ -278,7 +278,7 @@ static void _sign_half(tx_history_t *h, const uuid_t task, identity_t *scorer,
                        identity_t *other, double score)
 {
     uint8_t desig[HALF_DESIG_MAX];
-    size_t dlen = half_designation(task, scorer->uuid, other->uuid, score, NULL,
+    size_t dlen = half_designation(task, scorer->uuid, other->uuid, tx_score_to_milli(score), NULL,
                                    desig, sizeof(desig));
     ck_assert(dlen > 0);
     unsigned char sig[crypto_sign_BYTES];
@@ -304,8 +304,8 @@ static void _cohort(cohort_t *c)
     for (int i = 0; i < 3; i++)
     {
         uuid_generate(c->tasks[i]);
-        tx_history_update(&c->src, c->tasks[i], c->alice->uuid, 0.9, NULL);
-        tx_history_update(&c->src, c->tasks[i], c->carol->uuid, 0.8, NULL);
+        tx_history_update(&c->src, c->tasks[i], c->alice->uuid, 900, NULL);
+        tx_history_update(&c->src, c->tasks[i], c->carol->uuid, 800, NULL);
         /* Each scorer signs its own half (R+D.md §14.2): certificates are
          * what these cases are about, and a checkpoint never excuses a
          * missing scorer signature. */
@@ -393,8 +393,8 @@ DEFINE_TEST(test_an_entry_we_already_hold_is_not_asked_again)
     /* bob already holds entries 0 and 1, exactly as alice does. */
     for (int i = 0; i < 2; i++)
     {
-        reputation_install_tx_single(c.tasks[i], c.alice->uuid, 0.9);
-        reputation_install_tx_single(c.tasks[i], c.carol->uuid, 0.8);
+        reputation_install_tx_single(c.tasks[i], c.alice->uuid, 900);
+        reputation_install_tx_single(c.tasks[i], c.carol->uuid, 800);
     }
     ck_assert_int_eq(reputation_get_committed_tx_count(), 2);
     /* A segment repeating them uncertified, plus a certified new entry. */
