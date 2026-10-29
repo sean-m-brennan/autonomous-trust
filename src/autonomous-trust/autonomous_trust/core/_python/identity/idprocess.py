@@ -599,10 +599,13 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
 
     @group.setter
     def group(self, value):
+        # The backstop. Every path that chooses among groups filters spanning
+        # ones first, so a refusal here is a path that does not, and its caller
+        # carries on as if it had adopted: logged as an error to be found.
         if value is not None and self._spans_gateway(value):
             _probes.counter('id.group', 'gateway_span_refused')
-            self.logger.warning('Refusing group %s as primary: it lists a member of a '
-                                'cohort we gateway', getattr(value, 'uuid', '?'))
+            self.logger.error('Refusing group %s as primary: it lists a member of a '
+                              'cohort we gateway', getattr(value, 'uuid', '?'))
             return
         self.__dict__['_primary_group'] = value
 
@@ -1868,6 +1871,75 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
         with self.lock:
             self.phase = 2
 
+    # At most this many held access requests, and as many held group updates,
+    # one per sender: C's ID_HELD_ACCESS_REQUESTS and ID_HELD_GROUP_UPDATES.
+    HELD_PER_KIND = 16
+
+    def _bounded_held(self, messages):
+        """``messages`` with held access requests and group updates reduced to
+        the latest per sender, and to the newest HELD_PER_KIND of each kind.
+        Every held message is re-run through every handler on every pass, and a
+        joiner can wait in phase 2 for as long as its patience allows while the
+        rest of its cohort re-broadcasts. Mirrors C's held lists."""
+        kinds = (IdentityProtocol.announce, IdentityProtocol.update)
+        latest = {}
+        for i, msg in enumerate(messages):
+            if getattr(msg, 'function', None) in kinds:
+                sender = str(getattr(getattr(msg, 'from_whom', None), 'uuid', ''))
+                latest[(msg.function, sender)] = i
+        keep = set(latest.values())
+        for kind in kinds:
+            mine = sorted(i for (fn, _), i in latest.items() if fn == kind)
+            keep.difference_update(mine[:-self.HELD_PER_KIND])
+        return [m for i, m in enumerate(messages)
+                if getattr(m, 'function', None) not in kinds or i in keep]
+
+    # A welcome (access_granted, then full_history) is sent again this many
+    # seconds after the first. A joiner's request may be one of a hundred that
+    # got through a loaded host, and if its one welcome is then lost the joiner
+    # never hears back. A copy the joiner already has is refused as a replay by
+    # its freshness stamp. Mirrors C ID_WELCOME_RESEND_AFTER_S.
+    WELCOME_RESEND_AFTER = (2.0, 6.0)
+
+    def _schedule_welcome_resend(self, messages):
+        resends = self.__dict__.setdefault('_welcome_resends', [])
+        start = time.monotonic()
+        for delay in self.WELCOME_RESEND_AFTER:
+            resends.append((start + delay, list(messages)))
+
+    def _resend_welcomes(self, queues):
+        """Send every scheduled welcome copy that is due."""
+        resends = self.__dict__.get('_welcome_resends')
+        if not resends:
+            return
+        now_s = time.monotonic()
+        due = [r for r in resends if r[0] <= now_s]
+        if not due:
+            return
+        self.__dict__['_welcome_resends'] = [r for r in resends if r[0] > now_s]
+        for _, messages in due:
+            for message in messages:
+                try:
+                    queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
+                except Full:
+                    self.logger.warning('Welcome re-send dropped: network queue full')
+        _probes.counter('id.welcome', 'resent', str(len(due)))
+
+    def _first_hold(self, message) -> bool:
+        """Whether this is the first time ``message`` is held. process() offers
+        a held message on every pass until phase 3, and a joiner can wait there
+        for as long as its patience allows; logging each pass wrote millions of
+        lines a run. Keyed by object identity, which holds while the message
+        sits in self.messages."""
+        seen = self.__dict__.setdefault('_held_logged', set())
+        key = id(message)
+        if key in seen:
+            return False
+        if len(seen) >= 4096:
+            seen.clear()
+        seen.add(key)
+        return True
+
     def _join_patience(self) -> float:
         """How long a joiner waits for a cohort to admit it before founding a
         group of its own (AT_JOIN_PATIENCE_SEC; 0 leaves init_timeout)."""
@@ -2001,6 +2073,12 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
                 # A returning node rejoins the group it persisted.
                 accepted = group, steps
                 break
+            # A gateway never takes a group that spans it (see the group
+            # property). Filtered here, before the longest is chosen, so a
+            # longer field history cannot crowd out the command one.
+            if self._spans_gateway(group):
+                self.logger.debug('Skipping a history whose group spans the gateway')
+                continue
             # Under the join policy a history offered by an anchor beats any
             # that is not, and length decides within each (RD_14.4, D1 (c)).
             # Inert, every history ranks unanchored: longest wins, as before.
@@ -2167,6 +2245,11 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
                     # Its peers still count; its group is not ours to take.
                     self.logger.warning('Skipping a history whose group names no '
                                         'format: our group speaks proto')
+                    continue
+                if self._spans_gateway(group):
+                    # Its peers still count; a gateway does not take a group
+                    # that spans it (see the group property).
+                    self.logger.debug('Skipping a history whose group spans the gateway')
                     continue
                 rank = (self._offered_by_anchor(i), len(steps))
                 if accepted_rank is None or rank > accepted_rank:
@@ -2410,6 +2493,7 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
         message = Message(self.name, IdentityProtocol.accept, msg_str, to_whom=blob.identity,
                           from_whom=self.identity, encrypt=False)
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
+        grant = message
         self.logger.debug('Welcome queued for %s at %s',
                           blob.identity.nickname, blob.identity.address)
 
@@ -2446,6 +2530,7 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
         message = Message(self.name, IdentityProtocol.history, msg_str, to_whom=blob.identity)
         self.logger.debug('Send full history (+%d peer identities)', len(self.peers.all))
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
+        self._schedule_welcome_resend([grant, message])
 
         if not amnesia:  # otherwise, already in listings
             # add to group and peer list (after history is queued, so peer
@@ -2524,8 +2609,9 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
                 # held: unhandled, process() keeps it in self.messages and
                 # offers it again every pass until phase 3. C holds it the same
                 # way (identity_replay_held_access_requests).
-                self.logger.info('Holding access request from %s until phase 3 (identity phase %s)',
-                                 getattr(message.from_whom, 'nickname', '?'), self.phase)
+                if self._first_hold(message):
+                    self.logger.info('Holding access request from %s until phase 3 (identity phase %s)',
+                                     getattr(message.from_whom, 'nickname', '?'), self.phase)
             return False
         if message.function == IdentityProtocol.announce:
             try:
@@ -2896,17 +2982,15 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
         # design — see idprocess.py:1042 / [[project_group_key_sync]]).
         grp_msg = to_json_string(group.to_canonical())  # to self.handle_group_update()
         recipients = list(self.peers.hierarchy[level].values())
-        # A group stops at the gateway: a peer in a cohort we gateway, and not in
-        # this group, is not sent it. A gateway's peers include its field cohort,
-        # and the command group, key and all, reached field nodes; one that had
-        # not yet joined took it, and the two cohorts merged. A leaf node holds
-        # no child groups and sends to every peer, as before.
-        children = list((getattr(self, 'child_groups', None) or {}).values())
-        if children:
+        # A group stops at the gateway: a gateway sends a group only to that
+        # group's members. Its peers include its field cohort, and the command
+        # group, key and all, reached field nodes, including ones it had not yet
+        # placed in a child map; one that had not yet joined took it, and the
+        # two cohorts merged. A leaf node holds no child groups and sends to
+        # every peer, as before.
+        if getattr(self, 'child_groups', None):
             members = set(group.addresses)
-            recipients = [p for p in recipients
-                          if p.address in members
-                          or not any(p.address in set(c.addresses) for c in children)]
+            recipients = [p for p in recipients if p.address in members]
         # Name the key the update carries, so the wire can be compared with
         # what each side's identity and network hold. INFO when the key or
         # epoch changed since the last update sent, debug otherwise:
@@ -3874,10 +3958,11 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
                                if str(k) == str(ident.uuid)), None)
             # A gateway's members include its child cohorts': a field peer that
             # joined before its gateway was up missed the confirm broadcast, and
-            # this is how the gateway learns it, so its relay can subscribe.
+            # this is how the gateway learns it, so its relay can subscribe. By
+            # uuid only: the signature ties a response to its uuid, and anyone
+            # can name a field member's address.
             in_child = any(
                 str(ident.uuid) in {str(k) for k in child._address_map}
-                or (addr is not None and addr in set(child.addresses))
                 for child in (getattr(self, 'child_groups', None) or {}).values())
             if member_key is None and not in_child and (
                     addr is None or addr not in list(self.group.addresses)):
@@ -4398,8 +4483,9 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
                 # self.messages and offers it again every pass until phase 3.
                 # C holds it the same way (identity_replay_held_group_updates;
                 # ISSUES §2.18, §2.61).
-                self.logger.info('Holding group update from %s until phase 3 (identity phase %s)',
-                                 getattr(message.from_whom, 'nickname', '?'), self.phase)
+                if self._first_hold(message):
+                    self.logger.info('Holding group update from %s until phase 3 (identity phase %s)',
+                                     getattr(message.from_whom, 'nickname', '?'), self.phase)
             return False
         if message.function == IdentityProtocol.update:
             self.logger.debug('Received group update')
@@ -4687,6 +4773,7 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
                 self._expire_attest_pending(queues)
                 self._expire_attest_sent(queues)
 
+                self._resend_welcomes(queues)
                 untouched = []
                 while len(self.messages) > 0:
                     message = self.messages.pop(0)
@@ -4709,7 +4796,7 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
                     if message and not self.protocol.run_message_handlers(queues, message):
                         untouched.append(message)
                 _probes.counter('proc.identity', 'iter_drained', str(drained))
-                self.messages += untouched
+                self.messages = self._bounded_held(self.messages + untouched)
             except Exception as err:
                 self.report_exception(err, 'process')
         # Final flush on graceful shutdown — ensures the most-recent

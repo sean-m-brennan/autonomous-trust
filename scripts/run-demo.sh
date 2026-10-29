@@ -1034,6 +1034,12 @@ PY
                     else
                         "$here/scripts/reclaim-demo-state.sh" "$here/.demo-state/dod-mission"
                     fi
+                    # generate_k8s.py has no hierarchical mode, and the seeder
+                    # reads AT_COHORT_SIZE: a hierarchical seed under flat pods
+                    # gives every gateway a transport it has no config for.
+                    if [[ -n "${AT_COHORT_SIZE:-}" && "${AT_COHORT_SIZE}" != "0" ]]; then
+                        err "AT_COHORT_SIZE (cohort hierarchy) is supported by the compose path only"; exit 1
+                    fi
                     # Seed C-format identities for the C microdrones so the SPEC
                     # matches generate_k8s.py exactly (C Pod <-> C identity).
                     seed_c_arg=""

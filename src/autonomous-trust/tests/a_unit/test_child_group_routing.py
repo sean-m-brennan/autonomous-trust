@@ -363,3 +363,39 @@ class TestChildResync:
         named = [from_json_string(m.obj)['group_uuid'] for m in queues[CfgIds.network].items
                  if m.function == IdentityProtocol.id_query]
         assert str(child.uuid) in named
+
+
+class TestUpdateAllowList:
+    def test_the_primary_update_skips_a_peer_the_gateway_cannot_place(self):
+        """A field joiner the gateway has heard of but not yet placed in a child
+        map got the command group, key and all; one whose own group was smaller
+        took it. On a gateway the primary's update goes to its members only."""
+        proc, primary, child, anchor = _gateway()
+        joiner = _new_identity('joiner', '172.20.0.40')    # in neither map
+        boss = _new_identity('boss', [a for a in primary.addresses
+                                      if a != proc.identity.address][0])
+        proc.peers.add(joiner, proc.peers.mid_level)
+        proc.peers.add(boss, proc.peers.mid_level)
+        sent = []
+        qs = {CfgIds.network: MagicMock()}
+        qs[CfgIds.network].put.side_effect = lambda m, **kw: sent.append(_to_addr(m))
+        IdentityProcess._update_group(proc, qs, primary, proc.peers.mid_level)
+        assert boss.address in sent
+        assert joiner.address not in sent
+
+
+class TestChildResyncByUuid:
+    def test_a_stranger_at_a_child_members_address_is_not_backfilled(self):
+        """A response is signed by the identity it carries, which ties it to that
+        uuid and nothing else; anyone can broadcast one naming a field member's
+        address. Child membership is by uuid."""
+        from autonomous_trust.core.config import to_json_string
+        proc, primary, child, anchor = _gateway()
+        proc._record_peers = MagicMock()
+        stranger = _new_identity('stranger', anchor.address)
+        payload = to_json_string({'from_identity': stranger.publish(),
+                                  'from_address': stranger.address})
+        msg = Message(CfgIds.identity, IdentityProtocol.id_response, payload,
+                      from_whom=stranger, encrypt=False)
+        proc.handle_identity_response(_build_queues(), msg)
+        assert proc.peers.find_by_uuid(stranger.uuid) is None

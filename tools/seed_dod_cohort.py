@@ -115,7 +115,7 @@ from autonomous_trust.core._python.reputation.reputation import (  # noqa: E402
     Checkpoint, EVIDENCE_FILE, PLACE_BATCH_MAX, Reputations, SignedCheckpoint,
     Transaction, TransactionHistory, evidence_to_dict, place_designation,
     place_value_digest, placement_entry, roster_digest, roster_members_norm,
-    roster_task_id,
+    roster_task_id, score_to_milli,
 )
 from autonomous_trust.core._python.capabilities import PeerCapabilities  # noqa: E402
 from autonomous_trust.core._python.system import CfgIds  # noqa: E402
@@ -386,8 +386,8 @@ def _seed_evidence_chain(members: list[str], identities: dict[str, Identity],
             task_id = uuid5(NAMESPACE_URL, 'at-dod-seed-tx/%d/%s/%s'
                             % (rnd, members[i], members[nxt]))
             ring.append(placement_entry(Transaction(
-                task_id, p1_id=uuids[i], p1_score=SEED_TX_SCORE,
-                p2_id=uuids[nxt], p2_score=SEED_TX_SCORE)))
+                task_id, p1_id=uuids[i], p1_score_milli=score_to_milli(SEED_TX_SCORE),
+                p2_id=uuids[nxt], p2_score_milli=score_to_milli(SEED_TX_SCORE))))
     for at in range(0, len(ring), PLACE_BATCH_MAX):
         in_force = history.latest_roster()
         if history.next_index - in_force.index >= history.max_chain_len // 2:
@@ -907,13 +907,17 @@ def main(argv=None) -> int:
                         "(pair with AT_COMPOSE_SEED_COORDINATOR=1 so compose "
                         "mounts its state). Its capabilities are learned at "
                         "runtime.")
-    p.add_argument("--cohort-size", type=int, default=None, metavar="N",
+    p.add_argument("--cohort-size", type=int, metavar="N",
+                   default=int(os.environ.get("AT_COHORT_SIZE", "0") or 0) or None,
                    help="Seed a two-tier hierarchy: a command cohort over one "
                         "field cohort per RQ-86 gateway, each of at most N "
                         "nodes. The layout then decides which microdrones run "
                         "C, and --c-microdrones is ignored. Pair with "
-                        "AT_COHORT_SIZE=N for generate_compose.")
-    p.add_argument("--rq86-count", type=int, default=2)
+                        "AT_COHORT_SIZE=N for generate_compose (default: "
+                        "$AT_COHORT_SIZE, the variable generate_compose reads).")
+    p.add_argument("--rq86-count", type=int,
+                   default=int(os.environ.get("AT_RQ86_COUNT", "2")),
+                   help="RQ-86 gateways (default: $AT_RQ86_COUNT, else 2).")
     p.add_argument("--c-microdrones", metavar="SPEC", nargs="?",
                    const="all", default=None,
                    help="Seed microdrone-* peers as C at_demo nodes (C-format "

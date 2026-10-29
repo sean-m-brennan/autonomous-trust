@@ -252,7 +252,31 @@ DEFINE_TEST(test_a_rotation_reaches_a_member_through_a_full_queue)
 }
 END_TEST_DEFINITION()
 
+/* A welcome is sent again ID_WELCOME_RESEND_AFTER_S seconds later: a joiner's
+ * request may be one of a hundred that got through a loaded host, and if its
+ * one welcome is then lost it never hears back. Mirrors Python
+ * test_a_welcome_is_re_sent_after_the_delays. */
+DEFINE_TEST(test_a_welcome_is_re_sent)
+{
+    _admit(0);
+    ck_assert_uint_eq(g_granted, 1);
+    ck_assert_uint_eq(g_history, 1);
+    messaging_set_test_hook(_capture_hook);
+    directory_t *queues = _mk_queues();
+    identity_resend_welcomes_at(g_admit_proc, queues, 0.0);   /* none due yet */
+    ck_assert_uint_eq(g_granted, 1);
+    identity_resend_welcomes_at(g_admit_proc, queues, 1e12);  /* every copy due */
+    ck_assert_uint_eq(g_granted, 3);
+    ck_assert_uint_eq(g_history, 3);
+    identity_resend_welcomes_at(g_admit_proc, queues, 1e12);  /* sent once each */
+    ck_assert_uint_eq(g_granted, 3);
+    array_free(queues);
+    messaging_set_test_hook(NULL);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(AdmissionSend,
+          test_a_welcome_is_re_sent,
           test_a_joiner_gets_its_history_through_a_full_queue,
           test_an_idle_queue_sends_each_once,
           test_a_wedged_queue_keeps_both_for_the_tick,

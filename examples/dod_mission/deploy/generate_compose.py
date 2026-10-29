@@ -541,9 +541,10 @@ def main(argv=None):
     p.add_argument("--no-mq800", action="store_true")
     p.add_argument("--no-jet", action="store_true")
     p.add_argument("--no-command", action="store_true")
-    p.add_argument("--rq86-count", type=int, default=2,
+    p.add_argument("--rq86-count", type=int,
+                   default=int(os.environ.get("AT_RQ86_COUNT", "2")),
                    help="RQ-86 gateways; with AT_COHORT_SIZE set, one per "
-                        "field cohort (default %(default)s).")
+                        "field cohort (default: $AT_RQ86_COUNT, else 2).")
     p.add_argument("--record", metavar="FILE", default=None,
                    help="Record the run to FILE (basename; written under "
                         f"{RECORD_HOST_DIR}/ on the host via a coordinator "
