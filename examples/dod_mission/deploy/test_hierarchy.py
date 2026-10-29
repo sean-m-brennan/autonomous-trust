@@ -145,3 +145,19 @@ def test_field_joiners_wait_for_their_cohort_and_seeded_nodes_do_not(hier):
         assert float(hier["services"][name]["environment"]["AT_JOIN_PATIENCE_SEC"]) > 0, name
     for name in [c.anchor, c.gateway, "squad-captain", "command"]:
         assert "AT_JOIN_PATIENCE_SEC" not in hier["services"][name]["environment"], name
+
+
+def test_generator_and_seeder_take_the_gateway_count_from_the_environment(monkeypatch, tmp_path):
+    """Scripts set AT_RQ86_COUNT and AT_COHORT_SIZE; a CLI default of 2 that
+    ignored them seeded a flat cohort under a hierarchical compose file."""
+    import yaml
+    monkeypatch.setenv("AT_RQ86_COUNT", "3")
+    monkeypatch.setenv("AT_COHORT_SIZE", "32")
+    out = tmp_path / "c.yml"
+    gc.main([str(out), "--swarm-size", "35"])
+    services = yaml.safe_load(out.read_text().split("\n", 3)[-1])["services"]
+    assert "rq86-3" in services
+    from tools.seed_dod_cohort import main as seed_main
+    seed_main(["--out", str(tmp_path / "seed"), "--force", "--swarm-size", "35",
+               "--seed-coordinator"])
+    assert (tmp_path / "seed" / "rq86-3" / "etc/at/hybrid_net.cfg.json").exists()

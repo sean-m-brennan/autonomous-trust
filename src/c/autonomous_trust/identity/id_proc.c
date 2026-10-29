@@ -248,6 +248,53 @@ static double _vote_now_sec(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+/* Welcome re-sends (see identity_resend_welcomes_at). Copies of the packed
+ * frames, sent again at each delay and then freed. */
+#define ID_WELCOME_RESEND_MAX 64
+static const double ID_WELCOME_RESEND_AFTER_S[] = {2.0, 6.0};
+typedef struct {
+    double due;
+    char *function;              /* a static verb string, not owned */
+    bool encrypt;
+    public_identity_t to;
+    uint8_t *obj;                /* owned copy of the packed payload */
+    size_t len;
+} welcome_resend_t;
+static welcome_resend_t g_welcome_resends[ID_WELCOME_RESEND_MAX];
+static size_t g_n_welcome_resends;
+static pthread_mutex_t g_welcome_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void _schedule_welcome_resend(const net_msg_t *msg)
+{
+    double now = _vote_now_sec();
+    pthread_mutex_lock(&g_welcome_lock);
+    for (size_t i = 0; i < sizeof(ID_WELCOME_RESEND_AFTER_S) / sizeof(double); i++) {
+        if (g_n_welcome_resends >= ID_WELCOME_RESEND_MAX || msg->obj == NULL)
+            break;
+        uint8_t *copy = malloc(msg->len);
+        if (copy == NULL)
+            break;
+        memcpy(copy, msg->obj, msg->len);
+        welcome_resend_t *w = &g_welcome_resends[g_n_welcome_resends++];
+        w->due = now + ID_WELCOME_RESEND_AFTER_S[i];
+        w->function = msg->function;
+        w->encrypt = msg->encrypt;
+        memcpy(&w->to, &msg->to_whom, sizeof(public_identity_t));
+        w->obj = copy;
+        w->len = msg->len;
+    }
+    pthread_mutex_unlock(&g_welcome_lock);
+}
+
+static void _clear_welcome_resends(void)
+{
+    pthread_mutex_lock(&g_welcome_lock);
+    for (size_t i = 0; i < g_n_welcome_resends; i++)
+        free(g_welcome_resends[i].obj);
+    g_n_welcome_resends = 0;
+    pthread_mutex_unlock(&g_welcome_lock);
+}
+
 /****************************
  * Protocol function names (must match Python IdentityProtocol)
  ****************************/
@@ -1698,24 +1745,19 @@ bool identity_group_spans_gateway(const process_t *proc, const group_t *grp)
     return spans;
 }
 
-/* Whether @p addr sits in a cohort this gateway bridges and not in its primary
- * group: a peer the primary group's update must not reach. Always false on a
- * leaf node, which holds no child groups. */
+/* Whether a gateway must not send its primary group to the peer at @p addr:
+ * a gateway sends a group only to that group's members. Its peers include its
+ * field cohort, and the command group, key and all, reached field nodes,
+ * including ones it had not yet placed in a child map; one that had not yet
+ * joined took it, and the two cohorts merged. Always false on a leaf node,
+ * which holds no child groups and sends to every peer, as before. */
 static bool _peer_beyond_gateway(const process_t *proc, const char *addr)
 {
-    if (proc->protocol.child_groups == NULL || addr == NULL || addr[0] == '\0'
-        || _group_has_address((group_t *)&proc->protocol.group, addr))
+    if (proc->protocol.child_groups == NULL
+        || map_size(proc->protocol.child_groups) == 0)
         return false;
-    bool beyond = false;
-    map_key_t key;
-    data_t *val;
-    map_entries_for_each(proc->protocol.child_groups, key, val)
-        void *gp = NULL;
-        if (!beyond && data_object_ptr(val, &gp) == 0 && gp != NULL
-            && _group_has_address((group_t *)gp, addr))
-            beyond = true;
-    map_end_for_each
-    return beyond;
+    return addr == NULL || addr[0] == '\0'
+           || !_group_has_address((group_t *)&proc->protocol.group, addr);
 }
 
 static int _update_group(const process_t *proc, directory_t *queues)
@@ -1749,10 +1791,9 @@ static int _update_group(const process_t *proc, directory_t *queues)
     _log_group_update_sent(proc, proc->protocol.num_peers);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
-        /* A group stops at the gateway: a peer in a cohort we gateway, and not
-         * in our group, is not sent it. The command group, key and all, reached
-         * field nodes; one that had not yet joined took it, and the two cohorts
-         * merged. Mirrors Python _update_group. */
+        /* A group stops at the gateway: a gateway sends its group to that
+         * group's members only (see _peer_beyond_gateway). Mirrors Python
+         * _update_group. */
         if (_peer_beyond_gateway(proc, proc->protocol.peers[i].address))
             continue;
         generic_msg_t update = {0};
@@ -2356,6 +2397,7 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
     /* Bounded retry, not a bare send (ISSUES §2.14, §2.30): the admission is
      * one-shot, and nothing re-sends it. */
     identity_send_to_network(proc, &accept, "access_granted", new_peer->nickname);
+    _schedule_welcome_resend(&accept.info.net_msg);
     net_msg_free_obj(&accept.info.net_msg);
 
     /* Send ID_HISTORY to the new peer so they can decrypt subsequent
@@ -2407,6 +2449,7 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
      * "no histories received", and bootstrapped a group of his own. Bounded
      * retry, then a warning that names the joiner (ISSUES §2.30). */
     identity_send_to_network(proc, &hist, "full_history", new_peer->nickname);
+    _schedule_welcome_resend(&hist.info.net_msg);
     net_msg_free_obj(&hist.info.net_msg);
 
     /* Skip _add_peer in the amnesia case — the peer is already in our
@@ -3429,6 +3472,17 @@ static int _merge_to_mesh(process_t *proc, directory_t *queues)
              * Python _merge_to_mesh. */
             log_warn(proc->logger, "Identity: skipping a history whose group "
                      "names no format: our group speaks proto\n");
+            continue;
+        }
+        /* A gateway does not take a group that spans it; filtered before the
+         * pick is made so a longer field history cannot crowd out the
+         * command one. Mirrors Python _merge_to_mesh. */
+        if (g_json != NULL
+            && _json_group_spans_gateway(proc,
+                   json_string_value(json_object_get(g_json, "uuid")),
+                   json_object_get(g_json, "address_map"))) {
+            log_debug(proc->logger, "Identity: skipping a history whose group "
+                      "spans the gateway\n");
             continue;
         }
         if (g_json && json_is_object(g_json)) {
@@ -4499,8 +4553,44 @@ void identity_set_admission_quorum(process_t *proc, int quorum)
         proc->protocol.admission_quorum = quorum > 0 ? quorum : 1;
 }
 
+void identity_resend_welcomes_at(const process_t *proc, directory_t *queues,
+                                 double now)
+{
+    (void)queues;
+    welcome_resend_t due[ID_WELCOME_RESEND_MAX];
+    size_t n_due = 0;
+    pthread_mutex_lock(&g_welcome_lock);
+    size_t kept = 0;
+    for (size_t i = 0; i < g_n_welcome_resends; i++) {
+        if (g_welcome_resends[i].due <= now)
+            due[n_due++] = g_welcome_resends[i];
+        else
+            g_welcome_resends[kept++] = g_welcome_resends[i];
+    }
+    g_n_welcome_resends = kept;
+    pthread_mutex_unlock(&g_welcome_lock);
+    for (size_t i = 0; i < n_due; i++) {
+        generic_msg_t out = {0};
+        out.type = NET_MESSAGE;
+        strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
+        out.info.net_msg.function = due[i].function;
+        out.info.net_msg.encrypt = due[i].encrypt;
+        memcpy(&out.info.net_msg.to_whom, &due[i].to, sizeof(public_identity_t));
+        out.info.net_msg.obj = due[i].obj;
+        out.info.net_msg.len = due[i].len;
+        identity_send_to_network(proc, &out, due[i].function, due[i].to.nickname);
+        free(due[i].obj);
+    }
+    if (n_due > 0) {
+        char n_str[16];
+        snprintf(n_str, sizeof(n_str), "%zu", n_due);
+        probes_counter("id.welcome", "resent", n_str);
+    }
+}
+
 void identity_reset_state(void)
 {
+    _clear_welcome_resends();
     _ensure_id_init();
     pthread_mutex_lock(&id_state.lock);
     /* Preserve synchronous_dispatch across reset so the harness can set
@@ -7398,7 +7488,9 @@ static bool handle_identity_response(const process_t *proc, directory_t *queues,
     bool is_member = map_get(&group->address_map, member_key, &entry) == 0;
     /* A gateway's members include its child cohorts': a field peer that joined
      * before its gateway was up missed the confirm broadcast, and this is how
-     * the gateway learns it, so its relay can subscribe. Mirrors Python. */
+     * the gateway learns it, so its relay can subscribe. By uuid only: the
+     * signature ties a response to its uuid, and anyone can name a field
+     * member's address. Mirrors Python. */
     if (!is_member && proc->protocol.child_groups != NULL) {
         map_key_t ck;
         data_t *cv;
@@ -7406,8 +7498,7 @@ static bool handle_identity_response(const process_t *proc, directory_t *queues,
             void *gp = NULL;
             data_t *ce = NULL;
             if (!is_member && data_object_ptr(cv, &gp) == 0 && gp != NULL
-                && (map_get(&((group_t *)gp)->address_map, member_key, &ce) == 0
-                    || _group_has_address((group_t *)gp, addr)))
+                && map_get(&((group_t *)gp)->address_map, member_key, &ce) == 0)
                 is_member = true;
         map_end_for_each
     }
@@ -9721,6 +9812,13 @@ static bool _adopt_group_from_histories(process_t *proc,
         if (g_json == NULL || !json_is_object(g_json)
             || group_from_json(g_json, &parsed) != 0)
             continue;
+        /* A gateway does not take a group that spans it; filtered before the
+         * pick is made so a longer field history cannot crowd out the command
+         * one. Mirrors Python _adopt_from_histories. */
+        if (identity_group_spans_gateway(proc, &parsed)) {
+            map_free(&parsed.address_map);
+            continue;
+        }
         /* A returning node rejoins the group it persisted, whatever is longer
          * (RD_14.4 plan, D10). Mirrors Python choose_group. */
         bool ours = _is_configured_group_locked(&parsed);
@@ -10131,6 +10229,9 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
          * design and a pending admission is somebody sitting at the door. A
          * converged cohort has an empty map, so this is a no-op. */
         identity_periodic_vote_collection(proc, queues);
+
+        /* Welcome copies that are due (identity_resend_welcomes_at). */
+        identity_resend_welcomes_at(proc, queues, _vote_now_sec());
 
         /* Sibling hand-offs a full queue refused (GROUP / PEER / PEER_REMOVED):
          * one try each per tick until they land. Empty, and free, once the

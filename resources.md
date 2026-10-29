@@ -49,24 +49,28 @@ For each node we suggest budgeting:
 
 ## Hierarchical cohorts
 
-We ran the dod-mission scenario as a two-tier hierarchy on 2026-10-28: a command
+We ran the dod-mission scenario as a two-tier hierarchy on 2026-10-29: a command
 cohort (coordinator, squad, jet, command node and three RQ-86 gateways) over three
 field cohorts, each gateway on both the command subnet and its field subnet. Field
-microdrones were C nodes apart from one Python anchor per cohort. Join time is
-measured from a field peer's own announce to the first `access_granted` any node
-sent to its field address.
+microdrones were C nodes apart from one Python anchor per cohort, and all of it ran
+on one host. A field peer has joined when a member sends it `access_granted` or it
+adopts its cohort's group; join time runs from its own first announce, and a seeded
+drone that takes its cohort's group before asking counts as zero.
 
 | Run | Field cohorts | Joined | Join p90 per cohort | Anomaly detected | Host RAM peak |
 |---|---|---|---|---|---|
-| 48 peers (3 × 13 field nodes) | 14 nodes each | 36 of 36 | 117 s, 88 s, 61 s | yes, 810 s | under 80% |
-| 96 peers (3 × 29 field nodes) | 30 nodes each | 68 of 84 | 550 s, 205 s, 41 s | no, within 1500 s | 50% |
+| 48 peers (3 × 13 field nodes) | 14 nodes each | 36 of 36 | 83 s, 87 s, 70 s | yes, 835 s | 55% |
+| 96 peers (3 × 29 field nodes) | 30 nodes each | 84 of 84 | 744 s, 396 s, 175 s | yes, 919 s | 59% |
 
 At both sizes the cohorts stayed apart: the coordinator's group held its eight
-command members, no field peer reached the command cohort, and relayed field
-readings reached the coordinator. At 96 the MQ-800 bootstrapped its own group
-after waiting 8 s for a welcome that did not come, and never joined its cohort,
-so its readings were never relayed. The host's load average was about 20, and
-the same admission stall is what limited the flat 80- and 100-node runs. One
-host running three 30-node cohorts carries nearly the same load as one 90-node
-cohort, so this table measures the host as much as the cohort size.
-[TODO: rerun at 96 with field cohorts on separate hosts]
+command members, no field peer reached the command cohort, and the gateways relayed
+field readings, the MQ-800's among them, to the coordinator.
+
+Joins at 96 are slow because the host is saturated, not because the cohorts are
+large. The kernel drops a share of UDP sends at the sender while reporting success
+(`SndbufErrors` climbed on every node we sampled, a sixth of sends or more on some),
+and process start-up for 176 containers spread over twenty minutes, so a cohort's
+admitter often came up after its members. A joiner therefore asks again until it is
+admitted (`AT_JOIN_PATIENCE_SEC`), and a welcomer sends its welcome twice more a few
+seconds later. On hardware with one cohort per host the start-up spread and the send
+loss should both fall away. [TODO: rerun at 96 with field cohorts on separate hosts]

@@ -8,7 +8,7 @@ cohort.
 A hierarchy gateway sits in both cohorts, and nobody in the command cohort can
 reach a field producer, so the gateway subscribes to each field producer and
 queues what arrives for its own data source, which the coordinator already
-subscribes to. Each relayed reading keeps its producer's ``peer_name`` and
+subscribes to. Each relayed reading keeps its producer's name (``peer``) and
 loses the batch ``task_id``: the producer's bilateral score pairs with ITS
 subscriber (this gateway), and a coordinator scoring the gateway for a batch it
 did not produce would pair with nothing. ``relayed_by`` names the gateway."""
@@ -40,12 +40,18 @@ RELAY_FIELD_PEERS_ENV = "AT_GATEWAY_FIELD_PEERS"
 RELAY_TICK_SEC = 1.0
 
 
-def relay_readings(readings, gateway_name):
+def relay_readings(readings, gateway_name, producer=None):
     """Copies of ``readings`` fit to republish: no ``task_id``, ``relayed_by``
-    set, and none of the gateway's own (it already emits those itself)."""
+    set, and none of the gateway's own (it already emits those itself). With
+    ``producer``, only the readings that name it: a reading's producer is its
+    own claim, and the gateway relays it under that name, so a field node could
+    otherwise put words in any other peer's mouth. Readings are in their wire
+    form (Reading.to_dict), which names the producer under ``peer``."""
     out = []
     for r in readings or []:
-        if not isinstance(r, dict) or r.get("peer_name") == gateway_name:
+        if not isinstance(r, dict) or r.get("peer") == gateway_name:
+            continue
+        if producer is not None and r.get("peer") != producer:
             continue
         r = copy.deepcopy(r)
         meta = r.get("metadata")
@@ -92,15 +98,19 @@ class GatewayRelay(Process, metaclass=ProcMeta, proc_name="gateway-relay",
     def handle_data(self, _, message):
         if message.function != DataProtocol.data:
             return False
+        producer = roster_name_of(message.from_whom)
+        if producer not in self.field_producers:
+            return True   # not a field peer we relay for
         self._received.add(str(getattr(message.from_whom, "uuid", "")))
         readings = []
         try:
-            readings = relay_readings(from_yaml_string(message.obj), self.gateway_name)
+            readings = relay_readings(from_yaml_string(message.obj), self.gateway_name,
+                                      producer=producer)
             if readings:
                 self.relay_queue.put(readings, block=True, timeout=self.q_cadence)
                 if self._relayed == 0:
                     self.logger.info("Relaying field readings (first batch: %d from %s)",
-                                     len(readings), readings[0].get("peer_name"))
+                                     len(readings), readings[0].get("peer"))
                 self._relayed += len(readings)
         except Full:
             self.logger.warning("Relay queue full; dropping %d reading(s)", len(readings))
