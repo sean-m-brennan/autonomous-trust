@@ -340,6 +340,17 @@ build_images_once() {
 # given scale point. Mirrors what scripts/run-demo.sh does on `--compose`.
 regenerate_manifests() {
     local squad=$1 swarm=$2 sensor=$3 hacked=$4
+    # A hierarchical compose file (AT_COHORT_SIZE) needs a hierarchical seed:
+    # under a flat one the gateways start with the hybrid transport and no
+    # hybrid_net.cfg.json, and exit. Seed with tools.seed_dod_cohort under the
+    # same AT_COHORT_SIZE and AT_RQ86_COUNT.
+    if [[ -n "${AT_COHORT_SIZE:-}" && "${AT_COHORT_SIZE}" != "0" ]]; then
+        local gw_cfg="$here/.demo-state/dod-mission/rq86-1/etc/at/hybrid_net.cfg.json"
+        if [[ ! -f "$gw_cfg" ]]; then
+            err "AT_COHORT_SIZE=$AT_COHORT_SIZE but the seed is not hierarchical ($gw_cfg missing); run tools.seed_dod_cohort with the same AT_COHORT_SIZE"
+            return 1
+        fi
+    fi
     # The scenario clock starts at T0. A large point on slow storage can take
     # longer to start than the scenario lasts, so AT_DEMO_T0_DELAY_SEC pushes
     # T0 past start-up; producers emit nothing before T0.
@@ -430,7 +441,7 @@ run_scale_point() {
 
     log "[$label] squad=$squad swarm=$swarm sensor=$sensor hacked=$hacked"
 
-    regenerate_manifests "$squad" "$swarm" "$sensor" "$hacked"
+    regenerate_manifests "$squad" "$swarm" "$sensor" "$hacked" || exit 1
     cp "$COMPOSE_FILE" "$run_dir/docker-compose.yml"
     [[ -f "$SIM_SCENARIO_YAML" ]] && \
         cp "$SIM_SCENARIO_YAML" "$run_dir/scenario.yaml"

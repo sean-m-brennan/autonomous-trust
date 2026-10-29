@@ -150,7 +150,7 @@ static bool _group_lists(group_t *grp, const char *addr)
     return found;
 }
 
-static void _run(bool gateway)
+static void _run(bool gateway, bool field_in_child)
 {
     identity_reset_state();
     g_to_member = g_to_field = 0;
@@ -176,7 +176,8 @@ static void _run(bool gateway)
         group_init(&cuuid, (char *)me->address, child);
         char field_uuid[UUID_STRING_LEN + 1];
         uuid_unparse_lower(field->uuid, field_uuid);
-        group_add_address(child, field_uuid, field->address);
+        if (field_in_child)
+            group_add_address(child, field_uuid, field->address);
         ck_assert_ret_ok(identity_add_child_group(proc, child, NULL));
     }
     directory_t *queues = _mk_queues();
@@ -191,7 +192,7 @@ static void _run(bool gateway)
 
 DEFINE_TEST(test_the_primary_update_skips_the_child_cohort)
 {
-    _run(true);
+    _run(true, true);
     ck_assert(g_to_member >= 1);
     ck_assert_uint_eq(g_to_field, 0);
 }
@@ -199,7 +200,7 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_a_leaf_node_still_updates_every_peer)
 {
-    _run(false);
+    _run(false, false);
     ck_assert(g_to_member >= 1);
     ck_assert(g_to_field >= 1);
 }
@@ -438,7 +439,77 @@ DEFINE_TEST(test_a_gateway_queries_each_child_cohort_it_lacks)
 }
 END_TEST_DEFINITION()
 
+static json_t *_history_of(group_t *grp, int steps)
+{
+    json_t *g = NULL;
+    ck_assert_ret_ok(group_to_json(grp, &g));
+    json_t *s = json_array();
+    for (int i = 0; i < steps; i++)
+        json_array_append_new(s, json_string("step"));
+    json_t *h = json_array();
+    json_array_append_new(h, g);
+    json_array_append_new(h, s);
+    json_array_append_new(h, json_array());
+    return h;
+}
+
+/* A gateway offered a command history and a longer field history used to pick
+ * the field one and then refuse it, adopting neither. The spanning history is
+ * filtered out before the longest is chosen. Mirrors
+ * test_a_gateway_skips_a_history_whose_group_spans_it. */
+DEFINE_TEST(test_a_gateway_skips_a_history_whose_group_spans_it)
+{
+    identity_reset_state();
+    identity_t *me = _mk_identity("gw", "10.0.0.6");
+    identity_t *boss = _mk_identity("boss", "10.0.0.3");
+    identity_t *drone = _mk_identity("drone", "172.20.0.11");
+    process_t *proc = _mk_process(me);
+    char u[UUID_STRING_LEN + 1];
+
+    group_t *child = calloc(1, sizeof(group_t));
+    uuid_t cu;
+    uuid_generate(cu);
+    group_init(&cu, (char *)me->address, child);
+    uuid_unparse_lower(drone->uuid, u);
+    group_add_address(child, u, drone->address);
+    ck_assert_ret_ok(identity_add_child_group(proc, child, NULL));
+
+    group_t command = {0}, field = {0};
+    uuid_t gu;
+    uuid_generate(gu);
+    group_init(&gu, (char *)boss->address, &command);
+    uuid_unparse_lower(boss->uuid, u);
+    group_add_address(&command, u, boss->address);
+    uuid_generate(gu);
+    group_init(&gu, (char *)drone->address, &field);
+    uuid_unparse_lower(drone->uuid, u);
+    group_add_address(&field, u, drone->address);
+
+    identity_stash_history(_history_of(&command, 1));
+    identity_stash_history(_history_of(&field, 3));
+    directory_t *queues = _mk_queues();
+    identity_adopt_group_from_histories(proc, queues);
+    ck_assert(uuid_compare(proc->protocol.group.uuid, command.uuid) == 0);
+    array_free(queues);
+    map_free(&command.address_map);
+    map_free(&field.address_map);
+}
+END_TEST_DEFINITION()
+
+/* A field joiner the gateway has heard of but not yet placed in a child map
+ * got the command group, key and all. On a gateway the primary's update goes
+ * to its members only. Mirrors TestUpdateAllowList. */
+DEFINE_TEST(test_the_primary_update_skips_a_peer_the_gateway_cannot_place)
+{
+    _run(true, false);
+    ck_assert(g_to_member >= 1);
+    ck_assert_uint_eq(g_to_field, 0);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(GatewayUpdateScope,
+          test_the_primary_update_skips_a_peer_the_gateway_cannot_place,
+          test_a_gateway_skips_a_history_whose_group_spans_it,
           test_a_gateway_queries_each_child_cohort_it_lacks,
           test_the_primary_guard_names_a_spanning_group,
           test_a_primary_member_cannot_merge_the_field_in,

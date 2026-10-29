@@ -245,3 +245,48 @@ def test_without_patience_the_joiner_still_founds_its_own_group(monkeypatch, tmp
     node.choose_group(_queues())
     assert time.monotonic() - t < 2.0
     assert node.group is not None and str(me.uuid) in {str(k) for k in node.group._address_map}
+
+
+def test_a_gateway_skips_a_history_whose_group_spans_it():
+    """A gateway offered a command history and a longer field history used to
+    pick the field one and then have the guard refuse it, adopting neither
+    (and, in Python, half-applying the refused one). The spanning history is
+    filtered out before the longest is chosen."""
+    me, boss, drone = _peer('gw'), _peer('boss'), _peer('drone')
+    command = _group(boss, name='command')
+    child = _group(drone, name='field')
+    field_history = _group(drone, _peer('d2'), name='field2')
+    node = _chooser(me)
+    node.child_groups = {str(child.uuid): child}
+    node.histories = [(command.to_canonical(), ['s1'], []),
+                      (field_history.to_canonical(), ['s1', 's2', 's3'], [])]
+    assert node._adopt_from_histories(_queues()) is True
+    assert node.group == command
+
+
+# ---- a welcome is re-sent ----------------------------------------------------
+#
+# The welcomer used to send access_granted and full_history once. On a loaded
+# host a joiner's request may be one of a hundred that got through, and if that
+# one welcome is then lost the joiner never hears back (the MQ-800 at 96 nodes:
+# 114 requests, one received, its welcome lost). A re-sent copy the joiner
+# already has is refused as a replay by its freshness stamp.
+
+def test_a_welcome_is_re_sent_after_the_delays(monkeypatch):
+    import autonomous_trust.core._python.identity.idprocess as idp
+    clock = [100.0]
+    monkeypatch.setattr(idp.time, 'monotonic', lambda: clock[0])
+    node = _chooser(_peer('anchor'))
+    node.WELCOME_RESEND_AFTER = (2.0, 6.0)
+    grant, history = object(), object()
+    node._schedule_welcome_resend([grant, history])
+    queues = _queues()
+    node._resend_welcomes(queues)
+    assert _sent(queues) == []
+    clock[0] = 102.5
+    node._resend_welcomes(queues)
+    assert _sent(queues) == [grant, history]
+    clock[0] = 106.5
+    node._resend_welcomes(queues)
+    node._resend_welcomes(queues)
+    assert _sent(queues) == [grant, history, grant, history]

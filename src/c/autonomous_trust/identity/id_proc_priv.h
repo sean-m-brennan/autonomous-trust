@@ -598,6 +598,15 @@ bool identity_rejoin_due(long elapsed_us, long *last_us, long *interval_us,
  *  IdentityProcess._join_patience. */
 long identity_join_wait_us(long init_us);
 
+/** Send every scheduled welcome copy (access_granted, full_history) due at
+ *  @p now (monotonic seconds). A welcome is sent again 2 s and 6 s after the
+ *  first (ID_WELCOME_RESEND_AFTER_S): a joiner's request may be one of a
+ *  hundred that got through a loaded host, and if its one welcome is lost it
+ *  never hears back. A copy the joiner already has is refused as a replay by
+ *  its freshness stamp. Mirrors Python IdentityProcess._resend_welcomes. */
+void identity_resend_welcomes_at(const process_t *proc, directory_t *queues,
+                                 double now);
+
 int identity_add_child_group(process_t *proc, group_t *group,
                              const char *gateway_uuid);
 
