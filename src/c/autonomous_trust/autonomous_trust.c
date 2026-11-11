@@ -495,38 +495,16 @@ int register_queues(tracker_t *tracker, const char *main, directory_t *queues, d
 }
 
 
-int run_autonomous_trust(char *q_in, char *q_out,
-                         capability_t *capabilities, size_t cap_len,
-                         log_level_t log_level, char log_file[])
+/* The node itself, from logger setup to shutdown cleanup. Runs in whichever
+ * process is the node: the forked daemon, or the caller when in-process. */
+static int _run_node(char *q_in, char *q_out, log_level_t log_level,
+                     char log_file[], int fd1, int fd2)
 {
-    (void)capabilities; (void)cap_len;
     int error = 0;
     char cfg_dir[CFG_PATH_LEN + 1] = {0};
     get_cfg_dir(cfg_dir, sizeof(cfg_dir));
     char data_dir[CFG_PATH_LEN + 1] = {0};
     get_data_dir(data_dir, sizeof(data_dir));
-
-    int fd1 = 0;
-    int fd2 = 0;
-    int flags = 0;
-    if (log_file == NULL)
-    {
-        flags |= NO_STDERR_REDIRECT;
-        /* Foreground: keep subsystem children's stderr too, so their logs
-         * (id_proc admission/history handlers, net_proc, etc.) reach the
-         * controlling terminal / container stream instead of /dev/null. */
-        process_child_extra_flags |= NO_STDERR_REDIRECT;
-    }
-    /* In-process the caller's process IS the node (agorad, or a host that
-     * runs the node on a thread): nothing forks, and this returns at shutdown
-     * with 0 instead of returning the daemon's pid at once. */
-    int err = 0;
-    if (!messaging_in_process())
-    {
-        err = daemonize(data_dir, flags, &fd1, &fd2);
-        if (err != 0)
-            return err;
-    }
 
     const char *name = AT_MAIN_QUEUE;
     logger_t logger = {0};
@@ -847,4 +825,42 @@ int run_autonomous_trust(char *q_in, char *q_out,
         unlink(pid_path);
 
     return error;
+}
+
+
+int run_autonomous_trust(char *q_in, char *q_out,
+                         capability_t *capabilities, size_t cap_len,
+                         log_level_t log_level, char log_file[])
+{
+    (void)capabilities; (void)cap_len;
+    char data_dir[CFG_PATH_LEN + 1] = {0};
+    get_data_dir(data_dir, sizeof(data_dir));
+
+    int fd1 = 0;
+    int fd2 = 0;
+    int flags = 0;
+    if (log_file == NULL)
+    {
+        flags |= NO_STDERR_REDIRECT;
+        /* Foreground: keep subsystem children's stderr too, so their logs
+         * (id_proc admission/history handlers, net_proc, etc.) reach the
+         * controlling terminal / container stream instead of /dev/null. */
+        process_child_extra_flags |= NO_STDERR_REDIRECT;
+    }
+    /* In-process the caller's process IS the node (agorad, or a host that
+     * runs the node on a thread): nothing forks, and this returns at shutdown
+     * with 0 instead of returning the daemon's pid at once. */
+    if (messaging_in_process())
+        return _run_node(q_in, q_out, log_level, log_file, fd1, fd2);
+
+    int pid = daemonize(data_dir, flags, &fd1, &fd2);
+    if (pid != 0)
+        return pid;  /* the caller: the daemon's pid, or a negative error */
+
+    /* The daemon is a fork of the caller, so returning would carry it on into
+     * the caller's code (at_node_start, then the application's main) after
+     * shutdown. It exits here instead, without the caller's atexit handlers. */
+    int error = _run_node(q_in, q_out, log_level, log_file, fd1, fd2);
+    fflush(NULL);
+    _exit(error == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
 }
