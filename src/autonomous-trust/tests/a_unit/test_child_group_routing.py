@@ -158,6 +158,76 @@ class TestChildUpdate:
         assert boss2.address in set(proc.group.addresses)
 
 
+
+class TestChildKeyInstall:
+    """A gateway seeded with only a child's public key takes a carried key the
+    way it takes a rotation: from a verified message, at the epoch it holds or
+    a newer one. A larger membership alone is no reason to trust the key."""
+
+    def _public_child(self, proc, child, epoch):
+        public = Group(child.uuid, dict(child._address_map), child.nickname,
+                       child.encryptor, _public_only=True, _key_epoch=epoch)
+        proc.child_groups = {str(child.uuid): public}
+        return public
+
+    def _larger_with_key(self, child, epoch):
+        other = _group('fld', *[_new_identity('k%d' % i, '172.20.0.%d' % (60 + i))
+                                for i in range(4)])
+        bigger = Group(child.uuid, dict(child._address_map), child.nickname,
+                       other.encryptor, _public_only=False, _key_epoch=epoch)
+        for i in range(3):
+            j = _new_identity('j%d' % i, '172.20.0.%d' % (20 + i))
+            bigger.add_address(str(j.uuid), j.address)
+        return bigger
+
+    def _send(self, proc, bigger, child, anchor, verified):
+        if verified:
+            # Signed by the anchor, a child member the gateway holds: what a
+            # carried key must be to be installed.
+            from autonomous_trust.core.config import to_json_string
+            proc.peers.add(anchor.publish(), 0)
+            raw = bytes(Message(CfgIds.identity, IdentityProtocol.update,
+                                to_json_string(bigger.to_canonical()),
+                                from_whom=anchor))
+            msg = Message.parse(raw, anchor.publish())
+            msg.child_group = str(child.uuid)
+        else:
+            msg = _tagged(IdentityProtocol.update, bigger, child, anchor)
+            msg.verified = False
+        proc.handle_group_update(_build_queues(), msg)
+        return proc.child_groups[str(child.uuid)]
+
+    def test_an_unverified_update_installs_no_key(self):
+        proc, _, child, anchor = _gateway()
+        public = self._public_child(proc, child, 2)
+        held = self._send(proc, self._larger_with_key(child, 1), child, anchor, False)
+        assert held is public
+        assert not held.owns_private_key
+
+    def test_an_older_key_is_not_installed(self):
+        proc, _, child, anchor = _gateway()
+        public = self._public_child(proc, child, 2)
+        held = self._send(proc, self._larger_with_key(child, 1), child, anchor, True)
+        assert held is public
+        assert held.key_epoch == 2
+
+    def test_a_verified_key_at_our_epoch_is_installed(self):
+        proc, _, child, anchor = _gateway()
+        self._public_child(proc, child, 2)
+        bigger = self._larger_with_key(child, 2)
+        held = self._send(proc, bigger, child, anchor, True)
+        assert held.owns_private_key
+        assert held.key_epoch == 2
+        assert set(bigger.addresses) <= set(held.addresses)
+
+    def test_a_newer_key_brings_its_epoch(self):
+        proc, _, child, anchor = _gateway()
+        self._public_child(proc, child, 2)
+        held = self._send(proc, self._larger_with_key(child, 3), child, anchor, True)
+        assert held.owns_private_key
+        assert held.key_epoch == 3
+
+
 class TestChildConfirm:
     def test_a_child_confirmation_joins_the_child_and_the_peer_list(self):
         proc, primary, child, anchor = _gateway()

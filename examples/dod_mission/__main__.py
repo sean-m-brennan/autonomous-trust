@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from autonomous_trust.core import LOG_FORMAT, LOG_DATEFMT
 
@@ -72,6 +73,8 @@ def _parse_args(argv):
     p.add_argument("--no-command", action="store_true")
     p.add_argument("--log-level", default="info",
                    choices=("debug", "info", "warning", "error"))
+    p.add_argument("--theme", choices=("dark", "light"), default=None,
+                   help="Dashboard colors (default: $AT_THEME, else dark).")
     return p.parse_args(argv)
 
 
@@ -89,6 +92,11 @@ def main(argv=None):
     from autonomous_trust.evaluation.scenarios.playback_iface import (
         PlaybackInterface,
     )
+
+    # Before any panel renders: the panels read the theme at draw time.
+    from autonomous_trust.inspector.dashboard import theme
+    theme.set_theme(theme.resolve_theme(args.theme,
+                                        os.environ.get(theme.THEME_ENV)))
 
     from .scenario import DoDMissionScenario
     from .dashboard.dod_app import build_dashboard

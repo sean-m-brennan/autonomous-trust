@@ -28,6 +28,10 @@ FROM ${REGISTRY_URL}autonomous-trust-devel${IMAGE_TAG}
 
 USER root
 RUN apt-get update && apt-get install -y libgl1 libglx-mesa0
+# A mount point for volumes the nodes share (colluding_cohort's joiners swap
+# public identities there). A fresh named volume takes this directory's owner;
+# without it docker creates the mount point as root and `user` cannot write.
+RUN mkdir -p /shared && chown user:user /shared
 
 WORKDIR /app
 USER user
@@ -40,6 +44,9 @@ COPY --chown=user:user src/autonomous-trust-first-contact/autonomous_trust/first
 COPY --chown=user:user src/autonomous-trust-inspector/autonomous_trust/inspector autonomous_trust/inspector
 COPY --chown=user:user src/autonomous-trust-services/autonomous_trust/services autonomous_trust/services
 COPY --chown=user:user src/autonomous-trust-simulator/autonomous_trust/simulator autonomous_trust/simulator
+# The red-team scenarios that run inside the containers (colluding_cohort's
+# node_main is every hostile-join node's entry point).
+COPY --chown=user:user src/autonomous-trust-evaluation/autonomous_trust/evaluation autonomous_trust/evaluation
 
 # update and install any new dependencies from environment.yml
 #

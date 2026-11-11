@@ -21,6 +21,7 @@ import pickle
 import sys
 import time
 import uuid
+import weakref
 from datetime import datetime
 from queue import Empty, Full
 import threading
@@ -39,7 +40,7 @@ from .peer_standing import (PeerStanding, STANDINGS, STANDING_SOURCE_ZTA,
                             standing_source_or_default, standing_source_valid)
 from .history.history import IdentityHistory
 from .join_policy import AnchoredSet, load_join_policy_env
-from .anchored_cohort import AnchoredCohortMixin
+from .anchored_cohort import AnchoredCohortMixin, member_uuids
 
 #: Members learned only from a history adopted under the join policy
 #: (RD_14.4, D1 (d)): ``<cfg>/provisional_members.cfg.json``, a list of uuids.
@@ -396,6 +397,8 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.vote, self.count_vote)
         self.protocol.register_handler(IdentityProtocol.confirm, self.handle_confirm_peer)
         self.protocol.register_handler(IdentityProtocol.update, self.handle_group_update)
+        self.protocol.register_handler(IdentityProtocol.key_query, self.handle_key_query)
+        self.protocol.register_handler(IdentityProtocol.key_stale, self.handle_key_stale)
         self.protocol.register_handler(IdentityProtocol.caps_query, self.handle_caps_query)
         self.protocol.register_handler(IdentityProtocol.caps_response, self.handle_caps_response)
         self.protocol.register_handler(IdentityProtocol.id_query, self.handle_identity_query)
@@ -671,13 +674,15 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
         arriving from that cohort changes nothing. Applied to the primary, a
         larger field cohort won the size rule and replaced the command cohort.
         Rotation is gated as for the primary: a higher epoch only from a
-        verified message."""
+        message signed by a member of the child group that we hold. A gateway that holds only the child's public key takes
+        a carried key under the same gate, at the epoch it holds or a newer one:
+        a larger membership is no reason to trust the key that comes with it."""
         key = str(child.uuid)
         if theirs is None or str(theirs.uuid) != key:
             self.logger.debug('Ignoring group %s from child cohort %s: not the group we bridge',
                               getattr(theirs, 'uuid', '?'), key[:8])
             return True
-        verified = bool(getattr(message, 'verified', False))
+        verified = self._rotation_signed_by_member(message, child)
         carries_key = bool(getattr(theirs, 'owns_private_key', False))
         if theirs.key_epoch > child.key_epoch and not verified:
             self.logger.warning('Rejecting unverified child group key rotation from %s',
@@ -692,7 +697,7 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
         if len(theirs.addresses) > len(child.addresses):
             if child.owns_private_key:
                 child.adopt_membership(theirs)
-            elif carries_key:
+            elif carries_key and verified and theirs.key_epoch >= child.key_epoch:
                 self.child_groups[key] = theirs
             else:
                 return True
@@ -1929,15 +1934,16 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
         """Whether this is the first time ``message`` is held. process() offers
         a held message on every pass until phase 3, and a joiner can wait there
         for as long as its patience allows; logging each pass wrote millions of
-        lines a run. Keyed by object identity, which holds while the message
-        sits in self.messages."""
-        seen = self.__dict__.setdefault('_held_logged', set())
-        key = id(message)
-        if key in seen:
-            return False
-        if len(seen) >= 4096:
-            seen.clear()
-        seen.add(key)
+        lines a run. A weak set forgets each message when it is released, so
+        a later message never inherits an earlier one's entry, as it did when
+        keyed by id(), and the set needs no size bound."""
+        seen = self.__dict__.setdefault('_held_logged', weakref.WeakSet())
+        try:
+            if message in seen:
+                return False
+            seen.add(message)
+        except TypeError:   # not weakly referenceable: log every pass
+            pass
         return True
 
     def _join_patience(self) -> float:
@@ -2013,6 +2019,10 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
             with self.lock:
                 self.choosing = False
                 self.phase = 3
+                # Ask a few members for the current group once the history's
+                # peers have settled: rotations made while we were joining may
+                # never reach us (see _maybe_pull_key).
+                self._key_pull_due = time.monotonic() + self._KEY_PULL_SETTLE_SEC
         except Exception as err:
             self.report_exception(err, 'choose_group')
 
@@ -2143,6 +2153,21 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
                                 and not self.choosing)
                 if should_merge:
                     self.merging = True
+                # A full_history is sent only on admission, so one arriving
+                # once our group is settled means its group admitted us too:
+                # tell that group ours exists, and choose nothing again. A
+                # rerun of the choice adopted the longest stashed history
+                # wholesale, an older snapshot of our own group: in the
+                # 16-colluder hostile-join run of 2026-11-05 it took almost
+                # every node's key from epoch 16 back to 14, and the two it
+                # missed stayed outside the others' group. Mirrors C
+                # handle_receive_history.
+                bridged = (not should_merge and not self.merging
+                           and not self.choosing and self.phase == 3)
+            if bridged:
+                if isinstance(hist_tpl, (list, tuple)) and hist_tpl:
+                    self._tell_bridged_group(queues, hist_tpl[0])
+                return True
             if should_merge:
                 # Late history arrived after we already self-bootstrapped:
                 # adopt the mesh's group and re-announce so the mesh's BG
@@ -3003,8 +3028,16 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
         self._last_update_sent = sent
         log('Sending group update with key %s… epoch %d (carries_key=%d) to %d member(s)',
             key, group.key_epoch, int(group.owns_private_key), len(recipients))
+        # Signed, as C signs every frame: the update can carry the key, and a
+        # receiver takes a higher epoch only from a verified message, so an
+        # unsigned one was refused wherever it went. Signed once; the signature
+        # names no recipient, so for_recipient reuses it.
+        if not recipients:
+            return
+        signed = Message(self.name, IdentityProtocol.update, grp_msg,
+                         to_whom=recipients[0], from_whom=self.identity)
         for to_peer in recipients:
-            message = Message(self.name, IdentityProtocol.update, grp_msg, to_whom=to_peer)
+            message = signed.for_recipient(to_peer)
             queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
             self.logger.debug('Sent group %s to %s (%s)', group.nickname, to_peer.nickname, to_peer.address)
 
@@ -3513,6 +3546,127 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
             # an oversized descriptor (defensive symmetry).
             desc.update(sanitize_descriptor(raw))
         return desc
+
+    # --- catching up on the group key (doc/architecture/identity-protocol.md) --
+    # A node admitted while the cohort rotates can end behind on the key, and
+    # the cohort, seeing it as a member, never resends (hostile-join run,
+    # 2026-11-03). It asks: a few members once phase 3 settles, and the sender
+    # of any group frame that will not open. A member answers with an ordinary
+    # signed group_key_update, which the asker takes through the same verified
+    # gate as any other. Mirrors C id_proc.c identity_*_key_query.
+    _KEY_PULL_SETTLE_SEC = 1.0      # after phase 3, for the history's peers
+    _KEY_PULL_FANOUT = 3            # members asked on reaching phase 3
+    _KEY_QUERY_COOLDOWN_SEC = 10.0  # per member asked
+    _KEY_ANSWER_COOLDOWN_SEC = 5.0  # per asker answered
+    _key_pull_due = None
+
+    def _send_key_query(self, queues, peer) -> bool:
+        """Ask ``peer`` for the current group, at most once per cooldown."""
+        if self.group is None or peer is None:
+            return False
+        asked = self.__dict__.setdefault('_key_query_sent', {})
+        key = str(peer.uuid).lower()
+        tick = time.monotonic()
+        last = asked.get(key)
+        if last is not None and tick - last < self._KEY_QUERY_COOLDOWN_SEC:
+            return False
+        asked[key] = tick
+        body = json.dumps({'group_uuid': str(self.group.uuid),
+                           'epoch': int(self.group.key_epoch)})
+        try:
+            queues[CfgIds.network].put(
+                Message(self.name, IdentityProtocol.key_query, body,
+                        to_whom=peer, from_whom=self.identity),
+                block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('_send_key_query: Network queue full')
+            return False
+        self.logger.debug('Asked %s for the current group (ours epoch %d)',
+                          getattr(peer, 'nickname', '?'), self.group.key_epoch)
+        return True
+
+    def _maybe_pull_key(self, queues):
+        """Once per phase-3 entry, after the settle, ask a few held members."""
+        due = self._key_pull_due
+        if due is None or self.phase != 3 or time.monotonic() < due:
+            return
+        self._key_pull_due = None
+        if self.group is None:
+            return
+        me = str(self.identity.uuid).lower()
+        members = sorted(u for u in member_uuids(self.group) if u != me)
+        asked = 0
+        for uuid_str in members:
+            if asked >= self._KEY_PULL_FANOUT:
+                break
+            with self.lock:
+                peer = self.peers.find_by_uuid(uuid_str)
+            if peer is not None and self._send_key_query(queues, peer):
+                asked += 1
+
+    def handle_key_stale(self, queues, message):
+        """Local signal from NetProcess: a group frame from ``message.obj`` (an
+        address) would not open, so that member holds a key we lack. Refused
+        when it names a sender: the network's own signals name none, and a
+        peer must not be able to make us query on its say-so."""
+        if message.function != IdentityProtocol.key_stale:
+            return False
+        if getattr(message, 'from_whom', None) is not None:
+            return True
+        if self.phase != 3 or self.group is None:
+            return True
+        address = message.obj
+        if not isinstance(address, str) or address not in set(self.group.addresses):
+            return True
+        with self.lock:
+            peer = self.peers.find_by_address(address)
+        if peer is not None:
+            self._send_key_query(queues, peer)
+        return True
+
+    def handle_key_query(self, queues, message):
+        """Answer a member of our group with the group, signed, sealed to the
+        key we hold for it. Anyone else, another group, or a node not yet in
+        phase 3 gets nothing; one answer per asker per cooldown."""
+        if message.function != IdentityProtocol.key_query:
+            return False
+        if self.phase != 3 or self.group is None:
+            return True
+        try:
+            body = json.loads(message.obj) if isinstance(message.obj, str) else message.obj
+            group_uuid = str(body.get('group_uuid', ''))
+        except (ValueError, TypeError, AttributeError):
+            return True
+        if group_uuid.lower() != str(self.group.uuid).lower():
+            return True
+        asker_uuid = getattr(getattr(message, 'from_whom', None), 'uuid', None)
+        if asker_uuid is None:
+            return True
+        key = str(asker_uuid).lower()
+        if key not in member_uuids(self.group):
+            return True
+        with self.lock:
+            asker = self.peers.find_by_uuid(key)
+        if asker is None:
+            return True
+        answered = self.__dict__.setdefault('_key_query_answered', {})
+        tick = time.monotonic()
+        last = answered.get(key)
+        if last is not None and tick - last < self._KEY_ANSWER_COOLDOWN_SEC:
+            return True
+        answered[key] = tick
+        try:
+            queues[CfgIds.network].put(
+                Message(self.name, IdentityProtocol.update,
+                        to_json_string(self.group.to_canonical()),
+                        to_whom=asker, from_whom=self.identity),
+                block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('handle_key_query: Network queue full')
+            return True
+        self.logger.info('Sent the group (epoch %d) to %s, who asked',
+                         self.group.key_epoch, getattr(asker, 'nickname', '?'))
+        return True
 
     def handle_caps_query(self, queues, message):
         """Respond to a peer's caps_query with our own capability list."""
@@ -4469,6 +4623,50 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
             self.report_exception(err, 'handle_partition_response')
         return True
 
+    def _reverify_held(self, message):
+        """Check an update's signature again against the peer this node now
+        holds for its sender. An update held through phase 2 came from members
+        this node did not yet hold, so no signature had been checked, and the
+        gate below refused every rotation it held (hostile-join run,
+        2026-11-03). The check uses the stored peer's key, never one the frame
+        names for itself, and only a verified update raises the epoch."""
+        if getattr(message, 'verified', False) or not hasattr(message, 'reverify'):
+            return
+        uuid = getattr(getattr(message, 'from_whom', None), 'uuid', None)
+        if uuid is None:
+            return
+        with self.lock:
+            peer = self.peers.find_by_uuid(uuid)
+        if peer is not None and message.reverify(peer):
+            self.logger.debug('Group update from %s verified against the peer we hold',
+                              getattr(peer, 'nickname', '?'))
+
+    def _rotation_signed_by_member(self, message, group):
+        """Whether ``message`` may rotate ``group``'s key: its sender is a
+        member of ``group``, this node holds that member as a peer, and the
+        signature checks against the held peer's key.
+
+        ``message.verified`` alone is not enough. A frame the transport cannot
+        attribute (the broadcast channel) is verified against the key its own
+        envelope names, and any keypair signs its own frame validly, so a
+        stranger who knew the group uuid could hand a member a key of the
+        stranger's choosing. Naming a real member's uuid with the stranger's
+        own keys fails here too, because the key checked is the one held for
+        that uuid. Mirrors C _rotation_signed_by_member (id_proc.c)."""
+        if group is None:
+            return False
+        uuid = getattr(getattr(message, 'from_whom', None), 'uuid', None)
+        if uuid is None:
+            return False
+        key = str(uuid).lower()
+        amap = getattr(group, '_address_map', None) or {}
+        if not any(str(u).lower() == key for u in amap):
+            return False
+        with self.lock:
+            peer = self.peers.find_by_uuid(uuid)
+        signed_by = getattr(message, 'signed_by', None)
+        return peer is not None and callable(signed_by) and signed_by(peer) is True
+
     def handle_group_update(self, queues, message):
         """
         Receive a group update (addresses list only)
@@ -4489,6 +4687,7 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.update:
             self.logger.debug('Received group update')
+            self._reverify_held(message)
             group = message.obj  # from self._update_group()
             # Wire form arrives as a serialized string; parse it back to a
             # Group object. handle_confirm_peer (idprocess.py:742-743) does
@@ -4538,6 +4737,9 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
                 # is newer, not whether its sender had any business rotating,
                 # and an unauthenticated update naming a higher epoch would be
                 # a way to hand a cohort a key of the attacker's choosing.
+                # Verified here means signed by a member of this group that we
+                # hold, checked against the held key
+                # (_rotation_signed_by_member), never the parse-time verdict.
                 #
                 # An EQUAL epoch is a rotation candidate too, not a no-op: when
                 # two members rotate at the same instant they both mint THIS
@@ -4551,7 +4753,7 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
                 carries_key = bool(getattr(theirs, 'owns_private_key', False))
                 same_epoch_tiebreak = (theirs.key_epoch == mine.key_epoch
                                        and carries_key)
-                verified = bool(getattr(message, 'verified', False))
+                verified = self._rotation_signed_by_member(message, mine)
                 # A HIGHER epoch claims to supersede us, so an unverified one is
                 # refused AND the message dropped: that claim is the attack
                 # surface, and letting the rest through would be trusting an
@@ -4733,6 +4935,7 @@ class IdentityProcess(AnchoredCohortMixin, Process, metaclass=ProcMeta,
                     self.logger.debug('Phase %s', self.phase)
                     phase = self.phase
                 self.vote_response(queues)
+                self._maybe_pull_key(queues)
 
                 # Periodic late-joiner cap-loss backstop. Interval-gated so
                 # the fast drain loop doesn't run it every iteration; a

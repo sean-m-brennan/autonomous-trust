@@ -44,6 +44,8 @@ from typing import Optional
 import networkx as nx
 import plotly.graph_objects as go
 
+from .theme import current as current_theme
+
 
 _DEFAULT_AGENCY_COLORS = {
     "NOAA": "#1f77b4",
@@ -429,6 +431,9 @@ class TrustNetworkGraph:
         return base + 3 * min(node.stream_count, 10)
 
     def _node_color(self, node: _Node) -> str:
+        return current_theme().data(self._node_base_color(node))
+
+    def _node_base_color(self, node: _Node) -> str:
         if node.status == "excluded":
             return "#94a3b8"  # slate-400: dimmed but still visible on the dark
                               # bg (was #555, near-invisible on #121a2e)
@@ -463,6 +468,9 @@ class TrustNetworkGraph:
         return None        # solid
 
     def _edge_color(self, edge: _Edge) -> str:
+        return current_theme().data(self._edge_base_color(edge))
+
+    def _edge_base_color(self, edge: _Edge) -> str:
         # Inactive edges fade to very low opacity grey (cutoff visible).
         if not edge.active:
             return "rgba(148, 163, 184, 0.15)"
@@ -606,6 +614,7 @@ class TrustNetworkGraph:
 
     def figure(self) -> go.Figure:
         self._relayout()
+        th = current_theme()
         disp = self._display_coords()
         fig = go.Figure()
 
@@ -647,7 +656,7 @@ class TrustNetworkGraph:
                 mode="markers+text",
                 text=[n.name for n in nodes],
                 textposition="bottom center",
-                textfont=dict(size=10, color="#e2e8f0"),
+                textfont=dict(size=10, color=th.text),
                 marker=dict(
                     size=[self._node_size(n) for n in nodes],
                     color=[self._node_color(n) for n in nodes],
@@ -674,7 +683,7 @@ class TrustNetworkGraph:
                 y=[disp[n.name][1] for n in pulse_nodes],
                 mode="markers",
                 marker=dict(
-                    color="#ef4444",
+                    color=th.data("#ef4444"),
                     opacity=0.25,
                     size=[self._node_size(n) * 2.2 for n in pulse_nodes],
                     line=dict(width=0),
@@ -694,8 +703,8 @@ class TrustNetworkGraph:
             width=self._width,
             height=self._height,
             margin=dict(l=10, r=10, t=10, b=10),
-            paper_bgcolor="#121a2e",
-            plot_bgcolor="#121a2e",
+            paper_bgcolor=th.surface,
+            plot_bgcolor=th.surface,
             xaxis=dict(visible=False, range=[-view, view]),
             yaxis=dict(visible=False, range=[-view, view],
                        scaleanchor="x", scaleratio=1),
@@ -703,8 +712,9 @@ class TrustNetworkGraph:
                 orientation="h",
                 yanchor="bottom", y=-0.05,
                 xanchor="center", x=0.5,
-                bgcolor="rgba(18, 26, 46, 0.4)",
-                font=dict(size=10, color="#e2e8f0"),
+                bgcolor=("rgba(255, 255, 255, 0.6)" if th.light
+                         else "rgba(18, 26, 46, 0.4)"),
+                font=dict(size=10, color=th.text),
             ),
             showlegend=True,
         )

@@ -92,6 +92,8 @@ The protocol messages, for reference:
 | `vote_on_peer` | `vote` | `(IdentityObj, AgreementProof, (message_bytes, signature_bytes))` |
 | `peer_accepted` | `confirm` | `IdentityObj` |
 | `group_key_update` | `update` | `Group` |
+| `group_key_query` | `key_query` | `{group_uuid, epoch}` |
+| `group_key_stale` | `key_stale` | the sender's address (local only, never on the wire) |
 
 ## Standing border guard
 
@@ -160,6 +162,13 @@ the tally. After receiving acceptance, the newcomer adds the leader as a peer
 and then adopts the group key from the history that follows. And the
 group-selection step in the newcomer picks the longest history when several
 groups answered, sending back any steps the group turns out to be missing.
+A history that arrives after that choice starts no new one: it comes from a
+second group that admitted the node too, and the node tells that group's
+members that its own exists, keeping the group and key it holds. Python ran
+the choice again for every such history until 2026-11-05, and each rerun took
+back an older copy of the node's own group; in the 16-colluder hostile-join
+run that took almost every node's key from epoch 16 back to 14, and left two
+members outside everyone else's group. C never reran it.
 
 Two alternate paths exist. Under *amnesia readmission*, a member that lost its
 state and asks again skips the voting round, and the leader emits confirmation,
@@ -190,6 +199,57 @@ otherwise refuse it, since its UUID and keys are already in every peer list that
 holds it. A UUID that first contact recorded as a contact, presenting the keys it
 is known by and not yet a member, is therefore voted on like any newcomer. No
 other peer gets that exemption.
+
+### Catching up on the group key
+
+Every admission rotates the group key, and a member that misses a rotation
+cannot read the group until it gets the new key. Nobody resends to a member,
+because the senders already count it as one. So a node has to be able to catch
+up on its own, and it has two ways.
+
+The first recovers updates it was sent while it was still joining. Until phase 3
+a node holds every `group_key_update` it receives and replays them once it
+chooses a group. A node in phase 2 usually does not yet hold the senders as
+peers, so the network process could not check their signatures, and an
+unverified update never raises the epoch. On replay, identity checks the
+signature again against the key it now holds for the sender. It never uses a
+key the frame supplies. If the sender is still unknown, the update stays
+refused.
+
+The second covers updates it never received at all. A node asks a member for the
+current group with `group_key_query`, and the member answers with an ordinary
+`group_key_update`. The asker takes that answer through the same gate as any
+other update, so a query can make a member resend the group, but it can never
+make a node accept a key it would otherwise refuse. A node asks a few members
+about a second after it reaches phase 3. It also asks the sender of any group
+frame that will not open, because that member evidently holds a key it lacks.
+The network process reports such a frame to identity with the local signal
+`group_key_stale`, and identity refuses that signal if it names a sender, since
+only the network process may send it. A member answers only a member of its own
+group that it holds as a peer, seals the answer to the key it holds for the
+asker, and answers each asker at most once every five seconds. A node asks each
+member at most once every ten seconds.
+
+Both ways came out of a live hostile-join run on 2026-11-03. Two joiners were
+still in phase 2 when the cohort rotated its key twice. They held both updates
+and refused them as unverified after phase 3, so they ended two epochs behind on
+a key of their own and could read nothing for the rest of the run. Python's
+membership updates also went out unsigned until then, so a receiver could never
+have verified them, however they arrived. They are signed now, as C's always
+were.
+
+Neither way lets just anyone rotate the key. A node raises its epoch only on an
+update from a member of its own group that it holds as a peer, and it checks the
+signature against the key it holds for that member. The verdict the network
+process reached on parsing the frame is not enough. A frame on the broadcast
+channel cannot be attributed to any peer, so it is checked against the key its
+own envelope names, and any keypair signs its own frames validly. Until
+2026-11-04 that verdict was all the gate asked for, which meant a stranger who
+knew a group's uuid could hand its members a key of the stranger's choosing. A
+frame that names a real member's uuid but carries the stranger's keys now fails
+the check, and so does an update from a peer the node holds that is not in the
+group. A gateway applies the same rule to a child cohort's key, against that
+cohort's membership.
 
 ## What travels, and in what form
 
@@ -273,6 +333,15 @@ the next chapters layer on top of this rather than replacing it.
 | A member that moved is readmitted | [`amnesia-moved-address-readmitted.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/amnesia-moved-address-readmitted.yaml) |
 | A recorded contact is voted on, not refused as a sybil | [`propose-vote-admits-known-contact.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/propose-vote-admits-known-contact.yaml) |
 | Group key rotation | [`group-key-update.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/group-key-update.yaml) |
+| A held rotation is checked again after phase 3, and adopted | [`held-group-update-reverified-after-phase3.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/held-group-update-reverified-after-phase3.yaml) |
+| ... unless someone else signed it | [`held-group-update-forged-signature-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/held-group-update-forged-signature-refused.yaml) |
+| A rotation from a member the node holds is adopted | [`group-update-held-member-rotation-adopted.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/group-update-held-member-rotation-adopted.yaml) |
+| ... but not from a stranger on the broadcast channel | [`group-update-stranger-rotation-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/group-update-stranger-rotation-refused.yaml) |
+| ... nor from a stranger claiming a member's uuid | [`group-update-claimed-member-rotation-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/group-update-claimed-member-rotation-refused.yaml) |
+| ... nor from a held peer outside the group | [`group-update-held-outsider-rotation-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/group-update-held-outsider-rotation-refused.yaml) |
+| A member asking for the key gets the group | [`group-key-query-answered-for-member.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/group-key-query-answered-for-member.yaml) |
+| A non-member gets nothing | [`group-key-query-ignored-for-non-member.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/group-key-query-ignored-for-non-member.yaml) |
+| A frame that will not open makes identity ask its sender | [`group-key-stale-signal-queries-sender.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/group-key-stale-signal-queries-sender.yaml) |
 
 The diagram tool does not render alternate branches, so we keep the readmission
 path as a separate scenario rather than folding it into the canonical one.

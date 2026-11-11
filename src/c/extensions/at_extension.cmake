@@ -53,8 +53,9 @@ function(at_extension_library name)
     add_library(at_${name} SHARED ${A_SOURCES})
     # The core's own dependencies too: an extension calls sodium, jansson and
     # uuid directly, and Apple's linker refuses a dylib with unresolved symbols.
+    # AT_SHARED_DEPENDENCIES is empty in an AT_STATIC build.
     target_link_libraries(at_${name} PRIVATE $<TARGET_LINKER_FILE:autonomous_trust>
-        ${DEPENDENCIES})
+        ${AT_SHARED_DEPENDENCIES})
     add_dependencies(at_${name} autonomous_trust)
 
     add_library(at_${name}_static STATIC ${A_SOURCES})

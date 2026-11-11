@@ -117,7 +117,7 @@ class TestReadyItems:
         _ready(one, 1, first=B, second=A)
         _ready(two, 1, first=A, second=B)
         e1, e2 = one.ready_items()[0], two.ready_items()[0]
-        assert (e1.p1_id, e1.p1_score_milli, e1.p2_id) == (A, 600, B)
+        assert (e1.p1_id, e1.p1_score_milli, e1.p2_id) == (str(A), 600, str(B))
         assert e1._canonical_bytes() == e2._canonical_bytes()
 
 
@@ -134,7 +134,7 @@ class TestAttested:
         tx = _attested()
         assert hist.pool_attested(tx, {'v': 'sig'})
         (entry,) = hist.ready_items()
-        assert entry.attested and entry.p1_id == A
+        assert entry.attested and entry.p1_id == str(A)
         hist.apply_placed(0, [entry])
         assert hist.attest_certs[tx.task_id] == {'v': 'sig'}
 

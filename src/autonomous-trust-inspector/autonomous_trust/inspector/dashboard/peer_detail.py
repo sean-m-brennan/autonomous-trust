@@ -28,6 +28,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from .theme import current as current_theme
+
 
 # ----------------------------------------------------------------------
 # Runtime data the drawer consumes
@@ -150,8 +152,10 @@ class PeerDetailPanel:
     def to_html(self, state: Optional[PeerDetailState]) -> str:
         """Entry point: render full drawer as HTML."""
         if state is None:
-            return self._empty()
-        return (
+            return current_theme().recolor_html(self._empty())
+        # Built with dark literals; the theme swaps them in one pass so the
+        # iframe document (which host-page CSS cannot reach) matches.
+        return current_theme().recolor_html(
             '<div style="display:flex;flex-direction:column;gap:10px">'
             + self._header(state)
             + self._body(state)
@@ -499,6 +503,7 @@ def detection_figure(summary: "DetectionSummary") -> Any:
     except ImportError:
         return None
 
+    th = current_theme()
     raw = _b64.b64decode(summary.crop_b64)
     img = Image.open(io.BytesIO(raw)).convert("RGB")
     cw, ch = img.size
@@ -513,13 +518,13 @@ def detection_figure(summary: "DetectionSummary") -> Any:
         path = "M " + " L ".join(f"{int(p[0])},{int(p[1])}" for p in obb) + " Z"
         fig.add_shape(
             type="path", path=path,
-            line=dict(color="#ef4444", width=2, dash="dash"),
+            line=dict(color=th.data("#ef4444"), width=2, dash="dash"),
         )
     else:
         bx1, by1, bx2, by2 = summary.bbox_in_crop_px
         fig.add_shape(
             type="rect", x0=bx1, y0=by1, x1=bx2, y1=by2,
-            line=dict(color="#ef4444", width=2, dash="dash"),
+            line=dict(color=th.data("#ef4444"), width=2, dash="dash"),
         )
     annotation = (
         f"{summary.label or '(unlabelled)'} "
@@ -528,12 +533,12 @@ def detection_figure(summary: "DetectionSummary") -> Any:
     fig.add_annotation(
         x=cw / 2, y=-12, xref="x", yref="y",
         showarrow=False, text=annotation,
-        font=dict(color="#e2e8f0", size=11),
+        font=dict(color=th.text, size=11),
     )
     fig.update_layout(
         width=min(320, cw + 32), height=ch + 48,
         margin=dict(l=8, r=8, t=8, b=24),
-        paper_bgcolor="#121a2e", plot_bgcolor="#000",
+        paper_bgcolor=th.paper_bg, plot_bgcolor=th.plot_bg,
         xaxis=dict(visible=False, range=[0, cw]),
         yaxis=dict(visible=False, range=[ch, 0],
                    scaleanchor="x", scaleratio=1),
@@ -542,7 +547,7 @@ def detection_figure(summary: "DetectionSummary") -> Any:
         fig.add_annotation(
             x=cw / 2, y=ch / 2, xref="x", yref="y",
             text="STALE", showarrow=False,
-            font=dict(color="#ef4444", size=22, family="monospace"),
+            font=dict(color=th.data("#ef4444"), size=22, family="monospace"),
         )
     return fig
 

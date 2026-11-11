@@ -160,15 +160,29 @@ outstanding request, so a replayed or unsolicited answer extends nothing.
 Without a live answer the requester asks again once an extension's worth of
 time has gone by, and after three such rounds it gives the task up.
 
-Giving up is quiet. The tracker and everything kept beside it are dropped and a
-warning is logged, but no result goes to the orchestrator and nobody is scored,
-because silence is not evidence: a frame lost in transit looks exactly like a
-peer that walked away. A task nobody accepted has no one to ask, and is given
-up at its deadline.
+Giving up is quiet. The task is dropped and a warning is logged, but no result
+goes to the orchestrator and nobody is scored, because silence is not evidence:
+a frame lost in transit looks exactly like a peer that walked away. A task
+nobody accepted has no one to ask, and is given up at its deadline.
 
-The answers mean what they say, in both runtimes. A worker answers `pending`
-for a task still queued and `running` while it executes; the C worker runs each
-job on a thread of its own so that it stays free to answer while it works.
+An answer is evidence, though, whenever it comes. The tracker of a task given
+up is kept for ten minutes (at most 64 of them, the oldest let go first), and a
+result that arrives in that time from a peer that was invited is scored against
+it, as an on-time one would be, but not passed to the orchestrator, which
+already had the give-up. The tracker holds what was asked, which is what a
+probe's answer is checked against. In the hostile-join run of 2026-11-04 a
+colluder's backlog held a joiner's probes past their deadline, and the wrong
+answers that came minutes later were dropped, so the colluder was never
+scored.
+
+The answers mean what they say, in both runtimes, and negotiation gives them
+itself. A worker answers `pending` for a task still queued and `running` while
+it executes; the C worker runs each job on a thread of its own so that it stays
+free to answer while it works. The Python worker hands a task to its main
+process to run and answers `running` from then until the result goes out. It
+used to pass the request to main, through the same queue the task waited in,
+and main answered `unknown` for a task it had not started, so a requestor gave
+up on a busy worker's task as if the worker were gone.
 `unknown` says only that the worker is not tracking the task, which is also
 what it says once it has finished and its result is on the way, so it neither
 extends nor cancels: a cancel there would drop that result as uninvited.

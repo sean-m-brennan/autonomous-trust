@@ -44,8 +44,14 @@ typedef struct json_t {
 #define JSON_FALSE   6
 #define JSON_NULL    7
 
-/* json_dumps flags */
-#define JSON_COMPACT 0x20
+/* json_dumps / json_load* flags (values mirror jansson) */
+#define JSON_REJECT_DUPLICATES 0x1
+#define JSON_DECODE_ANY        0x4
+#define JSON_COMPACT           0x20
+#define JSON_ENSURE_ASCII      0x40
+#define JSON_SORT_KEYS         0x80
+#define JSON_ENCODE_ANY        0x200
+#define JSON_REAL_PRECISION(n) (((n) & 0x1F) << 11)
 
 /* Error reporting */
 #define JSON_ERROR_TEXT_LENGTH   160
@@ -92,6 +98,7 @@ typedef struct json_error_t {
 #define json_is_false(json)   (json != NULL && json_typeof(json) == JSON_FALSE)
 #define json_is_null(json)    (json != NULL && json_typeof(json) == JSON_NULL)
 #define json_is_boolean(json) (json_is_true(json) || json_is_false(json))
+#define json_is_number(json)  (json_is_integer(json) || json_is_real(json))
 
 /* json_object_foreach helper macros (opaque iteration) */
 #define json_object_foreach(object, key, value)                         \
@@ -248,6 +255,83 @@ int json_array_append_new(json_t *array, json_t *value);
 */
 int json_array_append(json_t *array, json_t *value);
 
+/*@
+  requires \valid(array);
+  requires \valid(value);
+  assigns *array;
+  ensures \result == 0 || \result == -1;
+*/
+int json_array_set_new(json_t *array, size_t index, json_t *value);
+
+/*@
+  requires \valid(array);
+  requires \valid(value);
+  assigns *array;
+  ensures \result == 0 || \result == -1;
+*/
+int json_array_set(json_t *array, size_t index, json_t *value);
+
+/*@
+  requires \valid(array);
+  assigns *array;
+  ensures \result == 0 || \result == -1;
+*/
+int json_array_remove(json_t *array, size_t index);
+
+/*@
+  requires \valid(array);
+  assigns *array;
+  ensures \result == 0 || \result == -1;
+*/
+int json_array_clear(json_t *array);
+
+/*@
+  requires \valid(array);
+  requires \valid_read(other);
+  assigns *array;
+  ensures \result == 0 || \result == -1;
+*/
+int json_array_extend(json_t *array, json_t *other);
+
+/* ================================================================
+ * Object removal.
+ * ================================================================ */
+
+/*@
+  requires \valid(object);
+  requires \valid_read(key);
+  assigns *object;
+  ensures \result == 0 || \result == -1;
+*/
+int json_object_del(json_t *object, const char *key);
+
+/*@
+  requires \valid(object);
+  assigns *object;
+  ensures \result == 0 || \result == -1;
+*/
+int json_object_clear(json_t *object);
+
+/* ================================================================
+ * Copy and equality.
+ * ================================================================ */
+
+/*@
+  requires value == \null || \valid_read(value);
+  allocates \result;
+  assigns \nothing;
+  ensures \result == \null || \valid(\result);
+*/
+json_t *json_deep_copy(const json_t *value);
+
+/*@
+  requires value1 == \null || \valid_read(value1);
+  requires value2 == \null || \valid_read(value2);
+  assigns \nothing;
+  ensures \result == 0 || \result == 1;
+*/
+int json_equal(const json_t *value1, const json_t *value2);
+
 /* ================================================================
  * Object getters — return BORROWED references (do not decref).
  * Return NULL if key is not present.
@@ -340,16 +424,16 @@ const char *json_string_value(const json_t *string);
 size_t json_string_length(const json_t *string);
 
 /*@
-  requires \valid_read(integer);
+  requires \valid_read(json);
   assigns \nothing;
 */
-json_int_t json_integer_value(const json_t *integer);
+json_int_t json_integer_value(const json_t *json);
 
 /*@
-  requires \valid_read(real);
+  requires \valid_read(json);
   assigns \nothing;
 */
-double json_real_value(const json_t *real);
+double json_real_value(const json_t *json);
 
 /*@
   requires \valid_read(json);
@@ -358,11 +442,11 @@ double json_real_value(const json_t *real);
 double json_number_value(const json_t *json);
 
 /*@
-  requires \valid_read(boolean);
+  requires \valid_read(json);
   assigns \nothing;
   ensures \result == 0 || \result == 1;
 */
-int json_boolean_value(const json_t *boolean);
+int json_boolean_value(const json_t *json);
 
 /* ================================================================
  * Serialisation / Deserialisation
@@ -385,7 +469,7 @@ char *json_dumps(const json_t *root, size_t flags);
   ensures \result == \null || \valid(\result);
 */
 json_t *json_loadb(const char *buffer, size_t buflen,
-                   size_t flags, void *error);
+                   size_t flags, json_error_t *error);
 
 /*@
   requires \valid_read(input);
@@ -394,7 +478,7 @@ json_t *json_loadb(const char *buffer, size_t buflen,
   assigns *error \from input[..], flags;
   ensures \result == \null || \valid(\result);
 */
-json_t *json_loads(const char *input, size_t flags, void *error);
+json_t *json_loads(const char *input, size_t flags, json_error_t *error);
 
 /* ================================================================
  * File I/O

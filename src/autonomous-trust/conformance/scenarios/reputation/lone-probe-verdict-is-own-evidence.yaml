@@ -1,0 +1,66 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: lone-probe-verdict-is-own-evidence
+byte_pinning: false
+description: |
+    A probe verdict counts as the prober's own evidence without the probed
+    peer's half (lone probe verdicts, 2026-11-06). bob probed subject three
+    times and failed it each time, scoring it 0.1, and subject never wrote
+    its half, so no entry of bob's with subject is on the chain. carol has
+    said 0.9 of subject three times.
+
+    brought reads bob's three verdicts alone, by contrite tit-for-tat: the
+    0.1s shrunk toward the 0.2 neutral, (0.3 + 0.6) / 6 = 0.15. No score of
+    bob stands behind a lone verdict, so none is a defection. Three own
+    entries meet own_evidence_min, so bounded is brought: tier 0, where the
+    peer's told standing alone would have held it at the tier-1 ceiling.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: oracle
+  - id: subject
+    role: subject
+  - id: carol
+    role: member
+
+fixtures:
+  join_policy:
+    version: 1
+    enabled: true
+    anchors: [verified_contact]
+    own_evidence_min: 3
+  tx_history:
+    bob:
+      - {task_id: t-c1, p1: carol, p1_score: 0.9, p2: subject, p2_score: 0.9}
+      - {task_id: t-c2, p1: carol, p1_score: 0.9, p2: subject, p2_score: 0.9}
+      - {task_id: t-c3, p1: carol, p1_score: 0.9, p2: subject, p2_score: 0.9}
+  lone_verdicts:
+    bob:
+      - {task_id: t-p1, subject: subject, score: 0.1}
+      - {task_id: t-p2, subject: subject, score: 0.1}
+      - {task_id: t-p3, subject: subject, score: 0.1}
+  reputations:
+    bob:
+      subject: 0.9
+      carol: 0.5
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: request reputation
+    payload:
+      target: subject
+      proc: negotiation
+    description: |
+        bob scores subject; brought reads his three lone verdicts.
+
+expected_state:
+  bob:
+    brought_of:
+      subject: 0.15
+    bounded_of:
+      subject: 0.15

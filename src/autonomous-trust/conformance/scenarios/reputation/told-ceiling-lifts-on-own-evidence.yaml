@@ -11,9 +11,10 @@ description: |
     told is the cooperation-mode mean over all six, each weighted by its
     author's reputation (bob, unrated by himself, at the 0.2 neutral; carol
     at 0.5): (3 x 0.9 x 0.2 + 3 x 0.3 x 0.5) / (3 x 0.2 + 3 x 0.5) = 0.4714.
-    brought reads bob's own three alone: contrite tit-for-tat first (0.9,
-    above the cooperation threshold), so the mean of bob's scores, 0.9.
-    Three own entries meet own_evidence_min, so bounded is brought.
+    brought reads bob's own three alone, by contrite tit-for-tat: bob's 0.9s
+    shrunk toward the 0.2 neutral, (2.7 + 0.6) / 6 = 0.55, not above the
+    cooperation threshold. Three own entries meet own_evidence_min, so
+    bounded is brought.
 
 participants:
   - id: alice
@@ -64,6 +65,6 @@ expected_state:
     reputation_of:
       subject: 0.4714
     brought_of:
-      subject: 0.9
+      subject: 0.55
     bounded_of:
-      subject: 0.9
+      subject: 0.55

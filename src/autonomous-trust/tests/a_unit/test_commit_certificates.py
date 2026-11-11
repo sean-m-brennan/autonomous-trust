@@ -256,6 +256,35 @@ class TestCertificateCheck:
         assert not rp._commit_cert_ok(p.uuid, t, 200, None, sigs)
 
 
+    def test_a_refused_commit_says_how_far_short_it_fell(self, four):
+        # Hostile-join run, 2026-11-04: each joiner refused ~200 commits this
+        # way while placement stalled for six minutes, and the log never said
+        # whether the certificate was short of signers or judged by another
+        # roster.
+        p, a1, _, o = four
+        obs, _ = _node(o, _roster(o, four))
+        obs.logger = MagicMock()
+        t = uuid4()
+        one = {str(a1.uuid): _sign(a1, p, t, 900)}
+        obs.handle_committed(None, _msg(ReputationProtocol.committed,
+                                        (t, p.uuid, 900, None, None, one), p))
+        assert obs.history.pooled(t) is None
+        [line] = [c.args[0] % c.args[1:] for c in obs.logger.warning.call_args_list
+                  if 'does not meet our quorum' in c.args[0] % c.args[1:]]
+        assert '1 of 1 signature(s) verify, 2 needed, no roster' in line
+
+    def test_against_a_roster_the_tally_names_its_size(self, four):
+        from tests.a_unit.test_placement_acceptor import _roster_of
+        p, a1, _, o = four
+        obs, _ = _node(o, _roster(o, four))
+        obs.history.roster_anchor = _roster_of(four)
+        t = uuid4()
+        one = {str(a1.uuid): _sign(a1, p, t, 900)}
+        tally = {}
+        assert not obs._commit_cert_ok(p.uuid, t, 900, None, one, tally=tally)
+        assert tally == {'offered': 1, 'verified': 1, 'needed': 2, 'members': 4,
+                         'named': False}
+
 class TestRound:
     def test_a_proposal_asks_to_be_certified_and_names_its_group(self, four):
         p = four[0]
@@ -299,7 +328,7 @@ class TestRound:
                    if m.function == ReputationProtocol.committed]
         assert len(commits) == 1
         parsed = from_json_string(commits[0].obj)
-        assert len(parsed) == 8 and len(parsed[5]) == 2
+        assert len(parsed) == 9 and len(parsed[5]) == 2
         # Whom the half names, and the scorer's own signature over it.
         assert parsed[6] == str(o.uuid)
         assert parsed[7] == _half(p, o, score.task_id, 900)

@@ -221,18 +221,24 @@ class ProbeCounts(object):
     (not anchored, not slashed, short of ``own_evidence_min`` own entries) and
     how many probe verdicts this node holds about it. A peer absent from the
     map has left the set. The user's call, 2026-10-27: reputation reports the
-    counts, so the burst and the ceiling read one source. Plain picklable
-    object; it only travels the local queues, never the network. The C twin
-    is PEER_PROBE_COUNT, one message per changed peer."""
+    counts, so the burst and the ceiling read one source. ``suspects`` are
+    the peers whose latest probe of ours failed and that are not yet held
+    for it (``probe_hold_of``): the worker probes them again at the burst's
+    interval. Plain picklable object; it only travels the local queues, never
+    the network. The C twin is PEER_PROBE_COUNT, one message per changed
+    peer."""
 
-    def __init__(self, counts=None):
+    def __init__(self, counts=None, suspects=()):
         self.counts = {str(k): int(v) for k, v in (counts or {}).items()}
+        self.suspects = {str(u) for u in (suspects or ())}
 
     def __eq__(self, other):
-        return isinstance(other, ProbeCounts) and self.counts == other.counts
+        return (isinstance(other, ProbeCounts) and self.counts == other.counts
+                and self.suspects == other.suspects)
 
     def __hash__(self):
-        return hash(frozenset(self.counts.items()))
+        return hash((frozenset(self.counts.items()),
+                     frozenset(self.suspects)))
 
     def __repr__(self):
         return 'ProbeCounts(%d)' % len(self.counts)

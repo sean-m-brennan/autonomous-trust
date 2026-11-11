@@ -85,3 +85,29 @@ class TestSassASGIMiddleware:
         send = AsyncMock()
         await mw(scope, recv, send)
         mw.app.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_call_css_compiles_scss_with_source_map(self, tmp_path):
+        # libsass returns (css, map) when a source map is requested; both
+        # must be written out as text, and the request passed through.
+        scss_dir = tmp_path / 'scss'
+        css_dir = tmp_path / 'css'
+        scss_dir.mkdir()
+        (scss_dir / 'style.scss').write_text('$c: #123456;\nbody { color: $c; }\n')
+
+        app = MagicMock()
+        app.logger = MagicMock()
+        inner = AsyncMock()
+        app.asgi_app = inner
+        manifests = {'test': (str(scss_dir), str(css_dir), '/css', True)}
+        mw = SassASGIMiddleware(app, manifests)
+        scope = {'path': '/css/style.css'}
+        recv = AsyncMock()
+        send = AsyncMock()
+        await mw(scope, recv, send)
+
+        css = (css_dir / 'style.css').read_text()
+        assert '#123456' in css
+        assert 'sourceMappingURL=style.css.map' in css
+        assert '"sources"' in (css_dir / 'style.css.map').read_text()
+        inner.assert_called_once_with(scope, recv, send)

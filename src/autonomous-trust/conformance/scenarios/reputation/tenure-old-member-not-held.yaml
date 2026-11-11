@@ -5,8 +5,8 @@ name: tenure-old-member-not-held
 byte_pinning: false
 description: |
     A member past its tenure is scored as it always was: the control for
-    tenure-young-member-held-below-tier-three. The same four 0.9 tasks, the
-    same 600 s minimum, but bob first held alice 1000 s ago, so the bound does
+    tenure-young-member-held-below-tier-three. The same four 0.9 tasks in
+    cooperation mode, the same 600 s minimum, but bob first held alice 1000 s ago, so the bound does
     not apply and her score stays 0.90 (doc/architecture/reputation.md,
     "Tenure").
 
@@ -27,10 +27,10 @@ fixtures:
       - {task_id: t-4, p1: bob, p1_score: 0.9, p2: alice, p2_score: 0.9}
   reputations:
     bob:
-      alice: 0.2
+      alice: 0.9
   coop_mode:
     bob:
-      alice: false
+      alice: true
   tenure:
     bob:
       min_sec: 600

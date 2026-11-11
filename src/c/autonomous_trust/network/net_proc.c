@@ -38,6 +38,7 @@
 #include "processes/processes.h"
 #include "processes/extension.h"
 #include "processes/plaintext_verbs.h"
+#include "config/deployment_manifest.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
@@ -75,64 +76,71 @@ _Static_assert(ADDR_LEN + 1 >= IPV6_ADDR_LEN,
  *   dispatch silently. */
 static char NET_ID_PARTITION_SIGNAL[] = "partition_signal";
 
-/* Per-from-addr last-signal-timestamp (CLOCK_MONOTONIC microseconds,
- * truncated to seconds for `integer_data` compatibility). 5s cooldown
- * per address keeps the identity queue clear under a chatty foreign
- * group. The map is initialized lazily on first use. */
-static struct {
+/* Local key-stale signal to IdentityProcess: a group frame from a peer we
+ * hold would not open, so that member holds a key we lack, and identity asks
+ * it for the current group (group_key_query). MUST match id_proc.c's
+ * ID_KEY_STALE[] (Python IdentityProtocol.key_stale). */
+static char NET_ID_KEY_STALE[] = "group_key_stale";
+
+/* What an unverified group_key_update comes to: identity checks a signed one
+ * again against the peer it holds for the sender (id_proc.c _reverify_held), and
+ * raises no epoch from it otherwise. */
+#define NET_UNVERIFIED_UPDATE_NOTE \
+    "identity takes a rotation from it only if its signature checks against " \
+    "a peer it holds"
+
+/* Per-from-addr last-signal-timestamp (CLOCK_MONOTONIC seconds, for
+ * `integer_data` compatibility), one table per signal. A 5 s cooldown per
+ * address keeps the identity queue clear while decrypts keep failing. Each
+ * map is initialized lazily on first use. */
+typedef struct {
     map_t cooldown;
     bool inited;
     pthread_mutex_t lock;
-} _net_partition_signal_state = {
-    .inited = false,
-};
+} net_signal_cooldown_t;
 
-static void _net_partition_signal_init_once(void)
+static net_signal_cooldown_t _net_partition_signal_state = { .inited = false };
+static net_signal_cooldown_t _net_key_stale_signal_state = { .inited = false };
+
+/* Whether @p from_addr may be signalled now; records it when so. */
+static bool _net_signal_due(net_signal_cooldown_t *st, const char *from_addr)
 {
-    if (!_net_partition_signal_state.inited) {
-        map_init(&_net_partition_signal_state.cooldown);
-        pthread_mutex_init(&_net_partition_signal_state.lock, NULL);
-        _net_partition_signal_state.inited = true;
+    if (!st->inited) {
+        map_init(&st->cooldown);
+        pthread_mutex_init(&st->lock, NULL);
+        st->inited = true;
     }
-}
-
-/* Forward a partition-recovery signal to IdentityProcess. Rate-limited
- * at one signal per `from_addr` per 5 seconds. Called from the group-
- * channel drop site (group_decrypt failure) — same role as Python's
- * NetProcess._signal_partition. */
-static void _net_signal_partition(net_thread_ctx_t *ctx, const char *from_addr)
-{
-    if (ctx == NULL || from_addr == NULL || from_addr[0] == '\0') return;
-    _net_partition_signal_init_once();
-
-    /* 5s cooldown lookup. */
     struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return false;
     int64_t now_s = (int64_t)ts.tv_sec;
 
-    pthread_mutex_lock(&_net_partition_signal_state.lock);
+    pthread_mutex_lock(&st->lock);
     data_t *prev = NULL;
-    if (map_get(&_net_partition_signal_state.cooldown,
-                (map_key_t)from_addr, &prev) == 0 && prev != NULL) {
+    if (map_get(&st->cooldown, (map_key_t)from_addr, &prev) == 0 && prev != NULL) {
         int prev_s = 0;
         if (data_integer(prev, &prev_s) == 0 && now_s - prev_s < 5) {
-            pthread_mutex_unlock(&_net_partition_signal_state.lock);
-            return;
+            pthread_mutex_unlock(&st->lock);
+            return false;
         }
     }
     char key_buf[64];
     snprintf(key_buf, sizeof(key_buf), "%s", from_addr);
     data_t *now_dat = integer_data((int)now_s);
     if (now_dat != NULL)
-        map_set(&_net_partition_signal_state.cooldown, key_buf, now_dat);
-    pthread_mutex_unlock(&_net_partition_signal_state.lock);
+        map_set(&st->cooldown, key_buf, now_dat);
+    pthread_mutex_unlock(&st->lock);
+    return true;
+}
 
-    /* Build a Message-like envelope with the from_addr as a JSON
-     * string payload. */
+/* Send IdentityProcess a local signal @p function carrying @p from_addr as a
+ * JSON string. It names no sender: identity refuses one that does. */
+static void _net_send_identity_signal(net_thread_ctx_t *ctx, char *function,
+                                      const char *from_addr)
+{
     generic_msg_t sig = {0};
     sig.type = NET_MESSAGE;
     strncpy(sig.info.net_msg.process, "identity", PROC_NAME_LEN);
-    sig.info.net_msg.function = NET_ID_PARTITION_SIGNAL;
+    sig.info.net_msg.function = function;
     sig.info.net_msg.encrypt = false;
     json_t *body = json_string(from_addr);
     if (body != NULL) {
@@ -144,10 +152,31 @@ static void _net_signal_partition(net_thread_ctx_t *ctx, const char *from_addr)
         net_msg_free_obj(&sig.info.net_msg);
         if (rc != 0) {
             log_debug(ctx->logger,
-                      "Network: partition_signal: messaging_send failed (%d)\n",
-                      rc);
+                      "Network: %s: messaging_send failed (%d)\n",
+                      function, rc);
         }
     }
+}
+
+/* Forward a partition-recovery signal to IdentityProcess. Rate-limited
+ * at one signal per `from_addr` per 5 seconds. Called from the group-
+ * channel drop site (group_decrypt failure) — same role as Python's
+ * NetProcess._signal_partition. */
+static void _net_signal_partition(net_thread_ctx_t *ctx, const char *from_addr)
+{
+    if (ctx == NULL || from_addr == NULL || from_addr[0] == '\0') return;
+    if (_net_signal_due(&_net_partition_signal_state, from_addr))
+        _net_send_identity_signal(ctx, NET_ID_PARTITION_SIGNAL, from_addr);
+}
+
+/* Tell IdentityProcess that a group frame from @p from_addr, a peer we hold,
+ * would not open: it holds a key we lack. Same cooldown as the partition
+ * signal. Twin of Python NetProcess._signal_key_stale. */
+static void _net_signal_key_stale(net_thread_ctx_t *ctx, const char *from_addr)
+{
+    if (ctx == NULL || from_addr == NULL || from_addr[0] == '\0') return;
+    if (_net_signal_due(&_net_key_stale_signal_state, from_addr))
+        _net_send_identity_signal(ctx, NET_ID_KEY_STALE, from_addr);
 }
 #include "identity/group.h"
 #include "structures/data.h"
@@ -1264,6 +1293,8 @@ static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
      * (network/message.py:243) and read by repprocess.handle_*. */
     gmsg.info.net_msg.verified = wmsg->verified;
     gmsg.info.net_msg.has_signature = wmsg->has_signature;
+    if (wmsg->has_signature)
+        memcpy(gmsg.info.net_msg.signature, wmsg->signature, crypto_sign_BYTES);
     /* A frame from a cohort we gateway is news about that cohort. The
      * from_whom here is the peer we attributed the frame to (the parser copies
      * the known peer in), so this is the sender's placement, not its claim. */
@@ -1485,7 +1516,7 @@ static int _seal_and_send(const identity_t *myself, const group_t *grp,
                           const net_transport_t *transport,
                           net_transport_ctx_t *ctx,
                           int port, net_wire_format_t fmt, logger_t *logger,
-                          int leg)
+                          int leg, bool fanout)
 {
     uint8_t *wire = NULL;
     size_t wire_len = 0;
@@ -1513,8 +1544,9 @@ static int _seal_and_send(const identity_t *myself, const group_t *grp,
         }
         int ret = _send_on(transport, ctx, leg, NET_CHAN_BROADCAST,
                                             send_buf, send_len, port);
-        net_ext_fanout(NET_CHAN_BROADCAST, msg->process, msg->function, grp,
-                       send_buf, send_len);
+        if (fanout)
+            net_ext_fanout(NET_CHAN_BROADCAST, msg->process, msg->function, grp,
+                           send_buf, send_len);
         if (ret == 0) {
             track_send(msg->to_whom.target.peer.address, send_len);
         } else if (ret == -1) {
@@ -1597,8 +1629,9 @@ static int _seal_and_send(const identity_t *myself, const group_t *grp,
         }
         int ret = _send_on(transport, ctx, leg, NET_CHAN_GROUP,
                                             send_buf, send_len, port);
-        net_ext_fanout(NET_CHAN_GROUP, msg->process, msg->function, grp,
-                       send_buf, send_len);
+        if (fanout)
+            net_ext_fanout(NET_CHAN_GROUP, msg->process, msg->function, grp,
+                           send_buf, send_len);
         if (ret == -1)
             log_debug(logger, "Network: transport lacks group multicast; skipping\n");
         if (send_buf != frame)
@@ -1682,6 +1715,59 @@ static int _seal_and_send(const identity_t *myself, const group_t *grp,
     return ret;
 }
 
+/* Show the extensions a broadcast once, as built. A multi-leg send seals one
+ * copy per leg, each naming that leg's address; the extensions are not a leg,
+ * and Python's _send_broadcast_message hands them the one frame it built. */
+static void _fanout_broadcast(const identity_t *myself, const group_t *grp,
+                              const net_wire_msg_t *msg, net_wire_format_t fmt)
+{
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    if (net_message_to_wire_fmt(msg, myself, fmt, &wire, &wire_len) != 0)
+        return;
+    const uint8_t *send_buf = wire;
+    size_t send_len = wire_len;
+    if (filter_outbound(NET_CHAN_BROADCAST, myself, NULL,
+                        wire, wire_len, &send_buf, &send_len) == 0) {
+        net_ext_fanout(NET_CHAN_BROADCAST, msg->process, msg->function, grp,
+                       send_buf, send_len);
+        if (send_buf != wire)
+            free((void *)send_buf);
+    }
+    free(wire);
+}
+
+/* The leg a group frame leaves on: the one that reaches the group's first
+ * member other than this node. A group stops at the gateway, so all its
+ * members sit on one of our networks. -1 when no other member names a leg. */
+static int _group_leg(const identity_t *myself, const group_t *grp,
+                      const net_transport_t *transport,
+                      const net_transport_ctx_t *ctx, size_t n_legs)
+{
+    if (grp == NULL || transport->address_for_target == NULL)
+        return -1;
+    int found = -1;
+    map_key_t key;
+    data_t *val;
+    map_entries_for_each((map_t *)&grp->address_map, key, val)
+        string_t member = NULL;
+        if (found >= 0 || data_string_ptr(val, &member) != 0 || member == NULL
+            || (myself != NULL && strcmp(member, myself->address) == 0))
+            continue;
+        char mine[sizeof(myself->address)];
+        if (transport->address_for_target(ctx, member, mine, sizeof(mine)) != 0
+            || strcmp(member, mine) == 0)
+            continue;   /* our own entry on one of the legs */
+        for (size_t i = 0; i < n_legs && found < 0; i++) {
+            char leg_addr[sizeof(myself->address)];
+            if (transport->leg_address(ctx, i, leg_addr, sizeof(leg_addr)) == 0
+                && strcmp(leg_addr, mine) == 0)
+                found = (int)i;
+        }
+    map_end_for_each
+    return found;
+}
+
 /* The sender address a frame names is the address this node holds on the
  * network the frame leaves on. A node on one network has one address and names
  * it. A transport with several legs (the hybrid) gives each leg's: each side
@@ -1702,18 +1788,27 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
         && transport->leg_count != NULL && transport->leg_address != NULL
         && transport->send_on_leg != NULL && transport->leg_count(ctx) > 1) {
         size_t n = transport->leg_count(ctx);
+        bool is_group = msg->to_whom.type == RECIPIENT_GROUP;
+        int only = is_group ? _group_leg(myself, grp, transport, ctx, n) : -1;
         int ret = -1;
         for (size_t i = 0; i < n; i++) {
+            if (only >= 0 && (int)i != only)
+                continue;
             net_wire_msg_t stamped = *msg;
             char addr[sizeof(stamped.from_whom.address)];
             if (transport->leg_address(ctx, i, addr, sizeof(addr)) == 0)
                 at_strlcpy(stamped.from_whom.address, addr,
                            sizeof(stamped.from_whom.address));
+            /* A group frame is sealed per leg, so the extensions see the
+             * first copy; a broadcast is shown to them once, as built. */
+            bool fanout = is_group && (only >= 0 || i == 0);
             int rc = _seal_and_send(myself, grp, &stamped, transport, ctx, port,
-                                    fmt, logger, (int)i);
+                                    fmt, logger, (int)i, fanout);
             if (rc == 0 || ret != 0)
                 ret = rc;
         }
+        if (!is_group)
+            _fanout_broadcast(myself, grp, msg, fmt);
         return ret;
     }
     if (named && msg->to_whom.type == RECIPIENT_PEER
@@ -1726,10 +1821,11 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
             at_strlcpy(stamped.from_whom.address, addr,
                        sizeof(stamped.from_whom.address));
             return _seal_and_send(myself, grp, &stamped, transport, ctx, port,
-                                  fmt, logger, -1);
+                                  fmt, logger, -1, true);
         }
     }
-    return _seal_and_send(myself, grp, msg, transport, ctx, port, fmt, logger, -1);
+    return _seal_and_send(myself, grp, msg, transport, ctx, port, fmt, logger, -1,
+                          true);
 }
 
 int net_proc_test_encrypt_and_send(const identity_t *myself, const group_t *grp,
@@ -2010,8 +2106,9 @@ static bool try_unencrypted_from_known_peer(net_thread_ctx_t *ctx,
         && strcmp(wmsg.function, "group_key_update") == 0)
         log_warn(ctx->logger,
                  "Network: group_key_update arrived UNVERIFIED via %s "
-                 "(has_signature=%d) — the rotation will be ignored\n",
-                 "plaintext-from-known-peer", (int)wmsg.has_signature);
+                 "(has_signature=%d) — %s\n",
+                 "plaintext-from-known-peer", (int)wmsg.has_signature,
+                 NET_UNVERIFIED_UPDATE_NOTE);
     if (wmsg.encrypt || !identity_verb_is_unencrypted(wmsg.function)) {
         if (!wmsg.encrypt && wmsg.function != NULL)
             log_warn(ctx->logger, "Refusing plaintext %s from known peer %s: "
@@ -2208,8 +2305,8 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
                 && strcmp(wmsg.function, "group_key_update") == 0)
                 log_warn(ctx->logger,
                          "Network: group_key_update arrived UNVERIFIED via "
-                         "unknown-sender-plaintext (has_signature=%d) — the rotation will be "
-                         "ignored\n", (int)wmsg.has_signature);
+                         "unknown-sender-plaintext (has_signature=%d) — %s\n",
+                         (int)wmsg.has_signature, NET_UNVERIFIED_UPDATE_NOTE);
             route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger,
                              NET_PATH_STRANGER);
             net_wire_msg_free(&wmsg);
@@ -2443,8 +2540,8 @@ void handle_inbound_broadcast(net_thread_ctx_t *ctx,
             && strcmp(wmsg.function, "group_key_update") == 0)
             log_warn(ctx->logger,
                      "Network: group_key_update arrived UNVERIFIED via "
-                     "broadcast-channel (has_signature=%d) — the rotation "
-                     "will be ignored\n", (int)wmsg.has_signature);
+                     "broadcast-channel (has_signature=%d) — %s\n",
+                     (int)wmsg.has_signature, NET_UNVERIFIED_UPDATE_NOTE);
         route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger,
                          NET_PATH_BROADCAST);
         net_wire_msg_free(&wmsg);
@@ -2736,8 +2833,8 @@ static void _inbound_group(net_thread_ctx_t *ctx, uint8_t *buf, size_t nbytes,
                 && strcmp(wmsg.function, "group_key_update") == 0)
                 log_warn(ctx->logger,
                          "Network: group_key_update arrived UNVERIFIED via "
-                         "group-channel (has_signature=%d) — the rotation will be "
-                         "ignored\n", (int)wmsg.has_signature);
+                         "group-channel (has_signature=%d) — %s\n",
+                         (int)wmsg.has_signature, NET_UNVERIFIED_UPDATE_NOTE);
             /* Gateway boundary, invariant B: the pre-admission handshake is
              * never a group message -- announce is broadcast, accept and
              * history are point-to-point to an unplaced identity -- so a
@@ -2781,12 +2878,16 @@ static void _inbound_group(net_thread_ctx_t *ctx, uint8_t *buf, size_t nbytes,
          * `partition_probe` and, on a response, initiate a normal
          * request_access to absorb the foreign group. See
          * doc/architecture/partition-recovery.md §5.1. */
-        if (_net_ext_inbound)
+        if (_net_ext_inbound) {
             /* Heard some other way (a radio): a foreign cohort's frame on the
              * air must not start partition recovery. */
             probes_counter("net.ext", "group_decrypt_fail", NULL);
-        else
+        } else {
             _net_signal_partition(ctx, from_addr);
+            /* The sender is a peer we hold (checked above), so it holds a
+             * key we lack: identity asks it for the group. */
+            _net_signal_key_stale(ctx, from_addr);
+        }
     }
     free(plain);
 }
@@ -3332,6 +3433,10 @@ static int net_start_checks(const network_config_t *net_cfg, logger_t *logger)
     net_presence_init();
     net_liveness_reset(net_liveness_now());
     if (plaintext_verbs_configure(NULL, logger) != 0)
+        return -1;
+    /* The deployment manifest (RD_13.4 §3.3): a file that exists and breaks a
+     * rule refuses the start, as the plaintext verbs above do. */
+    if (deployment_manifest_configure(NULL, logger) != 0)
         return -1;
     /* An extension whose configuration cannot be honoured refuses the start,
      * as the filters and plaintext verbs above do. */

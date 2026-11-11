@@ -77,6 +77,15 @@ class IdentityProtocol(Protocol):
     vote = 'vote_on_peer'  # msg.obj <- (identityobj, proof, signature)
     confirm = 'peer_accepted'  # msg.obj <- identityobj
     update = 'group_key_update'  # msg.obj <- group
+    # A node behind on the group key asks a member for the current group,
+    # point to point and encrypted. A member answers a member it holds with
+    # an ordinary signed group_key_update, which the asker takes through the
+    # same verified gate as any other (doc/architecture/identity-protocol.md).
+    key_query = 'group_key_query'  # msg.obj <- json {'group_uuid': str, 'epoch': int}
+    # key_stale: local-only IPC. NetProcess emits it when a group frame from a
+    # peer we hold will not open, which means that peer holds a key we lack.
+    #   msg.obj <- str (from_addr of the frame)
+    key_stale = 'group_key_stale'
     # Recovery path for the announce-broadcast loss case: when a peer
     # admits another via confirm but never received its announce
     # (no_prior_potential), it sends caps_query directly. The target

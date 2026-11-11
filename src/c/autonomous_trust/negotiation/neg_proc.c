@@ -104,6 +104,14 @@ static char ID_TIER_LOST[] = "tier_lost";
  * most max_concurrency are used at once; this is only the array's bound. */
 #define NEG_RUNNING_MAX 16
 
+/* A given-up task's tracker, kept until @c until so a late result is scored
+ * against it (negotiation_status_sweep, handle_results). */
+typedef struct {
+    char task[UUID_STRING_LEN + 1];   /* "" when free */
+    task_tracker_t *tracker;          /* owned */
+    double until;
+} neg_late_t;
+
 typedef struct {
     bool used;                    /* holds a job, running or not yet reported */
     bool done;                    /* its thread has finished */
@@ -185,7 +193,54 @@ static struct {
     /* Jobs running on worker threads, or finished and not yet reported. */
     neg_running_t running[NEG_RUNNING_MAX];
     neg_retained_trace_t traces[NEG_TRACE_RETAIN_MAX];
+    neg_late_t late[NEG_LATE_RESULT_MAX];
 } neg_state;
+
+/* Free a retained given-up tracker's slot. Caller holds neg_state.lock. */
+static void _late_free_locked(neg_late_t *l)
+{
+    if (l->tracker != NULL)
+    {
+        task_tracker_free(l->tracker);
+        free(l->tracker);
+    }
+    memset(l, 0, sizeof(*l));
+}
+
+/* The retained tracker of given-up task @p task_uuid_str, or NULL. Caller
+ * holds neg_state.lock. */
+static neg_late_t *_late_find_locked(const char *task_uuid_str)
+{
+    for (int i = 0; i < NEG_LATE_RESULT_MAX; i++)
+        if (neg_state.late[i].task[0] != '\0'
+            && strcmp(neg_state.late[i].task, task_uuid_str) == 0)
+            return &neg_state.late[i];
+    return NULL;
+}
+
+/* Keep @p tracker (owned from here on) for given-up task @p task_uuid_str
+ * until @p until; the slot that would be let go soonest is taken when the
+ * table is full. Caller holds neg_state.lock. */
+static void _late_retain_locked(const char *task_uuid_str,
+                                task_tracker_t *tracker, double until)
+{
+    neg_late_t *slot = &neg_state.late[0];
+    for (int i = 0; i < NEG_LATE_RESULT_MAX; i++)
+    {
+        neg_late_t *l = &neg_state.late[i];
+        if (l->task[0] == '\0')
+        {
+            slot = l;
+            break;
+        }
+        if (l->until < slot->until)
+            slot = l;
+    }
+    _late_free_locked(slot);
+    at_strlcpy(slot->task, task_uuid_str, sizeof(slot->task));
+    slot->tracker = tracker;
+    slot->until = until;
+}
 
 static void _join_running(void);
 
@@ -416,6 +471,8 @@ void negotiation_reset_state(void)
         neg_trace_free(&neg_state.traces[i].trace);
         memset(&neg_state.traces[i], 0, sizeof(neg_state.traces[i]));
     }
+    for (int i = 0; i < NEG_LATE_RESULT_MAX; i++)
+        _late_free_locked(&neg_state.late[i]);
     /* Replay marks too. The harness derives participant uuids
      * deterministically from their slugs, so "alice" is the same sender in
      * every scenario; a mark left behind by one would refuse the next
@@ -2737,6 +2794,12 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
             task_tracker_t *tracker = NULL;
             if (map_get(&neg_state.my_tasks, task_uuid_str, &trk_dat) == 0 && trk_dat)
                 data_object_ptr(trk_dat, (ptr_t *)&tracker);
+            /* A task we gave up is still scored if its result comes before
+             * we let its tracker go: scored, never forwarded to the main
+             * process, which already had the give-up. */
+            neg_late_t *late = NULL;
+            if (tracker == NULL && (late = _late_find_locked(task_uuid_str)) != NULL)
+                tracker = late->tracker;
 
             if (tracker && !task_tracker_was_invited(tracker, nmsg->from_whom.uuid))
             {
@@ -2794,7 +2857,12 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
                         && json_integer_value(j_tl) <= NEG_REPLAY_MAX_STEPS
                         ? (int)json_integer_value(j_tl) : 0,
                 };
-                neg_result_verdict_t held = neg_ext_on_result(proc, &info);
+                neg_result_verdict_t held = late != NULL ? NEG_RESULT_LEAVE
+                                                         : neg_ext_on_result(proc, &info);
+                if (late != NULL)
+                    log_info(proc->logger,
+                             "Negotiation: late result for given-up task %s from %s "
+                             "scored\n", task_uuid_str, nmsg->from_whom.nickname);
                 const char *channel = TX_CHANNEL_TASK_OUTCOME;
                 char subject[UUID_STRING_LEN + 1] = {0};
                 uuid_unparse_lower(nmsg->from_whom.uuid, subject);
@@ -2830,7 +2898,7 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
                  * tracker lives until every invitee has answered (or the
                  * task is cancelled). Mirrors Python handle_results, which
                  * marks the later ones score_only. */
-                if (collected == 1 && held != NEG_RESULT_CONSUME)
+                if (late == NULL && collected == 1 && held != NEG_RESULT_CONSUME)
                 {
                     log_info(proc->logger,
                              "Negotiation: task %s first result — forwarding\n",
@@ -2848,7 +2916,9 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
 
                     _neg_send(proc, AT_MAIN_QUEUE, &result_msg, "a task result");
                 }
-                if (collected >= tracker->expected)
+                if (late != NULL && collected >= tracker->expected)
+                    _late_free_locked(late);
+                else if (collected >= tracker->expected)
                 {
                     log_info(proc->logger,
                              "Negotiation: task %s complete\n", task_uuid_str);
@@ -3789,6 +3859,9 @@ size_t negotiation_status_sweep(const process_t *proc, double present)
     size_t given_up = 0;
     pthread_mutex_lock(&neg_state.lock);
     _compact_status_pending_locked();
+    for (int i = 0; i < NEG_LATE_RESULT_MAX; i++)
+        if (neg_state.late[i].task[0] != '\0' && neg_state.late[i].until <= present)
+            _late_free_locked(&neg_state.late[i]);
     array_t *keys = map_keys(&neg_state.my_tasks);
     size_t n = array_size(keys);
     for (size_t i = 0; i < n; i++)
@@ -3825,6 +3898,11 @@ size_t negotiation_status_sweep(const process_t *proc, double present)
                      "Negotiation: task %s past its deadline with no live answer "
                      "after %d status request round(s); giving it up\n",
                      task_uuid_str, tracker->status_asks);
+            /* Kept a while: a late result is still scored against it. Taken
+             * out of my_tasks first, so forgetting the task leaves it be. */
+            map_remove(&neg_state.my_tasks, (map_key_t)task_uuid_str);
+            _late_retain_locked(task_uuid_str, tracker,
+                                present + NEG_LATE_RESULT_SEC);
             _forget_task_locked(task_uuid_str);
             given_up++;
             continue;
@@ -4207,6 +4285,9 @@ int negotiation_run(process_t *proc, directory_t *queues, queue_id_t signal, log
                     &neg_state.bootstrap, pu,
                     buf.info.peer_probe_count.bounded,
                     (int)buf.info.peer_probe_count.verdicts);
+                bootstrap_worker_note_suspect(
+                    &neg_state.bootstrap, pu,
+                    buf.info.peer_probe_count.suspect);
                 continue;
             }
             run_message_handlers(proc, queues, buf.type, &buf);

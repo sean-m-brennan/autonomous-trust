@@ -60,7 +60,7 @@ static char LATEST_UPDATE_FN[] = "latest update";
 static char UPDATE_NEEDED_FN[] = "update needed";
 
 #define ENTRIES 20
-#define MAX_SENT 64
+#define MAX_SENT MAX_CHAIN_LEN
 
 /* Every `latest update` this node sent, parsed. */
 static json_t *g_sent[MAX_SENT];
@@ -165,27 +165,34 @@ static void _add_peers(process_t *proc, identity_t *a, identity_t *b)
     }
 }
 
-/* The group {a, b, c}'s placed chain in our own: its genesis, then ENTRIES
- * bilateral entries between @p a and @p b, so CHAIN_LEN entries in all. */
+/* The group {a, b, c}'s placed chain in our own: its genesis, then @p pairs
+ * bilateral entries between @p a and @p b, so @p pairs + 1 entries in all. */
 #define CHAIN_LEN (ENTRIES + 1)
-static void _stage_chain(identity_t *a, identity_t *b, identity_t *c)
+static void _stage_chain_of(identity_t *a, identity_t *b, identity_t *c,
+                            int pairs)
 {
     identity_t *all[3] = { a, b, c };
     tx_history_t h;
     ck_assert_ret_ok(tx_history_init(&h));
     rps_found(&h, all, 3);
-    for (int i = 0; i < ENTRIES; i++)
+    for (int i = 0; i < pairs; i++)
     {
         uuid_t task;
         uuid_generate(task);
-        rps_pair(&h, task, a, 0.3 + 0.01 * i, b, 0.9 - 0.01 * i, all, 3);
+        rps_pair(&h, task, a, 0.3 + 0.01 * (i % 60), b,
+                 0.9 - 0.01 * (i % 60), all, 3);
     }
     json_t *arr = NULL;
     ck_assert_ret_ok(tx_history_era_to_json(&h, 0, tx_history_len(&h), &arr));
     ck_assert(reputation_install_chain_json(arr) >= 0);
-    ck_assert_int_eq(reputation_get_committed_tx_count(), CHAIN_LEN);
+    ck_assert_int_eq(reputation_get_committed_tx_count(), pairs + 1);
     json_decref(arr);
     tx_history_free(&h);
+}
+
+static void _stage_chain(identity_t *a, identity_t *b, identity_t *c)
+{
+    _stage_chain_of(a, b, c, ENTRIES);
 }
 
 /* Ask @p proc for its chain, as @p asker, at a page size of @p bytes; the
@@ -258,6 +265,36 @@ DEFINE_TEST(test_a_window_over_the_page_size_goes_in_pages)
     ck_assert_int_eq((int)json_array_size(joined), CHAIN_LEN);
     json_decref(joined);
     json_decref(whole);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* At 32 colluders an entry ran 8-12 KB and a 24 KB page held two, so a window
+ * past about 130 entries needed more pages than the limit allowed and was
+ * never sent; a node that fell behind never caught up (hostile-join n32,
+ * 2026-11-06). The limit is the chain cap: one entry per page always fits. */
+DEFINE_TEST(test_a_full_window_goes_even_at_one_entry_per_page)
+{
+    _begin();
+    identity_t *me = _mk_identity("ada", "10.0.0.1");
+    identity_t *bob = _mk_identity("bob", "10.0.0.2");
+    identity_t *cal = _mk_identity("cal", "10.0.0.3");
+    process_t *proc = _mk_process(me);
+    _stage_chain_of(me, bob, cal, MAX_CHAIN_LEN - 1);
+    _ask(proc, bob, 1);
+    ck_assert_int_eq((int)g_num_sent, MAX_CHAIN_LEN);
+    json_t *pages = json_array();
+    for (size_t i = 0; i < g_num_sent; i++)
+        json_array_append(pages, g_sent[i]);
+    _forget_sent();
+
+    _begin();
+    process_t *recv = _mk_process(cal);
+    _add_peers(recv, me, bob);
+    for (size_t i = 0; i < json_array_size(pages); i++)
+        _dispatch(recv, me, LATEST_UPDATE_FN, json_array_get(pages, i));
+    ck_assert_int_eq(reputation_get_committed_tx_count(), MAX_CHAIN_LEN);
+    json_decref(pages);
     _end();
 }
 END_TEST_DEFINITION()
@@ -343,6 +380,7 @@ END_TEST_DEFINITION()
 
 RUN_TESTS(RepUpdatePages,
           test_a_window_over_the_page_size_goes_in_pages,
+          test_a_full_window_goes_even_at_one_entry_per_page,
           test_pages_are_put_together_in_any_order,
           test_a_page_of_another_head_starts_over,
           test_pages_from_two_senders_do_not_mix)

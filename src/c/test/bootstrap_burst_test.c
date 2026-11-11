@@ -222,7 +222,33 @@ DEFINE_TEST(test_burst_a_peer_listed_later_joins_and_grows_the_budget)
 }
 END_TEST_DEFINITION()
 
-DEFINE_TEST(test_burst_is_not_reentered)
+/* A joiner that knew one peer when its burst began, and whose window probes
+ * already gave that peer k verdicts, ended the burst within a second; the 32
+ * peers it learned of next were never probed (hostile-join n32 pass-on-2,
+ * 2026-11-06). A peer listed short after the burst ends opens it again, with
+ * that peer's share of the budget. */
+DEFINE_TEST(test_burst_a_peer_listed_after_it_ends_reopens_it)
+{
+    bootstrap_worker_t w;
+    _burst_worker(&w, true, 1, 0.0, 1);
+    bootstrap_worker_note_probe_count(&w, UUIDS[0], true, 0);
+    both_ctx_t both = {0};
+    double t = 0.0;
+    _burst_run(&w, 2, &t, 10.0, &both);
+    bootstrap_worker_note_probe_count(&w, UUIDS[0], true, 1);
+    _burst_run(&w, 2, &t, 10.0, &both);
+    ck_assert_int_eq(w.burst_state, BOOTSTRAP_BURST_DONE);
+    ck_assert_int_eq(w.burst_budget, 1);
+    int before = both.p.calls;
+    bootstrap_worker_note_probe_count(&w, UUIDS[1], true, 0);
+    ck_assert_int_eq(w.burst_budget, 2);
+    _burst_run(&w, 3, &t, 10.0, &both);
+    ck_assert_int_eq(both.p.calls, before + 1);
+    ck_assert_int_eq(both.p.per_peer[1], 1);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_burst_a_target_already_probed_does_not_reopen_it)
 {
     bootstrap_worker_t w;
     _burst_worker(&w, true, 1, 0.0, 4);
@@ -234,9 +260,10 @@ DEFINE_TEST(test_burst_is_not_reentered)
     _burst_run(&w, 2, &t, 10.0, &both);
     ck_assert_int_eq(w.burst_state, BOOTSTRAP_BURST_DONE);
     int before = both.p.calls;
-    bootstrap_worker_note_probe_count(&w, UUIDS[1], true, 0);
+    bootstrap_worker_note_probe_count(&w, UUIDS[0], true, 0);
     _burst_run(&w, 3, &t, 10.0, &both);
     ck_assert_int_eq(both.p.calls, before);
+    ck_assert_int_eq(w.burst_state, BOOTSTRAP_BURST_DONE);
 }
 END_TEST_DEFINITION()
 
@@ -273,13 +300,122 @@ DEFINE_TEST(test_burst_a_refused_probe_is_not_counted)
 }
 END_TEST_DEFINITION()
 
+/* --- Suspects: re-probed at once -------------------------------------------
+ * A peer whose latest probe of ours failed is a suspect: reputation flags it
+ * (PEER_PROBE_COUNT's suspect) and the worker probes it again at the burst's
+ * interval, at most AT_SUSPECT_REPROBES times a suspicion, rather than waiting
+ * its turn at one probe a minute. Mirrors TestSuspectReprobe in
+ * tests/a_unit/test_bootstrap_worker.py. */
+
+DEFINE_TEST(test_suspect_is_probed_again)
+{
+    bootstrap_worker_t w;
+    _burst_worker(&w, true, 3, 0.0, 4);
+    bootstrap_worker_note_suspect(&w, UUIDS[0], true);
+    both_ctx_t both = {0};
+    double t = 0.0;
+    _burst_run(&w, 1, &t, 10.0, &both);
+    ck_assert_int_eq(both.p.calls, 1);
+    ck_assert_int_eq(both.p.per_peer[0], 1);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_suspect_the_burst_interval_spaces_reprobes)
+{
+    bootstrap_worker_t w;
+    _burst_worker(&w, true, 3, 5.0, 4);
+    bootstrap_worker_note_suspect(&w, UUIDS[0], true);
+    both_ctx_t both = {0};
+    double t = 0.0;
+    _burst_run(&w, 10, &t, 1.0, &both);
+    ck_assert_int_eq(both.p.calls, 2);            /* t = 0 and t = 5 */
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_suspect_reprobes_are_capped_per_suspicion)
+{
+    bootstrap_worker_t w;
+    _burst_worker(&w, true, 3, 0.0, 4);
+    bootstrap_worker_note_suspect(&w, UUIDS[0], true);
+    both_ctx_t both = {0};
+    double t = 0.0;
+    _burst_run(&w, 20, &t, 10.0, &both);
+    ck_assert_int_eq(both.p.per_peer[0], AT_SUSPECT_REPROBES);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_suspect_cleared_is_left_and_a_new_suspicion_starts_over)
+{
+    bootstrap_worker_t w;
+    _burst_worker(&w, true, 3, 0.0, 4);
+    bootstrap_worker_note_suspect(&w, UUIDS[0], true);
+    both_ctx_t both = {0};
+    double t = 0.0;
+    _burst_run(&w, 20, &t, 10.0, &both);
+    bootstrap_worker_note_suspect(&w, UUIDS[0], false);
+    int before = both.p.calls;
+    _burst_run(&w, 3, &t, 10.0, &both);
+    ck_assert_int_eq(both.p.calls, before);
+    bootstrap_worker_note_suspect(&w, UUIDS[0], true);
+    _burst_run(&w, 1, &t, 10.0, &both);
+    ck_assert_int_eq(both.p.calls, before + 1);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_suspect_the_fewest_reprobed_goes_first)
+{
+    bootstrap_worker_t w;
+    _burst_worker(&w, true, 3, 0.0, 4);
+    bootstrap_worker_note_suspect(&w, UUIDS[0], true);
+    bootstrap_worker_note_suspect(&w, UUIDS[1], true);
+    both_ctx_t both = {0};
+    double t = 0.0;
+    _burst_run(&w, 4, &t, 10.0, &both);
+    ck_assert_int_eq(both.p.per_peer[0], 2);
+    ck_assert_int_eq(both.p.per_peer[1], 2);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_suspect_the_policy_off_reprobes_nothing)
+{
+    bootstrap_worker_t w;
+    _burst_worker(&w, false, 3, 0.0, 4);
+    bootstrap_worker_note_suspect(&w, UUIDS[0], true);
+    both_ctx_t both = {0};
+    double t = 0.0;
+    _burst_run(&w, 3, &t, 10.0, &both);
+    ck_assert_int_eq(both.p.calls, 0);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_suspect_not_held_waits)
+{
+    bootstrap_worker_t w;
+    _burst_worker(&w, true, 3, 0.0, 4);
+    bootstrap_worker_note_suspect(&w, "00000000-0000-4000-8000-0000000000ff",
+                                  true);
+    both_ctx_t both = {0};
+    double t = 0.0;
+    _burst_run(&w, 3, &t, 10.0, &both);
+    ck_assert_int_eq(both.p.calls, 0);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(BootstrapBurst,
+          test_suspect_is_probed_again,
+          test_suspect_the_burst_interval_spaces_reprobes,
+          test_suspect_reprobes_are_capped_per_suspicion,
+          test_suspect_cleared_is_left_and_a_new_suspicion_starts_over,
+          test_suspect_the_fewest_reprobed_goes_first,
+          test_suspect_the_policy_off_reprobes_nothing,
+          test_suspect_not_held_waits,
           test_burst_the_policy_off_runs_no_burst,
           test_burst_k_probes_each_spread_over_the_targets,
           test_burst_ends_when_every_target_has_k,
           test_burst_budget_bounds_a_burst_whose_verdicts_never_come,
           test_burst_interval_spaces_burst_probes,
           test_burst_a_peer_listed_later_joins_and_grows_the_budget,
-          test_burst_is_not_reentered,
+          test_burst_a_peer_listed_after_it_ends_reopens_it,
+          test_burst_a_target_already_probed_does_not_reopen_it,
           test_burst_a_target_not_held_or_absent_waits,
           test_burst_a_refused_probe_is_not_counted)

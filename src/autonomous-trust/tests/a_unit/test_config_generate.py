@@ -101,6 +101,33 @@ def test_generate_randomize_honors_at_peer_name(setup_teardown):
     assert ident.nickname == 'noaa-1@tekfive.com'
 
 
+def test_generate_randomize_adopts_a_provisioned_uuid(setup_teardown):
+    """AT_IDENTITY_UUID (RD_13.4 §3.3): a deployment generator that writes a
+    manifest names each node's uuid before the node exists, and the node
+    adopts it. Anything but the canonical form refuses."""
+    import pytest
+    cfg_dir = os.path.join(TEST_DIR, 'gen_provisioned_uuid')
+    os.makedirs(cfg_dir, exist_ok=True)
+    mock_addrs = {
+        'ip4': '192.168.1.100', 'ip6': '::1', 'mac': '00:11:22:33:44:55',
+        'ip4_subnet': '255.255.255.0',
+        'ip6_subnet': 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
+        'mac_bcast': 'ff:ff:ff:ff:ff:ff',
+    }
+    want = '5b1f8f3e-2d7a-5c1e-9a40-0123456789ab'
+    with patch('autonomous_trust.core.config.generate.Network.get_addresses',
+               return_value=mock_addrs):
+        with patch.dict(os.environ, {'AT_IDENTITY_UUID': want}):
+            _, ident, _ = generate_identity(cfg_dir, randomize=True, seed=1,
+                                            silent=True)
+        assert str(ident.uuid) == want
+        for bad in (want.upper(), want.replace('-', ''), 'not-a-uuid'):
+            with patch.dict(os.environ, {'AT_IDENTITY_UUID': bad}):
+                with pytest.raises(ValueError):
+                    generate_identity(cfg_dir, randomize=True, seed=1,
+                                      silent=True)
+
+
 def test_generate_randomize_no_at_peer_name_uses_random(setup_teardown):
     """Sanity: with AT_PEER_NAME unset, the random-pool nickname survives."""
     cfg_dir = os.path.join(TEST_DIR, 'gen_no_at_peer_name')

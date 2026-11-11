@@ -46,10 +46,11 @@ from .placement import PlacementMixin
 from .reputation import (TransactionHistory, ReconcileResult, Reputation, Reputations,
                          TransactionScore, SlashAttestation, SignedSlash,
                          AttestedScore, SignedAttestation,
-                         Checkpoint, SignedCheckpoint, validate_tx_score, validate_tx_milli, milli_to_score, TX_SCORE_SCALE,
+                         Checkpoint, SignedCheckpoint, validate_tx_score, validate_tx_milli, milli_to_score, TX_SCORE_SCALE, peer_id_str,
                          validate_tx_channel, commit_designation, half_designation,
                          window_root_of, _hex_str, byzantine_f,
-                         PeerReputation, EVIDENCE_FILE, SLASH_MARKS_FILE,
+                         PeerReputation, EVIDENCE_FILE, SLASH_MARKS_FILE, RETAINED_FILE,
+                         LONE_VERDICTS_FILE, LoneVerdict, LoneVerdicts,
                          evidence_to_dict, place_value_digest, placement_entry,
                          place_designation,
                          evidence_from_dict, evidence_attest_certs,
@@ -138,9 +139,14 @@ REP_CATCHUP_QUORUM = 1
 # part-3629127, ISSUES §2.67). A window whose JSON exceeds this many bytes goes
 # as pages {page, of, head, chain[, group]}; the receiver collects every page
 # of one head from one sender and then handles the window as if it came whole.
-# Mirrors rep_proc.c REP_UPDATE_PAGE_BYTES / _PAGES_MAX / REP_PAGE_BUFS.
+# The page limit is the default chain cap, so a window always fits even at one
+# entry per page: at 32 colluders an entry ran 8-12 KB, a page held two, and
+# a limit of 64 left every window past about 130 entries unsent (hostile-join
+# n32, 2026-11-06). A chain cap raised past the default by environment can
+# still outgrow it. Mirrors rep_proc.c REP_UPDATE_PAGE_BYTES / _PAGES_MAX /
+# REP_PAGE_BUFS.
 UPDATE_PAGE_BYTES = 24000
-UPDATE_PAGES_MAX = 64
+UPDATE_PAGES_MAX = TransactionHistory.DEFAULT_MAX_CHAIN_LEN
 UPDATE_PAGE_BUFS = 8
 
 
@@ -167,54 +173,112 @@ def _brought_of(proc) -> dict:
 
 def _evidence_by_peer(proc, peer_uuid, split=False):
     """The entries about ``peer_uuid`` the scorers read: ``proc``'s primary
-    chain's, then its anchored cohort chain's (RD_14.4 Phase 6). Raises
+    chain's, then its anchored cohort chain's (RD_14.4 Phase 6), each with the
+    own entries it retained past its window ahead of the resident ones. Raises
     KeyError, as ``by_peer`` does, when neither holds any. ``split`` returns
     the two lists apart (the primary chain's indices mean something the cohort
     chain's do not). A process holding no cohort reads its primary chain
     alone."""
-    primary, missing = [], False
-    try:
-        primary = list(proc.history.by_peer(peer_uuid))
-    except KeyError:
-        missing = True
+    def _of(chain):
+        # This node's own entries that left the window come first: they are
+        # older than every resident one.
+        kept = list(chain.retained_by_peer(peer_uuid)) \
+            if hasattr(chain, 'retained_by_peer') else []
+        try:
+            return kept + list(chain.by_peer(peer_uuid))
+        except KeyError:
+            return kept
+    primary = _of(proc.history)
     cohort = []
     grp = (getattr(getattr(proc, 'protocol', None), 'anchored_cohort', None)
            if _policy_on(proc) else None)
     chain = (getattr(proc, 'child_histories', {}).get(str(grp.uuid))
              if grp is not None else None)
     if chain is not None:
-        try:
-            cohort = list(chain.by_peer(peer_uuid))
-        except KeyError:
-            cohort = []
-    if missing and not cohort:
+        cohort = _of(chain)
+    if not primary and not cohort:
         raise KeyError(peer_uuid)
     return (primary, cohort) if split else primary + cohort
 
 
 def _probe_of_ours(tx, me) -> bool:
     """Whether ``tx``'s half by ``me`` is one of AT's probes (the ``probe``
-    channel): a verdict this node reached by asking a known-answer question."""
-    mine = tx.p1_channel if tx.p1_id == me else tx.p2_channel
+    channel): a verdict this node reached by asking a known-answer question.
+    A lone verdict (LoneVerdict) is one by construction."""
+    if getattr(tx, 'lone', False):
+        return True
+    mine = tx.p1_channel if tx.p1_id == peer_id_str(me) else tx.p2_channel
     return (mine or TX_CHANNEL_DEFAULT) == TX_CHANNEL_PROBE
 
 
-def contrite_tft_of(peer_scores, my_scores):
+def coop_regime_of(in_coop, previous, pure, enter, leave):
+    """Which regime scores a peer, given its latch and previous score:
+    ``(use_pure, the cooperation score or None)``. ``pure`` computes the
+    cooperation score, called only when needed.
+
+    A peer is scored in cooperation while the cooperation score itself is at
+    or above ``leave``: in it, once ``previous > leave``; out of it, once
+    ``previous > enter``. Otherwise it is scored by tit-for-tat. Without that
+    test the hostile-join runs without the policy, 2026-11-04, flipped every
+    rescore: contrite tit-for-tat over the joiners' own transactions scored
+    the contact 0.84, the cooperation mean over everyone's entries, slander
+    included, scored it 0.34, and each sent the next rescore to the other.
+    Testing it only on entry still scored the contact once on that mean on
+    the way out, and the runs of 2026-11-05 lost its tier for a minute. Own
+    evidence wins. Mirrors C reputation_coop_regime."""
+    if previous <= (leave if in_coop else enter):
+        return False, None
+    score = pure()
+    return (True, score) if score >= leave else (False, None)
+
+
+def contrite_tft_of(peer_scores, my_scores, neutral, k):
     """Contrite tit-for-tat over non-empty, aligned lists: the scores this
-    node gave the peer and the scores the peer gave this node, oldest first.
-    Shared by the told score and the brought one (RD_14.4 Phase 4)."""
-    peer_standing = sum(peer_scores) / len(peer_scores)
-    my_standing = sum(my_scores) / len(my_scores)
-    if peer_scores[-1] < 0.5 and my_standing < 0.5:  # peer defected, but my standing sucks
-        return max(0.51, peer_standing)
-    if peer_scores[-1] < 0.5 and my_standing >= 0.5:  # peer defected, my standing is ok
-        return min(0.49, peer_standing)
-    return max(0.51, peer_standing)  # cooperate/cooperate (but digging out of a hole)
+    node gave the peer (`given`) and the scores the peer gave this node
+    (`got`), oldest first. Shared by the told score and the brought one
+    (RD_14.4 Phase 4).
+
+    The peer's standing is the mean of `given` shrunk toward `neutral` by a
+    pseudo-count `k`, so trust grows with the record rather than jumping to
+    one transaction's score: one cooperative 0.9 reads 0.375 at the defaults,
+    ten read 0.74. A defection is a transaction in which the peer scored this
+    node below 0.5. The first is forgiven; when the latest two are both
+    defections the score is held below tier 1 (0.49). There is no floor: a
+    peer that keeps failing sinks to its record (hostile-join run,
+    2026-11-04, where a 0.51 floor kept five colluders at tier 1). Mirrors C
+    reputation_ctft_score."""
+    shrunk = (sum(peer_scores) + k * neutral) / (len(peer_scores) + k)
+    if len(my_scores) >= 2 and my_scores[-1] < 0.5 and my_scores[-2] < 0.5:
+        return min(0.49, shrunk)
+    return shrunk
+
+
+#: Where two failed probes in a row hold a peer's brought score: below tier 1,
+#: as contrite tit-for-tat holds a repeat defector.
+PROBE_HOLD = 0.49
+#: The probe score that is neither a pass nor a failure: an out-of-tolerance
+#: time attestation. Mirrors C REP_PROBE_NEUTRAL.
+PROBE_NEUTRAL = 0.5
+
+
+def probe_hold_of(recent) -> bool:
+    """Whether the latest two of our probe verdicts about a peer, ``recent``
+    (scores, oldest first), both failed: scored below 0.5. A known-answer
+    probe is a defection the prober stands behind alone, but a lone verdict
+    carries no score of us, so contrite tit-for-tat never counts one; a gamer
+    that answered rightly for eight minutes and wrongly after kept tier 2..3
+    for twelve minutes on every honest node (red-team batch, 2026-11-10). An
+    out-of-tolerance time attestation scores 0.5 (PROBE_NEUTRAL) and is left
+    out of ``recent``, so clock drift neither fails nor breaks a run.
+    Mirrors C reputation_probe_hold."""
+    recent = list(recent or ())
+    return len(recent) >= 2 and recent[-1] < 0.5 and recent[-2] < 0.5
 
 
 def bilateral_scores(tx, peer_uuid, me):
     """``(ours of the peer, the peer's of us)`` for a transaction between
     ``me`` and ``peer_uuid``, read through Tx.about, else None."""
+    peer_uuid, me = peer_id_str(peer_uuid), peer_id_str(me)
     if not ((tx.p1_id == peer_uuid and tx.p2_id == me)
             or (tx.p2_id == peer_uuid and tx.p1_id == me)):
         return None
@@ -350,7 +414,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
 
     # Hysteresis band for the CTFT ↔ pure-reputation dispatch in
     # _compute_reputation. A single 0.5 threshold made peers hovering
-    # near 0.5 flip scoring functions every tick (CTFT's 0.51 →
+    # near 0.5 flip scoring functions every tick (CTFT's then-floor 0.51 →
     # pure_reputation's 0.4 → CTFT's 0.51 → …), surfacing as a
     # 0.9 ↔ 0.4 oscillation on the dashboard. Widening the switch
     # band so a peer must clear COOP_ENTER to graduate and fall below
@@ -358,6 +422,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
     # either scoring function.
     COOP_ENTER = 0.55
     COOP_EXIT = 0.45
+    # Entering or staying in the band also needs the cooperation score itself
+    # to hold at or above COOP_EXIT (coop_regime_of): own evidence wins.
 
     # Pre-reputation cold-start (CTFT no-bilateral-history-with-us branch).
     # PREREP_NEUTRAL is the "no information" starting reputation on the
@@ -372,11 +438,10 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
     # third-party standing toward this value by a pseudo-count of
     # PREREP_SHRINKAGE_K, so a truly-unknown peer (zero observations) reads
     # exactly PREREP_NEUTRAL while a peer others have already scored gets an
-    # informed, conservatively-shrunk prior. This is the STARTING point only --
-    # the CTFT bilateral pivots (min(0.49, .)/max(0.51, .) around the 0.5
-    # per-transaction cooperate threshold) are the earned near-threshold
-    # outputs and are deliberately unchanged (the per-tx task-score scale is
-    # unchanged; only the aggregate-reputation thresholds move). Mirror:
+    # informed, conservatively-shrunk prior. CTFT shrinks a peer's bilateral
+    # standing toward the same value by the same pseudo-count
+    # (contrite_tft_of), so the prior and the earned score sit on one curve.
+    # Mirror:
     # reputation.c PREREP_NEUTRAL. Disable the heuristic via
     # AT_PREREP_HEURISTIC=0; re-adjust the neutral value via AT_REP_NEUTRAL.
     PREREP_NEUTRAL = _env_float('AT_REP_NEUTRAL', 0.2)
@@ -514,6 +579,14 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
     # without measurably growing memory.
     COMMITTED_ROUNDS_CAP = 2000
 
+    # How far back a commit certificate may name the roster it met: the roster
+    # in force, or one superseded within this many instances of the receiver's
+    # chain. A proposer a roster or two behind its receivers (a roster growing
+    # 4 -> 10 at a cohort's start) is still judged by the bar it met, and
+    # because rosters only grow, it bounds how small a bar a proposer can
+    # claim. Mirrors C REP_CERT_ROSTER_WINDOW.
+    CERT_ROSTER_WINDOW = 32
+
     # When True, _spawn replaces threading.Thread().start() with a direct,
     # synchronous call. The conformance harness sets this so scenario steps
     # are deterministic; production paths leave it False.
@@ -586,7 +659,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         self.protocol.register_handler(
             ReputationProtocol.place_nack, self.handle_place_nack)
         load_extensions(self, self.name)
-        self.history = TransactionHistory()
+        self.history = self._own_history()
         # Gateway reputation tree: one child chain per child group this node gateways
         # (keyed by group-uuid string). Empty on rank-1 leaf nodes — every code path
         # below degrades to the single self.history chain when this is empty, so leaves
@@ -654,6 +727,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         self._counts_due = set()
         self._counts_roster = frozenset()
         self._counts_published = None
+        self._suspects_published = set()
         self._last_counts_pass = None
         # Idle-decay bookkeeping. _last_interaction maps peer-uuid-str ->
         # epoch seconds of our most recent committed transaction with that
@@ -932,10 +1006,16 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         # does not cover. LAST in __init__ deliberately -- it reads the
         # loaded reputation snapshot, the peer roster and the checkpoint
         # state above, and it revises self.history.
+        self.lone_verdicts = LoneVerdicts(self.history.max_chain_len)
+        # Peer uuid str -> our latest two probe verdict scores, oldest first.
+        self._probe_recent = {}
+        # Peer uuid strs whose latest probe verdict of ours was a 0.5.
+        self._probe_unsure = set()
         self._rebuild_from_evidence()
         # Ordered placement's pending pool, after the chain it waits on.
         self._reset_pre_roster_chain('')
         self._restore_pool('')
+        self._load_lone_verdicts()
 
     @property
     def peers(self):
@@ -1128,7 +1208,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             return self.history
         if key in self.child_groups or key == self._cohort_key():
             if key not in self.child_histories:
-                self.child_histories[key] = TransactionHistory()
+                self.child_histories[key] = self._own_history()
             return self.child_histories[key]
         return self.history
 
@@ -1516,6 +1596,9 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                     str(message.task_id)[:8], message.capability_name,
                     'this node' if subject is not None else 'no counterparty')
                 return True
+            # Kept before the probe cap, so a half the cap drops still leaves
+            # its verdict as our own evidence.
+            self._record_lone_verdict(message)
             if not self.admit_new_half(message):
                 return True
             try:
@@ -1555,7 +1638,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             if voter_uuid is None:
                 return True
             round_group_uuid = self.round_group.get(idx)
-            certificate = None
+            certificate = cert_roster = None
             # Only a SIGNED acceptance counts here, and the round carries
             # once the signatures clear the same bar a receiver will hold
             # them to (_commit_cert_ok), so a commit this node sends is one
@@ -1578,6 +1661,10 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                                     score.channel, pending,
                                     round_group_uuid):
                 certificate = dict(pending)
+                # The roster it met, which the commit names so a receiver
+                # further along the roster's growth judges it by the same bar.
+                met = self._roster_for_group(round_group_uuid)
+                cert_roster = None if met is None else met.roster_digest
             # One vote per member per round, ours included: sending the
             # transaction was our own acceptance.
             voters = self.acceptances.setdefault(idx, set())
@@ -1637,7 +1724,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 # — primary for leaf nodes, a child chain on a gateway.
                 self._record_committed_half(
                     round_group_uuid, score.task_id, peer_id, score.score_milli,
-                    score.channel, certificate, counterparty, half_sig)
+                    score.channel, certificate, counterparty, half_sig,
+                    cert_roster)
                 self.commit_sigs_pending.pop(score.task_id, None)
                 self.acceptances.pop(idx, None)
                 # Our half is in: stop watching it (ISSUES §2.24).
@@ -1680,9 +1768,13 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                     # The certificate rides as element 6. Elements 7 and 8
                     # are whom the half names and the scorer's signature over
                     # it (R+D.md §14.2): a commit without them is refused.
+                    # Element 9 is the digest of the roster the certificate
+                    # met, unsigned: a receiver honors it only for a roster it
+                    # holds and that was in force within CERT_ROSTER_WINDOW.
                     commit_obj = (score.task_id, peer_id, score.score_milli,
                                   round_group_uuid, score.channel,
-                                  certificate, str(counterparty), half_sig)
+                                  certificate, str(counterparty), half_sig,
+                                  cert_roster)
                     commit_msg = Message(
                         self.name, ReputationProtocol.committed,
                         to_json_string(commit_obj),
@@ -1729,6 +1821,9 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                                 and isinstance(parsed[6], str) else None)
                 half_sig = (parsed[7] if len(parsed) > 7
                             and isinstance(parsed[7], str) else None)
+                # Element 9: the roster the certificate was collected under.
+                cert_roster = (parsed[8] if len(parsed) > 8
+                               and isinstance(parsed[8], str) else None)
             except Exception:
                 self.logger.warning(
                     'handle_committed: malformed payload %r', message.obj)
@@ -1779,13 +1874,28 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             # Commit certificates (doc/architecture/reputation.md): no
             # ordinary half goes to the pool without a quorum of the roster in
             # force having signed exactly this score.
+            tally, why = {}, {}
             if not (sigs and self._commit_cert_ok(
-                    peer_id, task_id, score, channel, sigs, group_uuid)):
+                    peer_id, task_id, score, channel, sigs, group_uuid,
+                    tally=tally, named=cert_roster, why=why)):
                 self.logger.warning(
                     'Rejecting committed from %s: %s',
                     getattr(message.from_whom, 'nickname', '?'),
-                    'its certificate does not meet our quorum' if sigs
-                    else 'it carries no commit certificate')
+                    'its certificate does not meet our quorum (%d of %d '
+                    'signature(s) verify, %d needed, %s, group %s; '
+                    'not counted: %s; names roster %s%s)' % (
+                        tally['verified'], tally['offered'], tally['needed'],
+                        'no roster' if tally['members'] is None
+                        else '%sroster of %d' % (
+                            'named ' if tally['named'] else '',
+                            tally['members']),
+                        str(group_uuid)[:8] if group_uuid else 'primary',
+                        ', '.join(why.get('failed') or ()) or 'none',
+                        str(why.get('named_digest') or 'none')[:12],
+                        '' if why.get('named_digest') is None
+                        else (' (held)' if why.get('named_held')
+                              else ' (not held)'))
+                    if sigs else 'it carries no commit certificate')
                 return True
             # Signed halves (R+D.md §14.2): the scorer's own word on its half
             # and on whom it is about. The certificate says a round ran; only
@@ -1803,7 +1913,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             chain = self._chain_for_group(group_uuid)
             if self._record_committed_half(
                     group_uuid, task_id, peer_id, score, channel, sigs,
-                    counterparty, half_sig) == 'mismatch':
+                    counterparty, half_sig, cert_roster) == 'mismatch':
                 return True
             self._note_interaction(peer_id)
             self.logger.info(
@@ -1962,6 +2072,13 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                                  len(roster.roster_members or ()), 1, roster)
         return self._checkpoint_quorum_met(designation, sigs, group_uuid)
 
+    @staticmethod
+    def _bar_need(members, extra, roster) -> int:
+        """The signatures `_bar_met` asks for: (members + F) // 2 + `extra`,
+        F from the N_min `roster` declares."""
+        f = byzantine_f(None if roster is None else roster.roster_n_min)
+        return (members + f) // 2 + extra
+
     def _bar_met(self, where, round_key, have, members, extra, roster) -> bool:
         """Does `have` reach the Byzantine bar over `members` (RD_13.2 plan
         §0.4)? The bar is (members + F) // 2 + `extra` signatures, F from the
@@ -1971,7 +2088,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         declared bar, warn once per round with the bar and the declaration."""
         n_min = None if roster is None else roster.roster_n_min
         f = byzantine_f(n_min)
-        need = (members + f) // 2 + extra
+        need = self._bar_need(members, extra, roster)
         if have >= need:
             return True
         if f:
@@ -2000,22 +2117,57 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
     # own half, which is R+D.md §14.2's to answer, not this one's.
 
     def _commit_cert_ok(self, scorer, task_id, score_milli, channel, sigs,
-                        group_uuid=None, roster=...) -> bool:
+                        group_uuid=None, roster=..., tally=None,
+                        named=None, why=None) -> bool:
         """Do `sigs` certify `scorer`'s half? At least ``_round_quorum``
         distinct members of OUR view must have signed its
         :func:`commit_designation`: with the scorer, a majority. The scorer's
         own signature never counts: a proposer cannot vouch for its own
-        round."""
+        round. `named` is the digest of the roster the certificate was
+        collected under, as its commit says: while that roster was in force
+        within ``CERT_ROSTER_WINDOW`` instances of our chain it is the bar,
+        and otherwise our own roster in force is. A `tally` dict, when given,
+        is filled with what the verdict rests on: signatures ``offered`` (the
+        scorer's aside), how many ``verified``, how many were ``needed``, the
+        roster's ``members`` (None when the live view decides), and whether
+        the ``named`` roster decided."""
         if not isinstance(sigs, dict) or not sigs:
             return False
         try:
             desig = commit_designation(scorer, task_id, score_milli, channel)
         except (TypeError, ValueError):
             return False
+        by_name = False
         if roster is ...:
-            # Unless told otherwise, the roster in force for the group.
-            roster = self._roster_for_group(group_uuid)
+            # Unless told otherwise, the roster the certificate names, if we
+            # hold it recently enough, else the roster in force for the group.
+            roster = self._chain_for_group(group_uuid).roster_named(
+                named, self.CERT_ROSTER_WINDOW) if named else None
+            by_name = roster is not None
+            if roster is None:
+                roster = self._roster_for_group(group_uuid)
         voters = self._verified_cosigners(desig, sigs, roster) - {str(scorer).lower()}
+        if tally is not None:
+            members = None if roster is None else len(roster.roster_members or ())
+            tally.update(
+                offered=len({str(v).lower() for v in sigs} - {str(scorer).lower()}),
+                verified=len(voters), members=members, named=by_name,
+                needed=(self._round_quorum(group_uuid) if roster is None
+                        else self._bar_need(members, 0, roster)))
+        if why is not None:
+            # Which signers did not count, and why: outside the roster that
+            # decided, or inside it with a signature that fails; and the
+            # roster the certificate names, held or not.
+            offered = {str(v).lower() for v in sigs} - {str(scorer).lower()}
+            in_roster = (None if roster is None else
+                         {str(m).lower() for m in
+                          dict(roster.roster_members or ())})
+            why.update(
+                failed=sorted(
+                    '%s:%s' % (v[:8], 'outside' if in_roster is not None
+                               and v not in in_roster else 'bad sig')
+                    for v in offered - voters),
+                named_digest=named, named_held=by_name)
         if roster is not None:
             # A majority of the logged roster, the scorer the remaining vote,
             # raised by the F it declares.
@@ -2155,8 +2307,9 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 if scorer is None:
                     continue
                 sigs = (getattr(tx, 'commit_sigs', None) or {}).get(str(scorer))
+                named = (getattr(tx, 'cert_rosters', None) or {}).get(str(scorer))
                 if not self._commit_cert_ok(scorer, tx.task_id, score, chan,
-                                            sigs, group):
+                                            sigs, group, named=named):
                     self.logger.warning(
                         'Rejecting chain from %s: entry %s (task %s) has no '
                         'commit certificate for %s\'s half meeting our quorum,'
@@ -3505,6 +3658,147 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 json.dump(doc, f, indent=2)
         except (OSError, IOError, ValueError, TypeError) as e:
             self.logger.warning('Could not persist reputation evidence: %s', e)
+        self._persist_retained(chain_key)
+        if not chain_key:
+            self._persist_lone_verdicts()
+
+    def _own_history(self, **kw) -> TransactionHistory:
+        """A chain of this node's, which keeps this node's own entries aside
+        when they leave its window (TransactionHistory.retained_by_peer)."""
+        hist = TransactionHistory(**kw)
+        hist.keep_party = peer_id_str(self.identity.uuid)
+        return hist
+
+    def _retained_path(self, chain_key: str = ''):
+        """The retained-entries file for one chain, named as its evidence."""
+        name = RETAINED_FILE
+        if chain_key:
+            name = '%s-%s' % (RETAINED_FILE, chain_key)
+        return os.path.join(Configuration.get_cfg_dir(),
+                            name + Configuration.file_ext)
+
+    def _persist_retained(self, chain_key: str = ''):
+        """Write a chain's retained own entries when they have changed since
+        the last write. Beside the evidence, at checkpoint finalization; a
+        crash loses at most what one interval evicted. Failure is logged and
+        swallowed, as for the evidence. Mirrors C _persist_retained."""
+        hist = self._chain_for_key(chain_key)
+        written = self.__dict__.setdefault('_retained_written', {})
+        rev = getattr(hist, 'retained_rev', 0)
+        if written.get(chain_key) == rev:
+            return
+        try:
+            doc = evidence_to_dict(hist.retained())
+            with atomic_write(self._retained_path(chain_key)) as f:
+                json.dump(doc, f, indent=2)
+            written[chain_key] = rev
+        except (OSError, IOError, ValueError, TypeError) as e:
+            self.logger.warning('Could not persist retained entries: %s', e)
+
+    def _load_retained(self, chain_key: str = ''):
+        """Put a chain's retained own entries back after a restart: only those
+        naming this node as a party and not resident, within the bounds. A
+        missing or unreadable file leaves the store empty. Mirrors C
+        _load_retained."""
+        try:
+            with open(self._retained_path(chain_key)) as f:
+                entries, _signed = evidence_from_dict(json.load(f))
+        except FileNotFoundError:
+            return
+        except (OSError, IOError, ValueError, TypeError) as e:
+            self.logger.warning('Retained entries unreadable (%s); starting '
+                                'chain %s without them', e,
+                                chain_key[:8] or 'primary')
+            return
+        hist = self._chain_for_key(chain_key)
+        hist.adopt_retained(entries)
+        self.__dict__.setdefault('_retained_written', {})[chain_key] = \
+            hist.retained_rev
+
+    # --- Lone probe verdicts ------------------------------------------------
+    # A verdict from one of our own probes is our own evidence as soon as it
+    # is recorded, without the probed peer's half (the user's call,
+    # 2026-11-06). It is read under the join policy only, never placed and
+    # never told; when the bilateral entry for the same task reaches a chain,
+    # that entry is read instead and the verdict is dropped at the next write.
+
+    def _record_lone_verdict(self, score):
+        """Keep ``score``, a half of ours, as a lone verdict when it is a
+        probe verdict naming its subject; mark the subject for rescoring and
+        for the burst's counts. Mirrors C _record_lone_verdict_locked."""
+        if score.channel != TX_CHANNEL_PROBE:
+            return
+        subject = getattr(score, 'subject_uuid', None)
+        if subject is None:
+            return
+        verdict = LoneVerdict(score.task_id, subject,
+                              milli_to_score(score.score_milli),
+                              now().timestamp())
+        if self.lone_verdicts.add(verdict):
+            # Our latest two probe verdicts per peer, in the order we reached
+            # them: the store drops a verdict once its entry is placed, and
+            # the chain carries no time, so neither orders them
+            # (probe_hold_of). A 0.5 (a time attestation out of tolerance,
+            # drift or a wrong clock alike) says nothing either way, so it
+            # neither joins a run of failures nor breaks one; the worker asks
+            # again until a probe answers rightly or wrongly (_suspects_of).
+            key = verdict.subject
+            if abs(verdict.score - PROBE_NEUTRAL) > 1e-9:
+                self._probe_recent[key] = (self._probe_recent.get(key, ())
+                                           + (verdict.score,))[-2:]
+                self._probe_unsure.discard(key)
+            else:
+                self._probe_unsure.add(key)
+            self._rescore_due.add(verdict.subject)
+            self._counts_due.add(verdict.subject)
+
+    def _placed_task_ids(self) -> set:
+        """The task ids on this node's chains, resident or retained: a lone
+        verdict for one of them is superseded by its bilateral entry."""
+        ids = set()
+        for hist in [self.history] + list(
+                getattr(self, 'child_histories', {}).values()):
+            for tx in list(hist) + list(getattr(hist, 'retained', list)()):
+                ids.add(str(tx.task_id))
+        return ids
+
+    def _lone_verdicts_path(self):
+        return os.path.join(Configuration.get_cfg_dir(),
+                            LONE_VERDICTS_FILE + Configuration.file_ext)
+
+    def _persist_lone_verdicts(self):
+        """Drop the superseded verdicts, then write the store when it has
+        changed since the last write. Beside the primary chain's retained
+        entries; failure is logged and swallowed, as for them. Mirrors C
+        _persist_lone_verdicts."""
+        self.lone_verdicts.drop_tasks(self._placed_task_ids())
+        rev = self.lone_verdicts.rev
+        if getattr(self, '_lone_verdicts_written', None) == rev:
+            return
+        try:
+            with atomic_write(self._lone_verdicts_path()) as f:
+                json.dump(self.lone_verdicts.to_dict(), f, indent=2)
+            self._lone_verdicts_written = rev
+        except (OSError, IOError, ValueError, TypeError) as e:
+            self.logger.warning('Could not persist lone verdicts: %s', e)
+
+    def _load_lone_verdicts(self):
+        """Put the lone verdicts back after a restart, within the bounds and
+        less those superseded. A missing or unreadable file leaves the store
+        empty. Mirrors C _load_lone_verdicts."""
+        store = LoneVerdicts(self.history.max_chain_len)
+        try:
+            with open(self._lone_verdicts_path()) as f:
+                store.load_dict(json.load(f))
+        except FileNotFoundError:
+            return
+        except (OSError, IOError, ValueError, TypeError, KeyError) as e:
+            self.logger.warning('Lone verdicts unreadable (%s); starting '
+                                'without them', e)
+            return
+        store.drop_tasks(self._placed_task_ids())
+        self.lone_verdicts = store
+        self._lone_verdicts_written = store.rev
 
     def _checkpoint_phase(self) -> float:
         """A per-node offset into the checkpoint interval, so members do not
@@ -3702,7 +3996,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         # Verified: adopt the chain, and with it the checkpoint that attests
         # it, so this node resumes with a history a peer can audit and an
         # anchor slash evidence can be measured against.
-        restored = TransactionHistory(_chain=chain)
+        restored = self._own_history(_chain=chain)
         # Attested entries keep their quorum certificates across a restart:
         # without them a peer catching up from us could not check the round.
         resident = {tx.task_id for tx in chain if tx.attested}
@@ -3718,10 +4012,13 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                     else self.history)
         if previous is not None and previous.pooled_count():
             restored.pool_from_dict(previous.pool_to_dict())
+        if previous is not None:
+            restored.adopt_retained(previous.retained())
         if chain_key:
             self.child_histories[chain_key] = restored
         else:
             self.history = restored
+        self._load_retained(chain_key)
         self._checkpoints[chain_key] = ckpt
         self._checkpoint_sigs_final[chain_key] = dict(signed.sigs or {})
         self._checkpoint_seen[ckpt.key()] = None
@@ -4541,14 +4838,15 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
 
     def _record_committed_half(self, group_uuid, task_id, scorer, score_milli,
                                channel, certificate, counterparty=None,
-                               half_sig=None) -> str:
+                               half_sig=None, cert_roster=None) -> str:
         """Put a committed half in its chain's pool, where it waits to be
         placed (doc/architecture/reputation.md, "Agreeing on an order").
         Returns record_half's outcome; a half that does not pair with the one
         the task holds ('mismatch') is logged and left out."""
         got = self._chain_for_group(group_uuid).record_half(
             task_id, scorer, score_milli, channel, certificate=certificate,
-            counterparty=counterparty, half_sig=half_sig)
+            counterparty=counterparty, half_sig=half_sig,
+            cert_roster=cert_roster)
         if got == 'mismatch':
             self.logger.warning(
                 'Not pooling %s\'s half of task %s: it names %s, and the half '
@@ -4616,7 +4914,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 commit_obj = (tx.task_id, tx.p1_id, tx.p1_score_milli, None,
                               tx.p1_channel, cert or None,
                               tx.counterparty_of(tx.p1_id),
-                              tx.half_sig_of(tx.p1_id))
+                              tx.half_sig_of(tx.p1_id),
+                              tx.cert_roster_of(tx.p1_id))
                 try:
                     queues[CfgIds.network].put(
                         Message(self.name, ReputationProtocol.committed,
@@ -4791,19 +5090,30 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         peer_uuid = peer if isinstance(peer, (UUID, str)) else peer.uuid
         peer_scores = []
         my_scores = []
+        read = set()
         try:
             for tx in _evidence_by_peer(self, peer_uuid):
                 rated = bilateral_scores(tx, peer_uuid, self.identity.uuid)
                 if rated is not None:
                     peer_scores.append(rated[0])
                     my_scores.append(rated[1])
+                    read.add(str(tx.task_id))
         except KeyError:
             self.logger.debug('No transaction history for peer %s', peer_uuid)
-        if len(peer_scores) < 1 or len(my_scores) < 1:  # no bilateral w/ us
+        # Under the policy our lone probe verdicts are given scores too, each
+        # unless its bilateral entry was read above; no score of us stands
+        # behind one, so it adds nothing to my_scores (the user's call,
+        # 2026-11-06).
+        if _policy_on(self) and hasattr(self, 'lone_verdicts'):
+            peer_scores.extend(v.score
+                               for v in self.lone_verdicts.by_peer(peer_uuid)
+                               if v.task_id not in read)
+        if len(peer_scores) < 1:  # no own evidence of the peer
             # Cold-start: before any bilateral history WITH us exists, fall
             # back to a transaction-memory prior rather than a flat neutral.
             return self._prereputation_prior(peer_uuid)
-        return contrite_tft_of(peer_scores, my_scores)
+        return contrite_tft_of(peer_scores, my_scores, self.PREREP_NEUTRAL,
+                               self.PREREP_SHRINKAGE_K)
 
     def _prereputation_prior(self, peer_uuid):
         """Transaction-memory prior for the CTFT cold-start window.
@@ -4896,11 +5206,17 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         """``[(ours of the peer, the peer's of us, tx)]``, oldest first: the
         bilateral transactions with ``peer_uuid``. A probe of ours counts
         under the join policy (Phase 5: the user's call, 2026-10-27, a
-        verdict is full own evidence) and not otherwise. Mirrors C
-        _own_evidence_locked."""
+        verdict is full own evidence) and not otherwise. Under the policy
+        this node's lone probe verdicts follow, as ``(score, None, verdict)``,
+        each unless its bilateral entry is read already (the user's call,
+        2026-11-06). Mirrors C _own_evidence_locked."""
         me = self.identity.uuid
+        probes_count = _policy_on(self)
+        lone = (self.lone_verdicts.by_peer(peer_uuid)
+                if probes_count and hasattr(self, 'lone_verdicts') else [])
         # The chain is keyed by whichever form its entries carry (a uuid
         # string in production); accept either.
+        txs = []
         for key in (peer_uuid, str(peer_uuid), _as_uuid(peer_uuid)):
             try:
                 txs = _evidence_by_peer(self, key)
@@ -4909,10 +5225,10 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             peer_uuid = key
             break
         else:
-            return []
+            if not lone:
+                return []
         own = []
         seen = set()
-        probes_count = _policy_on(self)
         for tx in txs:
             if tx.task_id in seen or getattr(tx, 'attested', False):
                 continue
@@ -4923,6 +5239,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 continue
             seen.add(tx.task_id)
             own.append((rated[0], rated[1], tx))
+        seen = {str(t) for t in seen}
+        own.extend((v.score, None, v) for v in lone if v.task_id not in seen)
         return own
 
     def _own_count(self, peer_uuid) -> int:
@@ -4976,18 +5294,40 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 n = self._burst_count(key)
                 if n is not None:
                     counts[key] = n
-        if counts == self._counts_published:
+        suspects = self._suspects_of(self._probe_recent) & roster
+        if (counts == self._counts_published
+                and suspects == self._suspects_published):
             return
         q = queues.get(self.BOOTSTRAP_WORKER_QUEUE)
         if q is None:
             self._counts_published = counts
+            self._suspects_published = suspects
             return
         try:
-            q.put(ProbeCounts(counts), block=True, timeout=self.q_cadence)
+            q.put(ProbeCounts(counts, suspects), block=True,
+                  timeout=self.q_cadence)
         except Full:
             self._counts_due |= due
             return
         self._counts_published = counts
+        self._suspects_published = suspects
+
+    def _suspects_of(self, recent) -> set:
+        """The peers (uuid str) whose latest probe verdict of ours in
+        ``recent`` (``_probe_recent``) failed, or whose latest was a 0.5 and
+        so settled nothing (``_probe_unsure``), and that are not yet held
+        (probe_hold_of), less the slashed: the worker asks them again at once.
+        A gamer's wrong time attestation scores 0.5 as drift does; without
+        the second ask, 16 of 36 honest nodes met a defected gamer only
+        through those and kept it at tier 3 (red-team rerun, 2026-11-10).
+        Mirrors C _is_suspect_locked."""
+        slashed = getattr(self, '_slashed', {})
+        keys = set(recent) | self._probe_unsure
+        return {key for key in keys
+                if (key in self._probe_unsure
+                    or (recent.get(key) and recent[key][-1] < 0.5))
+                and not probe_hold_of(recent.get(key, ()))
+                and key not in slashed}
 
     def _brought_pure(self, own):
         """Cooperation mode over own entries: the task-weighted mean of this
@@ -5021,15 +5361,27 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         if not own:
             return brought.get(key)
         peer_scores = [o[0] for o in own]
-        my_scores = [o[1] for o in own]
+        # A lone verdict has no score of us behind it: never a defection.
+        my_scores = [o[1] for o in own if o[1] is not None]
         previous = brought.get(key)
         if previous is None:
-            previous = contrite_tft_of(peer_scores, my_scores)
+            previous = contrite_tft_of(peer_scores, my_scores,
+                                       self.PREREP_NEUTRAL,
+                                       self.PREREP_SHRINKAGE_K)
         in_coop = self._coop_brought.get(key, False)
-        use_pure = previous > (self.COOP_EXIT if in_coop else self.COOP_ENTER)
+        use_pure, score = coop_regime_of(
+            in_coop, previous, lambda: self._brought_pure(own),
+            self.COOP_ENTER, self.COOP_EXIT)
         self._coop_brought[key] = use_pure
-        score = (self._brought_pure(own) if use_pure
-                 else contrite_tft_of(peer_scores, my_scores))
+        if not use_pure:
+            score = contrite_tft_of(peer_scores, my_scores,
+                                    self.PREREP_NEUTRAL,
+                                    self.PREREP_SHRINKAGE_K)
+        # Two failed probes in a row hold it in either regime: a long record
+        # and honest transactions do not outweigh wrong known answers.
+        if probe_hold_of(self._probe_recent.get(key, ())) \
+                and score > PROBE_HOLD:
+            score = PROBE_HOLD
         ceiling = self._standing_ceiling(peer_uuid)
         if ceiling is not None and score > ceiling:
             score = ceiling
@@ -5044,11 +5396,14 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
     def _bounded(self, peer_uuid, told):
         """What a decision about ``peer_uuid`` reads, given its told score:
         the brought score once the peer has ``own_evidence_min`` own entries,
-        otherwise told capped at the ``told_tier`` ceiling. An anchored peer
-        reads told uncapped; with the policy off every reader reads told.
-        Mirrors C _bounded_locked."""
+        otherwise told capped at the ``told_tier`` ceiling, or uncapped for an
+        anchored peer. An anchor reads brought too once this node has its own
+        evidence: told uncapped let the colluders' low scores of an anchor
+        pull an honest joiner from 0.9 to 0.573 while every transaction
+        between the two scored 0.9 (hostile-join run, 2026-11-04). With the
+        policy off every reader reads told. Mirrors C _bounded_locked."""
         policy = getattr(self, 'join_policy', JOIN_POLICY_INERT)
-        if told is None or not policy.enabled or self._is_anchored(peer_uuid):
+        if told is None or not policy.enabled:
             return told
         brought = _brought_of(self).get(str(peer_uuid))
         if brought is not None and \
@@ -5056,6 +5411,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             # A ceiling that landed since the score was written bounds it too.
             ceiling = self._standing_ceiling(peer_uuid)
             return brought if ceiling is None or brought <= ceiling else ceiling
+        if self._is_anchored(peer_uuid):
+            return told
         return min(told, self._tier_ceiling(policy.told_tier))
 
     def _exclusion_score(self, peer_uuid, told):
@@ -6018,27 +6375,24 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             else:
                 previous = self._contrite_tit_for_tat(peer)
             in_coop = self._coop_mode.get(peer_uuid, False)
-            if in_coop:
-                use_pure = previous > self.COOP_EXIT
-            else:
-                use_pure = previous > self.COOP_ENTER
+            use_pure, rep_score = coop_regime_of(
+                in_coop, previous, lambda: self._pure_reputation(peer),
+                self.COOP_ENTER, self.COOP_EXIT)
             self._coop_mode[peer_uuid] = use_pure
             if use_pure:
                 self.logger.debug('Cooperation mode')
-                rep_score = self._pure_reputation(peer)
             else:
                 # Debug aid: how much bilateral history does this peer
-                # actually have on this node?  CTFT returns 0.49 when
-                # n<1, so the count below tells you whether you're
-                # stuck at the no-history default or actually
-                # computing against real data.
+                # actually have on this node's primary chain?  With none,
+                # CTFT reads the cold-start prior. An anchored cohort's
+                # chain is read too, and not counted here.
+                peer_s = peer_id_str(peer_uuid)
+                me_s = peer_id_str(self.identity.uuid)
                 try:
                     n_bilateral = sum(
                         1 for tx in self.history.by_peer(peer_uuid)
-                        if ((tx.p1_id == peer_uuid
-                             and tx.p2_id == self.identity.uuid)
-                            or (tx.p2_id == peer_uuid
-                                and tx.p1_id == self.identity.uuid)))
+                        if ((tx.p1_id == peer_s and tx.p2_id == me_s)
+                            or (tx.p2_id == peer_s and tx.p1_id == me_s)))
                 except (KeyError, AttributeError):
                     n_bilateral = 0
                 self.logger.info(
@@ -7012,7 +7366,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             AT_REPDUMP {"t":<sec>,"self":"<uuid>","view":[
                 {"s":"<subj_uuid>","nick":"<subj_nick>","con":<own-view score>,
                  "rep":<aggregate rep or null>,"n":<n_tx>,"coop":<n>,"def":<n>,
-                 "tier":<int>,"exc":<bool>}, ... ]}
+                 "tier":<int>,"exc":<bool>}, ... ],
+             "chain":{"len":<entries placed>,"head":"<16 hex of head hash>"}}
 
         ``con`` is this node's OWN computed consensus of the subject (the
         Trust-Dynamics value); ``n``/``coop``/``def`` are the raw CTFT inputs
@@ -7051,9 +7406,9 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 n = coop = defect = 0
                 try:
                     for tx in self.history.by_peer(subj):
-                        if tx.p1_id == subj:
+                        if tx.p1_id == key:
                             s = tx.p1_score_milli
-                        elif tx.p2_id == subj:
+                        elif tx.p2_id == key:
                             s = tx.p2_score_milli
                         else:
                             continue
@@ -7080,10 +7435,20 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                     'con': None if con is None else round(con, 4),
                     'rep': None if rep is None else round(rep, 4),
                     'n': n, 'coop': coop, 'def': defect,
+                    # This node's own bilateral evidence of the subject, on
+                    # every chain it reads (n counts the primary chain only).
+                    'own': self._own_count(subj),
                     'tier': int(self.peer_tiers.get(key, 0)),
                     'exc': key in self._excluded,
                 })
-            rec = {'t': round(present, 3), 'self': me, 'view': view}
+            # The primary chain: how many entries it has placed (the window
+            # holds the last DEFAULT_MAX_CHAIN_LEN, so its length saturates)
+            # and the first 16 hex digits of its head entry's hash. Two nodes
+            # at one length with different heads have forked.
+            head = getattr(self.history, 'head_hash', None) or b''
+            rec = {'t': round(present, 3), 'self': me, 'view': view,
+                   'chain': {'len': int(self.history.next_index),
+                             'head': bytes(head).hex()[:16]}}
             self.logger.info('AT_REPDUMP %s', to_json_string(rec))
         except Exception as err:
             self.logger.error('reputation dump failed: %s', err)

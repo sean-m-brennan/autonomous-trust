@@ -248,8 +248,77 @@ DEFINE_TEST(test_identity_history_verify_object_divergent_digest)
 }
 END_TEST_DEFINITION()
 
+/* The backdating check orders history steps by their full stamp, nanoseconds
+ * included, as Python orders them by microseconds. A cold-start cohort admits
+ * many peers inside one second, and a check at whole seconds rejected every
+ * history that did. */
+
+static linked_step_t *_step_at(const char *uuid, int second, unsigned long nsec)
+{
+    linked_step_t *s = NULL;
+    if (linked_step_create(uuid, NULL, &s) != 0)
+        return NULL;
+    memset(&s->timestamp, 0, sizeof(s->timestamp));
+    s->timestamp.tm_year = 126;
+    s->timestamp.tm_mday = 1;
+    s->timestamp.tm_sec = second;
+    s->timestamp.tm_isdst = -1;
+    s->timestamp.tm_nsec = nsec;
+    return s;
+}
+
+/* Offer a two-step history (older, then newer) to an empty identity history;
+ * return whether it was accepted (merged into main). */
+static bool _accepts(int old_sec, unsigned long old_ns,
+                     int new_sec, unsigned long new_ns)
+{
+    public_identity_t *me = make_test_peer("Self");
+    peers_t peers;
+    memset(&peers, 0, sizeof(peers_t));
+    agreement_voter_t voter = {.rank = 1};
+    uuid_unparse_lower(me->uuid, voter.uuid);
+    logger_t logger = {0};
+    identity_history_t *history = NULL;
+    if (identity_history_create(&voter, &peers, &logger, 0, &history) != 0)
+        return false;
+    linked_step_t *older = _step_at("old", old_sec, old_ns);
+    linked_step_t *newer = _step_at("new", new_sec, new_ns);
+    newer->parent = older;
+    linked_step_t *steps[2] = {newer, older};   /* head to root */
+    dag_catch_up(&history->dag, steps, 2, NULL);
+    linked_step_t *head = NULL;
+    dag_fork(&history->dag, NULL, &head);
+    bool accepted = head != NULL && strcmp(head->uuid, "new") == 0;
+    identity_history_free(history);
+    free(me);
+    return accepted;
+}
+
+DEFINE_TEST(test_identity_history_orders_steps_within_one_second)
+{
+    ck_assert(_accepts(5, 200000000UL, 5, 600000000UL));
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_identity_history_rejects_backdating_within_one_second)
+{
+    ck_assert(!_accepts(5, 600000000UL, 5, 200000000UL));
+    ck_assert(!_accepts(5, 400000000UL, 5, 400000000UL));
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_identity_history_orders_steps_across_seconds)
+{
+    ck_assert(_accepts(5, 900000000UL, 6, 100000000UL));
+    ck_assert(!_accepts(6, 100000000UL, 5, 900000000UL));
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(history, test_identity_obj_create,
           test_identity_history_create_and_insert,
           test_identity_history_share_hear,
           test_identity_history_merkle_changes,
-          test_identity_history_verify_object_divergent_digest)
+          test_identity_history_verify_object_divergent_digest,
+          test_identity_history_orders_steps_within_one_second,
+          test_identity_history_rejects_backdating_within_one_second,
+          test_identity_history_orders_steps_across_seconds)

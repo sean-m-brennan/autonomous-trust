@@ -47,6 +47,7 @@
 #include "negotiation/neg_replay.h"
 #include "negotiation/negotiation.h"     /* NEG_PROTO_REPLAY_* */
 #include "utilities/msg_types_priv.h"      /* net_msg_unpack_json */
+#include "utilities/logger.h"
 #include "processes/capabilities.h"      /* find_capability */
 #include "processes/extension.h"
 #include "replication/adjudication.h"
@@ -96,7 +97,10 @@ static struct {
     pthread_mutex_t lock;
     bool model_loaded;
     at_replication_model_t model;
-    repl_group_t groups[REPL_GROUPS_MAX];
+    /* REPL_GROUPS_MAX groups, about 300 KB, allocated at the first task this
+     * node decides to replicate. NULL until then, so a node that never
+     * replicates carries none of it; every loop over the groups checks. */
+    repl_group_t *groups;
     uuid_t tombstones[REPL_TOMBSTONES];
     int next_tomb;
 } R = { .lock = PTHREAD_MUTEX_INITIALIZER };
@@ -222,7 +226,7 @@ static neg_result_verdict_t _on_result(const process_t *proc,
     (void)proc;
     neg_result_verdict_t out = NEG_RESULT_LEAVE;
     pthread_mutex_lock(&R.lock);
-    for (int i = 0; i < REPL_GROUPS_MAX; i++)
+    for (int i = 0; R.groups != NULL && i < REPL_GROUPS_MAX; i++)
     {
         repl_group_t *g = &R.groups[i];
         if (g->phase == PH_REPLICA && g->side[1].have
@@ -244,7 +248,15 @@ static neg_result_verdict_t _on_result(const process_t *proc,
         double prob = at_replication_live_prob_for(m, info->capability);
         if (prob <= 0.0 || !at_replication_should_replicate(prob, at_cert_verifier_seed(), NULL))
             goto done;
-        for (int i = 0; i < REPL_GROUPS_MAX; i++)
+        if (R.groups == NULL)
+            R.groups = calloc(REPL_GROUPS_MAX, sizeof(*R.groups));
+        if (R.groups == NULL)
+        {
+            log_error(NULL, "replication: no memory for the replica groups; "
+                            "this result is not replicated\n");
+            goto done;
+        }
+        for (int i = 0; R.groups != NULL && i < REPL_GROUPS_MAX; i++)
         {
             repl_group_t *g = &R.groups[i];
             if (g->phase != PH_FREE)
@@ -482,7 +494,7 @@ static void _periodic(const process_t *proc)
 {
     double now = _now();
     pthread_mutex_lock(&R.lock);
-    for (int gi = 0; gi < REPL_GROUPS_MAX; gi++)
+    for (int gi = 0; R.groups != NULL && gi < REPL_GROUPS_MAX; gi++)
     {
         repl_group_t *g = &R.groups[gi];
         switch (g->phase)
@@ -560,7 +572,7 @@ static bool _handle_replay_response(const process_t *proc, directory_t *queues,
         return true;
     }
     pthread_mutex_lock(&R.lock);
-    for (int gi = 0; gi < REPL_GROUPS_MAX; gi++)
+    for (int gi = 0; R.groups != NULL && gi < REPL_GROUPS_MAX; gi++)
     {
         repl_group_t *g = &R.groups[gi];
         if (g->phase != PH_CHALLENGE && g->phase != PH_REVEAL)
@@ -627,12 +639,14 @@ static bool _handle_replay_response(const process_t *proc, directory_t *queues,
 static void _reset(void)
 {
     pthread_mutex_lock(&R.lock);
-    for (int i = 0; i < REPL_GROUPS_MAX; i++)
+    for (int i = 0; R.groups != NULL && i < REPL_GROUPS_MAX; i++)
     {
         _side_free(&R.groups[i].side[0]);
         _side_free(&R.groups[i].side[1]);
         memset(&R.groups[i], 0, sizeof(R.groups[i]));
     }
+    free(R.groups);
+    R.groups = NULL;
     memset(R.tombstones, 0, sizeof(R.tombstones));
     R.next_tomb = 0;
     R.model_loaded = false;

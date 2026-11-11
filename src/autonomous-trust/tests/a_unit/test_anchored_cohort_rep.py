@@ -176,7 +176,8 @@ def test_the_scorers_read_the_cohort_chain():
     assert rp._own_count(ally.uuid) == 3
     rp.reputations.update(ally.uuid, 0.9)
     rp._compute_reputation(ally.uuid, None, None, respond=False)
-    assert rp.reputations.brought[str(ally.uuid)] == pytest.approx(0.9, abs=0.05)
+    # Three cooperative entries: CTFT's shrunk standing, (2.7 + 0.6) / 6.
+    assert rp.reputations.brought[str(ally.uuid)] == pytest.approx(0.55)
     assert rp._contrite_tit_for_tat(ally) > 0.2
 
 
@@ -190,3 +191,42 @@ def test_the_prior_does_not_read_catchup_marks_on_the_cohort_chain():
     _pair_on(chain, third, 900, ally.uuid, 900)
     rp._catchup_marks = {'': {0, 1, 2, 3}}
     assert rp._prereputation_prior(ally.uuid) > rp.PREREP_NEUTRAL
+
+
+def test_a_cohort_placement_round_goes_to_the_members_only():
+    """Hostile-join run, 2026-11-04: the cohort's placement went out as a group
+    frame under the cohort key. Its other member also belongs to the primary
+    group, opened the frame with the primary key, and failed (a CryptoError
+    every round), so the cohort chain never placed an entry."""
+    rp, ally, other, cohort = _setup()
+    key = str(cohort.uuid)
+    net_q = queue.Queue()
+    rp._start_place_round({CfgIds.network: net_q}, key,
+                          rp._chain_for_group(key))
+    (msg,) = _sent(net_q)
+    assert msg.function == ReputationProtocol.place_request
+    assert list(msg.to_whom) == [ally]           # pairwise, not the cohort
+    assert sorted(rp._place_members(key)) == sorted(
+        [str(rp.identity.uuid).lower(), str(ally.uuid).lower()])
+
+
+def test_the_dump_counts_own_evidence_on_the_cohort_chain(monkeypatch):
+    """The hostile-join collector counts a tier only once the joiner holds
+    its own evidence, and the joiners' evidence of each other is on the
+    cohort chain, which the dump's `n` (primary chain only) never sees."""
+    import json
+    from unittest.mock import MagicMock
+    rp, ally, other, cohort = _setup()
+    chain = rp._chain_for_group(str(cohort.uuid))
+    for _ in range(3):
+        _pair_on(chain, rp.identity.uuid, 900, ally.uuid, 900)
+    rp.reputations.update(ally.uuid, 0.5)
+    monkeypatch.setenv('AT_REP_DUMP_SEC', '1')
+    rp.logger = MagicMock()
+    rp._last_rep_dump = 0
+    rp._dump_reputation_trace(1e9)
+    [call] = [c for c in rp.logger.info.call_args_list
+              if c.args[0] == 'AT_REPDUMP %s']
+    view = {v['s']: v for v in json.loads(call.args[1])['view']}
+    assert view[str(ally.uuid)]['own'] == 3
+    assert view[str(ally.uuid)]['n'] == 0

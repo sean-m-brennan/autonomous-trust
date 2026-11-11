@@ -1,0 +1,57 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-update-claimed-member-rotation-refused
+byte_pinning: false
+description: |
+    A stranger's rotation that names a real member's uuid is refused.
+
+    As group-update-stranger-rotation-refused, except that mallory's envelope
+    claims other's uuid while carrying mallory's own keys (`claims: other`).
+    other is a member member holds, but the signature is checked against the
+    key member holds for that uuid, and mallory's signature fails it. member
+    keeps epoch 0.
+
+participants:
+  - id: member
+    role: group_member
+  - id: other
+    role: group_member
+  - id: mallory
+    role: group_member
+
+fixtures:
+  groups:
+    member:
+      uuid: "0a000000-0000-4000-8000-000000000ac2"
+      size: 1
+      key_epoch: 0
+      members: [other]
+    mallory:
+      uuid: "0a000000-0000-4000-8000-000000000ac2"
+      size: 1
+      key_epoch: 2
+
+steps:
+  - id: 1
+    from: member
+    to: member
+    function: trigger_phase3
+    payload:
+      admit: [other]
+    description: member is in phase 3 and holds other, a member of its group.
+
+  - id: 2
+    from: mallory
+    to: member
+    function: group_key_update
+    payload:
+      self_attested: true
+      claims: other
+    description: |
+        mallory's epoch-2 copy of member's group, claiming to be other's and
+        verified against mallory's own key, reaches member. It is refused.
+
+expected_state:
+  member:
+    group_key_epoch: 0

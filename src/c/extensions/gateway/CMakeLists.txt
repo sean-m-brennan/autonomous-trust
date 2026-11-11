@@ -42,8 +42,9 @@ add_library(at_gateway SHARED ${at_gateway_src})
 # Link the core .so by file, not by target: the core's target_sources(...
 # PUBLIC ${libsrc}) would otherwise compile a second copy of the whole core
 # into libat_gateway, with its own process tables and filter chain.
+# AT_SHARED_DEPENDENCIES is empty in an AT_STATIC build.
 target_link_libraries(at_gateway PRIVATE $<TARGET_LINKER_FILE:autonomous_trust>
-    ${DEPENDENCIES})
+    ${AT_SHARED_DEPENDENCIES})
 add_dependencies(at_gateway autonomous_trust)
 
 add_library(at_gateway_static STATIC ${at_gateway_src})

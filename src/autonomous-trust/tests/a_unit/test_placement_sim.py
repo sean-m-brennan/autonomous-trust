@@ -73,6 +73,11 @@ class Sim:
                 where / ('placement-%s.json' % (key or 'primary')))
             self.nodes.append((rp, q))
         self.drop = drop
+        # Seconds a message takes to arrive; 0 delivers within the tick. A
+        # live node handles its inbox once per 0.5 s pass, so a hop there
+        # takes about that long.
+        self.latency = 0.0
+        self.inflight = []          # (due, sender index, message)
         self.island = None          # set of node indexes cut off, or None
         self.sent = Counter()       # (sender index, function) -> messages sent
         # Members admitted so far: the others have no peers, nobody lists
@@ -119,13 +124,22 @@ class Sim:
         return (a in self.island) == (b in self.island)
 
     def deliver(self, rounds=200):
-        """Move messages until the network is quiet, shuffled, some dropped."""
+        """Move messages until the network is quiet, shuffled, some dropped.
+        Under a latency, a message sent now arrives on the first tick at least
+        that much later."""
         for _ in range(rounds):
             batch = []
             for i, (_rp, q) in enumerate(self.nodes):
                 net = q[CfgIds.network]
                 while not net.empty():
                     batch.append((i, net.get_nowait()))
+            if self.latency > 0:
+                self.inflight.extend((self.clock.t + self.latency, src, msg)
+                                     for src, msg in batch)
+                due = [(src, msg) for t, src, msg in self.inflight
+                       if t <= self.clock.t]
+                self.inflight = [m for m in self.inflight if m[0] > self.clock.t]
+                batch = due
             if not batch:
                 return
             self.rng.shuffle(batch)
@@ -396,3 +410,180 @@ def test_a_late_joiner_catches_up_on_a_restated_roster(tmp_path, monkeypatch):
     sim.settle(lambda: sim.roster_of(3) == sim.uuids({0, 1, 2, 3})
                and len({rp.history.head_hash for rp, _q in sim.nodes}) == 1,
                limit=3000)
+
+
+# --- Many proposers (the 16-colluder hostile-join runs of 2026-11-05) -------
+#
+# Eighteen members, every one holding ready items, with the last placer gone:
+# each takes over in rank order, and a round's messages take a live node's
+# pass (about 0.5 s) to arrive. A node that heard a round waits
+# PLACE_ROUND_TIMEOUT before trying, so a refused node's short random backoff
+# ended inside that wait, and every node that heard the same round tried again
+# at the same moment. The runs sat on one instance for thirteen minutes, a
+# thousand rounds all refused. A refused node's backoff now doubles with each
+# refusal at the instance and starts after the wait.
+
+def _contended(seed, tmp_path, monkeypatch, n=18):
+    sim = Sim(n, seed, tmp_path, monkeypatch)
+    first = sim.complete(0, 1)
+    sim.run(20)
+    placer = sim.nodes[0][0]._place_vars()['_placers'].get('')
+    gone = sim.index_of(placer)
+    live = [i for i in range(n) if i != gone]
+    sim.island = set(live)          # the leader drops off
+    sim.latency = 0.5
+    tasks = [first]
+    for a in live:
+        b = live[(live.index(a) + 1) % len(live)]
+        tasks.append(sim.complete(a, b, at=live))
+    return sim, set(live), tasks
+
+
+@pytest.mark.parametrize('seed', range(3))
+def test_many_proposers_place_within_a_minute(tmp_path, monkeypatch, seed):
+    sim, live, tasks = _contended(seed, tmp_path, monkeypatch)
+    sim.run(60)
+    chains = sim.chains(live)
+    assert all(c == chains[0] for c in chains)
+    assert len(chains[0]) == len(tasks), (len(chains[0]), sim.asked())
+
+
+# --- A value fits one datagram ----------------------------------------------
+#
+# A batch was bounded only by count (PLACE_BATCH_MAX). At 18 members an entry
+# carries two certificates of sixteen signatures, about 6 KB, so a backlog of
+# thirty-two made a `place` frame of 257 KB, and every send failed with
+# "Message too long". Nobody heard the round, every member that took over
+# carried the same backlog, and the 16-colluder runs of 2026-11-05 sat on one
+# instance to the end. A value now stops short of PLACE_VALUE_BYTES_MAX.
+
+def test_a_backlog_is_placed_in_values_that_fit_a_datagram(tmp_path, monkeypatch):
+    from autonomous_trust.core.config import to_json_string
+    from autonomous_trust.core._python.reputation.placement import entry_to_dict
+    from autonomous_trust.core._python.reputation.reputation import (
+        PLACE_VALUE_BYTES_MAX)
+    sim = Sim(18, 1, tmp_path, monkeypatch)
+    for _ in range(32):
+        a, b = sim.rng.sample(range(18), 2)
+        sim.complete(a, b, at=[0])
+    rp, _q = sim.nodes[0]
+    entries = rp._own_place_value(rp.history, '', None)
+    raw = to_json_string([entry_to_dict(e) for e in entries])
+    assert 1 <= len(entries) < 32
+    assert len(raw) <= PLACE_VALUE_BYTES_MAX
+
+
+def test_an_entry_too_large_alone_is_still_placed_alone(tmp_path, monkeypatch):
+    import autonomous_trust.core._python.reputation.placement as pm
+    sim = Sim(4, 2, tmp_path, monkeypatch)
+    monkeypatch.setattr(pm, 'PLACE_VALUE_BYTES_MAX', 10)
+    for _ in range(3):
+        sim.complete(0, 1, at=[0])
+    rp, _q = sim.nodes[0]
+    assert len(rp._own_place_value(rp.history, '', None)) == 1
+
+
+# --- A refused proposer backs off further each time -------------------------
+#
+# A refusal or a stalled round at an instance counts one against it; the
+# backoff window doubles with each, to PLACE_BACKOFF_CAP, and the backoff
+# drawn also stretches the wait after hearing someone else's round, which
+# swallowed the old fixed backoff whole. A member that promises a higher
+# ballot than its own open round steps back from that round at once.
+
+def test_the_backoff_window_doubles_to_its_cap():
+    from autonomous_trust.core._python.reputation.placement import (
+        PlacementMixin as P, place_backoff_window)
+    lo, hi = P.PLACE_BACKOFF
+    assert [place_backoff_window(n) for n in (1, 2, 3)] == [hi, 2 * hi, 4 * hi]
+    assert place_backoff_window(40) == P.PLACE_BACKOFF_CAP
+
+
+def test_refusals_count_per_instance(tmp_path, monkeypatch):
+    sim = Sim(4, 3, tmp_path, monkeypatch)
+    rp, _q = sim.nodes[0]
+    k = rp.history.next_index
+    for _ in range(3):
+        rp._place_failed('', k)
+    assert rp._place_vars()['_place_fails'][''][:2] == (k, 3)
+    rp._place_failed('', k + 1)
+    assert rp._place_vars()['_place_fails'][''][:2] == (k + 1, 1)
+
+
+def test_a_drawn_backoff_stretches_the_wait_after_a_heard_round(tmp_path, monkeypatch):
+    sim = Sim(4, 4, tmp_path, monkeypatch)
+    rp, q = sim.nodes[0]
+    k = rp.history.next_index
+    for _ in range(4):
+        rp._place_failed('', k)
+    _k, _n, drawn = rp._place_vars()['_place_fails']['']
+    assert drawn >= rp.PLACE_BACKOFF[0]
+    rp._note_place_heard('', k)
+    t0 = sim.clock.t
+    assert rp._place_busy('', k)
+    sim.clock.t = t0 + rp.PLACE_ROUND_TIMEOUT + drawn - 0.01
+    assert rp._place_busy('', k)
+    sim.clock.t = t0 + rp.PLACE_ROUND_TIMEOUT + drawn + 0.01
+    assert not rp._place_busy('', k)
+
+
+def test_promising_a_higher_ballot_steps_back_from_our_round(tmp_path, monkeypatch):
+    sim = Sim(4, 6, tmp_path, monkeypatch)
+    sim.complete(0, 1)
+    a, qa = sim.nodes[0]
+    b, qb = sim.nodes[1]
+    a._start_place_round(qa, '', a.history)
+    assert a._place_vars()['_place_rounds'].get('') is not None
+    while not qa[CfgIds.network].empty():
+        qa[CfgIds.network].get_nowait()
+    sim.clock.t += 1.0
+    b._start_place_round(qb, '', b.history)
+    request = qb[CfgIds.network].get_nowait()
+    request.verified = True
+    a.protocol.run_message_handlers(qa, request)
+    assert a._place_vars()['_place_rounds'].get('') is None
+    assert a._place_vars()['_place_fails'][''][1] == 1
+
+
+# --- A member behind the chain does not stop it -------------------------------
+#
+# pass-off-1, 2026-11-05: the genesis listed the 13 members that were up, and
+# the next entry added a 14th that saw 16. A node with no roster anchors only
+# on one at most one member off its live view, so that member stayed at
+# instance 0, yet it was on the roster and answered every round with "at 2,
+# our next is 0". Any roster member's nack ended the round, so nothing more
+# was placed, nobody else was added, and the joiners refused the chain for the
+# whole run. A nack from a member behind the round's instance carries no
+# promise and now leaves the round running; the majority that is not behind
+# goes on placing, and adds the missing members one at a time.
+
+def test_members_admitted_together_all_reach_the_roster(tmp_path, monkeypatch):
+    sim = Sim(6, 23, tmp_path, monkeypatch, joined={0, 1, 2})
+    for i in (3, 4, 5):
+        sim.join(i)
+    sim.settle(lambda: all(sim.roster_of(j) == sim.uuids(range(6))
+                           for j in range(6)), limit=3000)
+    task = sim.complete(0, 5)
+    sim.run(30)
+    chains = sim.chains()
+    assert all(c == chains[0] for c in chains) and task in chains[0]
+
+
+def test_a_nack_from_a_member_behind_leaves_the_round_open(tmp_path, monkeypatch):
+    sim = Sim(4, 8, tmp_path, monkeypatch)
+    sim.complete(0, 1)
+    a, qa = sim.nodes[0]
+    a._start_place_round(qa, '', a.history)
+    request = qa[CfgIds.network].get_nowait()
+    b, qb = sim.nodes[1]
+    from autonomous_trust.core.config import from_json_string, to_json_string
+    from autonomous_trust.core.network import Message
+    payload = from_json_string(request.obj)
+    nack = {'group': '', 'k': payload['k'], 'ballot': payload['ballot'],
+            'next': payload['k'] - 1}
+    msg = Message(b.name, ReputationProtocol.place_nack, to_json_string(nack),
+                  a.identity, from_whom=b.identity)
+    msg.verified = True
+    a.protocol.run_message_handlers(qa, msg)
+    assert a._place_vars()['_place_rounds'].get('') is not None
+    assert '' not in a._place_vars()['_place_fails']

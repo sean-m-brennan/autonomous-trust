@@ -1,0 +1,54 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-update-held-outsider-rotation-refused
+byte_pinning: false
+description: |
+    A rotation from a peer we hold that is not a member of our group is refused.
+
+    member holds outsider as a peer, so outsider's update is attributed to it
+    and verifies against its real key. Holding a peer says nothing about
+    whether it belongs to this group, and outsider is not in member's group, so
+    its epoch-2 copy of the group is refused and member keeps epoch 0.
+
+participants:
+  - id: member
+    role: group_member
+  - id: other
+    role: group_member
+  - id: outsider
+    role: group_member
+
+fixtures:
+  groups:
+    member:
+      uuid: "0a000000-0000-4000-8000-000000000ac3"
+      size: 1
+      key_epoch: 0
+      members: [other]
+    outsider:
+      uuid: "0a000000-0000-4000-8000-000000000ac3"
+      size: 1
+      key_epoch: 2
+
+steps:
+  - id: 1
+    from: member
+    to: member
+    function: trigger_phase3
+    payload:
+      admit: [other, outsider]
+    description: member is in phase 3 and holds both other and outsider.
+
+  - id: 2
+    from: outsider
+    to: member
+    function: group_key_update
+    payload: {}
+    description: |
+        outsider's epoch-2 copy of member's group, signed by outsider, reaches
+        member. It is refused.
+
+expected_state:
+  member:
+    group_key_epoch: 0

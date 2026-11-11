@@ -82,13 +82,16 @@ def _new_identity(name, address):
         return Identity.initialize(name, name, address)
 
 
-def _build_process(identity, group):
+def _build_process(identity, group, *held):
     """A minimally-populated IdentityProcess: exactly what handle_group_update
-    and its helpers reach for. Mirrors test_partition_recovery's fixture."""
+    and its helpers reach for. Mirrors test_partition_recovery's fixture.
+    ``held`` are the identities it holds as peers."""
     proc = object.__new__(IdentityProcess)
     proc.identity = identity
     proc.group = group
     proc.peers = Peers()
+    for peer in held:
+        proc.peers.add(peer.publish(), 0)
     proc.protocol = Protocol(CfgIds.identity, logging.getLogger('test'), None)
     proc.protocol.group = group
     proc.protocol.peers = proc.peers
@@ -126,10 +129,21 @@ def _shared_group(a_ident, b_ident):
     return grp, other
 
 
-def _update_from(sender_group, verified=True):
+def _update_from(sender_group, signer=None, verified=True):
     """The group_key_update a member sends after rotating: its whole group,
     private key included (that is what makes it a rotation), as the canonical
-    wire form the C side also emits."""
+    wire form the C side also emits.
+
+    With ``signer``, the update is signed by that member and parsed back as a
+    peer's frame, which is what a rotation must be to be adopted: signed by a
+    member the receiver holds. Without one it carries no signature and no
+    sender, so it can never rotate a key."""
+    if signer is not None and verified:
+        from autonomous_trust.core.config import to_json_string
+        raw = bytes(Message(CfgIds.identity, IdentityProtocol.update,
+                            to_json_string(sender_group.to_canonical()),
+                            from_whom=signer))
+        return Message.parse(raw, signer.publish())
     msg = Message(CfgIds.identity, IdentityProtocol.update,
                   Group.from_canonical(sender_group.to_canonical()),
                   encrypt=True)
@@ -148,8 +162,8 @@ class TestSimultaneousRotationConverges:
         a_grp, b_grp = _shared_group(a_id, b_id)
         assert _key_of(a_grp) == _key_of(b_grp), 'precondition: one cohort key'
 
-        a = _build_process(a_id, a_grp)
-        b = _build_process(b_id, b_grp)
+        a = _build_process(a_id, a_grp, b_id)
+        b = _build_process(b_id, b_grp, a_id)
 
         # The live failure: both rotate on the same membership event, so both
         # mint THIS epoch and neither claims a higher one.
@@ -159,8 +173,8 @@ class TestSimultaneousRotationConverges:
         assert _key_of(a.group) != _key_of(b.group), 'precondition: forked'
 
         # Each hands the other its freshly rotated key.
-        a_says = _update_from(a.group)
-        b_says = _update_from(b.group)
+        a_says = _update_from(a.group, a_id)
+        b_says = _update_from(b.group, b_id)
         a.handle_group_update(_queues(), b_says)
         b.handle_group_update(_queues(), a_says)
 
@@ -188,10 +202,10 @@ class TestSimultaneousRotationConverges:
 
         winners = []
         for order in ('a-first', 'b-first'):
-            a = _build_process(a_id, Group.from_canonical(rotated_a))
-            b = _build_process(b_id, Group.from_canonical(rotated_b))
-            a_says = _update_from(Group.from_canonical(rotated_a))
-            b_says = _update_from(Group.from_canonical(rotated_b))
+            a = _build_process(a_id, Group.from_canonical(rotated_a), b_id)
+            b = _build_process(b_id, Group.from_canonical(rotated_b), a_id)
+            a_says = _update_from(Group.from_canonical(rotated_a), a_id)
+            b_says = _update_from(Group.from_canonical(rotated_b), b_id)
             if order == 'a-first':
                 b.handle_group_update(_queues(), a_says)
                 a.handle_group_update(_queues(), b_says)
@@ -299,11 +313,11 @@ class TestRotationRefusalIsNamed:
         a_id = _new_identity('a', '10.0.0.1')
         b_id = _new_identity('b', '10.0.0.2')
         a_grp, b_grp = _shared_group(a_id, b_id)
-        a = _build_process(a_id, a_grp)
-        b = _build_process(b_id, b_grp)
+        a = _build_process(a_id, a_grp, b_id)
+        b = _build_process(b_id, b_grp, a_id)
         a.group.rotate_key()
         b.group.rotate_key()
-        a_says, b_says = _update_from(a.group), _update_from(b.group)
+        a_says, b_says = _update_from(a.group, a_id), _update_from(b.group, b_id)
         a_key, b_key = _key_of(a.group)[:16].decode(), _key_of(b.group)[:16].decode()
         with caplog.at_level(logging.INFO):
             a.handle_group_update(_queues(), b_says)
@@ -349,6 +363,31 @@ class TestRotationRefusalIsNamed:
                 % _key_of(grp)[:16].decode()) in sent[0].getMessage()
 
 
+    def test_an_outgoing_update_is_signed(self):
+        # The update can carry the group key, and the receiver's gate takes a
+        # higher epoch only from a verified message. Unsigned, it could never
+        # be verified, however and whenever it arrived. C signs every frame.
+        from nacl.encoding import HexEncoder
+        a_id = _new_identity('a', '10.0.0.1')
+        b_id = _new_identity('b', '10.0.0.2')
+        c_id = _new_identity('c', '10.0.0.3')
+        grp, _ = _shared_group(a_id, b_id)
+        proc = _build_process(a_id, grp)
+        del proc._update_group
+        proc.peers.hierarchy[0][str(b_id.uuid)] = b_id.publish()
+        proc.peers.hierarchy[0][str(c_id.uuid)] = c_id.publish()
+        queues = _queues()
+        proc._update_group(queues, grp, 0)
+        sent = queues[CfgIds.network].items
+        assert len(sent) == 2
+        assert {m.to_whom[0].nickname for m in sent} == {'b', 'c'}
+        for m in sent:
+            assert m.signature is not None
+            content = Message._signable_content(m.process, m.function, m._obj_b64())
+            a_id.signature.public.verify(content.encode(),
+                                         HexEncoder.decode(m.signature))
+
+
 class TestAdoptedGroupKeepsItsEpoch:
     """Reputation cohort rep-4070096-11 (2026-10-16): C adopted a DIFFERENT,
     larger group from a stale update and installed its epoch-1 key under its
@@ -389,10 +428,10 @@ class TestAdoptedKeyReachesSiblings:
         a_id = _new_identity('a', '10.0.0.1')
         b_id = _new_identity('b', '10.0.0.2')
         a_grp, b_grp = _shared_group(a_id, b_id)
-        a = _build_process(a_id, a_grp)
+        a = _build_process(a_id, a_grp, b_id)
         b_grp.rotate_key()   # b supersedes: higher epoch, same membership
 
-        a.handle_group_update(_queues(), _update_from(b_grp))
+        a.handle_group_update(_queues(), _update_from(b_grp, b_id))
 
         assert _key_of(a.group) == _key_of(b_grp), 'precondition: adopted'
         a._record_group.assert_called()
@@ -432,9 +471,9 @@ class TestHeldUntilPhase3:
         assert a.key_epoch == b.key_epoch and _key_of(a) != _key_of(b)
         winner, loser = (a, b) if _key_of(a) < _key_of(b) else (b, a)
 
-        cal = _build_process(cal_id, None)
+        cal = _build_process(cal_id, None, amy_id)
         cal.phase = 2
-        early = _update_from(winner)
+        early = _update_from(winner, amy_id)
         assert cal.handle_group_update(_queues(), early) is False, (
             'an early update was consumed: process() would not offer it again')
 
@@ -446,3 +485,62 @@ class TestHeldUntilPhase3:
 
         assert _key_of(cal.group) == _key_of(winner)
 
+
+
+class TestHeldRotationReverified:
+    """Hostile-join run, 2026-11-03: a joiner still in phase 2 held the
+    cohort's rotations to epochs 10 and 11. It did not yet hold the senders as
+    peers, so no signature had been checked, and after phase 3 the gate
+    refused every one; the cohort never resent, and the joiner kept a forked
+    key for the whole run. A held update's signature is now checked against
+    the peer this node holds for the sender, once it holds one. Only a
+    verified update raises the epoch, as before."""
+
+    @staticmethod
+    def _held_rotation(sender_group, signer, claimed_sender):
+        """A rotation as a phase-2 joiner held it: signed by ``signer``, its
+        signature kept but not checked, attributed to ``claimed_sender``."""
+        import json
+        from autonomous_trust.core.config import to_json_string
+        msg = Message(CfgIds.identity, IdentityProtocol.update,
+                      to_json_string(sender_group.to_canonical()), from_whom=signer)
+        wire = json.loads(bytes(msg).decode('utf-8'))
+        for key in [k for k in wire if k.startswith('from_')]:
+            del wire[key]
+        held = Message.parse(json.dumps(wire).encode('utf-8'), None)
+        assert held.verified is False
+        held.from_whom = claimed_sender.publish()
+        return held
+
+    def _joiner_and_cohort(self):
+        joiner_id = _new_identity('joiner', '10.0.0.3')
+        member_id = _new_identity('member', '10.0.0.2')
+        mine, theirs = _shared_group(joiner_id, member_id)
+        theirs.rotate_key()
+        theirs.rotate_key()
+        joiner = _build_process(joiner_id, mine)
+        return joiner, joiner_id, member_id, mine, theirs
+
+    def test_a_rotation_signed_by_a_held_member_is_adopted(self):
+        joiner, _, member_id, _, theirs = self._joiner_and_cohort()
+        joiner.peers.add(member_id.publish(), 0)
+        held = self._held_rotation(theirs, member_id, member_id)
+        joiner.handle_group_update(_queues(), held)
+        assert joiner.group.key_epoch == 2
+        assert _key_of(joiner.group) == _key_of(theirs)
+
+    def test_a_rotation_signed_by_anyone_else_is_refused(self):
+        joiner, _, member_id, mine, theirs = self._joiner_and_cohort()
+        mallory_id = _new_identity('mallory', '10.0.0.9')
+        joiner.peers.add(member_id.publish(), 0)
+        before = _key_of(mine)
+        held = self._held_rotation(theirs, mallory_id, member_id)
+        joiner.handle_group_update(_queues(), held)
+        assert joiner.group.key_epoch == 0 and _key_of(joiner.group) == before
+
+    def test_a_rotation_from_a_sender_not_yet_held_is_refused(self):
+        joiner, _, member_id, mine, theirs = self._joiner_and_cohort()
+        before = _key_of(mine)
+        held = self._held_rotation(theirs, member_id, member_id)
+        joiner.handle_group_update(_queues(), held)
+        assert joiner.group.key_epoch == 0 and _key_of(joiner.group) == before

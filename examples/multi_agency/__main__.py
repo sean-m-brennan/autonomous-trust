@@ -39,6 +39,7 @@ the node that computed it. See log_harvest.py.
 
 import argparse
 import logging
+import os
 import sys
 
 from autonomous_trust.core import LogLevel
@@ -91,6 +92,8 @@ def _parse_args(argv):
     p.add_argument("--log-level", default="info",
                    choices=list(_LOG_LEVEL_BY_NAME),
                    help="Log level (default: info).")
+    p.add_argument("--theme", choices=("dark", "light"), default=None,
+                   help="Dashboard colors (default: $AT_THEME, else dark).")
     return p.parse_args(argv)
 
 
@@ -164,6 +167,11 @@ def main(argv=None):
     if args.triage:
         _run_triage(args, DisasterResponseScenario)
         return
+
+    # Before the demo builds its layout: panels read the theme at draw time.
+    from autonomous_trust.inspector.dashboard import theme
+    theme.set_theme(theme.resolve_theme(args.theme,
+                                        os.environ.get(theme.THEME_ENV)))
 
     from autonomous_trust.evaluation.scenarios.playback_iface import (
         PlaybackInterface,

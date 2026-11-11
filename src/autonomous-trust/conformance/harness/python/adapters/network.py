@@ -479,6 +479,9 @@ class NetworkAdapter:
         if case.name == 'plaintext-verbs-file':
             self._run_plaintext_verbs_file(case)
             return
+        if case.name == 'deployment-manifest':
+            self._run_deployment_manifest(case)
+            return
         if case.name == 'transport-binds-the-recipient':
             self._run_transport_binds_the_recipient(case)
             return
@@ -891,6 +894,74 @@ class NetworkAdapter:
             'all_rows_match': all_match,
             'a_refusal_grants_nothing': refusal_grants_nothing,
             'group_key_update_never_plaintext': gku_never,
+        })
+
+    def _run_deployment_manifest(self, case: Case) -> None:
+        """The rules of the deployment manifest (RD_13.4 §3.3): each row is
+        applied over the baseline through the production loader. An accepted
+        row's gateway-pair counts must match; a refused row must leave the
+        baseline in force. Mirrors C run_deployment_manifest."""
+        import json
+        import os
+        import tempfile
+        from autonomous_trust.core import deployment_manifest as dm
+
+        fx = case.data.get('fixtures') or {}
+        rows = fx.get('rows') or []
+        if not rows:
+            raise AssertionError('scenario: fixtures.rows missing or empty')
+        base_node = fx['baseline_node']
+        env = dm.DEPLOYMENT_MANIFEST_ENV
+        saved_env = os.environ.pop(env, None)
+        all_match = keeps_previous = True
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                base_path = os.path.join(tmp, 'baseline.json')
+                with open(base_path, 'w') as fh:
+                    json.dump(fx['baseline'], fh)
+                for row in rows:
+                    dm.reset()
+                    dm.configure(base_path)
+                    source = row.get('source')
+                    path = None
+                    if source == 'unset':
+                        os.environ.pop(env, None)
+                    elif source == 'missing':
+                        os.environ[env] = os.path.join(tmp, 'absent.json')
+                    else:
+                        path = os.path.join(tmp, 'row.json')
+                        with open(path, 'w') as fh:
+                            if 'text' in row:
+                                fh.write(row['text'])
+                            else:
+                                json.dump(row['manifest'], fh)
+                    try:
+                        dm.configure(path)
+                        refused = False
+                    except dm.ManifestError:
+                        refused = True
+                    finally:
+                        os.environ.pop(env, None)
+                    active = dm.active()
+                    if refused and active.gateway_pairs(base_node) != 1:
+                        keeps_previous = False
+                    pairs_ok = all(
+                        active.gateway_pairs(node) == int(want)
+                        for node, want in (row.get('expect_pairs') or {}).items())
+                    if refused != bool(row['expect_refused']) or \
+                            (not refused and not pairs_ok):
+                        all_match = False
+                        raise AssertionError(
+                            '%s: refused=%s pairs_ok=%s, want refused=%s'
+                            % (row.get('id', '?'), refused, pairs_ok,
+                               row['expect_refused']))
+        finally:
+            dm.reset()
+            if saved_env is not None:
+                os.environ[env] = saved_env
+        _assert_expected_flags(case, 'node', {
+            'all_rows_match': all_match,
+            'a_refusal_keeps_the_previous_manifest': keeps_previous,
         })
 
     def _run_transport_binds_the_recipient(self, case: Case) -> None:

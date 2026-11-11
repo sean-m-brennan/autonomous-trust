@@ -68,6 +68,16 @@ typedef enum {
     BOOTSTRAP_BURST_DONE        /* for good: the burst is not re-entered */
 } bootstrap_burst_state_t;
 
+/** Re-probes of a suspect per suspicion: two failures hold it, so this leaves
+ *  room for one unanswered probe. */
+#define AT_SUSPECT_REPROBES 3
+
+/** A suspect reputation has flagged (PEER_PROBE_COUNT's suspect). */
+typedef struct {
+    char uuid[AT_BURST_UUID_LEN];
+    int  issued;     /* re-probes issued in this suspicion */
+} bootstrap_suspect_t;
+
 /** One peer reputation has listed (PEER_PROBE_COUNT). */
 typedef struct {
     char uuid[AT_BURST_UUID_LEN];
@@ -130,6 +140,13 @@ typedef struct {
     int      burst_spent;
     double   last_burst_sec;
     bool     burst_ever;
+    /* Suspects: peers whose latest probe failed, probed again at the burst's
+     * interval, at most AT_SUSPECT_REPROBES times a suspicion. Under the join
+     * policy (burst_enabled) only. See _suspect_tick. */
+    bootstrap_suspect_t suspects[AT_BURST_MAX_PEERS];
+    size_t   n_suspects;
+    double   last_suspect_sec;
+    bool     suspect_ever;
     /* The uuid string of each peer, by index, @c peer_count entries; NULL =
      * no burst probe this tick. Borrowed for one tick, as skip_peer is. */
     const char *const *peer_uuids;
@@ -268,11 +285,21 @@ void bootstrap_worker_set_burst(bootstrap_worker_t *w, bool enabled, int k,
 /** Take one peer's count from reputation (PEER_PROBE_COUNT): whether it reads
  *  under the told ceiling and the probe verdicts held. The first listing a
  *  peer short of k starts the burst; a peer listed short while it runs joins
- *  it and adds budget_factor x k to the budget. Ignored while the burst is
- *  off or done. Mirrors Python BootstrapWorker._note_probe_counts. */
+ *  it and adds budget_factor x k to the budget, and one first listed short
+ *  after the burst ended opens it again the same way. Ignored while the burst
+ *  is off. Mirrors Python BootstrapWorker._note_probe_counts. */
 void bootstrap_worker_note_probe_count(bootstrap_worker_t *w,
                                        const char *peer_uuid, bool bounded,
                                        int verdicts);
+
+/** Take reputation's suspect flag for one peer (PEER_PROBE_COUNT): a peer whose
+ *  latest probe of ours failed and that one more failure would hold below
+ *  tier 1. Flagged, it is probed again at the burst's interval, at most
+ *  AT_SUSPECT_REPROBES times; cleared, it is left; flagged again, it starts
+ *  over. Ignored while the burst is off. Mirrors Python
+ *  BootstrapWorker._note_suspects. */
+void bootstrap_worker_note_suspect(bootstrap_worker_t *w,
+                                   const char *peer_uuid, bool suspect);
 
 /** Burst targets probed at least once. */
 int bootstrap_worker_burst_peers_probed(const bootstrap_worker_t *w);

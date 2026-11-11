@@ -1,0 +1,51 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: place-value-cert-unnamed-judged-by-roster-in-force
+byte_pinning: false
+description: |
+    The negative control of place-value-cert-judged-by-named-roster: the same
+    value, each half certified by alice and bob, with no roster named. bob
+    judges the certificates by his roster in force, six members needing three
+    signatures a half besides the scorer's, and does not accept the value.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+  - id: erin
+    role: member
+  - id: frank
+    role: member
+
+fixtures:
+  roster: {}
+  local_chain:
+    bob:
+      - {roster: genesis, members: [alice, bob, carol, dave]}
+      - {roster: add, member: erin}
+      - {roster: add, member: frank}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: place
+    payload:
+      k: 3
+      ballot: {n: 5, by: alice}
+      head: recipient
+      value:
+          - {task_id: t-1, p1: carol, p1_score: 0.9, p2: dave, p2_score: 0.7, cosigners: [alice, bob]}
+  - id: 2
+    from: bob
+    to: alice
+    function: place accepted
+    in_response_to: 1
+    expect_none: true
+    payload: {}

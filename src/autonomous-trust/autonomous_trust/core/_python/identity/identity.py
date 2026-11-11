@@ -438,12 +438,16 @@ class Identity(InitializableConfig, AgreementVoter):
                 break
 
     @staticmethod
-    def initialize(my_name, my_nickname, my_address):
-        # my_name -> online nickname; my_nickname -> local petname.
+    def initialize(my_name, my_nickname, my_address, uuid=None):
+        # my_name -> online nickname; my_nickname -> local petname. *uuid* is
+        # a provisioned identity uuid (AT_IDENTITY_UUID, see
+        # config/generate.py); without one a random uuid is drawn.
         if '/' in my_address:
             my_address = my_address.split('/')[0]
-        time.sleep(secrets.randbelow(1000) / 1000.0)  # reduce chance of collision
-        return Identity(uuid_mod.uuid4(), my_address, my_name,
+        if uuid is None:
+            time.sleep(secrets.randbelow(1000) / 1000.0)  # reduce chance of collision
+            uuid = uuid_mod.uuid4()
+        return Identity(uuid, my_address, my_name,
                         Signature.generate(), Encryptor.generate(), my_nickname, False)
 
 

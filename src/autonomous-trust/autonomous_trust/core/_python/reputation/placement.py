@@ -39,7 +39,7 @@ from ..config import Configuration, atomic_write, from_json_string, to_json_stri
 from ..network import Message
 from ..system import CfgIds, now
 from .protocol import ReputationProtocol
-from .reputation import (PLACE_BATCH_MAX, ROSTER_OPS, AttestedScore,
+from .reputation import (PLACE_BATCH_MAX, PLACE_VALUE_BYTES_MAX, ROSTER_OPS, AttestedScore,
                          Transaction, TransactionHistory, place_designation,
                          place_value_digest, roster_digest,
                          roster_members_norm, roster_n_min_norm, roster_task_id,
@@ -77,6 +77,14 @@ def parse_ballot(obj):
     return (n, by.lower())
 
 
+def place_backoff_window(fails):
+    """The longest backoff after ``fails`` refusals at one instance: the
+    second end of PlacementMixin.PLACE_BACKOFF, doubled for each refusal
+    after the first, to PLACE_BACKOFF_CAP. Mirrors C _place_backoff_window."""
+    hi, cap = PlacementMixin.PLACE_BACKOFF[1], PlacementMixin.PLACE_BACKOFF_CAP
+    return min(cap, hi * 2 ** max(0, fails - 1))
+
+
 def ballot_obj(ballot):
     return {'n': int(ballot[0]), 'by': str(ballot[1])}
 
@@ -112,6 +120,9 @@ def entry_to_dict(tx: Transaction) -> dict:
         cert = tx.certificate_of(uid)
         if cert:
             d[side + '_cert'] = {str(k): _hex(v) for k, v in cert.items()}
+            roster = tx.cert_roster_of(uid)
+            if roster:
+                d[side + '_cert_roster'] = str(roster)
         sig = tx.half_sig_of(uid)
         if sig:
             d[side + '_sig'] = _hex(sig)
@@ -160,11 +171,16 @@ def entry_from_dict(d) -> Transaction:
                            attest_scope=d.get('attest_scope') or None,
                            attest_sigs=_sigs('attest_sigs'))
     p1, p2 = UUID(str(d['p1'])), UUID(str(d['p2']))
-    certs, half_sigs = {}, {}
+    certs, half_sigs, rosters = {}, {}, {}
     for side, uid in (('p1', p1), ('p2', p2)):
         cert = _sigs(side + '_cert')
         if cert:
             certs[str(uid)] = cert
+            roster = d.get(side + '_cert_roster')
+            if roster is not None:
+                if not isinstance(roster, str):
+                    raise ValueError('%s_cert_roster is not a string' % side)
+                rosters[str(uid)] = roster
         sig = d.get(side + '_sig')
         if sig is not None:
             if not isinstance(sig, str):
@@ -174,7 +190,8 @@ def entry_from_dict(d) -> Transaction:
                        p2_id=p2, p2_score_milli=_score('p2_score_milli'),
                        p1_channel=d.get('p1_channel') or None,
                        p2_channel=d.get('p2_channel') or None,
-                       commit_sigs=certs or None, half_sigs=half_sigs or None)
+                       commit_sigs=certs or None, half_sigs=half_sigs or None,
+                       cert_rosters=rosters or None)
 
 
 def value_from_list(raw):
@@ -265,6 +282,9 @@ class PlacementMixin:
                             'resetting it, its placement state and its pool',
                             key or 'primary', len(chain))
         fresh = TransactionHistory(max_chain_len=chain.max_chain_len)
+        # The chain is abandoned, not this node's own evidence.
+        fresh.keep_party = getattr(chain, 'keep_party', None)
+        fresh.adopt_retained(chain.retained())
         if key:
             self.child_histories[key] = fresh
         else:
@@ -418,6 +438,7 @@ class PlacementMixin:
         st['promised'] = ballot
         if not self._persist_place_state(key, st):
             return True
+        self._place_step_back(key, ballot)
         grant = {'group': payload.get('group') or '', 'k': payload['k'],
                  'ballot': ballot_obj(ballot)}
         held = st['accepted'].get(payload['k'])
@@ -463,7 +484,8 @@ class PlacementMixin:
             for uid, score, chan in ((tx.p1_id, tx.p1_score_milli, tx.p1_channel),
                                      (tx.p2_id, tx.p2_score_milli, tx.p2_channel)):
                 if not self._commit_cert_ok(uid, tx.task_id, score, chan,
-                                            tx.certificate_of(uid), group):
+                                            tx.certificate_of(uid), group,
+                                            named=tx.cert_roster_of(uid)):
                     return 'half %s of %s is not certified' % (
                         str(uid)[:8], str(tx.task_id)[:8])
             who = self._entry_halves_signed(tx, chain)
@@ -507,6 +529,7 @@ class PlacementMixin:
         st['accepted'][k] = (ballot, raw)
         if not self._persist_place_state(key, st):
             return True
+        self._place_step_back(key, ballot)
         digest = place_value_digest(entries, k)
         try:
             sig = self._detached_sig(self.identity, place_designation(
@@ -761,7 +784,14 @@ class PlacementMixin:
     # instance's ranking, before taking over; hearing anyone else work on the
     # instance resets that wait. A round that stalls for PLACE_ROUND_TIMEOUT
     # is dropped, and a refused one backs off a random interval, so rival
-    # proposers spread out instead of colliding again.
+    # proposers spread out instead of colliding again. Each refusal or stall
+    # at an instance doubles the longest that interval can be, to
+    # PLACE_BACKOFF_CAP, and the interval drawn also lengthens the wait after
+    # hearing a round: a node that heard a round waits PLACE_ROUND_TIMEOUT
+    # after it, so a backoff shorter than that ended inside the wait, and
+    # every node that heard the same round tried again at the same moment.
+    # A member that promises a higher ballot than its own open round steps
+    # back from that round at once (_place_step_back).
     #
     # The leader skips the first phase (Multi-Paxos). A promise is for the
     # whole chain, not one instance, and an acceptor only accepts at its own
@@ -775,6 +805,7 @@ class PlacementMixin:
     PLACE_RANK_STEP = 0.3
     PLACE_ROUND_TIMEOUT = 5.0
     PLACE_BACKOFF = (0.5, 2.0)
+    PLACE_BACKOFF_CAP = 30.0
 
     def _place_vars(self):
         d = self.__dict__
@@ -786,6 +817,7 @@ class PlacementMixin:
             d['_place_backoff'] = {}      # chain key -> do not start before
             d['_place_seen_n'] = 0        # highest ballot n seen anywhere
             d['_place_lead'] = {}         # chain key -> (k, ballot) we may place at unasked
+            d['_place_fails'] = {}        # chain key -> (k, refusals at k, backoff drawn)
         return d
 
     def _place_roster(self, key, k):
@@ -998,11 +1030,53 @@ class PlacementMixin:
         return order.index(me)
 
     def _place_target(self, key):
-        """Where a round's broadcast goes: the chain's group."""
+        """Where a round's broadcast goes: the chain's group, or, for the
+        anchored cohort's chain, its other members pairwise, as its halves and
+        commits go (``_send_target``). A cohort member is in the primary group
+        too, and a receiver opens a group frame with the first group that
+        holds the sender, so a frame under the cohort key never opened."""
+        if key and key == self._cohort_key():
+            return self._send_target(key)
         return (self._group_by_uuid(key) if key else None) or self.group
 
     def _note_place_heard(self, key, k):
         self._place_vars()['_place_heard'][key] = (k, time.monotonic())
+
+    def _place_failed(self, key, k):
+        """Our round at instance k of chain `key` was refused or stalled:
+        count it, and back off a random interval within the window that many
+        refusals allow."""
+        v = self._place_vars()
+        was = v['_place_fails'].get(key)
+        n = was[1] + 1 if was is not None and was[0] == k else 1
+        drawn = random.uniform(self.PLACE_BACKOFF[0], place_backoff_window(n))
+        v['_place_fails'][key] = (k, n, drawn)
+        v['_place_backoff'][key] = time.monotonic() + drawn
+
+    def _place_busy(self, key, k) -> bool:
+        """Whether someone else's round at instance k of chain `key` was heard
+        recently enough that we leave it to finish: within
+        PLACE_ROUND_TIMEOUT, plus the backoff drawn after our own refusals
+        there."""
+        v = self._place_vars()
+        heard = v['_place_heard'].get(key)
+        if heard is None or heard[0] != k:
+            return False
+        fails = v['_place_fails'].get(key)
+        drawn = fails[2] if fails is not None and fails[0] == k else 0.0
+        return time.monotonic() - heard[1] < self.PLACE_ROUND_TIMEOUT + drawn
+
+    def _place_step_back(self, key, ballot):
+        """We promised `ballot` on chain `key`: an open round of ours under a
+        lower ballot can no longer win, so drop it now and count it refused,
+        rather than wait for the nacks."""
+        v = self._place_vars()
+        rnd = v['_place_rounds'].get(key)
+        if rnd is None or not rnd['ballot'] < ballot:
+            return
+        v['_place_rounds'].pop(key, None)
+        v['_place_lead'].pop(key, None)
+        self._place_failed(key, rnd['k'])
 
     def _maybe_place(self, queues, present=None):
         """Start a placement round on any chain that has ready items and whose
@@ -1021,7 +1095,7 @@ class PlacementMixin:
                 if clock - rnd['started'] > self.PLACE_ROUND_TIMEOUT:
                     v['_place_rounds'].pop(key, None)
                     v['_place_lead'].pop(key, None)
-                    v['_place_backoff'][key] = clock + random.uniform(*self.PLACE_BACKOFF)
+                    self._place_failed(key, rnd['k'])
                 continue
             if clock < v['_place_backoff'].get(key, 0.0):
                 continue
@@ -1034,9 +1108,7 @@ class PlacementMixin:
             if since is None or since[0] != k:
                 since = (k, clock)
                 v['_place_ready_since'][key] = since
-            heard = v['_place_heard'].get(key)
-            if heard is not None and heard[0] == k \
-                    and clock - heard[1] < self.PLACE_ROUND_TIMEOUT:
+            if self._place_busy(key, k):
                 continue
             me = str(self.identity.uuid).lower()
             placer = v['_placers'].get(key)
@@ -1142,13 +1214,14 @@ class PlacementMixin:
         # accepted at k, or, if none did, our own ready items.
         reported = [g for g in rnd['grants'].values() if g is not None]
         if reported:
-            raw = max(reported, key=lambda g: g[0])[1]
+            ballot, raw = max(reported, key=lambda g: g[0])
             entries = value_from_list(raw)
-            if entries is None or self._place_value_ok(
-                    entries, chain, group if key else None,
-                    config_check=False) is not None:
-                self.logger.warning('Placement %d: the value to carry is not '
-                                    'valid here; dropping the round', rnd['k'])
+            why = 'unreadable' if entries is None else self._place_value_ok(
+                entries, chain, group if key else None, config_check=False)
+            if why is not None:
+                self.logger.warning('Placement %d: the value to carry (accepted '
+                                    'under %s) is not valid here: %s; dropping '
+                                    'the round', rnd['k'], ballot, why)
                 self._place_vars()['_place_rounds'].pop(key, None)
                 return True
         else:
@@ -1164,17 +1237,23 @@ class PlacementMixin:
         """Our ready items, as a value to place: only items an acceptor will
         take. One it would refuse (a half whose certificate falls short of our
         quorum, say) leaves the pool, or it would sink every round that
-        carries it."""
+        carries it. The value stops short of PLACE_VALUE_BYTES_MAX encoded,
+        so its frame fits a datagram, and holds at least one entry."""
         item = self._roster_item(key, chain)
         if item is not None:
             return [item]
         if not self._founded(chain):
             return []                   # nothing is placed before the genesis
         entries = []
+        size = 2                        # the list's brackets
         for e in chain.ready_items():
             why = self._place_value_ok([e], chain, group)
             if why is None:
+                more = len(to_json_string(entry_to_dict(e))) + 1
+                if entries and size + more > PLACE_VALUE_BYTES_MAX:
+                    break
                 entries.append(e)
+                size += more
             else:
                 chain.pool_drop(e.task_id)
                 self.logger.warning('Placement: dropping %s from the pool: '
@@ -1271,10 +1350,17 @@ class PlacementMixin:
         # -- would otherwise end every round that adds it.
         if rnd is None or self._place_voter(message, key, payload['k']) is None:
             return True
+        # A member behind the round's instance promised nothing and cannot
+        # accept here; the members that are not behind may still carry it.
+        # Ending the round on its nack let one member stuck at instance 0 stop
+        # the chain for the whole hostile-join run of 2026-11-05 (pass-off-1):
+        # nobody else was added, and the joiners refused the chain to the end.
+        nxt = payload.get('next')
+        if isinstance(nxt, int) and nxt < rnd['k']:
+            return True
         v['_place_rounds'].pop(key, None)
         v['_place_lead'].pop(key, None)
-        v['_place_backoff'][key] = time.monotonic() + random.uniform(*self.PLACE_BACKOFF)
-        nxt = payload.get('next')
+        self._place_failed(key, rnd['k'])
         if isinstance(nxt, int) and nxt > chain.next_index:
             try:
                 self._request_update(queues, key=key)

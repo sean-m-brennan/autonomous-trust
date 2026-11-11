@@ -90,6 +90,15 @@ def score_to_milli(score, where: str = 'TransactionScore') -> int:
     return int(whole) + (1 if product - whole >= 0.5 else 0)
 
 
+def peer_id_str(peer_id) -> 'str | None':
+    """A peer's id in the one form a Transaction holds it: its string, which is
+    how an identity carries its uuid. An entry decoded from the wire is handed
+    ``UUID`` objects, and a history keyed by those finds nothing under a peer's
+    own id. The canonical bytes render an id with ``str``, so the entry hash is
+    the same in either form."""
+    return None if peer_id is None else str(peer_id)
+
+
 def validate_tx_milli(milli, where: str = 'TransactionScore') -> int:
     """Return `milli` as an int in [0, 1000], or raise ValueError.
 
@@ -630,6 +639,15 @@ def half_designation(task_id, scorer, counterparty, score_milli, channel=None) -
 # reputation.md, "Agreeing on an order").
 PLACE_BATCH_MAX = 32
 
+# Upper bound on a value's encoded size, in bytes of its JSON: the entries a
+# proposer puts in one value stop short of it, though a value always holds at
+# least one. A `place` frame carries the value base64-encoded, about 1.34
+# times its size, and must fit one UDP datagram (65,507 bytes). At 18 members
+# an entry is about 6 KB, so PLACE_BATCH_MAX alone made frames of 257 KB that
+# no send could carry, and the 16-colluder hostile-join runs of 2026-11-05 sat
+# on one instance to the end. Mirrors C PLACE_VALUE_BYTES_MAX.
+PLACE_VALUE_BYTES_MAX = 40000
+
 # The persisted pool's schema (TransactionHistory.pool_to_dict). 2: scores
 # are integer thousandths (`score_milli`); a schema-1 pool is refused.
 POOL_SCHEMA = 2
@@ -709,15 +727,16 @@ class Transaction(Configuration):
                  place_sigs: dict = None, roster_op: str = None,
                  roster_uuid: UUID = None, roster_digest: str = None,
                  roster_members: list = None, roster_n_min: int = None,
-                 half_sigs: dict = None, names: dict = None):
+                 half_sigs: dict = None, names: dict = None,
+                 cert_rosters: dict = None):
         self.task_id = task_id
-        self.p1_id = p1_id
+        self.p1_id = peer_id_str(p1_id)
         # Each side's score, integer thousandths (0..1000; TX_SCORE_SCALE),
         # None for a side not yet filled. Validated here because this is also
         # the catch-up and persistence reader (`cls(**kwargs)`).
         self.p1_score_milli = (None if p1_score_milli is None
                                else validate_tx_milli(p1_score_milli, 'Transaction'))
-        self.p2_id = p2_id
+        self.p2_id = peer_id_str(p2_id)
         self.p2_score_milli = (None if p2_score_milli is None
                                else validate_tx_milli(p2_score_milli, 'Transaction'))
         self.index = index
@@ -750,7 +769,7 @@ class Transaction(Configuration):
         # covered by the canonical bytes. Mirrors transaction_t.attested /
         # subject_uuid / evidence_digest.
         self.attested = bool(attested)
-        self.subject_id = subject_id
+        self.subject_id = peer_id_str(subject_id)
         self.evidence_digest = evidence_digest
         # An attested entry's optional SCOPE (64 lowercase hex): what the
         # attesting application says the finding is about. Keys the rate cap
@@ -781,6 +800,16 @@ class Transaction(Configuration):
         self.half_sigs = ({str(k): str(v) for k, v in half_sigs.items() if v}
                           if isinstance(half_sigs, dict) and half_sigs
                           else None)
+        # The roster each half's certificate was collected under: scorer uuid
+        # str -> roster digest hex, as its commit named it. A receiver ahead
+        # of the proposer judges the certificate against that roster while it
+        # is recent (ReputationProcess.CERT_ROSTER_WINDOW), so it travels
+        # wherever the certificate does. Outside the canonical bytes, like the
+        # certificates.
+        self.cert_rosters = ({str(k): str(v).lower()
+                              for k, v in cert_rosters.items() if v}
+                             if isinstance(cert_rosters, dict) and cert_rosters
+                             else None)
         # Whom a POOLED half names, scorer uuid str -> counterparty uuid str,
         # while it waits for that counterparty. A paired entry needs none (the
         # other side is the counterparty), so this never travels or persists
@@ -868,6 +897,8 @@ class Transaction(Configuration):
         # shape. `names` is the pool's, never an entry's.
         if not d.get('half_sigs'):
             d.pop('half_sigs', None)
+        if not d.get('cert_rosters'):
+            d.pop('cert_rosters', None)
         d.pop('names', None)
         # And the placement certificate: only a placement's last entry has one.
         if not d.get('place_sigs'):
@@ -886,14 +917,28 @@ class Transaction(Configuration):
         """The commit certificate held for `scorer`'s half, or None."""
         return (self.commit_sigs or {}).get(str(scorer))
 
-    def attach_certificate(self, scorer, sigs) -> None:
+    def attach_certificate(self, scorer, sigs, roster=...) -> None:
         """Keep `sigs` as the certificate of `scorer`'s half. The caller has
-        verified it; an empty one is not kept."""
+        verified it; an empty one is not kept. `roster`, when given, is the
+        digest of the roster it was collected under (None for none named);
+        left out, what the half held is kept."""
         if not sigs:
             return
         if self.commit_sigs is None:
             self.commit_sigs = {}
         self.commit_sigs[str(scorer)] = dict(sigs)
+        if roster is ...:
+            return
+        rosters = dict(self.cert_rosters or {})
+        if roster:
+            rosters[str(scorer)] = str(roster).lower()
+        else:
+            rosters.pop(str(scorer), None)
+        self.cert_rosters = rosters or None
+
+    def cert_roster_of(self, scorer) -> 'str | None':
+        """The digest of the roster `scorer`'s certificate names, or None."""
+        return (self.cert_rosters or {}).get(str(scorer))
 
     def half_sig_of(self, scorer) -> 'str | None':
         """`scorer`'s own signature over its half, or None."""
@@ -1020,6 +1065,7 @@ class Transaction(Configuration):
 
     def add(self, peer_id: UUID, score_milli: int, channel: str = None):
         score_milli = validate_tx_milli(score_milli, 'Transaction')
+        peer_id = peer_id_str(peer_id)
         if self.p1_id is None:
             self.p1_id = peer_id
             self.p1_score_milli = score_milli
@@ -1059,6 +1105,124 @@ class ReconcileResult:
         # Under ordered placement: how many dropped entries went back to the
         # pool to be placed again.
         self.pooled = 0
+
+
+# Own entries outlive the window: an evicted entry naming the history's
+# ``keep_party`` (this node) as a party is kept aside, at most RETAINED_PER_PEER
+# per counterparty and RETAINED_FACTOR times the cap in all, oldest out first.
+# The hostile-join runs without the policy, 2026-11-04, lost a joiner's own
+# transactions with its contact to ten nodes' traffic in minutes (35 fell to
+# 2). Mirrors C REP_RETAINED_PER_PEER / REP_RETAINED_FACTOR.
+RETAINED_PER_PEER = 64
+RETAINED_FACTOR = 4
+
+
+class LoneVerdict:
+    """This node's verdict on a peer from one of its own probes, kept before
+    and without the peer's half: the prober's own evidence alone. It is never
+    placed or told; when the bilateral entry for the same task reaches the
+    chain, that entry is read instead. Shaped for the own-evidence readers:
+    ``task_id`` keys the dedup and the task weight, ``lone`` marks it a probe
+    of ours. Mirrors C rep_lone_verdict_t."""
+    __slots__ = ('task_id', 'subject', 'score', 't')
+    attested = False
+    lone = True
+
+    def __init__(self, task_id, subject, score: float, t: float):
+        self.task_id = str(task_id)
+        self.subject = str(subject)
+        self.score = float(score)
+        self.t = float(t)
+
+    def to_dict(self) -> dict:
+        return {'task': self.task_id, 'subject': self.subject,
+                'score': self.score, 't': self.t}
+
+
+class LoneVerdicts:
+    """The lone probe verdicts this node holds, per subject, oldest first,
+    at most RETAINED_PER_PEER per subject and RETAINED_FACTOR times
+    ``max_chain_len`` in all, oldest out first: the retained store's bounds.
+    The hostile-join runs of 2026-11-05 counted a verdict only once the
+    probed peer wrote its half; at 18 nodes the colluders sat at the probe
+    cap and dropped 90 halves, so the burst spent 107 probes for 48 verdicts,
+    and a peer that never writes its half was never graded. ``rev`` moves on
+    every change, so the file is written only when it has. Mirrors C
+    rep_lone_verdicts."""
+    SCHEMA = '1'
+
+    def __init__(self, max_chain_len: int):
+        self.total_max = RETAINED_FACTOR * max(1, int(max_chain_len))
+        self._by_subject: 'OrderedDict[str, list]' = OrderedDict()
+        self._count = 0
+        self.rev = 0
+
+    def __len__(self):
+        return self._count
+
+    def by_peer(self, peer) -> list:
+        return list(self._by_subject.get(str(peer), ()))
+
+    def all(self) -> list:
+        """Every verdict, oldest first."""
+        return sorted((v for vs in self._by_subject.values() for v in vs),
+                      key=lambda v: v.t)
+
+    def add(self, verdict: LoneVerdict) -> bool:
+        """Keep ``verdict`` unless its task is already held; apply the
+        bounds. Returns whether it was kept."""
+        held = self._by_subject.setdefault(verdict.subject, [])
+        if any(v.task_id == verdict.task_id for v in held):
+            return False
+        held.append(verdict)
+        self._count += 1
+        if len(held) > RETAINED_PER_PEER:
+            held.pop(0)
+            self._count -= 1
+        while self._count > self.total_max:
+            oldest = min(self._by_subject.items(),
+                         key=lambda kv: kv[1][0].t if kv[1] else float('inf'))
+            oldest[1].pop(0)
+            self._count -= 1
+        for key in [k for k, vs in self._by_subject.items() if not vs]:
+            del self._by_subject[key]
+        self.rev += 1
+        return True
+
+    def drop_tasks(self, task_ids) -> int:
+        """Drop the verdicts whose task is in ``task_ids`` (their bilateral
+        entry is on a chain now). Returns how many."""
+        task_ids = {str(t) for t in task_ids}
+        dropped = 0
+        for key in list(self._by_subject):
+            kept = [v for v in self._by_subject[key]
+                    if v.task_id not in task_ids]
+            dropped += len(self._by_subject[key]) - len(kept)
+            if kept:
+                self._by_subject[key] = kept
+            else:
+                del self._by_subject[key]
+        if dropped:
+            self._count -= dropped
+            self.rev += 1
+        return dropped
+
+    def to_dict(self) -> dict:
+        return {'schema': self.SCHEMA,
+                'entries': [v.to_dict() for v in self.all()]}
+
+    def load_dict(self, doc) -> None:
+        """Add the verdicts of a ``to_dict`` document, oldest first, through
+        the bounds. Raises ValueError on an unknown schema or a malformed
+        entry."""
+        if not isinstance(doc, dict) or doc.get('schema') != self.SCHEMA:
+            raise ValueError('unknown lone-verdict schema')
+        for e in doc.get('entries') or []:
+            score = float(e['score'])
+            if not 0.0 <= score <= 1.0:
+                raise ValueError('lone verdict score out of range')
+            self.add(LoneVerdict(UUID(str(e['task'])), UUID(str(e['subject'])),
+                                 score, float(e['t'])))
 
 
 class TransactionHistory(Mapping):
@@ -1114,6 +1278,14 @@ class TransactionHistory(Mapping):
         if max_chain_len < 1:
             raise ValueError("max_chain_len must be >= 1")
         self.max_chain_len = max_chain_len
+        # Own entries evicted from the window (see RETAINED_PER_PEER): not on
+        # the chain, never on the wire; the scorers read them before the
+        # resident entries. ``keep_party`` is set by the owning process.
+        self.keep_party: 'str | None' = None
+        self._retained: list[Transaction] = []
+        self.retained_per_peer = RETAINED_PER_PEER
+        self.retained_max = RETAINED_FACTOR * max_chain_len
+        self.retained_rev = 0
         self._chain: list[Transaction] = list(_chain) if _chain else []
         self._task_mapping: dict[UUID, Transaction] = {
             link.task_id: link for link in self._chain}
@@ -1195,6 +1367,7 @@ class TransactionHistory(Mapping):
         (a single ``list.remove`` would drop only the first).
         """
         oldest = self._chain.pop(0)
+        self._retain(oldest)
         self._task_mapping.pop(oldest.task_id, None)
         self.attest_certs.pop(oldest.task_id, None)
         self.place_certs.pop(oldest.task_id, None)
@@ -1217,11 +1390,47 @@ class TransactionHistory(Mapping):
         else:
             self._first_index = self._next_index
 
+    def _retain(self, tx: Transaction):
+        """Keep an evicted entry aside when this node is a party to it and it
+        is not attested; then hold the bounds, oldest out first: the
+        counterparty's oldest past ``retained_per_peer``, the overall oldest
+        past ``retained_max``."""
+        me = self.keep_party
+        if me is None or tx.attested or me not in (tx.p1_id, tx.p2_id):
+            return
+        other = tx.p2_id if tx.p1_id == me else tx.p1_id
+        self._retained.append(tx)
+        theirs = [t for t in self._retained if other in (t.p1_id, t.p2_id)]
+        for t in theirs[:max(0, len(theirs) - self.retained_per_peer)]:
+            self._retained.remove(t)
+        del self._retained[:max(0, len(self._retained) - self.retained_max)]
+        self.retained_rev += 1
+
+    def retained_by_peer(self, peer_id) -> 'list[Transaction]':
+        """The retained entries naming ``peer_id`` as a party, oldest first."""
+        key = peer_id_str(peer_id)
+        return [t for t in self._retained if key in (t.p1_id, t.p2_id)]
+
+    def retained(self) -> 'list[Transaction]':
+        """Every retained entry, oldest first."""
+        return list(self._retained)
+
+    def adopt_retained(self, entries):
+        """Take ``entries`` (oldest first) as retained, as a restart or a
+        chain reset does: only those naming ``keep_party`` and not resident
+        count, and the bounds hold."""
+        for tx in entries:
+            if tx.task_id in self._task_mapping or any(
+                    t.task_id == tx.task_id for t in self._retained):
+                continue
+            self._retain(tx)
+
     def __getitem__(self, key):
         return self._task_mapping[key]
 
     def update(self, task_id: UUID, peer_id: UUID, score_milli: int,
                channel: str = None, certificate: dict = None):
+        peer_id = peer_id_str(peer_id)
         if task_id not in self._task_mapping:
             # Refuse to reanimate a task we already committed and
             # rolled out of the resident chain. handle_committed
@@ -1342,7 +1551,8 @@ class TransactionHistory(Mapping):
 
     def record_half(self, task_id: UUID, peer_id: UUID, score_milli: int,
                     channel: str = None, certificate: dict = None,
-                    counterparty=None, half_sig: str = None) -> str:
+                    counterparty=None, half_sig: str = None,
+                    cert_roster: str = None) -> str:
         """Put a committed half in the pool. Returns 'pending' (the task has
         one half), 'ready' (both, so its entry can be placed), 'dup' (this
         scorer's half is already held), 'placed' (the task is in the chain),
@@ -1357,7 +1567,8 @@ class TransactionHistory(Mapping):
         the held half names, and this scorer's signed half names somebody
         else. Otherwise the first stays and this one is refused. A half with
         no name (a pool written before names, a fixture) pairs as it always
-        did."""
+        did. `cert_roster` is the digest of the roster the certificate was
+        collected under, kept beside it."""
         if self._placed(task_id):
             return 'placed'
         if task_id in self._evicted_task_ids:
@@ -1372,8 +1583,9 @@ class TransactionHistory(Mapping):
             return 'dup'
         if peer_id is not None and str(peer_id) in (str(tx.p1_id),
                                                     str(tx.p2_id)):
-            if certificate and tx.certificate_of(peer_id) != certificate:
-                tx.attach_certificate(peer_id, certificate)
+            if certificate and (tx.certificate_of(peer_id) != certificate
+                                or tx.cert_roster_of(peer_id) != cert_roster):
+                tx.attach_certificate(peer_id, certificate, cert_roster)
                 self.pool_rev += 1
             if half_sig and not tx.half_sig_of(peer_id):
                 tx.attach_half_sig(peer_id, half_sig)
@@ -1398,7 +1610,7 @@ class TransactionHistory(Mapping):
                     return 'mismatch'
         tx.add(peer_id, score_milli, channel)
         if certificate:
-            tx.attach_certificate(peer_id, certificate)
+            tx.attach_certificate(peer_id, certificate, cert_roster)
         if half_sig:
             tx.attach_half_sig(peer_id, half_sig)
         if named is not None and peer_id is not None:
@@ -1467,6 +1679,9 @@ class TransactionHistory(Mapping):
                 sig = tx.half_sig_of(uid)
                 if sig:
                     half['sig'] = _hex_str(sig)
+                roster = tx.cert_roster_of(uid)
+                if roster:
+                    half['cert_roster'] = roster
                 halves.append(half)
             items.append({'task': str(tx.task_id), 'halves': halves})
         return {'schema': POOL_SCHEMA, 'pool': items}
@@ -1497,11 +1712,14 @@ class TransactionHistory(Mapping):
                             if isinstance(cert, dict) else None)
                     names = half.get('names')
                     sig = half.get('sig')
+                    roster = half.get('cert_roster')
                     self.record_half(task, UUID(str(half['by'])), milli,
                                      half.get('channel') or None, cert,
                                      counterparty=(UUID(str(names)) if names
                                                    else None),
-                                     half_sig=str(sig) if sig else None)
+                                     half_sig=str(sig) if sig else None,
+                                     cert_roster=(str(roster) if roster
+                                                  else None))
             except (KeyError, TypeError, ValueError, AttributeError):
                 continue
         return len(self._pool)
@@ -1587,6 +1805,31 @@ class TransactionHistory(Mapping):
         """The roster in force for the next instance."""
         return self.roster_at(self._next_index)
 
+    def roster_named(self, digest, window: int) -> 'Transaction | None':
+        """The roster entry `digest` names while it may still judge a commit
+        certificate: the roster in force, or one superseded at an instance no
+        more than `window` below the next, or None. A digest covers the members
+        only and a restatement keeps it, so this is the newest such entry with
+        that digest, and its N_min is the latest declared for those members.
+        The anchor stands below every resident entry. Mirrors C
+        tx_history_roster_named."""
+        if not digest:
+            return None
+        digest = str(digest).lower()
+        rosters = sorted((tx for tx in self._chain
+                          if tx.is_roster and tx.index is not None),
+                         key=lambda tx: tx.index)
+        if self.roster_anchor is not None:
+            rosters.insert(0, self.roster_anchor)
+        floor = self._next_index - window
+        found = None
+        for i, r in enumerate(rosters):
+            after = rosters[i + 1] if i + 1 < len(rosters) else None
+            if str(r.roster_digest).lower() == digest \
+                    and (after is None or after.index >= floor):
+                found = r
+        return found
+
     @property
     def placed_end(self) -> 'int | None':
         """One past the highest resident index a placement certificate covers,
@@ -1602,7 +1845,7 @@ class TransactionHistory(Mapping):
         return self._chain.__iter__()
 
     def by_peer(self, peer_id: UUID):
-        return self._peer_mapping[peer_id]
+        return self._peer_mapping[peer_id_str(peer_id)]
 
     def era(self, idx: int):
         """Return the chain suffix from absolute index ``idx`` onward.
@@ -1898,7 +2141,8 @@ class TransactionHistory(Mapping):
                     self.record_half(tx.task_id, uid, milli, chan,
                                      certificate=tx.certificate_of(uid),
                                      counterparty=tx.counterparty_of(uid),
-                                     half_sig=tx.half_sig_of(uid))
+                                     half_sig=tx.half_sig_of(uid),
+                                     cert_roster=tx.cert_roster_of(uid))
             back += self.pooled(tx.task_id) is not None
         return back
 
@@ -2332,6 +2576,14 @@ EVIDENCE_FILE = 'reputation-history'
 # can lose harmlessly, while these marks are the memory a replayed slash has
 # to clear, so the two should not share a failure.
 SLASH_MARKS_FILE = 'reputation-slash-marks'
+# Own entries evicted from a chain's window (TransactionHistory.retained), in
+# the evidence document's shape with no checkpoint; one file per chain, like
+# the evidence. This node's own record, so nothing in it is verified on load
+# beyond naming this node as a party.
+RETAINED_FILE = 'reputation-retained'
+# This node's lone probe verdicts (LoneVerdicts.to_dict); one file per node,
+# written beside the primary chain's retained entries.
+LONE_VERDICTS_FILE = 'reputation-verdicts'
 
 
 def _hex_str(value) -> str:
@@ -2404,6 +2656,9 @@ def evidence_to_dict(chain, signed_checkpoint=None, attest_certs=None,
         if not tx.attested and getattr(tx, 'half_sigs', None):
             entries[-1]['half_sigs'] = {str(scorer): _hex_str(sig)
                                         for scorer, sig in tx.half_sigs.items()}
+        # The roster each certificate was collected under, by scorer.
+        if not tx.attested and getattr(tx, 'cert_rosters', None):
+            entries[-1]['cert_rosters'] = dict(tx.cert_rosters)
         # A roster entry: its fields are in the entry hash, its member list
         # beside it (checked against the digest on the way back in).
         if getattr(tx, 'roster_op', None) is not None:
@@ -2522,6 +2777,11 @@ def evidence_from_dict(doc):
                        else {str(scorer): str(sig) for scorer, sig
                              in entry['half_sigs'].items()
                              if isinstance(sig, str)}),
+            cert_rosters=(None if entry.get('attested')
+                          or not isinstance(entry.get('cert_rosters'), dict)
+                          else {str(scorer): str(d) for scorer, d
+                                in entry['cert_rosters'].items()
+                                if isinstance(d, str)}),
             place_from=(int(entry['place_from'])
                         if isinstance(entry.get('place_from'), int)
                         and not isinstance(entry.get('place_from'), bool)
@@ -3031,11 +3291,23 @@ class Reputations(Configuration):
                             for k, v in current.items()}
         self.brought = {str(k): float(v) for k, v in (brought or {}).items()}
 
+    def _key(self, peer_id):
+        """The key ``current`` holds `peer_id` under. A loaded file keys it by
+        ``UUID``, a live update by whatever id the caller held, and a chain
+        entry names its peers by string; one peer is one score either way."""
+        if peer_id in self.current:
+            return peer_id
+        try:
+            alt = str(peer_id) if isinstance(peer_id, UUID) else UUID(str(peer_id))
+        except ValueError:
+            return peer_id
+        return alt if alt in self.current else peer_id
+
     def __getitem__(self, key):
-        return self.current[key]
+        return self.current[self._key(key)]
 
     def __contains__(self, item):
-        return item in self.current
+        return self._key(item) in self.current
 
     def to_dict(self):
         doc = {'current': {str(k): v for k, v in self.current.items()}}

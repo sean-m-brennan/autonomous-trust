@@ -498,6 +498,7 @@ ffi.cdef("""
         char trace_id[33];      /* 32-char hex + NUL; NET_TRACE_ID_LEN */
         bool verified;
         bool has_signature;
+        uint8_t signature[64];  /* crypto_sign_BYTES; checked again by identity once it holds the sender */
         char child_group[37];   /* sender's child cohort uuid on a gateway; "" = none */
     } net_msg_t;
 

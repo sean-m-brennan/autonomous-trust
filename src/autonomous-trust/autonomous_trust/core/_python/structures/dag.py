@@ -49,6 +49,14 @@ class GenesisType(Step):
 Genesis = GenesisType()
 
 
+def same_step(a, b) -> bool:
+    """Whether ``a`` and ``b`` are one step. A step received from a peer is a
+    new object with the sender's uuid, so identity of objects is not enough."""
+    return a is b or (a is not None and b is not None
+                      and getattr(a, 'uuid', None) is not None
+                      and getattr(a, 'uuid', None) == getattr(b, 'uuid', None))
+
+
 class LinkedStep(Step, Configuration):
     """
     A link in a DAG
@@ -180,7 +188,10 @@ class StepDAG(ABC):
             current = self.heads[source]
         self.heads[name] = step
         step.parent = current
-        self.__branch_lists[name].append(step)
+        # A new branch starts its own list. A name can come back after its
+        # branch was merged or its head dropped (history diffs are ingested
+        # under the sender's name), and must not inherit the old steps.
+        self.__branch_lists[name] = [step]
 
     def ingest_branch(self, steps, name=None):
         """
@@ -210,14 +221,15 @@ class StepDAG(ABC):
         if target not in self.heads:
             raise InvalidBranchError(target)
 
-        shorter = min(len(self.__branch_lists[branch]), len(self.__branch_lists[target]))
-        common_root = Genesis
+        b_list, t_list = self.__branch_lists[branch], self.__branch_lists[target]
+        shorter = min(len(b_list), len(t_list))
+        # idx is the length of the shared prefix: where the lists first differ,
+        # or the whole shorter list when one extends the other. The root is the
+        # target's own copy, so a merged chain continues from local steps.
         idx = 0
-        for idx in range(0, shorter):
-            if self.__branch_lists[branch][idx] != self.__branch_lists[target][idx]:
-                if idx > 0:
-                    common_root = self.__branch_lists[branch][idx - 1]
-                break
+        while idx < shorter and same_step(b_list[idx], t_list[idx]):
+            idx += 1
+        common_root = t_list[idx - 1] if idx > 0 else Genesis
         return idx, common_root
 
     @staticmethod
@@ -242,14 +254,20 @@ class StepDAG(ABC):
         idx, common_root = self.diff(branch, target)
         temp = self.temp_name
         self.heads[temp] = common_root
-        steps = self.__branch_lists[branch][idx:] + self.__branch_lists[target][idx:]  # noqa
-        steps = self._sort_step_list(steps)
+        # A step both lists hold past the divergence (each node recorded its
+        # own steps first) is kept once, as the target's copy.
+        ours = self.__branch_lists[target][idx:]  # noqa
+        held = {s.uuid for s in ours}
+        theirs = [s for s in self.__branch_lists[branch][idx:] if s.uuid not in held]  # noqa
+        steps = self._sort_step_list(theirs + ours)
         for step in steps:
             self.add_step(step, temp)
         self.heads[target] = self.heads[temp]
         del self.heads[temp]
+        self.__branch_lists.pop(temp, None)
         if not keep:
             del self.heads[branch]
+            self.__branch_lists.pop(branch, None)
 
     def fork(self, head=None):
         if head is None:
@@ -273,7 +291,7 @@ class StepDAG(ABC):
             root = Genesis
         step_list = []
         step = self.heads[branch]
-        while step != root:
+        while not same_step(step, root):
             step_list.append(step)
             step = step.parent
         if root is not Genesis:

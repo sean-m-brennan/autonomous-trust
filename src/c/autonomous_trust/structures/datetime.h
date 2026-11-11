@@ -98,6 +98,21 @@ int datetime_strftime(const datetime_t *dt, const char *format, char *s, size_t 
 int datetime_to_isoformat(const datetime_t *dt, char *s, size_t max);
 
 /**
+ * @brief Order two datetimes by their full stamp: seconds, then nanoseconds.
+ *
+ * Returns -1, 0 or 1 as @p a is earlier than, equal to or later than @p b.
+ * Comparing at whole seconds alone (mktime) calls two stamps inside one
+ * second equal, which Python, comparing microseconds, does not.
+ */
+/*@
+  requires \valid_read(a);
+  requires \valid_read(b);
+  assigns \nothing;
+  ensures \result == -1 || \result == 0 || \result == 1;
+*/
+int datetime_compare(const datetime_t *a, const datetime_t *b);
+
+/**
  * @brief Parse a string into a datetime according to format.
  */
 /*@

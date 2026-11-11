@@ -72,8 +72,9 @@ from autonomous_trust.inspector.dashboard.disaster_response_map import (
 )
 from autonomous_trust.inspector.dashboard.event_log import EventLogPanel
 from autonomous_trust.inspector.dashboard.narration import (
-    NarrationOverlay, STYLE_COLORS,
+    NarrationOverlay, style_colors,
 )
+from autonomous_trust.inspector.dashboard.theme import current as current_theme
 from autonomous_trust.inspector.dashboard.peer_detail import (
     PeerDetailPanel, PeerDetailState, IdentityInfo, ReputationSnapshot,
     StreamSummary,
@@ -118,6 +119,10 @@ _MAP_GRAPH = "demo-map-graph"
 _TIMELINE_GRAPH = "demo-timeline-graph"
 _DETAIL_IFRAME = "demo-detail-iframe"
 _SELECTED_PEER = "demo-selected-peer"   # dcc.Store payload key = "name"
+# Per-page dcc.Stores holding the signature of what that page last drew: the
+# map's (an int) and the main tick's ({"timeline": int, "graph": int}).
+_MAP_DRAWN = "demo-map-drawn"
+_TICK_DRAWN = "demo-tick-drawn"
 
 # Display thresholds for deriving node status from REAL mesh reputation
 # (no scripted peer_states). 0.5 mirrors AT's REPUTATION_PERSIST_THRESHOLD /
@@ -218,14 +223,15 @@ class MultiAgencyDemo:
         # peer name and from None, so the very first tick always
         # renders the empty placeholder.
         self._peer_detail_last_peer: object = "<unset>"
-        # Figure dirty-check signatures. Each Plotly figure is rebuilt only
-        # when its underlying data actually changed since the last render;
-        # otherwise the callback returns no_update and Dash skips the redraw.
-        # Sentinel object() differs from any real signature so the first
-        # render of each always fires. Reset by _on_reset.
-        self._last_map_sig: object = object()
-        self._last_timeline_sig: object = object()
-        self._last_graph_sig: object = object()
+        # Figure dirty-checks. Each Plotly figure is rebuilt only when its
+        # underlying data changed since that page last drew it; otherwise the
+        # callback returns no_update and Dash skips the redraw. What a page
+        # last drew lives in its own dcc.Store (_MAP_DRAWN, _TICK_DRAWN), not
+        # here: a server-side copy let the first page to poll take the draw
+        # and left every later page or reload with an empty figure until the
+        # inputs next changed. The generation is folded into every signature;
+        # _on_reset bumps it so every open page redraws.
+        self._render_gen = 0
         self._event_log_panel = EventLogPanel(capacity=200)
         self._streams_panel = DataStreamsPanel(
             peer_colors=_agency_palette(iface.scenario))
@@ -382,11 +388,13 @@ class MultiAgencyDemo:
             dcc.Interval(id=_MAP_TICK_INTERVAL_ID,
                          interval=_MAP_TICK_MS, n_intervals=0),
             dcc.Store(id=_SELECTED_PEER, data={"name": None}),
+            dcc.Store(id=_MAP_DRAWN),
+            dcc.Store(id=_TICK_DRAWN),
             # Document-level keyboard listener for the spacebar
             # play/pause shortcut. captureKeys filters at the JS layer
             # so the callback only fires for ' ' (Space).
             Keyboard(id=_PB_KEYBOARD, captureKeys=[" "]),
-            dashboard,
+            _theme_layout(dashboard),
         ])
 
     @staticmethod
@@ -476,10 +484,13 @@ class MultiAgencyDemo:
             Output(_STREAMS_PANEL, "children"),
             Output(_SENSOR_GRAPH, "figure"),
             Output(_SENSOR_DETAILS, "style"),
+            Output(_TICK_DRAWN, "data"),
             Input(_TICK_INTERVAL_ID, "n_intervals"),
             Input(_SELECTED_PEER, "data"),
+            State(_TICK_DRAWN, "data"),
         )
-        def _on_tick(_n, selected):
+        def _on_tick(_n, selected, drawn):
+            drawn = dict(drawn or {})
             iface.tick()
             tel = iface.telemetry()
 
@@ -522,11 +533,11 @@ class MultiAgencyDemo:
             # landed. _rep_samples lists are append-only, so a change in the
             # per-peer sample counts is a sufficient dirty signal (phase
             # markers are static). Unchanged → skip the redraw.
-            timeline_sig = tuple(sorted(
+            timeline_sig = hash((demo._render_gen, tuple(sorted(
                 (name, len(samples))
-                for name, samples in demo._rep_samples.items()))
-            if timeline_sig != demo._last_timeline_sig:
-                demo._last_timeline_sig = timeline_sig
+                for name, samples in demo._rep_samples.items()))))
+            if timeline_sig != drawn.get("timeline"):
+                drawn["timeline"] = timeline_sig
                 timeline_fig = demo._build_timeline_figure()
                 timeline_fig.update_layout(uirevision="demo-timeline")
             else:
@@ -555,14 +566,15 @@ class MultiAgencyDemo:
             # status) changed since the last render.
             trust_matrix = demo._build_trust_matrix()
             stream_counts = demo._real_stream_counts()
-            graph_sig = (
+            graph_sig = hash((
+                demo._render_gen,
                 tuple(sorted(trust_matrix)),
                 tuple(sorted(stream_counts.items())),
                 frozenset(compromised), frozenset(excluded),
                 tuple(sorted(peer_opacity.items())),
-            )
-            if graph_sig != demo._last_graph_sig:
-                demo._last_graph_sig = graph_sig
+            ))
+            if graph_sig != drawn.get("graph"):
+                drawn["graph"] = graph_sig
                 graph_fig = build_graph_from_scenario(
                     scenario,
                     trust_matrix=trust_matrix,
@@ -582,24 +594,26 @@ class MultiAgencyDemo:
                     play_icon, time_label, progress_style,
                     timeline_fig, detail_html,
                     graph_fig, streams_children,
-                    sensor_fig, sensor_style)
+                    sensor_fig, sensor_style, drawn)
 
         @self._dash.callback(
             Output(_MAP_GRAPH, "figure"),
+            Output(_MAP_DRAWN, "data"),
             Input(_MAP_TICK_INTERVAL_ID, "n_intervals"),
+            State(_MAP_DRAWN, "data"),
         )
-        def _refresh_map(_n):
+        def _refresh_map(_n, drawn):
             # Tactical Map, decoupled from the main data tick. Read-only: the
             # scenario clock is advanced solely by _on_tick's iface.tick(), so
             # this consumes the peer status produced by the most recent data
             # tick. Rebuild only when node status changed (position is static,
             # so compromised/excluded/opacity fully determine the figure).
             compromised, excluded, peer_opacity = demo._real_peer_status()
-            map_sig = (frozenset(compromised), frozenset(excluded),
-                       tuple(sorted(peer_opacity.items())))
-            if map_sig == demo._last_map_sig:
-                return no_update
-            demo._last_map_sig = map_sig
+            map_sig = hash((demo._render_gen,
+                            frozenset(compromised), frozenset(excluded),
+                            tuple(sorted(peer_opacity.items()))))
+            if map_sig == drawn:
+                return no_update, no_update
             map_fig = build_map_from_scenario(
                 scenario,
                 compromised=compromised,
@@ -609,7 +623,7 @@ class MultiAgencyDemo:
             # uirevision preserves pan/zoom across frames; the figure's
             # own autosize=True handles container fit via dcc.Graph.
             map_fig.update_layout(uirevision="demo-map")
-            return map_fig
+            return map_fig, map_sig
 
         @self._dash.callback(
             Output(_SELECTED_PEER, "data"),
@@ -1089,11 +1103,9 @@ class MultiAgencyDemo:
         # Force a re-render of the peer detail iframe on the next tick
         # so the user sees the post-reset state if a peer was selected.
         self._peer_detail_last_peer = "<unset>"
-        # Invalidate the figure dirty-check signatures so the map, timeline,
-        # and trust graph all rebuild from the cleared state on the next tick.
-        self._last_map_sig = object()
-        self._last_timeline_sig = object()
-        self._last_graph_sig = object()
+        # Change every figure signature so the map, timeline, and trust graph
+        # rebuild from the cleared state on each page's next tick.
+        self._render_gen += 1
 
     def _maybe_record_snapshot(self, snapshot: dict) -> None:
         """Push a snapshot to the interface's recorder if one is
@@ -1189,6 +1201,8 @@ class MultiAgencyDemo:
                          "borderRadius": "6px",
                          "background": "#121a2e",
                          "overflow": "hidden"}
+        hidden_style = current_theme().recolor_style(hidden_style)
+        visible_style = current_theme().recolor_style(visible_style)
         if peer_name is None or peer_name not in self._iface.scenario.peers:
             return (go.Figure(), hidden_style)
         role = self._iface.scenario.peers[peer_name]
@@ -1303,6 +1317,30 @@ def _render_keystat_chips(callouts: list[tuple[str, str]]) -> list:
     return chips
 
 
+def _theme_layout(root):
+    """Apply the current theme to a built dashboard tree, in place.
+
+    Light adds ``theme-light`` to the ``demo-root`` element, which switches
+    the demo.css color tokens, and swaps the dark literals in inline styles.
+    Dark leaves the tree untouched.
+    """
+    th = current_theme()
+    if not th.light:
+        return root
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if getattr(node, "id", None) == "demo-root":
+            node.className = f"{node.className} theme-light"
+            break
+        kids = getattr(node, "children", None)
+        if isinstance(kids, (list, tuple)):
+            stack.extend(kids)
+        elif kids is not None and not isinstance(kids, str):
+            stack.append(kids)
+    return th.recolor_layout(root)
+
+
 def _build_narration(block) -> tuple[list, dict]:
     """Return (children, style) for the narration overlay.
 
@@ -1310,7 +1348,7 @@ def _build_narration(block) -> tuple[list, dict]:
     """
     if block is None:
         return ([], {"display": "none"})
-    colors = STYLE_COLORS.get(block.style, STYLE_COLORS["default"])
+    colors = style_colors(block.style)
     style = {
         "display": "block",
         "position": "fixed",

@@ -517,6 +517,16 @@ if(_has_parent)
     set(DEPENDENCIES "${DEPENDENCIES}" PARENT_SCOPE)
 endif()
 
+# What a SHARED library (the core .so, each extension .so) links. An AT_STATIC
+# build resolves DEPENDENCIES to .a archives, which are not built -fPIC and
+# cannot go into a shared object, so there the shared libraries leave those
+# symbols unresolved; at_demo, the static build's product, links them itself.
+if(AT_STATIC)
+    set(AT_SHARED_DEPENDENCIES)
+else()
+    set(AT_SHARED_DEPENDENCIES ${DEPENDENCIES})
+endif()
+
 set(TEST_DEPENDENCIES ${DEPENDENCIES})
 if(LIBCHECK_LIBRARY)
     list(APPEND TEST_DEPENDENCIES ${LIBCHECK_LIBRARY})
@@ -575,6 +585,7 @@ set(libsrc
     autonomous_trust/config/discover.c
     autonomous_trust/config/names.c
     autonomous_trust/config/trust_ladder.c
+    autonomous_trust/config/deployment_manifest.c
     autonomous_trust/identity/encryptor.c
     autonomous_trust/identity/group.c
     autonomous_trust/identity/group_file.c
@@ -860,6 +871,13 @@ include_directories(${PROTO_BINARY_DIR} ${PROTO_BINARY_DIR}/autonomous_trust/cor
 ## Python will not be built without specifying this target
 add_custom_target(proto_python DEPENDS ${proto_py_src})
 
+## The shared and static core libraries both list the generated C sources and
+## table headers. Under the Makefile generator each target would run the
+## generators itself, and two parallel runs race: pb-c-unpack-align.cmake
+## rewrites a .pb-c.c in place while the other target compiles it. One target
+## owns the generation and both libraries wait for it.
+add_custom_target(at_generated_sources DEPENDS ${proto_c_src} ${table_hdrs})
+
 
 ####################
 # create libraries
@@ -872,8 +890,9 @@ set_target_properties(autonomous_trust PROPERTIES COMPILE_FLAGS "${lib_compile_f
 # The shared library names its own dependencies. It used to leave them to each
 # final executable (a .so may carry unresolved symbols), which Apple's linker
 # refuses for a dylib; on Linux it adds the DT_NEEDED entries the library always
-# had in practice through its consumers.
-target_link_libraries(autonomous_trust PRIVATE ${DEPENDENCIES})
+# had in practice through its consumers. AT_SHARED_DEPENDENCIES is empty in
+# an AT_STATIC build.
+target_link_libraries(autonomous_trust PRIVATE ${AT_SHARED_DEPENDENCIES})
 target_sources(autonomous_trust PUBLIC ${libsrc}
     PUBLIC FILE_SET HEADERS
     BASE_DIRS ${CMAKE_CURRENT_BINARY_DIR} FILES ${genhdr}
@@ -885,6 +904,8 @@ set_target_properties(autonomous_trust_static PROPERTIES
     OUTPUT_NAME autonomous_trust
     COMPILE_FLAGS "${lib_compile_flags}"
     )
+add_dependencies(autonomous_trust at_generated_sources)
+add_dependencies(autonomous_trust_static at_generated_sources)
 target_sources(autonomous_trust PUBLIC ${libsrc}
     PUBLIC FILE_SET HEADERS
     BASE_DIRS ${CMAKE_CURRENT_BINARY_DIR} FILES ${genhdr}
@@ -1034,6 +1055,12 @@ target_link_libraries(identity_resync_test PRIVATE ${AT_TEST_LIBS})
 add_executable(group_rotation_sibling_test test/group_rotation_sibling_test.c)
 set_source_files_properties(test/group_rotation_sibling_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(group_rotation_sibling_test PRIVATE ${AT_TEST_LIBS})
+add_executable(group_key_query_test test/group_key_query_test.c)
+set_source_files_properties(test/group_key_query_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(group_key_query_test PRIVATE ${AT_TEST_LIBS})
+add_executable(group_rotation_forgery_test test/group_rotation_forgery_test.c)
+set_source_files_properties(test/group_rotation_forgery_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(group_rotation_forgery_test PRIVATE ${AT_TEST_LIBS})
 add_executable(bridged_group_test test/bridged_group_test.c)
 set_source_files_properties(test/bridged_group_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(bridged_group_test PRIVATE ${AT_TEST_LIBS})
@@ -1267,6 +1294,8 @@ add_test(NAME partition_recovery_test COMMAND $<TARGET_FILE:partition_recovery_t
 add_test(NAME late_joiner_caps_resync_test COMMAND $<TARGET_FILE:late_joiner_caps_resync_test>)
 add_test(NAME identity_resync_test COMMAND $<TARGET_FILE:identity_resync_test>)
 add_test(NAME group_rotation_sibling_test COMMAND $<TARGET_FILE:group_rotation_sibling_test>)
+add_test(NAME group_key_query_test COMMAND $<TARGET_FILE:group_key_query_test>)
+add_test(NAME group_rotation_forgery_test COMMAND $<TARGET_FILE:group_rotation_forgery_test>)
 add_test(NAME bridged_group_test COMMAND $<TARGET_FILE:bridged_group_test>)
 add_test(NAME amnesia_recognition_test COMMAND $<TARGET_FILE:amnesia_recognition_test>)
 add_test(NAME handoff_retry_test COMMAND $<TARGET_FILE:handoff_retry_test>)
@@ -1421,6 +1450,10 @@ target_link_libraries(trust_ladder_test PRIVATE ${AT_TEST_LIBS})
 target_compile_definitions(trust_ladder_test PRIVATE
     AT_REPO_ROOT_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/../..")
 
+add_executable(deployment_manifest_test test/deployment_manifest_test.c)
+set_source_files_properties(test/deployment_manifest_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(deployment_manifest_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(config2_test test/config2_test.c)
 set_source_files_properties(test/config2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(config2_test PRIVATE ${AT_TEST_LIBS})
@@ -1440,6 +1473,7 @@ add_test(NAME rep_attest_test COMMAND $<TARGET_FILE:rep_attest_test>)
 add_test(NAME trust_ladder_test COMMAND $<TARGET_FILE:trust_ladder_test>)
 set_tests_properties(trust_ladder_test PROPERTIES
     ENVIRONMENT "AT_REPO_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/../..")
+add_test(NAME deployment_manifest_test COMMAND $<TARGET_FILE:deployment_manifest_test>)
 add_test(NAME config2_test COMMAND $<TARGET_FILE:config2_test>)
 add_test(NAME util2_test COMMAND $<TARGET_FILE:util2_test>)
 add_test(NAME msg_types2_test COMMAND $<TARGET_FILE:msg_types2_test>)
@@ -1666,10 +1700,30 @@ add_executable(rep_cohort_test test/rep_cohort_test.c)
 set_source_files_properties(test/rep_cohort_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rep_cohort_test PRIVATE ${AT_TEST_LIBS} m)
 add_test(NAME rep_cohort_test COMMAND $<TARGET_FILE:rep_cohort_test>)
+add_executable(rep_cert_roster_test test/rep_cert_roster_test.c)
+set_source_files_properties(test/rep_cert_roster_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_cert_roster_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rep_cert_roster_test COMMAND $<TARGET_FILE:rep_cert_roster_test>)
+add_executable(rep_ctft_rule_test test/rep_ctft_rule_test.c)
+set_source_files_properties(test/rep_ctft_rule_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_ctft_rule_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rep_ctft_rule_test COMMAND $<TARGET_FILE:rep_ctft_rule_test>)
+add_executable(rep_coop_entry_test test/rep_coop_entry_test.c)
+set_source_files_properties(test/rep_coop_entry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_coop_entry_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rep_coop_entry_test COMMAND $<TARGET_FILE:rep_coop_entry_test>)
+add_executable(rep_retained_test test/rep_retained_test.c)
+set_source_files_properties(test/rep_retained_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_retained_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rep_retained_test COMMAND $<TARGET_FILE:rep_retained_test>)
 add_executable(rep_brought_test test/rep_brought_test.c)
 set_source_files_properties(test/rep_brought_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rep_brought_test PRIVATE ${AT_TEST_LIBS} m)
 add_test(NAME rep_brought_test COMMAND $<TARGET_FILE:rep_brought_test>)
+add_executable(rep_lone_verdict_test test/rep_lone_verdict_test.c)
+set_source_files_properties(test/rep_lone_verdict_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_lone_verdict_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rep_lone_verdict_test COMMAND $<TARGET_FILE:rep_lone_verdict_test>)
 
 add_executable(rescore_sweep_test test/rescore_sweep_test.c)
 set_source_files_properties(test/rescore_sweep_test.c PROPERTIES COMPILE_FLAGS "-Wall")

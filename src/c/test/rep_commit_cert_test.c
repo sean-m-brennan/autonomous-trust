@@ -28,6 +28,7 @@
 
 #include <pthread.h>
 #include <string.h>
+#include <unistd.h>
 #include <stdlib.h>
 
 #include <jansson.h>
@@ -48,6 +49,7 @@
 #include "utilities/msg_types_priv.h"
 #include "utilities/allocation.h"
 #include "utilities/util.h"
+#include "utilities/logger.h"
 
 static char UPDATE_FN[] = "latest update";
 
@@ -411,10 +413,56 @@ DEFINE_TEST(test_an_entry_we_already_hold_is_not_asked_again)
 }
 END_TEST_DEFINITION()
 
+/* Hostile-join run, 2026-11-04: each joiner refused ~200 commits this way
+ * while placement stalled for six minutes, and the log never said whether the
+ * certificate was short of signers or judged by another roster. */
+DEFINE_TEST(test_a_refused_commit_says_how_far_short_it_fell)
+{
+    cohort_t c;
+    _cohort(&c);
+    char log_path[] = "/tmp/rep_commit_cert_XXXXXX";
+    int fd = mkstemp(log_path);
+    ck_assert(fd >= 0);
+    close(fd);
+    logger_t lg;
+    ck_assert_int_eq(logger_init(&lg, INFO, log_path), 0);
+    c.proc->logger = &lg;
+
+    char t[UUID_STRING_LEN + 1], a[UUID_STRING_LEN + 1], cr[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(c.tasks[0], t);
+    uuid_unparse_lower(c.alice->uuid, a);
+    uuid_unparse_lower(c.carol->uuid, cr);
+    json_t *cert = json_object();
+    json_object_set_new(cert, cr, _sig(c.carol, c.alice->uuid, c.tasks[0], 0.9));
+    json_t *payload = json_pack("{s:s, s:s, s:i, s:o}", "task_uuid", t, "peer_uuid", a,
+                                "score_milli", 900, "certificate", cert);
+    static char COMMITTED_FN[] = "tx committed";
+    _dispatch(c.proc, c.alice, COMMITTED_FN, payload);
+    json_decref(payload);
+
+    c.proc->logger = NULL;
+    if (lg.file != NULL)
+        fclose(lg.file);
+    FILE *f = fopen(log_path, "r");
+    ck_assert_ptr_nonnull(f);
+    char line[1024];
+    int seen = 0;
+    while (fgets(line, sizeof(line), f) != NULL)
+        if (strstr(line, "does not meet our quorum (1 of 1 signature(s) verify, "
+                         "2 needed, no roster, group primary)") != NULL)
+            seen++;
+    fclose(f);
+    unlink(log_path);
+    ck_assert_int_eq(seen, 1);
+    tx_history_free(&c.src);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(RepCommitCert,
           test_the_designation_matches_python_byte_for_byte,
           test_a_retired_group_declaration_is_ignored,
           test_a_certificate_needs_its_half_and_travels_with_the_entry,
           test_a_quorum_checkpoint_covers_what_it_commits_to,
           test_a_checkpoint_the_segment_does_not_reproduce_covers_nothing,
-          test_an_entry_we_already_hold_is_not_asked_again)
+          test_an_entry_we_already_hold_is_not_asked_again,
+          test_a_refused_commit_says_how_far_short_it_fell)

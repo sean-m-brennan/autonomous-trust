@@ -125,10 +125,24 @@ class RedTeamHarness:
         """Bring a scenario's own compose up, let it run ``duration_s``, read
         the logs of the containers ``sim_config['collect_logs']`` names, and
         bring it down. Returns ``{'logs': {name: text}}`` for the scenario's
-        ``collect``. Needs docker on the host."""
+        ``collect``. Needs docker on the host.
+
+        A scenario whose containers write files names a placeholder in
+        ``compose_config['artifacts']`` and uses it as the host side of a
+        bind mount; the harness puts a fresh directory there and returns its
+        files as ``{'artifacts': {filename: text}}``."""
         import tempfile
-        doc = {k: v for k, v in compose_config.items() if k != 'standalone'}
+        placeholder = compose_config.get('artifacts')
+        doc = {k: v for k, v in compose_config.items()
+               if k not in ('standalone', 'artifacts')}
         with tempfile.TemporaryDirectory() as tmp:
+            art_dir = None
+            if placeholder:
+                art_dir = os.path.join(tmp, 'artifacts')
+                os.makedirs(art_dir)
+                os.chmod(art_dir, 0o777)
+                doc = json.loads(json.dumps(doc).replace(
+                    json.dumps(placeholder)[1:-1], art_dir))
             path = os.path.join(tmp, 'docker-compose.json')
             with open(path, 'w') as f:
                 json.dump(doc, f, indent=2)
@@ -144,7 +158,15 @@ class RedTeamHarness:
                         (getattr(out, 'stderr', '') or '')
             finally:
                 self._exec(base + ['down', '-v'], check=False)
-        return {'logs': logs}
+            if art_dir is None:
+                return {'logs': logs}
+            artifacts = {}
+            for name in sorted(os.listdir(art_dir)):
+                full = os.path.join(art_dir, name)
+                if os.path.isfile(full):
+                    with open(full, errors='replace') as f:
+                        artifacts[name] = f.read()
+        return {'logs': logs, 'artifacts': artifacts}
 
     def _run_simulation(self, quick: bool, timeout_s: int,
                         sim_config: dict, caldera: bool = False,
@@ -262,6 +284,9 @@ class RedTeamHarness:
         # regardless of convergence/reputation deltas.
         specific = attack_metrics.get('attack_specific') or {}
         if specific.get('identity_count_bounded') is False:
+            return 'FAIL'
+        # A scenario's own checks, by name, when it reports any that failed.
+        if specific.get('failed_checks'):
             return 'FAIL'
 
         return 'PASS'

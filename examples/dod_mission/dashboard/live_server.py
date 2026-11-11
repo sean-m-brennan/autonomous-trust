@@ -49,8 +49,9 @@ from autonomous_trust.inspector.dashboard.sensor_chart import (
     SensorComparisonChart,
 )
 from autonomous_trust.inspector.dashboard.narration import (
-    NarrationBlock, NarrationOverlay, STYLE_COLORS,
+    NarrationBlock, NarrationOverlay, style_colors,
 )
+from autonomous_trust.inspector.dashboard.theme import current as current_theme
 
 # Pure pause/auto-pause state machine, kept in a Dash-free sibling module so
 # the logic is unit-testable without standing up a server.
@@ -97,7 +98,7 @@ def _narration_div(block: Optional[NarrationBlock]) -> Any:
     """
     if block is None:
         return html.Div()
-    colors = STYLE_COLORS.get(block.style, STYLE_COLORS["default"])
+    colors = style_colors(block.style)
     children = [
         html.Div(block.text,
                  style={"fontSize": "16px",
@@ -130,6 +131,20 @@ def _narration_div(block: Optional[NarrationBlock]) -> Any:
         "backdropFilter": "blur(8px)",
         "textAlign": "center",
     })
+
+
+def _themed(children):
+    """Swap dark literals in the inline styles of rendered children (a
+    component or a list of them) for the current theme. The renderers below
+    write dark literals; dark returns them untouched. Only pass children
+    built from dark literals: the swap is not idempotent, so already-themed
+    colors (e.g. _narration_div's) would be remapped."""
+    th = current_theme()
+    if isinstance(children, (list, tuple)):
+        for child in children:
+            th.recolor_layout(child)
+        return children
+    return th.recolor_layout(children)
 
 
 def _render_status_bar(title: str, state: dict[str, Any]) -> list:
@@ -535,14 +550,14 @@ def make_app(name: str, title: str,
         # so the map and the other panels don't force mutual redraws.
         dcc.Interval(id="map-tick", interval=_MAP_TICK_MS, n_intervals=0),
     ]
-    app.layout = html.Div(
+    app.layout = _themed(html.Div(
         style={"backgroundColor": "#0F172A",
                "color": "#E2E8F0",
                "fontFamily": "Inter, system-ui, sans-serif",
                "padding": "12px",
                "minHeight": "100vh"},
         children=layout_children,
-    )
+    ))
 
     chart_outputs = [Output(gid, "figure") for gid in chart_graph_ids]
     # The Tactical Map (chart-0) is driven by its own callback/Interval (see
@@ -651,12 +666,14 @@ def make_app(name: str, title: str,
             cf.update_layout(width=map_w)
         pause_label = "▶ Resume" if is_paused else "⏸ Pause"
         return (
-            _render_status_bar(title, state),
+            _themed(_render_status_bar(title, state)),
             timeline_fig,
             *chart_figs,
-            map_legend,
-            _render_reputations(state),
+            _themed(map_legend),
+            _themed(_render_reputations(state)),
             event_log.to_dash_children(),
+            # Not _themed: style_colors() already picked this theme's colors,
+            # and recoloring light values would remap them as dark ones.
             narration_children,
             overlay_style,
             {"paused": is_paused, "auto_done": auto_done},
@@ -758,7 +775,7 @@ def make_app(name: str, title: str,
     )
     def _render_drawer(_n, selected_peer):
         if not selected_peer:
-            return _DRAWER_PLACEHOLDER
+            return _drawer_placeholder()
         # Read the snapshot _refresh cached this tick rather than calling
         # state_provider() again — that would advance the recording clock a
         # second time per tick and would defeat a paused demo.
@@ -1125,6 +1142,10 @@ def detection_log_for(state: dict[str, Any], peer_name: str) -> list:
     return out
 
 
+def _drawer_placeholder() -> str:
+    return current_theme().recolor_html(_DRAWER_PLACEHOLDER)
+
+
 _DRAWER_PLACEHOLDER = (
     '<!DOCTYPE html><html><body style="margin:0;padding:20px;'
     'background:#0B1220;color:#64748b;font-family:Inter,sans-serif;'
@@ -1146,7 +1167,7 @@ def _render_peer_drawer(state: dict[str, Any], peer_name: str) -> str:
             PeerDetailPanel, PeerDetailState, ReputationSnapshot,
         )
     except ImportError:
-        return _DRAWER_PLACEHOLDER
+        return _drawer_placeholder()
 
     # A pre-established peer that hasn't produced a consensus reputation yet
     # has a None score (the Reputations list shows "forming…" for it). Treat
@@ -1186,14 +1207,15 @@ def _render_peer_drawer(state: dict[str, Any], peer_name: str) -> str:
         detection=summary,
         detection_log=log,
     ))
-    return (
+    # Only the wrapper is recolored here: drawer_html is already themed, and
+    # a second pass would remap its light colors as if they were dark ones.
+    head = current_theme().recolor_html(
         '<!DOCTYPE html><html><head><style>'
         'body{margin:0;padding:8px;background:#0F172A;color:#E2E8F0;'
         'font-family:Inter,system-ui,sans-serif;font-size:12px}'
         '.mono{font-family:monospace}'
-        '</style></head><body>' + drawer_html
-        + _DRAWER_STATE_SCRIPT + '</body></html>'
-    )
+        '</style></head><body>')
+    return head + drawer_html + _DRAWER_STATE_SCRIPT + '</body></html>'
 
 
 # The drawer iframe's srcDoc is rebuilt every tick (1 s) to refresh live

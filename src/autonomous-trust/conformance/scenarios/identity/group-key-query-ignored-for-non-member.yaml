@@ -1,0 +1,67 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-key-query-ignored-for-non-member
+byte_pinning: false
+description: |
+    A group key query from a node that is not a member gets nothing.
+
+    member holds group G and holds outsider as a peer, but G does not list
+    outsider. outsider asks for G, and then asks naming another group; member
+    answers neither. The group carries its private key, so it goes only to a
+    member of that group.
+
+participants:
+  - id: member
+    role: group_member
+  - id: outsider
+    role: group_member
+
+fixtures:
+  groups:
+    member:
+      uuid: "0a000000-0000-4000-8000-000000000ab4"
+      size: 1
+      key_epoch: 2
+    outsider:
+      uuid: "0a000000-0000-4000-8000-000000000ab5"
+      size: 1
+      key_epoch: 0
+  holds:
+    member: [outsider]
+
+steps:
+  - id: 1
+    from: outsider
+    to: member
+    function: group_key_query
+    payload: {}
+    description: outsider asks for member's group G.
+
+  - id: 2
+    from: member
+    to: outsider
+    function: group_key_update
+    in_response_to: 1
+    expect_none: true
+    description: member does not answer a non-member.
+
+  - id: 3
+    from: outsider
+    to: member
+    function: group_key_query
+    payload:
+      other_group: true
+    description: outsider asks naming a group member does not hold.
+
+  - id: 4
+    from: member
+    to: outsider
+    function: group_key_update
+    in_response_to: 3
+    expect_none: true
+    description: Nothing for another group either.
+
+expected_state:
+  member:
+    group_key_epoch: 2

@@ -207,6 +207,13 @@ class _Participant:
                 if not ok:
                     raise AssertionError(f'{self.id}: place_promised={have!r}, '
                                          f'expected {expected!r}')
+            elif key == 'retained_count':
+                # Own entries held past the primary window.
+                actual = len(self.process.history.retained())
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: retained_count={actual}, '
+                        f'expected {expected}')
             elif key == 'committed_tx_count':
                 # Count of transactions resident in the hash-linked chain
                 # (== len(history) here). The C twin reads tx_history rather
@@ -833,6 +840,11 @@ class ReputationAdapter:
         # (AT_REP_N_MIN; RD_13.2 plan §0.4). Mirrors the C adapter, which sets
         # the variable for the participant a step is delivered to.
         preset_n_min: dict = fixtures.get('n_min', {}) or {}
+        # resolve_min_signers: {pid: N} -- the floor of verified, trusted
+        # co-signers a participant demands of a rep_resolved answer
+        # (AT_REP_RESOLVE_MIN_SIGNERS; RD_13.4 D5). Mirrors the C adapter,
+        # which sets the variable for the participant a step is delivered to.
+        preset_min_signers: dict = fixtures.get('resolve_min_signers', {}) or {}
         # attest_conflicts: [[pid, ...], ...] -- the teams whose members do not
         # witness for each other (ISSUES §2.54). Scenario-level: every node
         # holds the same set, as every node holding one verified team roster
@@ -942,6 +954,8 @@ class ReputationAdapter:
             # harness process was launched.
             participant.process.SLASH_ENABLED = preset_slash_enabled
             participant.process.N_MIN = preset_n_min.get(pid)
+            participant.process.RESOLVE_MIN_SIGNERS = int(
+                preset_min_signers.get(pid, 1))
 
             if pid in preset_checkpoint:
                 spec_ck = preset_checkpoint[pid]
@@ -1118,6 +1132,23 @@ class ReputationAdapter:
                 parse_join_policy(fixtures['join_policy'])
                 if fixtures.get('join_policy') is not None else INERT_JOIN_POLICY)
             participant.process._catchup_marks = {}
+            # lone_verdicts: {pid: [{task_id, subject, score}, ...]}, the
+            # verdicts held from this participant's own probes without the
+            # probed peer's half (lone probe verdicts, 2026-11-06), oldest
+            # first. Always reset, so nothing a case's config dir holds leaks
+            # in. Mirrors the C adapter.
+            from autonomous_trust.core.reputation.reputation import (
+                LoneVerdict, LoneVerdicts)
+            proc = participant.process
+            proc.lone_verdicts = LoneVerdicts(proc.history.max_chain_len)
+            for i, lv in enumerate((fixtures.get('lone_verdicts') or {})
+                                   .get(pid, [])):
+                if lv.get('subject') not in identities:
+                    continue
+                proc.lone_verdicts.add(LoneVerdict(
+                    uuid5(_NS, f"tx:{lv['task_id']}"),
+                    identities[lv['subject']].uuid, float(lv['score']),
+                    float(i)))
             # Phase 4 (RD_14.4): `catchup_told` {pid: [index, ...]} pre-marks
             # primary-chain entries as told; `anchored` {pid: [other, ...]}
             # is the AnchoredSet identity would have sent; `seeds`
@@ -1425,7 +1456,8 @@ class ReputationAdapter:
     def _place_value(self, participants, payload, base=None):
         """A placement value from its spec: {task_id, p1, p1_score, p2,
         p2_score} entries, each half certified by `cosigners` (default every
-        participant but the entry's two parties) unless `uncertified`, halves
+        participant but the entry's two parties) unless `uncertified`, under
+        the roster `cert_roster: [ids]` names when given, halves
         in canonical order unless `swap`, entries by task id unless the step
         says `unsorted`. Returns (entries, wire list). Mirrors the C adapter's
         _rp_place_value."""
@@ -1457,10 +1489,20 @@ class ReputationAdapter:
                     ia, half_designation(task, ia.uuid, ib.uuid, sa)),
                 str(ib.uuid): self._detached_sig(
                     ib, half_designation(task, ib.uuid, ia.uuid, sb))}
+            # cert_roster: [ids] names the roster both certificates were
+            # collected under.
+            named = None
+            if certs and isinstance(spec.get('cert_roster'), list):
+                from autonomous_trust.core.reputation.reputation import \
+                    roster_digest
+                d = roster_digest([self._roster_member(participants, m)
+                                   for m in spec['cert_roster']])
+                named = {str(ia.uuid): d, str(ib.uuid): d}
             tx = placement_entry(Transaction(task, p1_id=ia.uuid, p1_score_milli=sa,
                                              p2_id=ib.uuid, p2_score_milli=sb,
                                              commit_sigs=certs,
-                                             half_sigs=halves))
+                                             half_sigs=halves,
+                                             cert_rosters=named))
             if spec.get('swap'):
                 tx.p1_id, tx.p2_id = tx.p2_id, tx.p1_id
                 tx.p1_score_milli, tx.p2_score_milli = (tx.p2_score_milli,
@@ -1607,6 +1649,17 @@ class ReputationAdapter:
                         payload.get('channel'))),)
                 tup = tup + self._half_elements(participants, payload, to_id,
                                                 proposer_id, task_id, tup[2])
+                # cert_roster: the roster the certificate names, as element 9
+                # -- participant ids (their roster's digest) or a literal
+                # digest. Mirrors the C adapter.
+                named = payload.get('cert_roster')
+                if isinstance(named, list):
+                    from autonomous_trust.core.reputation.reputation import \
+                        roster_digest
+                    named = roster_digest([self._roster_member(participants, m)
+                                           for m in named])
+                if named is not None:
+                    tup = tup + (str(named),)
             obj = to_json_string(tup)
         elif function == ReputationProtocol.outdated:
             obj = str(payload.get('length', 0))

@@ -49,6 +49,7 @@
 
 static char TX_VERB[] = "transaction";
 static char ACCEPTED_VERB[] = "tx accepted";
+static char PLACE_REQUEST_VERB[] = "place request";
 
 /* What went out: `transaction` frames (recipient, group named) and
  * `tx accepted` replies. */
@@ -56,6 +57,8 @@ static int  g_tx;
 static char g_tx_to[8][UUID_STRING_LEN + 1];
 static char g_tx_group[UUID_STRING_LEN + 1];
 static int  g_accepted;
+static int  g_requests;
+static char g_request_to[8][UUID_STRING_LEN + 1];
 
 static int _hook(const char *key, const message_type_t type, generic_msg_t *msg,
                  bool blocking)
@@ -76,6 +79,11 @@ static int _hook(const char *key, const message_type_t type, generic_msg_t *msg,
         }
     } else if (strcmp(fn, ACCEPTED_VERB) == 0) {
         g_accepted++;
+    } else if (strcmp(fn, PLACE_REQUEST_VERB) == 0) {
+        if (g_requests < 8)
+            uuid_unparse_lower(msg->info.net_msg.to_whom.uuid,
+                               g_request_to[g_requests]);
+        g_requests++;
     }
     return 0;
 }
@@ -157,6 +165,7 @@ static void _begin(bool on)
 
     g_tx = 0;
     g_accepted = 0;
+    g_requests = 0;
     g_tx_group[0] = '\0';
     g_present = (double)time(NULL);
     messaging_set_test_hook(_hook);
@@ -295,10 +304,53 @@ DEFINE_TEST(test_the_scorers_read_the_cohort_chain)
     g_present += 1000.0;
     (void)reputation_rescore_sweep(g_proc, g_present, me->uuid);
     double v = 0.0;
+    /* Three cooperative entries: CTFT's shrunk standing, (2.7 + 0.6) / 6. */
     ck_assert_ret_ok(reputation_get_brought(ally->uuid, &v));
-    ck_assert_double_eq_tol(v, 0.9, 1e-3);
+    ck_assert_double_eq_tol(v, 0.55, 1e-3);
     ck_assert_ret_ok(reputation_get_bounded(ally->uuid, &v));
-    ck_assert_double_eq_tol(v, 0.9, 1e-3);
+    ck_assert_double_eq_tol(v, 0.55, 1e-3);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* Where @p who stands in instance @p k's takeover order: blake2b(uuid|k). */
+static void _rank_hash(const identity_t *who, int k, char out[33])
+{
+    char in[UUID_STRING_LEN + 24], u[UUID_STRING_LEN + 1];
+    unsigned char h[16];
+    uuid_unparse_lower(who->uuid, u);
+    snprintf(in, sizeof(in), "%s|%d", u, k);
+    crypto_generichash(h, sizeof(h), (const unsigned char *)in, strlen(in), NULL, 0);
+    sodium_bin2hex(out, 33, h, sizeof(h));
+}
+
+/* The cohort chain's rounds go to the cohort's members alone, and only they
+ * decide them. It used to treat the cohort's key as the primary chain's: its
+ * genesis listed every primary member, `other` (outside the cohort) took part
+ * in the takeover order, and a round asked `other` too. Here `other` outranks
+ * self and self outranks `ally` at instance 0, so self leads the cohort's
+ * genesis only when `other` is not counted. */
+DEFINE_TEST(test_a_cohort_placement_round_goes_to_the_members_only)
+{
+    for (int tries = 0;; tries++) {
+        ck_assert(tries < 200);
+        _begin(true);
+        char hm[33], ha[33], ho[33];
+        _rank_hash(me, 0, hm);
+        _rank_hash(ally, 0, ha);
+        _rank_hash(other, 0, ho);
+        if (strcmp(ho, hm) < 0 && strcmp(hm, ha) < 0)
+            break;
+        _end();
+    }
+    uuid_t task;
+    uuid_generate(task);
+    reputation_record_half_on(g_cohort, task, ally->uuid, 900, NULL, NULL);
+    reputation_maybe_place(g_proc);
+    ck_assert_int_eq(g_requests, 1);
+    char a[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(ally->uuid, a);
+    ck_assert_str_eq(g_request_to[0], a);
     _end();
 }
 END_TEST_DEFINITION()
@@ -309,4 +361,5 @@ RUN_TESTS(RepCohort,
           test_without_the_policy_nothing_routes_to_the_cohort,
           test_an_acceptor_checks_the_cohort_and_unknown_groups,
           test_without_the_policy_an_unknown_group_is_accepted_as_before,
-          test_the_scorers_read_the_cohort_chain)
+          test_the_scorers_read_the_cohort_chain,
+          test_a_cohort_placement_round_goes_to_the_members_only)

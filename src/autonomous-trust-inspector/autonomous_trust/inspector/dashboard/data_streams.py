@@ -35,6 +35,8 @@ from dash_extensions.enrich import html
 
 from autonomous_trust.services.data import Reading
 
+from .theme import current as current_theme
+
 
 @dataclass
 class StreamStatus:
@@ -119,10 +121,11 @@ class DataStreamsPanel:
         place rather than recreating the DOM node, which preserves the
         user's scroll position across the ``dcc.Interval`` cadence.
         """
+        th = current_theme()
         rows = []
         for key in sorted(self._streams.keys()):
             s = self._streams[key]
-            peer_color = self._peer_colors.get(s.peer_name, "#888")
+            peer_color = th.data(self._peer_colors.get(s.peer_name, "#888"))
             opacity = "1.0" if s.active else "0.4"
             strike = "line-through" if not s.active else "none"
             rows.append(html.Tr(
@@ -135,12 +138,12 @@ class DataStreamsPanel:
                     html.Td(s.rate_str, style={"textAlign": "right"}),
                     html.Td(f"{s.avg_quality:.0%}",
                             style={"textAlign": "center",
-                                   "color": s.quality_color}),
+                                   "color": th.data(s.quality_color)}),
                 ],
             ))
         header = html.Tr(
-            style={"color": "#94A3B8", "fontSize": "10px",
-                   "borderBottom": "1px solid #334155"},
+            style={"color": th.ui("#94A3B8"), "fontSize": "10px",
+                   "borderBottom": f"1px solid {th.ui('#334155')}"},
             children=[
                 html.Th("Peer",    style={"textAlign": "left"}),
                 html.Th("Type",    style={"textAlign": "left"}),
@@ -151,7 +154,7 @@ class DataStreamsPanel:
         )
         return [
             html.Div(f"Active Streams: {self.active_count}",
-                     style={"color": "#94A3B8", "fontSize": "10px",
+                     style={"color": th.ui("#94A3B8"), "fontSize": "10px",
                             "marginBottom": "4px"}),
             html.Table(
                 style={"width": "100%", "borderCollapse": "collapse"},
@@ -189,7 +192,7 @@ class DataStreamsPanel:
             '</tr>'
         )
 
-        return (
+        return current_theme().recolor_html(
             f'<div style="height:{height};overflow-y:auto;'
             f'background:#1E1E2E;padding:8px;border-radius:6px;'
             f'font-size:11px;font-family:monospace">'

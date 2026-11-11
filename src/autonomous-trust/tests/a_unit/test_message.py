@@ -380,3 +380,55 @@ class TestNormalizeToWhom:
                              from_whom=me).for_recipient(shape)
             assert type(fresh.to_whom) is type(copied.to_whom)
             assert fresh.to_whom == copied.to_whom
+
+
+class TestReverify:
+    """A signed frame from a sender the network did not yet hold arrives
+    unverified. The signature and its pre-image stay on the message so that,
+    once the sender is a known peer, the identity process can check it
+    against that peer's stored key: a node admitted during a key rotation
+    otherwise refuses every rotation it held (hostile-join run, 2026-11-03)."""
+
+    @staticmethod
+    def _unattributed(msg):
+        import json
+        wire = json.loads(bytes(msg).decode('utf-8'))
+        for key in [k for k in wire if k.startswith('from_')]:
+            del wire[key]
+        return Message.parse(json.dumps(wire).encode('utf-8'), None)
+
+    def test_an_unattributed_signed_frame_keeps_its_signature(self):
+        alice = _real_identity('alice')
+        parsed = self._unattributed(Message('identity', 'group_key_update', '{"a":1}',
+                                            from_whom=alice))
+        assert parsed.verified is False
+        assert parsed.wire_signature is not None and len(parsed.wire_signature) == 64
+        assert parsed.signed_content.startswith('identity|group_key_update|')
+
+    def test_reverify_against_the_sender_marks_it_verified(self):
+        alice = _real_identity('alice')
+        parsed = self._unattributed(Message('identity', 'group_key_update', '{"a":1}',
+                                            from_whom=alice))
+        assert parsed.reverify(alice) is True
+        assert parsed.verified is True
+
+    def test_reverify_against_anyone_else_leaves_it_unverified(self):
+        alice, mallory = _real_identity('alice'), _real_identity('mallory')
+        parsed = self._unattributed(Message('identity', 'group_key_update', '{"a":1}',
+                                            from_whom=alice))
+        assert parsed.reverify(mallory) is False
+        assert parsed.verified is False
+
+    def test_an_unsigned_frame_cannot_be_reverified(self):
+        alice = _real_identity('alice')
+        parsed = self._unattributed(Message('identity', 'group_key_update', '{"a":1}'))
+        assert parsed.wire_signature is None
+        assert parsed.reverify(alice) is False
+
+    def test_the_signature_survives_a_queue_hop(self):
+        import pickle
+        alice = _real_identity('alice')
+        parsed = self._unattributed(Message('identity', 'group_key_update', '{"a":1}',
+                                            from_whom=alice))
+        hopped = pickle.loads(pickle.dumps(parsed))
+        assert hopped.reverify(alice) is True

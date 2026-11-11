@@ -134,6 +134,9 @@ class BootstrapWorker(Process, metaclass=ProcMeta,
     DEFAULT_PAIRS_TARGET = 20
     #: Minimum seconds between continuous (post-window) probes.
     DEFAULT_PROBE_INTERVAL_SEC = 60.0
+    #: Re-probes of a suspect per suspicion: two failures hold it, so this
+    #: leaves room for one unanswered probe.
+    SUSPECT_REPROBES = 3
 
     def __init__(self, configurations: dict, subsystems, log_q,
                  dependencies: list[str] = None, **kwargs: Any) -> None:
@@ -220,6 +223,10 @@ class BootstrapWorker(Process, metaclass=ProcMeta,
         self._burst_budget = 0
         self._burst_spent = 0
         self._last_burst_at = None
+        # Suspects: peers whose latest probe failed, as reputation last
+        # listed them (uuid str -> re-probes issued in this suspicion).
+        self._suspects: dict[str, int] = {}
+        self._last_suspect_at = None
 
     @staticmethod
     def _read_float_env(name: str, default: float) -> float:
@@ -453,10 +460,15 @@ class BootstrapWorker(Process, metaclass=ProcMeta,
         """Take reputation's burst targets and their probe-verdict counts
         (ProbeCounts). The first listing a peer short of burst_k starts the
         burst over those peers, with a budget of burst_budget_factor·N·k; a
-        peer listed short while the burst runs joins it and adds factor·k.
+        peer listed short while the burst runs joins it and adds factor·k. A
+        peer first listed short after the burst ended opens it again the same
+        way: a joiner that knew one peer when the burst began, whose window
+        probes had already given that peer k verdicts, ended its burst within
+        a second and never probed the 32 peers it learned of next (hostile-join
+        n32, 2026-11-06). A target the burst already took does not reopen it.
         Mirrors C bootstrap_worker_note_probe_count."""
         policy = self.join_policy
-        if not policy.enabled or self._burst_state == 'done':
+        if not policy.enabled:
             return
         self._burst_verdicts = {str(u): int(n) for u, n in counts.items()}
         k = policy.burst_k
@@ -467,12 +479,13 @@ class BootstrapWorker(Process, metaclass=ProcMeta,
         for u in new:
             self._burst_issued[u] = 0
         self._burst_budget += policy.burst_budget_factor * k * len(new)
-        if self._burst_state == 'idle':
-            self._burst_state = 'active'
+        if self._burst_state != 'active':
             self.logger.info(
-                'BootstrapWorker: join burst over %d peer(s), k=%d, '
-                'budget=%d, interval=%.1fs', len(new), k,
-                self._burst_budget, policy.burst_interval_sec)
+                'BootstrapWorker: join burst %s %d peer(s), k=%d, '
+                'budget=%d, interval=%.1fs',
+                'over' if self._burst_state == 'idle' else 'reopened for',
+                len(new), k, self._burst_budget, policy.burst_interval_sec)
+            self._burst_state = 'active'
 
     def _burst_short(self, uuid_str: str) -> bool:
         """Whether burst target ``uuid_str`` still lacks burst_k verdicts. A
@@ -484,8 +497,9 @@ class BootstrapWorker(Process, metaclass=ProcMeta,
         """Issue one burst probe if the burst runs and its interval allows:
         to the held target with the fewest burst probes (lowest uuid on a
         tie) among those still short. A probe whose verdict never arrives is
-        retried while the budget lasts. Ends the burst, for good, when no
-        target is short or the budget is spent. True when it used this tick.
+        retried while the budget lasts. Ends the burst when no target is short
+        or the budget is spent, until a peer first listed short later opens it
+        again. True when it used this tick.
         Mirrors C _burst_tick."""
         if self._burst_state != 'active':
             return False
@@ -517,6 +531,49 @@ class BootstrapWorker(Process, metaclass=ProcMeta,
         self._burst_spent += 1
         return True
 
+    # --- Suspects ---------------------------------------------------------
+
+    def _note_suspects(self, suspects) -> None:
+        """Take reputation's suspects: the peers whose latest probe of ours
+        failed and that one more failure would hold below tier 1. A peer no
+        longer listed is cleared; one listed again starts a new suspicion.
+        Mirrors C bootstrap_worker_note_probe_count's suspect flag."""
+        if not self.join_policy.enabled:
+            return
+        listed = {str(u) for u in suspects}
+        self._suspects = {u: self._suspects.get(u, 0) for u in listed}
+
+    def _suspect_tick(self, queues: dict) -> bool:
+        """Probe a suspect again, at most SUSPECT_REPROBES times a suspicion,
+        one per burst_interval_sec: the held suspect with the fewest
+        re-probes (lowest uuid on a tie). Waiting its turn at one probe a
+        minute among every peer, a gamer that turned on its known answers
+        met two to five probes in eleven minutes and kept its tier (red-team
+        batch, 2026-11-10). True when it used this tick. Mirrors C
+        _suspect_tick."""
+        if not self.join_policy.enabled:
+            return False
+        pending = {u for u, n in self._suspects.items()
+                   if n < self.SUSPECT_REPROBES}
+        if not pending:
+            return False
+        current = now()
+        if self._last_suspect_at is not None and (
+                current - self._last_suspect_at).total_seconds() \
+                < self.join_policy.burst_interval_sec:
+            return False
+        held = [p for p in list(self.peers.all)
+                if str(getattr(p, 'uuid', '')) in pending]
+        if not held:
+            return False
+        target = min(held, key=lambda p: (self._suspects[str(p.uuid)],
+                                          str(p.uuid)))
+        self._last_suspect_at = current
+        if not self._try_issue_probe(queues, target):
+            return True
+        self._suspects[str(target.uuid)] += 1
+        return True
+
     def _drain(self, queues: dict) -> None:
         """Apply what the worker is sent: the peer list (identity's Peers)
         and the join burst's counts (reputation's ProbeCounts). Everything
@@ -533,6 +590,7 @@ class BootstrapWorker(Process, metaclass=ProcMeta,
                 self.peers = message
             elif isinstance(message, ProbeCounts):
                 self._note_probe_counts(message.counts)
+                self._note_suspects(getattr(message, 'suspects', ()))
 
     def _tick(self, queues: dict) -> None:
         """One pass of the worker's main loop: open window when peers
@@ -541,6 +599,8 @@ class BootstrapWorker(Process, metaclass=ProcMeta,
         due, takes the tick."""
         self._drain(queues)
         if self._burst_tick(queues):
+            return
+        if self._suspect_tick(queues):
             return
         if self._window_start is None:
             if list(self.peers.all):

@@ -39,6 +39,8 @@ from typing import Optional
 
 import plotly.graph_objects as go
 
+from .theme import current as current_theme
+
 
 # Earth radius in km for the haversine-based offsets used by
 # range circles. WGS-84 mean; precise enough for visual radii up
@@ -748,27 +750,38 @@ class AgencyMap:
 
         if self._use_tiles:
             layout["map"] = dict(
-                style=os.environ.get("MAPBOX_STYLE", "dark"),
+                # An explicit MAPBOX_STYLE wins; otherwise the theme's.
+                style=(os.environ.get("MAPBOX_STYLE")
+                       or current_theme().mapbox_style),
                 center=dict(lat=_PNW_CENTER[0], lon=_PNW_CENTER[1]),
                 zoom=_PNW_DEFAULT_ZOOM,
             )
         else:
             layout["geo"] = dict(
-                scope="usa",
-                projection=dict(type="albers usa"),
+                # Plotly 7 (plotly.js 3) ignores fitbounds under "albers
+                # usa" and draws the whole lower 48 with the peers packed
+                # into one corner. Mercator fits in plotly 6 and 7, and the
+                # North America scope still draws state lines ("usa" would
+                # force albers usa back).
+                scope="north america",
+                projection=dict(type="mercator"),
                 showland=True,
                 landcolor=self._style.land_color,
                 bgcolor=self._style.paper_bg,
                 subunitcolor=self._style.country_color,
                 showcountries=False,
                 showsubunits=True,
-                center=dict(lat=_PNW_CENTER[0], lon=_PNW_CENTER[1]),
-                # Fit bounds to the peer cluster if present.
+                # Fit bounds to the peer cluster if present; with no peers
+                # the view opens on the PNW.
                 fitbounds="locations" if self._peers else None,
+                center=(None if self._peers else
+                        dict(lat=_PNW_CENTER[0], lon=_PNW_CENTER[1])),
             )
 
         fig.update_layout(**layout)
-        return fig
+        # Built with dark literals (MapStyle defaults included); the theme
+        # swaps them so the light map needs no second set of draw code.
+        return current_theme().recolor_figure(fig)
 
 
 # ----------------------------------------------------------------------

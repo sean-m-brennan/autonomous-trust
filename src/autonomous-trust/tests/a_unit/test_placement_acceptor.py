@@ -24,6 +24,7 @@ learner writes a placement only on a quorum certificate over the placement's
 designation after its own head.
 """
 import os
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
@@ -450,6 +451,23 @@ class TestPropose:
         _grant(rp, q, four[1], req, accepted=reported)
         place = _only(_grant(rp, q, four[2], req), ReputationProtocol.place)
         assert place['value'] == _value(theirs)
+
+    def test_a_value_we_cannot_carry_is_dropped_with_its_reason(self, four):
+        # Hostile-join run, 2026-11-04: a joiner dropped 14,340 rounds in eight
+        # minutes on this path, and the log never said why.
+        me = four[0]
+        rp, q = _placing(me, four)
+        theirs = _entry(four, four[2], four[3])
+        req = _start(rp, q)
+        reported = {'ballot': {'n': 1, 'by': str(four[3].uuid).lower()},
+                    'value': _value(theirs, theirs)}
+        _grant(rp, q, four[1], req, accepted=reported)
+        rp.logger = MagicMock()
+        assert _grant(rp, q, four[2], req) == []
+        [line] = [c.args[0] % c.args[1:] for c in rp.logger.warning.call_args_list
+                  if 'value to carry' in c.args[0]]
+        assert 'not one of each task, by task id' in line
+        assert str(four[3].uuid).lower()[:8] in line
 
     def test_a_nack_ends_the_round_and_the_next_outranks_it(self, four):
         me = four[0]

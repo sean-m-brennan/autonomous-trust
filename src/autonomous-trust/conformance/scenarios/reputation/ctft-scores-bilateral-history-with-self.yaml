@@ -19,9 +19,14 @@ description: |
         t-b1: subject is p1 (gave bob 0.8), bob is p2 (gave subject 0.9)
         t-b2: bob is p1 (gave subject 0.9), subject is p2 (gave bob 0.7)
 
-    subject's standing is what bob gave it, [0.9, 0.9], last 0.9 >= 0.5
-    (cooperated), so score = max(0.51, 0.9) = 0.9. With the scorer's uuid
-    lost, neither transaction is bilateral and the prior answers instead.
+    subject's standing is what bob gave it, [0.9, 0.9], shrunk toward the 0.2
+    neutral by a pseudo-count of 3: (1.8 + 0.6) / 5 = 0.48. subject scored
+    bob 0.8 and 0.7, so it never defected. With the scorer's uuid lost,
+    neither transaction is bilateral and the prior answers instead.
+
+    Re-pinned 2026-11-04: the rule took the plain mean with a 0.51 floor,
+    max(0.51, 0.9) = 0.9, which carried an honest joiner to tier 4 on a few
+    transactions in the hostile-join run.
 
     Re-pinned 2026-10-26 (RD_14.4 plan, Phase 4): CTFT read the peer's OWN
     submitted score as its standing ([0.8, 0.7], 0.75), so a peer's
@@ -73,4 +78,4 @@ steps:
 expected_state:
   bob:
     reputation_of:
-      subject: 0.9
+      subject: 0.48

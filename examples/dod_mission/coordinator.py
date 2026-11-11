@@ -617,6 +617,11 @@ class DoDMissionCoordinator(TransitiveTrustMixin, AutonomousTrust):
 
         # Panel components — built once, fed incrementally below and
         # rendered each tick by the Dash live server.
+        # Dashboard colors come from AT_THEME (run-demo.sh --theme, forwarded
+        # by the compose/k8s generators); unset or invalid means dark.
+        from autonomous_trust.inspector.dashboard import theme
+        theme.set_theme(theme.resolve_theme(None,
+                                            os.environ.get(theme.THEME_ENV)))
         self._panels = build_dashboard(scenario)
 
         # silent=False so logger output goes to stdout (and thus docker

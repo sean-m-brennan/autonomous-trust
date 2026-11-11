@@ -184,6 +184,28 @@ void identity_set_configured_group(const group_t *g, json_t *steps);
  *  phase 3 (ISSUES §2.18); past it the oldest is dropped. */
 #define ID_HELD_GROUP_UPDATES 16
 
+/** Catching up on the group key (doc/architecture/identity-protocol.md). A node
+ *  admitted while the cohort rotates can end behind on the key, and the
+ *  cohort, seeing it as a member, never resends (hostile-join run,
+ *  2026-11-03). It asks with group_key_query: a few members once phase 3
+ *  settles, and the sender of any group frame that will not open
+ *  (group_key_stale from the network process). A member answers a member it
+ *  holds with an ordinary group_key_update, taken through the same verified
+ *  gate as any other. Mirrors Python IdentityProcess._KEY_*. */
+#define ID_KEY_PULL_SETTLE_SEC     1.0   /* after phase 3, for the history's peers */
+#define ID_KEY_PULL_FANOUT         3     /* members asked on reaching phase 3 */
+#define ID_KEY_QUERY_COOLDOWN_SEC  10.0  /* per member asked */
+#define ID_KEY_ANSWER_COOLDOWN_SEC 5.0   /* per asker answered */
+#define ID_KEY_MARKS               32    /* cooldown entries kept per direction */
+
+/** Ask a few held members for the current group @p delay_sec from now
+ *  (identity_run calls it on reaching phase 3). */
+void identity_schedule_key_pull(double delay_sec);
+
+/** Once the scheduled pull is due and we are in phase 3, ask up to
+ *  ID_KEY_PULL_FANOUT held members, once; returns how many were asked. */
+size_t identity_maybe_pull_key(const process_t *proc);
+
 /** Replay, in arrival order, the group updates held because they arrived
  *  before phase 3, and forget them. identity_run calls it the moment it enters
  *  phase 3; returns how many were replayed. */
@@ -574,9 +596,6 @@ int identity_request_cohort_join(process_t *proc, directory_t *queues,
  *  surface for tests. */
 bool identity_join_pending(const char *group_uuid);
 
-/** Seed a child cohort this node gateways (C twin of Python child_groups
- *  seeding). @p gateway_uuid names the deeper gateway to recurse into for that
- *  child group (NULL for a 2-level gateway). Returns 0 on success. */
 /** Whether @p grp as our primary group would span the gateway: it is one of
  *  our child groups, or lists an address one of them holds (our own entries
  *  aside). Every primary adopt checks it, so invariant G holds on the result
@@ -607,6 +626,9 @@ long identity_join_wait_us(long init_us);
 void identity_resend_welcomes_at(const process_t *proc, directory_t *queues,
                                  double now);
 
+/** Seed a child cohort this node gateways (C twin of Python child_groups
+ *  seeding). @p gateway_uuid names the deeper gateway to recurse into for that
+ *  child group (NULL for a 2-level gateway). Returns 0 on success. */
 int identity_add_child_group(process_t *proc, group_t *group,
                              const char *gateway_uuid);
 

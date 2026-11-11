@@ -53,6 +53,7 @@
 static char ACCEPTED_FN[] = "tx accepted";
 
 #define TX_VERB      "transaction"
+static char TX_FN[] = TX_VERB;
 
 /* Far enough past any default timeout to make "overdue" unambiguous. */
 #define LATER(n) ((double)time(NULL) + 60.0 * (n))
@@ -217,6 +218,59 @@ static void _propose(cohort_t *c)
     _forward_transaction(c->proc, c->task, c->me->uuid, 0.9, "agora-post",
                          NULL, subject, 0.0);
 }
+
+/* `proposer` sends us its own half of `task` under ballot `id1` at `slot`, as
+ * the other party to a handshake does: both halves of a task carry the same
+ * task uuid. */
+static void _send_tx(process_t *proc, identity_t *proposer, int64_t id1,
+                     int64_t slot, const uuid_t task)
+{
+    char proposer_str[UUID_STRING_LEN + 1], task_str[UUID_STRING_LEN + 1];
+    char group[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(proposer->uuid, proposer_str);
+    uuid_unparse_lower(task, task_str);
+    uuid_unparse_lower(proc->protocol.group.uuid, group);
+    json_t *p = json_object();
+    json_object_set_new(p, "id1", json_integer(id1));
+    json_object_set_new(p, "id2", json_integer(slot));
+    json_object_set_new(p, "peer_uuid", json_string(proposer_str));
+    json_object_set_new(p, "score_milli", json_integer(800));
+    json_object_set_new(p, "task_uuid", json_string(task_str));
+    json_object_set_new(p, "certify", json_true());
+    json_object_set_new(p, "group", json_string(group));
+    _dispatch(proc, proposer, TX_FN, p);
+    json_decref(p);
+}
+
+/* THE REGRESSION (fleet-32, 2026-11-09): alice's half of the same handshake
+ * reached us between our proposal and its acceptance. Recording its weight
+ * refreshed the task's entry, and the refresh dropped whom OUR half names, so
+ * every acceptance of ours found "it names nobody" and refused to commit; all
+ * five re-proposals met alice's re-proposals the same way, and the half was
+ * given up. */
+DEFINE_TEST(test_the_counterpart_half_does_not_unname_ours)
+{
+    _begin();
+    cohort_t c;
+    _cohort(&c);
+    _propose(&c);
+    int64_t id1 = g_req_id1, id2 = g_req_id2;
+    char me_str[UUID_STRING_LEN + 1];
+    at_strlcpy(me_str, g_req_peer_uuid, sizeof(me_str));
+
+    _send_tx(c.proc, c.alice, id1 + 1, id2 + 1, c.task);
+
+    g_req_id1 = id1;
+    g_req_id2 = id2;
+    at_strlcpy(g_req_peer_uuid, me_str, sizeof(g_req_peer_uuid));
+    _accept(c.proc, c.alice, c.task, c.task_str);
+    _accept(c.proc, c.bob, c.task, c.task_str);
+    uuid_t pooled[4];
+    ck_assert_int_eq(reputation_get_pool_tasks(pooled, 4), 1);
+    ck_assert_uint_eq(reputation_awaiting_commit_count(), 0);
+    _end();
+}
+END_TEST_DEFINITION()
 
 /* THE REGRESSION (part-3490610): the transaction went out and was never
  * accepted. Before, nothing ever looked at it again. */
@@ -567,6 +621,7 @@ END_TEST_DEFINITION()
 
 RUN_TESTS(RepCommitRetry,
           test_an_unaccepted_half_is_re_proposed,
+          test_the_counterpart_half_does_not_unname_ours,
           test_a_committed_half_is_left_alone,
           test_an_exhausted_half_is_parked_not_dropped,
           test_a_parked_half_is_re_proposed_every_park_retry,
