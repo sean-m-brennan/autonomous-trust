@@ -127,11 +127,10 @@ DEFINE_TEST(test_reputation_contrite_tft)
     ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 900, NULL));
 
     score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
-    /* One cooperative direct interaction: peer_standing = 0.8 (what we gave
-     * it), my_standing = 0.9 (what it gave us), peer_last = 0.8 (not < 0.5).
-     * Falls into the cooperate/cooperate branch which returns
-     * max(0.51, peer_standing). Mirrors Python _contrite_tit_for_tat. */
-    ck_assert_double_eq_tol(score, 0.8, 0.001);
+    /* One cooperative direct interaction: what we gave it (0.8) shrunk
+     * toward the neutral prior, (0.8 + 3 * 0.2) / 4 = 0.35. Mirrors Python
+     * _contrite_tit_for_tat. */
+    ck_assert_double_eq_tol(score, 0.35, 0.001);
 
     tx_history_free(&hist);
     reputations_free(&reps);
@@ -162,17 +161,18 @@ DEFINE_TEST(test_reputation_contrite_tft_cooperative_self_p2)
     ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 800, NULL));  /* self → p2 */
 
     double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
-    ck_assert_double_eq_tol(score, 0.8, 0.001);
+    ck_assert_double_eq_tol(score, 0.35, 0.001);
 
     tx_history_free(&hist);
     reputations_free(&reps);
 }
 END_TEST_DEFINITION()
 
-DEFINE_TEST(test_reputation_contrite_tft_retaliation)
+DEFINE_TEST(test_reputation_contrite_tft_our_low_score_is_its_record)
 {
-    /* Peer defected on last tx (peer_last < 0.5) and self's standing
-     * is good → retaliation branch → min(0.49, peer_standing). */
+    /* We scored the peer 0.2 on the last tx and it rated us well both times:
+     * a defection is the peer's score of us, so there is none, and its
+     * standing is our scores shrunk toward neutral. */
     tx_history_t hist;
     reputations_t reps;
     ck_assert_ret_ok(tx_history_init(&hist));
@@ -192,19 +192,18 @@ DEFINE_TEST(test_reputation_contrite_tft_retaliation)
     ck_assert_ret_ok(tx_history_update(&hist, t2, peer_id, 900, NULL));
 
     double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
-    /* peer_standing = (0.8 + 0.2)/2 = 0.5; my_standing = 0.9.
-     * peer_last < 0.5, my_standing >= 0.5 → min(0.49, 0.5) = 0.49. */
-    ck_assert_double_eq_tol(score, 0.49, 0.001);
+    /* (0.8 + 0.2 + 3 * 0.2) / 5 = 0.32. */
+    ck_assert_double_eq_tol(score, 0.32, 0.001);
 
     tx_history_free(&hist);
     reputations_free(&reps);
 }
 END_TEST_DEFINITION()
 
-DEFINE_TEST(test_reputation_contrite_tft_contrition)
+DEFINE_TEST(test_reputation_contrite_tft_repeat_defection_has_no_floor)
 {
-    /* Peer defected on last tx but my own standing is also poor →
-     * contrition branch → max(0.51, peer_standing). */
+    /* The peer scored us low twice running: a repeat defection, held at
+     * min(0.49, standing). There is no 0.51 floor any more. */
     tx_history_t hist;
     reputations_t reps;
     ck_assert_ret_ok(tx_history_init(&hist));
@@ -223,9 +222,8 @@ DEFINE_TEST(test_reputation_contrite_tft_contrition)
     ck_assert_ret_ok(tx_history_update(&hist, t2, peer_id, 200, NULL));
 
     double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
-    /* peer_standing = (0.3 + 0.4)/2 = 0.35; my_standing = 0.2.
-     * peer_last < 0.5, my_standing < 0.5 → max(0.51, 0.35) = 0.51. */
-    ck_assert_double_eq_tol(score, 0.51, 0.001);
+    /* (0.3 + 0.4 + 3 * 0.2) / 5 = 0.26, below the 0.49 cap. */
+    ck_assert_double_eq_tol(score, 0.26, 0.001);
 
     tx_history_free(&hist);
     reputations_free(&reps);
@@ -959,8 +957,8 @@ RUN_TESTS(Reputation3, test_tx_history_json_roundtrip,
           test_tx_catchup_skips_entries_already_held, test_tx_two_peer_transaction,
           test_reputation_contrite_tft,
           test_reputation_contrite_tft_cooperative_self_p2,
-          test_reputation_contrite_tft_retaliation,
-          test_reputation_contrite_tft_contrition,
+          test_reputation_contrite_tft_our_low_score_is_its_record,
+          test_reputation_contrite_tft_repeat_defection_has_no_floor,
           test_reputation_contrite_tft_third_party_informs_prior,
           test_reputation_pure_with_counterparty,
           test_reputation_pure_unknown_counterparty_default_0_5,

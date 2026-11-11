@@ -1,0 +1,55 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: ctft-first-defection-forgiven
+byte_pinning: false
+description: |
+    Contrite tit-for-tat forgives a first defection. bob gave subject 0.9 in
+    each of six transactions; subject scored bob 0.9 five times and then
+    0.2. A defection is the peer's score of the scorer below 0.5, and this is
+    the first, so subject reads its standing: bob's 0.9s shrunk toward the
+    0.2 neutral by a pseudo-count of 3, (5.4 + 0.6) / 9 = 0.6667.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: oracle
+  - id: subject
+    role: subject
+
+fixtures:
+  tx_history:
+    bob:
+      - {task_id: t-1, p1: bob, p1_score: 0.9, p2: subject, p2_score: 0.9}
+      - {task_id: t-2, p1: subject, p1_score: 0.9, p2: bob, p2_score: 0.9}
+      - {task_id: t-3, p1: bob, p1_score: 0.9, p2: subject, p2_score: 0.9}
+      - {task_id: t-4, p1: subject, p1_score: 0.9, p2: bob, p2_score: 0.9}
+      - {task_id: t-5, p1: bob, p1_score: 0.9, p2: subject, p2_score: 0.9}
+      - {task_id: t-6, p1: subject, p1_score: 0.2, p2: bob, p2_score: 0.9}
+
+  reputations:
+    bob:
+      # Below COOP_ENTER (0.55): the CTFT branch.
+      subject: 0.2
+
+  coop_mode:
+    bob:
+      subject: false
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: request reputation
+    payload:
+      target: subject
+      proc: negotiation
+    description: |
+        alice asks bob for subject's reputation; bob scores it by CTFT over
+        the six transactions it took part in.
+
+expected_state:
+  bob:
+    reputation_of:
+      subject: 0.6667

@@ -1,0 +1,10 @@
+# Buildroot runs "systemctl preset-all" when it assembles the rootfs; units
+# not enabled here are disabled by systemd's catch-all preset.
+enable autonomous-trust.service
+enable at-wifi.service
+enable systemd-networkd.service
+enable systemd-resolved.service
+enable systemd-timesyncd.service
+# The WPA package's own preset enables its D-Bus service; at-wifi.service runs
+# wpa_supplicant directly, so the D-Bus one would only be an idle daemon
+disable wpa_supplicant.service

@@ -379,6 +379,17 @@ int dag_ingest_branch(step_dag_t *dag, linked_step_t **steps, size_t count,
 }
 
 /* Frama-C: skipped — [recursive-ds] tree diff with complex control flow */
+/* Whether a and b are one step. A step received from a peer is a new object
+ * with the sender's uuid, so equal pointers are not enough. */
+static bool _same_step(const linked_step_t *a, const linked_step_t *b)
+{
+    if (a == b)
+        return true;
+    if (a == NULL || b == NULL || a->uuid[0] == '\0')
+        return false;
+    return strncmp(a->uuid, b->uuid, DAG_UUID_LEN) == 0;
+}
+
 int dag_diff(step_dag_t *dag, const char *branch, const char *target,
              int *idx_out, linked_step_t **common_root)
 {
@@ -398,19 +409,16 @@ int dag_diff(step_dag_t *dag, const char *branch, const char *target,
     int t_size = (int)array_size(t_list);
     int shorter = b_size < t_size ? b_size : t_size;
 
+    /* idx is the length of the shared prefix: where the lists first differ,
+     * or the whole shorter list when one extends the other. The root is the
+     * target's own copy, so a merged chain continues from local steps. */
     linked_step_t *root = (linked_step_t *)&dag_genesis;
     int idx = 0;
-    for (idx = 0; idx < shorter; idx++)
-    {
-        linked_step_t *b_step = _get_step_from_list(b_list, idx);
-        linked_step_t *t_step = _get_step_from_list(t_list, idx);
-        if (b_step != t_step)
-        {
-            if (idx > 0)
-                root = _get_step_from_list(b_list, idx - 1);
-            break;
-        }
-    }
+    while (idx < shorter && _same_step(_get_step_from_list(b_list, idx),
+                                       _get_step_from_list(t_list, idx)))
+        idx++;
+    if (idx > 0)
+        root = _get_step_from_list(t_list, idx - 1);
 
     if (idx_out != NULL)
         *idx_out = idx;
@@ -426,7 +434,7 @@ int dag_diff(step_dag_t *dag, const char *branch, const char *target,
   ensures \result == -1 || \result == 0 || \result == 1;
 */
 /* A step and where it stood before sorting: qsort is not stable, and steps
- * stamped in the same second compare equal. glibc's qsort happens to keep
+ * with the same stamp compare equal. glibc's qsort happens to keep
  * equal elements in order; the Windows CRT's does not, so two nodes merging
  * the same branches built different chains. Equal stamps now keep their
  * original order on every platform (what glibc gave). */
@@ -441,10 +449,9 @@ static int _cmp_steps_by_timestamp(const void *a, const void *b)
 {
     const positioned_step_t *pa = a;
     const positioned_step_t *pb = b;
-    time_t ta = mktime((struct tm *)&pa->step->timestamp);
-    time_t tb = mktime((struct tm *)&pb->step->timestamp);
-    if (ta < tb) return -1;
-    if (ta > tb) return 1;
+    int order = datetime_compare(&pa->step->timestamp, &pb->step->timestamp);
+    if (order != 0)
+        return order;
     return (pa->pos > pb->pos) - (pa->pos < pb->pos);
 }
 
@@ -481,11 +488,29 @@ int dag_merge(step_dag_t *dag, const char *branch, const char *target, bool keep
         return ENOMEM;
     }
 
+    /* A step both lists hold past the divergence (each node recorded its own
+     * steps first) is kept once, as the target's copy. */
     int n = 0;
-    for (int i = idx; i < b_size; i++, n++)
-        order[n] = (positioned_step_t){_get_step_from_list(b_list, i), n};
+    for (int i = idx; i < b_size; i++)
+    {
+        linked_step_t *b_step = _get_step_from_list(b_list, i);
+        bool held = false;
+        for (int j = idx; j < t_size && !held; j++)
+            held = _same_step(b_step, _get_step_from_list(t_list, j));
+        if (!held)
+        {
+            order[n] = (positioned_step_t){b_step, n};
+            n++;
+        }
+    }
     for (int i = idx; i < t_size; i++, n++)
         order[n] = (positioned_step_t){_get_step_from_list(t_list, i), n};
+    if (n == 0)
+    {
+        free(sorted);
+        free(order);
+        return 0;
+    }
 
     qsort(order, n, sizeof(positioned_step_t), _cmp_steps_by_timestamp);
     for (int i = 0; i < n; i++)
@@ -624,7 +649,7 @@ int dag_recite(step_dag_t *dag, const char *branch, linked_step_t *root,
         return err;
 
     linked_step_t *step = head;
-    while (!_is_genesis(step) && step != root)
+    while (!_is_genesis(step) && !_same_step(step, root))
     {
         data_t *val = object_ptr_data(step, sizeof(linked_step_t));
         if (val == NULL)
@@ -634,7 +659,7 @@ int dag_recite(step_dag_t *dag, const char *branch, linked_step_t *root,
             return err;
         step = step->parent;
     }
-    if (root != NULL && !_is_genesis(root) && step == root)
+    if (root != NULL && !_is_genesis(root) && _same_step(step, root))
     {
         data_t *val = object_ptr_data(step, sizeof(linked_step_t));
         if (val != NULL)

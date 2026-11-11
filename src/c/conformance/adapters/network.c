@@ -39,6 +39,7 @@
 #include "rendezvous/net_relay_rosters.h"
 #endif
 #include "processes/plaintext_verbs.h"
+#include "config/deployment_manifest.h"
 
 #include "../negative_runner.h"
 #include "../jcs.h"
@@ -3050,6 +3051,118 @@ static int run_plaintext_verbs_file(const at_case_t *c, char *err, size_t err_le
     return 0;
 }
 
+/* The rules of the deployment manifest (scenario `deployment-manifest`,
+ * RD_13.4 §3.3): each row is applied over the baseline through the production
+ * loader. An accepted row's gateway-pair counts must match; a refused row must
+ * leave the baseline in force. Mirrors Python _run_deployment_manifest. */
+static int _dm_write(const char *path, const json_t *row)
+{
+    json_t *text = json_object_get(row, "text");
+    if (json_is_string(text)) {
+        FILE *fh = fopen(path, "w");
+        if (fh == NULL)
+            return -1;
+        fputs(json_string_value(text), fh);
+        return fclose(fh);
+    }
+    return json_dump_file(json_object_get(row, "manifest"), path, 0);
+}
+
+static int run_deployment_manifest(const at_case_t *c, char *err, size_t err_len) {
+    json_t *fx = json_object_get(c->data, "fixtures");
+    json_t *rows = fx ? json_object_get(fx, "rows") : NULL;
+    const char *base_node = fx ? json_string_value(json_object_get(fx, "baseline_node")) : NULL;
+    if (!json_is_array(rows) || json_array_size(rows) == 0 || base_node == NULL) {
+        snprintf(err, err_len, "scenario: fixtures.rows or baseline_node missing");
+        return -1;
+    }
+    const char *tmp = getenv("TMPDIR");
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/at_dm_XXXXXX", tmp != NULL && tmp[0] ? tmp : "/tmp");
+    if (mkdtemp(dir) == NULL) {
+        snprintf(err, err_len, "adapter: cannot make a scratch dir");
+        return -1;
+    }
+    char base_path[600], row_path[600], absent[600];
+    snprintf(base_path, sizeof(base_path), "%s/baseline.json", dir);
+    snprintf(row_path, sizeof(row_path), "%s/row.json", dir);
+    snprintf(absent, sizeof(absent), "%s/absent.json", dir);
+    char *saved = getenv(DEPLOYMENT_MANIFEST_ENV) != NULL
+                      ? strdup(getenv(DEPLOYMENT_MANIFEST_ENV)) : NULL;
+    unsetenv(DEPLOYMENT_MANIFEST_ENV);
+
+    int rc = 0;
+    bool all_match = true, keeps_previous = true;
+    if (json_dump_file(json_object_get(fx, "baseline"), base_path, 0) != 0) {
+        snprintf(err, err_len, "adapter: cannot write the baseline");
+        rc = -1;
+    }
+    size_t i;
+    json_t *row;
+    json_array_foreach(rows, i, row) {
+        if (rc != 0)
+            break;
+        deployment_manifest_reset();
+        if (deployment_manifest_configure(base_path, NULL) != 0) {
+            snprintf(err, err_len, "adapter: the baseline did not load");
+            rc = -1;
+            break;
+        }
+        const char *source = json_string_value(json_object_get(row, "source"));
+        const char *path = NULL;
+        if (source != NULL && strcmp(source, "unset") == 0) {
+            unsetenv(DEPLOYMENT_MANIFEST_ENV);
+        } else if (source != NULL && strcmp(source, "missing") == 0) {
+            setenv(DEPLOYMENT_MANIFEST_ENV, absent, 1);
+        } else {
+            if (_dm_write(row_path, row) != 0) {
+                snprintf(err, err_len, "adapter: cannot write a row");
+                rc = -1;
+                break;
+            }
+            path = row_path;
+        }
+        bool refused = deployment_manifest_configure(path, NULL) != 0;
+        unsetenv(DEPLOYMENT_MANIFEST_ENV);
+        const deployment_manifest_t *active = deployment_manifest_active();
+        if (refused && deployment_manifest_gateway_pairs(active, base_node) != 1)
+            keeps_previous = false;
+        bool pairs_ok = true;
+        json_t *want = json_object_get(row, "expect_pairs");
+        const char *node;
+        json_t *n;
+        json_object_foreach(want, node, n) {
+            if (deployment_manifest_gateway_pairs(active, node)
+                != (size_t)json_integer_value(n))
+                pairs_ok = false;
+        }
+        bool want_refused = json_is_true(json_object_get(row, "expect_refused"));
+        if (refused != want_refused || (!refused && !pairs_ok)) {
+            all_match = false;
+            const char *id = json_string_value(json_object_get(row, "id"));
+            snprintf(err, err_len, "%s: refused=%s pairs_ok=%s, want refused=%s",
+                     id != NULL ? id : "?", refused ? "true" : "false",
+                     pairs_ok ? "true" : "false", want_refused ? "true" : "false");
+            rc = -1;
+        }
+    }
+    deployment_manifest_reset();
+    unlink(base_path);
+    unlink(row_path);
+    rmdir(dir);
+    if (saved != NULL) {
+        setenv(DEPLOYMENT_MANIFEST_ENV, saved, 1);
+        free(saved);
+    }
+    if (rc != 0)
+        return rc;
+    if (expect_flag(c, "node", "all_rows_match", all_match, err, err_len) != 0 ||
+        expect_flag(c, "node", "a_refusal_keeps_the_previous_manifest",
+                    keeps_previous, err, err_len) != 0)
+        return -1;
+    return 0;
+}
+
 /* The envelope's from_* claim is read ONLY when the transport gave no peer
  * (scenario `transport-binds-the-recipient`, R+D.md 2.6).
  *
@@ -3406,6 +3519,9 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
     }
     if (strcmp(c->name, "plaintext-verbs-file") == 0) {
         return run_plaintext_verbs_file(c, err, err_len);
+    }
+    if (strcmp(c->name, "deployment-manifest") == 0) {
+        return run_deployment_manifest(c, err, err_len);
     }
     if (strcmp(c->name, "transport-binds-the-recipient") == 0) {
         return run_transport_binds_the_recipient(c, err, err_len);

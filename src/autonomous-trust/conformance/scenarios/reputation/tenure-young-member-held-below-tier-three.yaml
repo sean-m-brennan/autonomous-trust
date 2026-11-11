@@ -8,9 +8,10 @@ description: |
     however well it has answered (doc/architecture/reputation.md, "Tenure").
 
     alice answered four of bob's tasks at 0.9 and bob scored her the same, a
-    tier-4 record. But bob first held her as a member 10 s ago, and the
-    minimum is 600 s. bob scores her by the ordinary algebra and then bounds
-    the result just below 0.80, the tier-3 floor. Stele's red team found the
+    tier-4 record in cooperation mode, where her score is the mean of the
+    record. But bob first held her as a member 10 s ago, and the minimum is
+    600 s. bob scores her by the ordinary algebra and then bounds the result
+    just below 0.80, the tier-3 floor. Stele's red team found the
     case: the owner's shill answered four probes honestly and was counted as
     a replica fourteen seconds after it joined (rt-3717776).
 
@@ -35,10 +36,10 @@ fixtures:
       - {task_id: t-4, p1: bob, p1_score: 0.9, p2: alice, p2_score: 0.9}
   reputations:
     bob:
-      alice: 0.2
+      alice: 0.9
   coop_mode:
     bob:
-      alice: false
+      alice: true
   tenure:
     bob:
       min_sec: 600

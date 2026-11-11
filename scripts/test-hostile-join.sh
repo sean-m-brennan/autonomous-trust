@@ -73,19 +73,23 @@ EOF
 done
 
 python3 - "$OUT" <<'EOF'
-import glob, json, os, sys
-print('| colluders | adversary | policy | joiner | j2 trusted | colluders low | told tier, unprobed |')
-print('|---|---|---|---|---|---|---|')
-for path in sorted(glob.glob(os.path.join(sys.argv[1], 'n*.json'))):
+import glob, json, os, re, sys
+def order(path):
+    m = re.match(r'n(\d+)-(\w+)-policy(\d)', os.path.basename(path))
+    return (int(m.group(1)), m.group(2), m.group(3)) if m else (0, path, '')
+print('| colluders | adversary | policy | joiner | j2 trusted | colluders low | told tier, unprobed | dumps | result |')
+print('|---|---|---|---|---|---|---|---|---|')
+for path in sorted(glob.glob(os.path.join(sys.argv[1], 'n*.json')), key=order):
     with open(path) as f:
         report = json.load(f)
     for scen in report.get('attacks', []):
         a = scen.get('attack_specific') or {}
         for j, r in (a.get('joiners') or {}).items():
             fmt = lambda v: '-' if v is None else '%.0f s' % v
-            print('| %s | %s | %s | %s | %s | %s | %s |' % (
+            print('| %s | %s | %s | %s | %s | %s | %s | %s | %s |' % (
                 a.get('colluders'), a.get('adversary'),
                 'on' if a.get('policy') else 'off', j, fmt(r['t_honest']),
                 fmt(r['t_colluders']) if a.get('adversary') == 'fail' else 'n/a',
-                r['told_tier_unprobed']))
+                r['told_tier_unprobed'], r.get('dumps', '?'),
+                scen.get('result')))
 EOF

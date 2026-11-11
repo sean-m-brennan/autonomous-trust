@@ -44,6 +44,8 @@ from typing import Optional
 
 import plotly.graph_objects as go
 
+from autonomous_trust.inspector.dashboard.theme import current as current_theme
+
 # numpy and the bundled DEM loader are needed ONLY by the isometric terrain
 # view. Import them defensively: numpy is an optional visualisation dependency,
 # not required for the default 2D MapLibre map. A deployment without it (e.g. a
@@ -463,10 +465,12 @@ class TargetPositionMapPanel:
         """
         if self._view_mode == "iso":
             try:
-                return self._figure_iso(width, height)
+                return current_theme().recolor_figure(
+                    self._figure_iso(width, height))
             except Exception:  # pragma: no cover - defensive, keep demo alive
                 pass
-        return self._figure_2d(width, height)
+        # Both views draw with dark literals; the theme swaps them.
+        return current_theme().recolor_figure(self._figure_2d(width, height))
 
     def _figure_2d(self, width: Optional[int] = None,
                    height: Optional[int] = None) -> go.Figure:
@@ -627,9 +631,9 @@ class TargetPositionMapPanel:
 
         fig.update_layout(
             title=self._title,
-            template="plotly_dark",
+            template=current_theme().plotly_template,
             map={
-                "style": "carto-darkmatter",
+                "style": current_theme().carto_style,
                 "center": {"lat": c_lat, "lon": c_lon},
                 "zoom": 13,
                 # Constant across ticks: Plotly preserves the user's
@@ -916,7 +920,7 @@ class TargetPositionMapPanel:
 
         fig.update_layout(
             title=self._title,
-            template="plotly_dark",
+            template=current_theme().plotly_template,
             paper_bgcolor="#0b0f1a",
             scene=scene,
             # Preserve the operator's rotate/zoom across live ticks.

@@ -276,4 +276,12 @@ DECLARE_ERROR(ENEG_NOPEERS, "No capable peers available");
  *  test_task_start_epoch_ignores_the_host_timezone. */
 time_t negotiation_dt_epoch(const datetime_t *dt);
 
+/* How long a given-up task's tracker is kept, and how many at most, so a
+ * result that arrives after give-up is still scored against the challenge we
+ * issued (hostile-join run, 2026-11-04: a colluder's backlog held a joiner's
+ * probes past their deadline, and the answers that came minutes later were
+ * dropped). Mirrors Python NegotiationProcess.LATE_RESULT_SEC / _MAX. */
+#define NEG_LATE_RESULT_SEC 600.0
+#define NEG_LATE_RESULT_MAX 64
+
 #endif  /* NEG_PROC_PRIV_H */

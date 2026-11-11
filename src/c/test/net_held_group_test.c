@@ -45,6 +45,7 @@
 
 static int g_delivered;      /* peer_dm frames routed to a process */
 static int g_partition;      /* partition_signal frames sent to identity */
+static int g_key_stale;      /* group_key_stale frames sent to identity */
 
 static int _hook(const char *key, const message_type_t type,
                  generic_msg_t *msg, bool blocking)
@@ -56,6 +57,9 @@ static int _hook(const char *key, const message_type_t type,
     if (type == NET_MESSAGE && msg->info.net_msg.function != NULL
         && strcmp(msg->info.net_msg.function, "partition_signal") == 0)
         g_partition++;
+    if (type == NET_MESSAGE && msg->info.net_msg.function != NULL
+        && strcmp(msg->info.net_msg.function, "group_key_stale") == 0)
+        g_key_stale++;
     return 0;
 }
 
@@ -127,7 +131,7 @@ static uint8_t *_frame(identity_t *from, const group_t *grp, size_t *out_len)
 static void _begin(void)
 {
     ck_assert(sodium_init() >= 0);
-    g_delivered = g_partition = 0;
+    g_delivered = g_partition = g_key_stale = 0;
     net_held_group_frames_reset();
     messaging_set_test_hook(_hook);
 }
@@ -277,9 +281,36 @@ DEFINE_TEST(test_an_injected_frame_keeps_its_mark_when_retried)
     _end();
 }
 
+/* Hostile-join run, 2026-11-03: a joiner behind on the key decrypted none of
+ * the cohort's frames for ten minutes and never asked for the key. A frame
+ * from a peer we hold that will not open now tells identity that the peer is
+ * ahead, once per address per 5 s, and identity asks it (group_key_query).
+ * Twin of Python test_a_frame_that_will_not_open_tells_identity_the_sender_is_ahead.
+ * Its own address: the cooldown table outlives a test. */
+DEFINE_TEST(test_a_frame_that_will_not_open_tells_identity_the_sender_is_ahead)
+{
+    _begin();
+    identity_t *me = _mk("mate", "10.0.0.1"), *off = _mk("officer", "10.0.0.5");
+    process_t *proc = _mk_proc(off);
+    net_thread_ctx_t ctx = { .proc = proc, .myself = me };
+    group_t next;
+    _rotated(&proc->protocol.group, &next);
+
+    for (int i = 0; i < 3; i++) {
+        size_t fl = 0;
+        uint8_t *f = _frame(off, &next, &fl);
+        handle_inbound_group(&ctx, f, fl, "10.0.0.5");
+        free(f);
+    }
+    ck_assert_int_eq(g_delivered, 0);
+    ck_assert_int_eq(g_key_stale, 1);
+    _end();
+}
+
 RUN_TESTS(NetHeldGroup,
           test_a_frame_under_a_key_not_yet_installed_opens_once_it_is,
           test_a_frame_that_still_does_not_open_is_dropped,
           test_a_frame_under_our_key_is_not_held,
           test_the_hold_is_bounded_and_keeps_the_newest,
-          test_an_injected_frame_keeps_its_mark_when_retried)
+          test_an_injected_frame_keeps_its_mark_when_retried,
+          test_a_frame_that_will_not_open_tells_identity_the_sender_is_ahead)

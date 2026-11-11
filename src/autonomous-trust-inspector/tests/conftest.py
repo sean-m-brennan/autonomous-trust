@@ -22,3 +22,15 @@ for _pkg in ('autonomous-trust', 'autonomous-trust-oracle', 'autonomous-trust-se
     _pkg_dir = os.path.join(_repo_src, _pkg)
     if _pkg_dir not in sys.path and os.path.isdir(_pkg_dir):
         sys.path.insert(0, _pkg_dir)
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _dashboard_theme_dark():
+    """Every test starts and ends on the dark dashboard theme."""
+    from autonomous_trust.inspector.dashboard import theme
+    theme.set_theme(theme.DARK)
+    yield
+    theme.set_theme(theme.DARK)

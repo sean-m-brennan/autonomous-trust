@@ -139,6 +139,7 @@ deploy
 /embedded/.test-qemu/
 /embedded/.test-docker-fleet*/
 /embedded/.fleet-test*/
+/embedded/.wifi-fleet/
 /embedded/.interop-cpython/
 /embedded/.buildroot-build/
 /embedded/dist/

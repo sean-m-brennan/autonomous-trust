@@ -112,8 +112,10 @@ def _process(policy_on: bool, me: UUID, peers: list):
 
 
 def _pair(chain, task, a, a_score, b, b_score, a_channel=None):
-    chain.update(task, a, a_score, a_channel)
-    chain.update(task, b, b_score)
+    """Both halves of one task. The chain takes scores as integer thousandths."""
+    from autonomous_trust.core._python.reputation.reputation import score_to_milli
+    chain.update(task, a, score_to_milli(a_score), a_channel)
+    chain.update(task, b, score_to_milli(b_score))
 
 
 def _tier_of(rp, peer):

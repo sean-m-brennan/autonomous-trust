@@ -160,7 +160,7 @@ at_demo starts (signature verified)
 | Shell (post-provisioning) | Busybox is present for first boot only; prevents lateral movement via shell |
 | Compiler, interpreter, debug tools | No on-device code execution capability for attackers |
 | Man pages, docs, locales | Reduces image size and eliminates unnecessary files |
-| Unnecessary kernel modules | Custom defconfig disables sound, DRM, framebuffer, HID, wireless, Bluetooth, NFS, CIFS |
+| Unnecessary kernel modules | Custom defconfig disables sound, HID, Bluetooth, NFS, CIFS; display is limited to simpledrm on the bootloader's framebuffer |
 
 ### Supply Chain Spectrum
 
@@ -179,7 +179,7 @@ The root filesystem uses dm-verity for block-level integrity verification:
 
 1. Buildroot produces a read-only ext4 root filesystem image.
 2. `veritysetup format` generates a Merkle hash tree over the image (SHA-256).
-3. The root hash (64 hex characters) is stored in `root-hash.txt` and embedded in the signed initramfs.
+3. The root hash (64 hex characters) is stored in `root-hash.txt`. It is meant to be embedded in a signed initramfs, which the image does not build yet, so steps 4 and 5 are not enforced on the device today.
 4. At boot, the kernel's device-mapper verity target checks every block read against the hash tree.
 5. Any tampered block causes an I/O error -- the system refuses to run from a modified filesystem.
 
@@ -236,16 +236,19 @@ The mesh manages itself using AT's existing trust, negotiation, and reputation m
 | `embedded/provision.sh` | Generate provisioning configs for a fleet of N nodes. Produces per-node bootstrap configs with peer addresses and optional full identity pre-generation. | `--nodes N`, `--subnet CIDR`; optionally `at_demo` in PATH for `--full-identity` | Per-node tarballs in `embedded/fleet-configs/` containing bootstrap configs and environment files |
 | `embedded/sign-binary.sh` | Sign `at_demo` with an Ed25519 key. Can generate a new keypair on first use. | Binary file, Ed25519 private key (PEM) | Detached signature file (`at_demo.sig`) |
 | `embedded/verify-binary.sh` | Verify an `at_demo` binary signature against a public key. | Binary file, signature file (`.sig`), Ed25519 public key (PEM) | Exit code 0 (valid) or 1 (invalid) |
-| `embedded/verify-image.sh` | 21-point verification of a built SD card image without booting it. Checks partition layout, boot contents, rootfs contents, dm-verity, binary signature, and sizes. | Buildroot output images directory; optional public key for signature check | Pass/fail report with counts |
+| `embedded/verify-image.sh` | Verification of a built SD card image without booting it. Checks partition layout, boot contents (Pi 4 firmware, U-Boot, extlinux.conf, kernel, DTBs), the kernel's embedded config (tmpfs and the other options systemd needs to start, the SD, Ethernet and HDMI console drivers, module signature enforcement), rootfs contents (systemd, enabled units, networkd config, Wi-Fi firmware and regulatory database, signed brcmfmac module), dm-verity, binary signature, and sizes. | Buildroot output images directory; optional public key for signature check | Pass/fail report with counts |
 | `embedded/flash.sh` | Write an `.img` file to an SD card with safety checks. Refuses system disks, verifies image fits on device, requires user confirmation. | `.img` file, block device path (e.g., `/dev/sdb`) | Written SD card |
 | `embedded/test-qemu.sh` | End-to-end test using QEMU VMs. Spins up N Debian VMs on a shared virtual LAN, deploys via `install.sh` + `provision.sh`, verifies multi-node discovery. | `build-arm.sh` output (amd64 tarball); Debian cloud image (downloaded) | Pass/fail verification report; VMs with AT running |
 | `embedded/autonomous-trust.service` | systemd unit file for the `at_demo` service. Configures environment, startup delay, restart policy, and systemd hardening (NoNewPrivileges, ProtectSystem, etc.). | N/A (declarative config) | N/A (consumed by systemd) |
 | `embedded/buildroot/Dockerfile` | Reproducible Buildroot build environment. Installs all host dependencies, downloads Buildroot 2024.02.10. Based on `debian:bookworm`. | `BR_VERSION` build arg | Docker image `at-buildroot` with Buildroot source at `/buildroot` |
-| `embedded/buildroot/at_defconfig` | Buildroot defconfig for the hardened Pi4/CM4 image. Targets aarch64 Cortex-A72, uses musl libc, systemd init, minimal busybox, dm-verity packages, U-Boot bootloader. | N/A (declarative config) | N/A (consumed by Buildroot `make defconfig`) |
-| `embedded/buildroot/kernel.defconfig` | Minimal Linux kernel config based on `bcm2711_defconfig`. Enables dm-verity, networking (IPv4/IPv6/multicast/UDP), MMC, USB, virtio (QEMU testing). Disables sound, DRM, framebuffer, HID, wireless, Bluetooth, NFS, debug. | N/A (declarative config) | N/A (consumed by Buildroot kernel build) |
-| `embedded/buildroot/post-build.sh` | Buildroot post-build hook. Verifies `at_demo` is in the overlay, sets permissions, creates data partition mount point, writes `/etc/fstab` (rootfs read-only, data partition read-write), strips man/doc/locale. | Buildroot target rootfs directory | Modified rootfs with fstab, permissions, stripped docs |
-| `embedded/buildroot/post-image.sh` | Buildroot post-image hook. Generates dm-verity hash tree via `veritysetup format`, assembles FAT32 boot partition (Pi firmware, U-Boot, kernel, DTBs, config.txt), creates data partition, assembles final 3-partition SD card image via `sfdisk` + `dd`. | Buildroot images directory (rootfs.ext4, Image, DTBs, u-boot.bin, rpi-firmware) | `autonomous-trust.img`, `root-hash.txt`, `verity.table`, `boot.vfat`, `data.ext4` |
+| `embedded/buildroot/at_defconfig` | Buildroot defconfig for the hardened Pi4/CM4 image. Targets aarch64 Cortex-A72, uses a glibc toolchain (Buildroot's systemd requires it), systemd init with a tmpfs overlay on `/var`, minimal busybox, dm-verity packages, U-Boot bootloader, Pi 4 firmware, CYW43455 Wi-Fi firmware, wireless-regdb and wpa_supplicant. | N/A (declarative config) | N/A (consumed by Buildroot `make defconfig`) |
+| `embedded/buildroot/kernel.defconfig` | Minimal mainline 6.6 kernel config, resolved by `olddefconfig`, so every driver the board needs is named in it. Enables the BCM2711 platform (firmware mailbox, clocks, power domains, GPIO expander, regulators, watchdog), the SD card and Wi-Fi SDIO controllers (sdhci-iproc), GENET Ethernet, cfg80211 and brcmfmac (the only modules, signed and enforced), PCIe and USB, dm-verity, networking (IPv4/IPv6/multicast), the mini UART console, an output-only HDMI console (simpledrm and fbcon on the framebuffer U-Boot hands over), the ACT LED heartbeat, `/proc/config.gz`, and virtio (QEMU testing). Disables sound, HID, Bluetooth, NFS, EFI and debug. | N/A (declarative config) | N/A (consumed by Buildroot kernel build) |
+| `embedded/buildroot/post-build.sh` | Buildroot post-build hook. Verifies `at_demo` is in the overlay, sets permissions, creates the `/boot` and data partition mount points, writes `/etc/fstab` by PARTUUID (boot read-only and root-only, rootfs read-only, data partition read-write), strips man/doc/locale. | Buildroot target rootfs directory | Modified rootfs with fstab, permissions, stripped docs |
+| `embedded/buildroot/post-image.sh` | Buildroot post-image hook. Generates dm-verity hash tree via `veritysetup format`, assembles FAT32 boot partition (Pi firmware, U-Boot, kernel, DTBs, config.txt, `extlinux/extlinux.conf`, `wpa_supplicant.conf.example`), creates data partition, assembles final 3-partition SD card image via `sfdisk` + `dd` with the fixed MBR disk ID `0x41540001`. | Buildroot images directory (rootfs.ext4, Image, DTBs, u-boot.bin, rpi-firmware) | `autonomous-trust.img`, `root-hash.txt`, `verity.table`, `boot.vfat`, `data.ext4` |
 | `embedded/buildroot/rootfs-overlay/etc/systemd/system/autonomous-trust.service` | Copy of the systemd service file placed into the Buildroot rootfs overlay. Identical to `embedded/autonomous-trust.service`. | N/A | N/A (baked into rootfs) |
+| `embedded/buildroot/rootfs-overlay/etc/systemd/system/at-wifi.service` | Runs `wpa_supplicant` on `wlan0` with `/boot/wpa_supplicant.conf` once the interface appears. Does nothing if the file is absent. | `/boot/wpa_supplicant.conf` | Associated `wlan0` |
+| `embedded/buildroot/rootfs-overlay/etc/systemd/network/` | systemd-networkd DHCP config for `eth0` (route metric 100) and `wlan0` (600), with MAC-based client IDs so leases survive the per-boot machine ID. A drop-in makes `systemd-networkd-wait-online` wait for either link, not both. | N/A | N/A (baked into rootfs) |
+| `embedded/buildroot/rootfs-overlay/usr/lib/systemd/system-preset/50-autonomous-trust.preset` | Enables `autonomous-trust.service`, `at-wifi.service`, networkd, resolved and timesyncd. Buildroot runs `systemctl preset-all` when it assembles the rootfs, which disables any unit not named in a preset. | N/A | N/A (baked into rootfs) |
 | `src/autonomous-trust/Dockerfile-c-static` | Multi-stage Docker build producing a fully static `at_demo`. Stage 1 builds with `clang`, `-DAT_STATIC=ON`, linking libsodium, libjansson, libuuid, protobuf-c statically. Stage 2 verifies `ldd` reports "not a dynamic executable". | `src/c/`, `src/protobuf/`, `GIT_VERSION` build arg | Docker image with static `at_demo` at `/usr/local/bin/at_demo` |
 | `src/c/extensions/fleet/fleet_proc.{h,c}` | Fleet process: Paxos consensus for binary update proposals. Validates Ed25519 signatures, checks reputation thresholds, manages vote protocol, triggers artifact fetch on acceptance. | Update proposals from peers, reputation scores | UPDATE_ACCEPTED messages, ARTIFACT_REQUEST to artifact_proc |
 | `src/c/extensions/fleet/update_proposal.{h,c}` | Update proposal struct and operations: JSON serialization, Ed25519 signing/verification. Defines UPDATE_HASH_LEN (32), UPDATE_VERSION_LEN (64), UPDATE_SIG_LEN (64). | Proposal data, Ed25519 keys | Serialized/signed proposals |
@@ -259,17 +262,19 @@ The mesh manages itself using AT's existing trust, negotiation, and reputation m
 
 Step-by-step from power-on to `at_demo` running on a Pi4 with the Phase 2 image:
 
-1. **Pi4 EEPROM loads boot partition.** The EEPROM reads the FAT32 partition (partition 1) from the SD card at `/dev/mmcblk0p1`.
+1. **Pi4 EEPROM loads boot partition.** The EEPROM reads `start4.elf` and `fixup4.dat` from the FAT32 partition (partition 1) on the SD card.
 
-2. **config.txt directs to U-Boot.** The Pi firmware reads `config.txt` which specifies `arm_64bit=1`, `kernel=u-boot.bin`, `enable_uart=1`, and `dtoverlay=disable-bt`.
+2. **config.txt directs to U-Boot.** The Pi firmware reads `config.txt`, which specifies `arm_64bit=1`, `kernel=u-boot.bin` and `enable_uart=1`. The firmware loads the mainline device tree for the board (`bcm2711-rpi-4-b.dtb` or `bcm2711-rpi-cm4-io.dtb`) and hands it to U-Boot.
 
-3. **U-Boot loads kernel and DTB.** U-Boot (built from Buildroot with `rpi_4` defconfig) loads the `Image` kernel file and the appropriate device tree blob (`bcm2711-rpi-4-b.dtb` or `bcm2711-rpi-cm4-io.dtb`).
+3. **U-Boot loads the kernel.** U-Boot (built from Buildroot with `rpi_4` defconfig) runs distro boot, reads `extlinux/extlinux.conf` from partition 1, loads `Image`, and boots it with the firmware's device tree. The kernel command line names the root partition as `PARTUUID=41540001-02`, because the mainline device tree has no mmc aliases and the SD card can enumerate as either `mmcblk0` or `mmcblk1`. The kernel logs to the mini UART (`ttyS1`) on GPIO 14/15 and to HDMI (`tty1`); systemd's boot status goes to HDMI. `net.ifnames=0` keeps the interface names `eth0` and `wlan0`, which systemd 254 would otherwise rename (`eth0` to `end0`, from the device tree's `ethernet0` alias). The green ACT LED blinks a heartbeat while the kernel runs.
 
-4. **Kernel boots, initramfs sets up dm-verity.** The kernel starts, and the initramfs configures the device-mapper verity target using the embedded root hash. The `veritysetup` command maps `/dev/mmcblk0p2` through dm-verity, creating a verified block device.
+4. **Root filesystem mounted read-only.** The kernel mounts the root partition read-only at `/`. dm-verity is not yet enforced: `post-image.sh` generates the hash tree and root hash, but the image has no initramfs to set up the verity target, so the kernel mounts the partition directly.
 
-5. **Root filesystem mounted read-only.** The verified root filesystem is mounted read-only at `/`. The data partition (`/dev/mmcblk0p3`) is mounted read-write at `/opt/autonomous-trust` per `/etc/fstab`.
+5. **systemd mounts the rest.** systemd mounts the data partition (`PARTUUID=41540001-03`) read-write at `/opt/autonomous-trust`, the boot partition read-only (root-readable only) at `/boot`, and a tmpfs overlay on `/var`.
 
-6. **systemd starts `autonomous-trust.service`.** systemd reaches `multi-user.target`, which triggers the `autonomous-trust.service` unit. The `ExecStartPre` directives create `/opt/autonomous-trust/etc/at` and `/opt/autonomous-trust/var/at` if they do not exist, and apply any configured startup delay.
+6. **Network comes up.** udev loads the signed `brcmfmac` module when the Wi-Fi chip appears on the SDIO bus. If `/boot/wpa_supplicant.conf` exists, `at-wifi.service` associates `wlan0`. systemd-networkd runs DHCP on `eth0` and `wlan0`, and systemd-timesyncd sets the clock, since the Pi has no RTC.
+
+7. **systemd starts `autonomous-trust.service`.** Once either link is online, systemd reaches `multi-user.target`, which triggers the `autonomous-trust.service` unit. The `ExecStartPre` directives create `/opt/autonomous-trust/etc/at` and `/opt/autonomous-trust/var/at` if they do not exist, and apply any configured startup delay.
 
 7. **`at_demo --generate-config` creates identity.** On first boot, `at_demo` generates a NaCl identity keypair and network configuration in `/opt/autonomous-trust/etc/at/`. If provisioned configs from `provision.sh` are present, the node uses those for peer discovery.
 
@@ -370,9 +375,9 @@ The trade-off is larger binary size and inability to update individual libraries
 
 OpenSSL 1.1.1+ supports Ed25519 natively via `openssl genpkey` and `openssl pkeyutl`. The underlying algorithm is identical (Ed25519 per RFC 8032). Using `openssl` keeps the signing pipeline portable and auditable without introducing additional build dependencies.
 
-### Why musl over glibc
+### Why glibc for the system image
 
-The Buildroot defconfig specifies `BR2_TOOLCHAIN_BUILDROOT_MUSL=y`. musl libc produces smaller binaries and has a simpler, more auditable codebase than glibc. For a statically linked single-binary appliance, musl's smaller footprint reduces the Trusted Computing Base. musl is the standard choice for minimal embedded Linux images built with Buildroot.
+The image first specified `BR2_TOOLCHAIN_BUILDROOT_MUSL=y`, for musl's smaller and simpler codebase. Buildroot 2024.02 only offers systemd on a glibc toolchain, though, and with musl it silently dropped `BR2_INIT_SYSTEMD=y` and built BusyBox init instead. That image never started `autonomous-trust.service`. The defconfig now specifies `BR2_TOOLCHAIN_BUILDROOT_GLIBC=y`, which keeps systemd's sandboxing on the AT service along with networkd, timesyncd and udev. The choice affects only the system userland, because `at_demo` is statically linked in its own build and carries its own libc.
 
 ### The unikernel analysis -- why not now, what would change that
 

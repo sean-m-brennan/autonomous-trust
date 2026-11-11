@@ -34,6 +34,10 @@ set -euo pipefail
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
+# The interpreter for the Python harness and the diff. A conda env provides
+# `python`; a bare system often has only `python3`. $PYTHON overrides both.
+PYTHON="${PYTHON:-$(command -v python || command -v python3 || echo python)}"
+
 usage() {
   cat <<'EOF'
 Usage: test-conformance.sh [OPTIONS] [pytest args...]
@@ -50,6 +54,8 @@ Options:
   -h, --help          Show this help message and exit.
 
 Environment:
+  PYTHON                     Interpreter for the Python harness and the diff.
+                             Default: python, else python3.
   AT_CONFORMANCE_BUILD_DIR   Where to build the C harness. Default is
                              src/c/build-zta (or src/c/build without OpenSSL).
                              Point this at a non-virtiofs filesystem -- e.g.
@@ -176,7 +182,7 @@ run_python() {
     echo "protobuf and the harness deps):" >&2
     echo "  conda activate autonomous_trust" >&2
     echo "  conda install -c conda-forge jsonschema   # if missing" >&2
-    python -m pytest \
+    "$PYTHON" -m pytest \
       conformance/harness/python \
       conformance/harness/common/tests \
       tools/tests \
@@ -386,7 +392,7 @@ run_diff() {
   if (( strict_coverage )); then
     diff_args+=(--strict-coverage)
   fi
-  python -m conformance.harness.common.diff_results "${diff_args[@]}"
+  "$PYTHON" -m conformance.harness.common.diff_results "${diff_args[@]}"
 }
 
 # ---------------------------------------------------------------------------

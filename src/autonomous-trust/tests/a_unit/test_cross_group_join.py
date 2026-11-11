@@ -53,6 +53,7 @@ from autonomous_trust.core._python.identity.identity import Identity
 from autonomous_trust.core._python.identity.sign import Signature
 from autonomous_trust.core._python.identity.protocol import IdentityProtocol
 from autonomous_trust.core._python.identity.idprocess import IdentityProcess
+from autonomous_trust.core._python.network.message import Message
 from autonomous_trust.core.system import CfgIds
 
 
@@ -453,13 +454,14 @@ class TestRotationOnTheWire:
         assert grp.key_epoch == 0, 'unverified rotation must not be adopted'
 
     def test_verified_rotation_is_adopted(self):
-        node, grp, _peers = self._node_with_peers()
+        node, grp, peers = self._node_with_peers()
         rotated = Group.from_canonical(grp.to_canonical())
         rotated.rotate_key()
-        msg = MagicMock()
-        msg.function = IdentityProtocol.update
-        msg.obj = to_json_string(rotated.to_canonical())
-        msg.verified = True
+        # Signed by a member the node holds: what a rotation must be.
+        raw = bytes(Message(CfgIds.identity, IdentityProtocol.update,
+                            to_json_string(rotated.to_canonical()),
+                            from_whom=peers[0]))
+        msg = Message.parse(raw, peers[0].publish())
         node.handle_group_update(_queues(), msg)
         assert grp.key_epoch == 1
         assert grp.encryptor.publish() == rotated.encryptor.publish()

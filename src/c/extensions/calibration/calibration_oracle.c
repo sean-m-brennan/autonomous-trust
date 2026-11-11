@@ -17,6 +17,7 @@
 /* The coverage audit (R+D.md §12.4) as two scorer arms (negotiation/neg_oracle.h).
  * Until FEATURE_SPLIT_PLAN Phase 3 this lived in neg_proc.c. */
 
+#include <stdlib.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
@@ -32,7 +33,7 @@
 /* The verdict IS the accumulated record of resolved predictions, so an auditor
  * built per result would have nothing to audit and would be permanently
  * silent: one per process, built from $AT_CALIBRATION on first use. */
-static at_calibration_auditor_t auditor;
+static at_calibration_auditor_t *auditor = NULL;
 static bool loaded = false;
 
 /* Mirrors Python calibration_auditor(): a malformed declaration is fatal at
@@ -50,10 +51,22 @@ static at_calibration_auditor_t *calibration_auditor(void)
                             "OFF: %s\n", err);
             at_calibration_model_parse(NULL, &model, NULL, 0);
         }
-        at_calibration_auditor_init(&auditor, &model);
+        /* Allocated only for a model that declares something, so an
+         * unconfigured node carries none of the auditor's tables; NULL reads
+         * as the layer being off. */
+        free(auditor);
+        auditor = NULL;
+        if (model.n_capabilities > 0)
+        {
+            auditor = calloc(1, sizeof(*auditor));
+            if (auditor == NULL)
+                log_error(NULL, "calibration: no memory for the auditor, layer stays OFF\n");
+            else
+                at_calibration_auditor_init(auditor, &model);
+        }
         loaded = true;
     }
-    return &auditor;
+    return auditor;
 }
 
 /* Half one: let this result RESOLVE predictions other peers made about the

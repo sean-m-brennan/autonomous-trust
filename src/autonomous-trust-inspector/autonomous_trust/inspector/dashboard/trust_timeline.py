@@ -38,6 +38,8 @@ from typing import Any, Optional
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from .theme import current as current_theme
+
 
 # Communication cut-off (default 0.1), kept in sync with the reputation
 # backend via the shared AT_REP_COMM_CUTOFF override so the dashboard
@@ -123,6 +125,7 @@ class TrustTimeline:
 
     def figure(self, width: int = 900, height: int = 350) -> go.Figure:
         """Build the Plotly figure from current data."""
+        th = current_theme()
         fig = go.Figure()
 
         # Reputation threshold line
@@ -136,7 +139,7 @@ class TrustTimeline:
         # whose line dips into this region is excluded from the network.
         fig.add_hrect(
             y0=0, y1=self._threshold,
-            fillcolor="rgba(255, 68, 68, 0.10)",
+            fillcolor=th.data("rgba(255, 68, 68, 0.10)"),
             line_width=0, layer="below",
         )
         # Faint tier-1 trust-floor reference (0.5): elevated-trust tasking
@@ -145,7 +148,8 @@ class TrustTimeline:
             x=[0, t_max],
             y=[0.5, 0.5],
             mode="lines",
-            line=dict(color="rgba(148, 163, 184, 0.5)", width=1, dash="dash"),
+            line=dict(color=th.data("rgba(148, 163, 184, 0.5)"), width=1,
+                      dash="dash"),
             name="Trust tier-1 (0.5)",
             showlegend=True,
         ))
@@ -154,14 +158,14 @@ class TrustTimeline:
             x=[0, t_max],
             y=[self._threshold, self._threshold],
             mode="lines",
-            line=dict(color="#FF4444", width=1, dash="dot"),
+            line=dict(color=th.data("#FF4444"), width=1, dash="dot"),
             name="Comm cut-off (%g)" % self._threshold,
             showlegend=True,
         ))
 
         # Per-peer reputation lines
         for peer_name, samples in sorted(self._samples.items()):
-            color = self._peer_colors.get(peer_name, "#888")
+            color = th.data(self._peer_colors.get(peer_name, "#888"))
             ts = [s.t for s in samples]
             scores = [s.score for s in samples]
             fig.add_trace(go.Scatter(
@@ -175,11 +179,11 @@ class TrustTimeline:
         for marker in self._phase_markers:
             fig.add_vline(
                 x=marker.t, line_dash=marker.dash,
-                line_color=marker.color, line_width=1,
+                line_color=th.data(marker.color), line_width=1,
                 annotation_text=marker.label,
                 annotation_position="top",
                 annotation_font_size=10,
-                annotation_font_color=marker.color,
+                annotation_font_color=th.data(marker.color),
             )
 
         # Explicit m:ss time ticks + vertical gridlines so a reader can drop a
@@ -194,12 +198,12 @@ class TrustTimeline:
                 tickvals=xtickvals,
                 ticktext=xticktext,
                 showgrid=True,
-                gridcolor="rgba(148, 163, 184, 0.18)",
+                gridcolor=th.grid,
                 range=[0, t_max] if self._samples else None,
             ),
             yaxis_title="Reputation",
             yaxis=dict(range=[0, 1.05]),
-            template="plotly_dark",
+            template=th.plotly_template,
             width=width,
             height=height,
             legend=dict(
@@ -211,7 +215,7 @@ class TrustTimeline:
                 font=dict(size=9),
                 # Transparent so it doesn't paint over the m:ss x-axis tick
                 # labels it sits on top of (legend is anchored below the plot).
-                bgcolor="rgba(0, 0, 0, 0)",
+                bgcolor=th.legend_bg,
                 bordercolor="rgba(0, 0, 0, 0)",
                 borderwidth=0,
             ),

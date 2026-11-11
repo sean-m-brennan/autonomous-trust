@@ -15,6 +15,7 @@
  *******************/
 
 #include <stdlib.h>
+#include <sys/stat.h>
 #include "autonomous_trust/processes/process_tracker.h"
 #include "autonomous_trust/processes/processes.h"
 #include "autonomous_trust/config/configuration_priv.h"
@@ -67,6 +68,35 @@ DEFINE_TEST(test_process_tracker_write_config)
 }
 END_TEST_DEFINITION()
 
+/* Config files hold identity seeds: write_config_file creates them owner-only
+ * whatever the umask, and narrows a file created earlier with wider modes. */
+DEFINE_TEST(test_write_config_file_is_owner_only)
+{
+#ifndef _WIN32
+    const char *filename = "proc_track_mode_test.cfg.json";
+
+    FILE *f = fopen(filename, "w");
+    ck_assert_ptr_nonnull(f);
+    fclose(f);
+    ck_assert_int_eq(chmod(filename, 0666), 0);
+
+    logger_t logger;
+    ck_assert_ret_ok(logger_init(&logger, DEBUG, NULL));
+    tracker_t tracker;
+    ck_assert_ret_ok(tracker_init(&logger, &tracker));
+    ck_assert_ret_ok(tracker_register_subsystem(&tracker, "network", "first"));
+
+    config_t *cfg = find_configuration("process_tracker");
+    ck_assert_int_eq(write_config_file(cfg, &tracker, filename), 0);
+
+    struct stat st;
+    ck_assert_int_eq(stat(filename, &st), 0);
+    remove(filename);
+    ck_assert_int_eq(st.st_mode & 0777, 0600);
+#endif
+}
+END_TEST_DEFINITION()
+
 DEFINE_TEST(test_process_tracker_read_config)
 {
     const char *config = "{\"typename\": \"process_tracker\", \"subsystems\": [{\"network\": \"first\"}, {\"identity\": \"second\"}]}";
@@ -91,4 +121,5 @@ DEFINE_TEST(test_process_tracker_read_config)
 }
 END_TEST_DEFINITION()
 
-RUN_TESTS(ProcessTracker, test_process_tracker_write_config, test_process_tracker_read_config)
+RUN_TESTS(ProcessTracker, test_process_tracker_write_config,
+          test_write_config_file_is_owner_only, test_process_tracker_read_config)

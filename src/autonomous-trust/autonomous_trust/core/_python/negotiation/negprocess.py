@@ -49,11 +49,24 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
     # Status-request rounds the deadline sweep sends, without a live answer,
     # before it gives a task up. C twin: NEG_STATUS_ASKS.
     STATUS_ASKS = 3
+    #: How long a given-up task's tracker is kept, and how many at most, so a
+    #: result that arrives after give-up is still scored against the
+    #: challenge we issued (hostile-join run, 2026-11-04: a colluder's backlog
+    #: held a joiner's probes past their deadline, and the answers that came
+    #: minutes later were dropped). Mirrors C NEG_LATE_RESULT_SEC / _MAX.
+    LATE_RESULT_SEC = 600.0
+    LATE_RESULT_MAX = 64
 
     def __init__(self, configurations, subsystems, log_q, max_cores=max_concurrency, **kwargs):
         super().__init__(configurations, subsystems, log_q,
                          dependencies=[CfgIds.network, CfgIds.identity], **kwargs)
         self.task_stack = JobQueue()
+        # Tasks handed to main for execution whose result has not gone out:
+        # they answer a status request "running" (handle_stat_req).
+        self._dispatched: set[str] = set()
+        # Given-up tasks' trackers, by task id, with when each is let go: a
+        # late result is scored against them (status_sweep, handle_results).
+        self._given_up: dict = {}
         self.proposed_tasks = {}  # TaskCounters for local tasks remotely requested
         # Persistent per-task flood counter. Kept separate from
         # `proposed_tasks` because `_add_task` clears the latter on every
@@ -493,17 +506,25 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                               getattr(peer, 'nickname', peer))
 
     def handle_stat_req(self, queues, message):
+        """Answer a requestor's status request from what negotiation holds:
+        pending while the task waits in the stack, running once it has been
+        handed to execution and until its result has gone out, unknown
+        otherwise. The answer used to come from main, through main's queue:
+        on a node whose queue was backed up (a colluder held 162 tasks in the
+        hostile-join run of 2026-11-04) it waited behind the work it reported
+        on, and main answered unknown for a task it had not started, so the
+        requestor gave the task up. Mirrors C handle_stat_req."""
         if message.function == NegotiationProtocol.status_req:
             task_status = TaskStatus(message.obj, message.from_whom)
             if task_status.uuid in self.task_stack:
                 task_status.status = Status.pending
-                self.forward_status(queues, task_status)
+            elif str(task_status.uuid) in self._dispatched:
+                task_status.status = Status.running
             else:
-                try:
-                    queues[CfgIds.main].put(task_status, block=True, timeout=self.q_cadence)
-                    self.logger.debug('Remote status requested')
-                except Full:
-                    self.logger.error('handle_stat_req: Main queue full')
+                task_status.status = Status.unknown
+            self.logger.debug('Remote status requested: %s',
+                              task_status.status.value)
+            self.forward_status(queues, task_status)
             return True
         return False
 
@@ -590,6 +611,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
 
     def forward_result(self, queues, message):
         if isinstance(message, TaskResult):
+            self._dispatched.discard(str(message.uuid))
             self._retain_trace(message)
             try:
                 msg = Message(self.name, NegotiationProtocol.result, message.to_json_string(), message.requestor)
@@ -715,9 +737,14 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
         answered (or the task is cancelled). Mirrors C handle_results."""
         if message.function == NegotiationProtocol.result:
             task = message.obj
-            if task.uuid in self.my_tasks:
+            # A task we gave up is still scored if its result comes before
+            # we let its tracker go: scored, never forwarded to the
+            # application, which already had the give-up.
+            late = task.uuid not in self.my_tasks and task.uuid in self._given_up
+            if task.uuid in self.my_tasks or late:
                 try:
-                    tracker = self.my_tasks[task.uuid]
+                    tracker = (self._given_up[task.uuid][0] if late
+                               else self.my_tasks[task.uuid])
                     results = tracker.results
                     who = message.from_whom.uuid
                     invited = set(results)
@@ -761,7 +788,16 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                             'handle_results: no parameters retained for '
                             'task %s; result forwarded unstamped', task.uuid)
                     # Local-only: never serialized, read by automate.py.
-                    task.score_only = len(scored) > 1
+                    task.score_only = len(scored) > 1 or late
+                    if late:
+                        self.logger.info(
+                            'late result for given-up task %s from %s scored',
+                            task.uuid, str(who)[:8])
+                        queues[CfgIds.main].put(task, block=True,
+                                                timeout=self.q_cadence)
+                        if len(scored) >= max(1, len(invited)):
+                            del self._given_up[task.uuid]
+                        return True
                     # Live replication may hold this result's score, or take
                     # a replica's result entirely (RD_12.6 plan §3.7).
                     held = negotiation_on_result(self, queues, task, tracker)
@@ -905,6 +941,17 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                 peer_uuid_str, new_tier, cancelled_jobs)
         return True
 
+    def _dispatch_jobs(self, queues) -> None:
+        """Hand every due job in the stack to main for execution, and note it
+        as dispatched until its result goes out (handle_stat_req)."""
+        for job in self._get_jobs():  # local jobs
+            try:
+                queues[CfgIds.main].put(job.task, block=True, timeout=self.q_cadence)
+                self._dispatched.add(str(job.task.uuid))
+                self.logger.debug('Send for execution')
+            except Full:
+                self.logger.error('process: Main queue full')
+
     def _forget_task(self, task_id):
         """Everything this node keeps about one of its own tasks: the tracker,
         the confirmations and any outstanding status token."""
@@ -922,9 +969,14 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
         Silence, or an answer that does not extend, is asked again once an
         extension's worth of time has passed, and after ``STATUS_ASKS`` rounds
         the task is given up: logged and forgotten, with no result to main and
-        no score, since a lost frame looks the same as a refusal. Returns the
-        number given up. C twin: ``negotiation_status_sweep``."""
+        no score, since a lost frame looks the same as a refusal. Its tracker
+        is kept LATE_RESULT_SEC so a result that comes after all is scored
+        (handle_results). Returns the number given up. C twin:
+        ``negotiation_status_sweep``."""
         given_up = 0
+        for task_id in [t for t, (_tr, until) in self._given_up.items()
+                        if until <= present]:
+            del self._given_up[task_id]
         for task_id, tracker in list(self.my_tasks.items()):
             params = tracker.parameters
             if present <= params.when + params.duration + params.timeout:
@@ -953,6 +1005,11 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                 self.logger.warning(
                     'Task %s past its deadline with no live answer after %d '
                     'status request round(s); giving it up', task_id, asks)
+                # Kept a while: a late result is still scored against it.
+                self._given_up[task_id] = (
+                    tracker, present + timedelta(seconds=self.LATE_RESULT_SEC))
+                while len(self._given_up) > self.LATE_RESULT_MAX:
+                    del self._given_up[next(iter(self._given_up))]
                 self._forget_task(task_id)
                 given_up += 1
                 continue
@@ -1007,12 +1064,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                                         self.logger.error('Unhandled message of type %s', message.__class__.__name__)  # noqa
                 _probes.counter('proc.negotiation', 'iter_drained', str(drained))
 
-                for job in self._get_jobs():  # local jobs
-                    try:
-                        queues[CfgIds.main].put(job.task, block=True, timeout=self.q_cadence)
-                        self.logger.debug('Send for execution')
-                    except Full:
-                        self.logger.error('process: Main queue full')
+                self._dispatch_jobs(queues)
 
                 self.status_sweep(queues, now())
                 self._expire_traces()

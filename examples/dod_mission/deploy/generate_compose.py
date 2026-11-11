@@ -76,6 +76,8 @@ DEBUG_PEERS = frozenset(
 
 def _peer_log_level(peer_name: str) -> str:
     return "debug" if peer_name in DEBUG_PEERS else PEER_LOG_LEVEL
+
+
 # How long a hierarchy field joiner keeps asking to be admitted before founding
 # a group of its own (AT_JOIN_PATIENCE_SEC). Bring-up of a 96-node stack on one
 # host has spread over twenty minutes.
@@ -404,6 +406,9 @@ def build_compose(scenario_kwargs: Optional[dict] = None,
             "AUTONOMOUS_TRUST_EXE": "examples/dod_mission/coordinator.py",
             "AUTONOMOUS_TRUST_ARGS": coord_args,
             "AUTONOMOUS_TRUST_ROOT": "/app/config/coordinator",
+            # Dashboard colors (run-demo.sh --theme); omitted when unset.
+            **({"AT_THEME": os.environ["AT_THEME"]}
+               if os.environ.get("AT_THEME") else {}),
         },
         volumes=coord_volumes,
         ports=["8050:8050", "8000:8000"],

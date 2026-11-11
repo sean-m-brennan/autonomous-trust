@@ -33,12 +33,19 @@ chmod 755 "$TARGET_DIR/usr/local/bin/at_demo"
 # Create the data partition mount point
 mkdir -p "$TARGET_DIR/opt/autonomous-trust"
 
-# Configure fstab: rootfs is read-only, data partition is read-write
+mkdir -p "$TARGET_DIR/boot"
+
+# Configure fstab: rootfs is read-only, data partition is read-write.
+# Partitions are named by PARTUUID because the mainline Pi 4 device tree has
+# no mmc aliases, so the SD card is mmcblk0 or mmcblk1 depending on whether
+# its controller probes before the Wi-Fi SDIO controller. post-image.sh
+# writes the MBR disk ID 0x41540001. /boot holds wpa_supplicant.conf, so it
+# is readable by root only.
 cat > "$TARGET_DIR/etc/fstab" <<'FSTAB'
-# <device>       <mount>                  <type>  <options>         <dump> <pass>
-/dev/mmcblk0p1   /boot                    vfat    ro                0      2
-/dev/mmcblk0p2   /                        ext4    ro,noatime        0      1
-/dev/mmcblk0p3   /opt/autonomous-trust    ext4    rw,noatime,nosuid 0      2
+# <device>              <mount>                  <type>  <options>                <dump> <pass>
+PARTUUID=41540001-01    /boot                    vfat    ro,umask=0077            0      2
+PARTUUID=41540001-02    /                        ext4    ro,noatime               0      1
+PARTUUID=41540001-03    /opt/autonomous-trust    ext4    rw,noatime,nosuid        0      2
 FSTAB
 
 # Remove unnecessary files to minimize image

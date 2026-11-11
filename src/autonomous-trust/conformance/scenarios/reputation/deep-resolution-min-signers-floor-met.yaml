@@ -1,0 +1,47 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: deep-resolution-min-signers-floor-met
+byte_pinning: false
+description: |
+    Deep resolution, the signer floor, positive control for
+    deep-resolution-min-signers-floor: the same requestor, demanding two
+    verified, trusted co-signers, accepts an answer that carries two. Without
+    this case a runtime that refused every answer under a raised floor would
+    pass the negative one.
+
+participants:
+  - id: requestor
+    role: proposer
+  - id: holder
+    role: acceptor
+  - id: subject
+    role: acceptor
+
+fixtures:
+  resolve_min_signers:
+    requestor: 2
+  tx_history:
+    holder:
+      - {task_id: d1, p1: holder, p1_score: 0.8, p2: subject, p2_score: 0.6}
+      - {task_id: d2, p1: holder, p1_score: 0.9, p2: subject, p2_score: 0.4}
+      - {task_id: d3, p1: holder, p1_score: 0.7, p2: subject, p2_score: 0.5}
+
+steps:
+  - id: 1
+    from: holder
+    to: requestor
+    function: resolved reputation
+    payload:
+      peer: subject
+      query_id: q1
+      cosigners: [holder, subject]
+    description: |
+        Two genuine co-signatures against a floor of two.
+
+expected_state:
+  requestor:
+    resolved_reputation:
+      peer: subject
+      verified: true
+      score: 0.7999

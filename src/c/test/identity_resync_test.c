@@ -73,6 +73,7 @@ static char ID_UPDATE_FN[]   = "group_key_update";
 
 static size_t g_query_count;
 static size_t g_response_count;
+static size_t g_update_count;       /* group_key_update frames sent */
 static char   g_last_query_group[UUID_STRING_LEN + 1];
 static json_t *g_last_query_have;   /* owned; freed in _end */
 /* Last PEER_OBSERVED emission's group-membership flag: -1 none yet, else 0/1. */
@@ -112,6 +113,8 @@ static int _capture_hook(const char *key, const message_type_t type,
         }
     } else if (strcmp(fn, ID_RESPONSE_FN) == 0) {
         g_response_count++;
+    } else if (strcmp(fn, ID_UPDATE_FN) == 0) {
+        g_update_count++;
     }
     return 0;
 }
@@ -539,6 +542,88 @@ DEFINE_TEST(test_confirm_adds_real_peer)
     _end();
 }
 
+/* As _dispatch_confirm, but from confirmer @p from with sequence @p seq, as
+ * each member of a cohort confirms a newcomer to every other member. */
+static void _dispatch_confirm_from(process_t *proc, identity_t *who,
+                                   identity_t *from, int64_t seq)
+{
+    public_identity_t *pub = NULL;
+    ck_assert_ret_ok(identity_publish(who, &pub));
+    json_t *ident_json = NULL;
+    ck_assert_ret_ok(public_identity_to_json(pub, &ident_json));
+    smrt_deref(pub);
+
+    json_t *payload = json_object();
+    json_object_set_new(payload, "peer", ident_json);
+    json_object_set_new(payload, "seq", json_integer(seq));
+
+    generic_msg_t msg = {0};
+    msg.type = NET_MESSAGE;
+    strncpy(msg.info.net_msg.process, "identity", PROC_NAME_LEN);
+    msg.info.net_msg.function = ID_CONFIRM_FN;
+    uuid_copy(msg.info.net_msg.from_whom.uuid, from->uuid);
+    at_strlcpy(msg.info.net_msg.from_whom.nickname, from->nickname,
+               sizeof(msg.info.net_msg.from_whom.nickname));
+    ck_assert_ret_ok(net_msg_pack_json(&msg.info.net_msg, payload));
+    json_decref(payload);
+
+    directory_t *queues = NULL;
+    ck_assert_ret_ok(array_create(&queues));
+    run_message_handlers(proc, queues, NET_MESSAGE, &msg);
+    array_free(queues);
+}
+
+/* A confirm naming a peer that is already a member at the same address
+ * changes nothing, so it sends no group_key_update. It used to send our whole
+ * group to every peer on each such confirm, and every member confirms each
+ * admission (and each re-admission of a returning member) to every other
+ * member: in a 16-node fleet one re-admission cost 15 confirms x 15 updates,
+ * and the burst kept the network and identity queues full for minutes
+ * (fleet-16, 2026-11-09). */
+DEFINE_TEST(test_confirm_of_known_member_sends_no_group_update)
+{
+    _begin();
+    identity_t *me = _mk_identity("coord", "10.0.0.1");
+    identity_t *alice = _mk_identity("alice", "10.0.0.2");
+    identity_t *bob = _mk_identity("bob", "10.0.0.3");
+    identity_t *carol = _mk_identity("carol", "10.0.0.4");
+    process_t *proc = _mk_process(me);
+    _add_peer(proc, alice);
+    _add_peer(proc, bob);
+    _add_peer(proc, carol);
+    _add_group_member_addr(proc, alice);
+    _add_group_member_addr(proc, bob);
+    _add_group_member_addr(proc, carol);
+
+    g_update_count = 0;
+    _dispatch_confirm_from(proc, alice, bob, 1);
+    _dispatch_confirm_from(proc, alice, carol, 1);
+    _dispatch_confirm_from(proc, alice, bob, 2);
+    ck_assert_uint_eq(g_update_count, 0);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* Control: promoting a provisional peer (in peers[] but not yet in the group
+ * address map) is a membership change, and every peer is told. */
+DEFINE_TEST(test_confirm_promoting_a_peer_sends_group_update)
+{
+    _begin();
+    identity_t *me = _mk_identity("coord", "10.0.0.1");
+    identity_t *alice = _mk_identity("alice", "10.0.0.2");
+    identity_t *bob = _mk_identity("bob", "10.0.0.3");
+    process_t *proc = _mk_process(me);
+    _add_peer(proc, alice);
+    _add_peer(proc, bob);
+    _add_group_member_addr(proc, bob);
+
+    g_update_count = 0;
+    _dispatch_confirm_from(proc, alice, bob, 1);
+    ck_assert_uint_eq(g_update_count, 2);
+    _end();
+}
+END_TEST_DEFINITION()
+
 /* Dispatch a group_key_update from @p member advertising group @p group_uuid_str,
  * so handle_group_update records the peer's advertised group. from_whom is the
  * authenticated sender = member. */
@@ -639,4 +724,6 @@ RUN_TESTS(IdentityResync,
           test_response_rejects_non_member,
           test_confirm_does_not_add_self,
           test_confirm_adds_real_peer,
+          test_confirm_of_known_member_sends_no_group_update,
+          test_confirm_promoting_a_peer_sends_group_update,
           test_emit_peer_observed_in_group)

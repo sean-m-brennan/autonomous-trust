@@ -1,0 +1,50 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-update-held-member-rotation-adopted
+byte_pinning: false
+description: |
+    A rotation signed by a member of our group that we hold is adopted.
+
+    The control for the refusals beside it. other is in member's group and
+    member holds it, so other's epoch-2 copy of the group, signed by other,
+    raises member to epoch 2.
+
+participants:
+  - id: member
+    role: group_member
+  - id: other
+    role: group_member
+
+fixtures:
+  groups:
+    member:
+      uuid: "0a000000-0000-4000-8000-000000000ac4"
+      size: 1
+      key_epoch: 0
+      members: [other]
+    other:
+      uuid: "0a000000-0000-4000-8000-000000000ac4"
+      size: 1
+      key_epoch: 2
+      members: [member]
+
+steps:
+  - id: 1
+    from: member
+    to: member
+    function: trigger_phase3
+    payload:
+      admit: [other]
+    description: member is in phase 3 and holds other, a member of its group.
+
+  - id: 2
+    from: other
+    to: member
+    function: group_key_update
+    payload: {}
+    description: other's epoch-2 copy of the group reaches member and is adopted.
+
+expected_state:
+  member:
+    group_key_epoch: 2

@@ -132,17 +132,29 @@ if [ -f "$BOOT_IMG" ]; then
         info "  Contents:"
         echo "$BOOT_LIST" | sed 's/^/    /'
 
-        echo "$BOOT_LIST" | grep -qi "config" && rc=0 || rc=1
+        grep -qi "config" <<<"$BOOT_LIST" && rc=0 || rc=1
         check "config.txt present in boot" $rc
 
-        echo "$BOOT_LIST" | grep -qi "u-boot" && rc=0 || rc=1
+        grep -qi "u-boot" <<<"$BOOT_LIST" && rc=0 || rc=1
         check "u-boot.bin present in boot" $rc
 
-        echo "$BOOT_LIST" | grep -qi "image" && rc=0 || rc=1
+        grep -qi "image" <<<"$BOOT_LIST" && rc=0 || rc=1
         check "Kernel Image present in boot" $rc
 
-        echo "$BOOT_LIST" | grep -qi "dtb" && rc=0 || rc=1
+        grep -qi "dtb" <<<"$BOOT_LIST" && rc=0 || rc=1
         check "Device tree blob(s) present in boot" $rc
+
+        grep -qi "start4.*elf" <<<"$BOOT_LIST" && rc=0 || rc=1
+        check "Pi 4 firmware start4.elf present in boot" $rc
+
+        grep -qi "fixup4.*dat" <<<"$BOOT_LIST" && rc=0 || rc=1
+        check "Pi 4 firmware fixup4.dat present in boot" $rc
+
+        mdir -i "$BOOT_IMG" ::extlinux/extlinux.conf &>/dev/null && rc=0 || rc=1
+        check "U-Boot extlinux/extlinux.conf present in boot" $rc
+
+        grep -qi "wpa_supplicant.conf.example" <<<"$BOOT_LIST" && rc=0 || rc=1
+        check "wpa_supplicant.conf.example present in boot" $rc
 
         # Extract and display config.txt (timeout prevents mcopy hangs)
         if command -v mcopy &>/dev/null; then
@@ -181,7 +193,34 @@ else
 fi
 
 # -----------------------------------------------------------------------
-# 3. Root filesystem (inspect the ext4 image via debugfs or tar)
+# 3. Kernel config (embedded in the Image by CONFIG_IKCONFIG)
+# -----------------------------------------------------------------------
+step "Kernel config"
+
+# The config sits gzipped between the IKCFG_ST and IKCFG_ED markers. Each
+# option below is one the image cannot boot or be seen without.
+KERNEL_IMAGE="$IMAGES_DIR/Image"
+KCONFIG=""
+if [ -f "$KERNEL_IMAGE" ]; then
+    KCFG_OFF=$(grep -abo IKCFG_ST "$KERNEL_IMAGE" | head -1 | cut -d: -f1 || true)
+    if [ -n "$KCFG_OFF" ]; then
+        KCONFIG=$(tail -c +$((KCFG_OFF + 9)) "$KERNEL_IMAGE" | gzip -dc 2>/dev/null || true)
+    fi
+fi
+
+if [ -n "$KCONFIG" ]; then
+    for opt in TMPFS TMPFS_POSIX_ACL DEVTMPFS CGROUPS INOTIFY_USER FHANDLE \
+               MMC_SDHCI_IPROC BCMGENET MODULE_SIG_FORCE \
+               DRM_SIMPLEDRM DRM_FBDEV_EMULATION FRAMEBUFFER_CONSOLE; do
+        grep -qx "CONFIG_$opt=y" <<<"$KCONFIG" && rc=0 || rc=1
+        check "Kernel built with CONFIG_$opt=y" $rc
+    done
+else
+    check "Kernel Image carries its config (CONFIG_IKCONFIG)" 1
+fi
+
+# -----------------------------------------------------------------------
+# 4. Root filesystem (inspect the ext4 image via debugfs or tar)
 # -----------------------------------------------------------------------
 step "Root filesystem"
 
@@ -194,17 +233,47 @@ if [ -f "$ROOTFS_TAR" ]; then
 
     TAR_LIST=$(tar tf "$ROOTFS_TAR")
 
-    echo "$TAR_LIST" | grep -q "usr/local/bin/at_demo$" && rc=0 || rc=1
+    grep -q "usr/local/bin/at_demo$" <<<"$TAR_LIST" && rc=0 || rc=1
     check "at_demo binary in rootfs" $rc
 
-    echo "$TAR_LIST" | grep -q "etc/systemd/system/autonomous-trust.service" && rc=0 || rc=1
+    grep -q "etc/systemd/system/autonomous-trust.service" <<<"$TAR_LIST" && rc=0 || rc=1
     check "systemd service file in rootfs" $rc
 
-    echo "$TAR_LIST" | grep -q "multi-user.target.wants/autonomous-trust" && rc=0 || rc=1
+    grep -q "multi-user.target.wants/autonomous-trust" <<<"$TAR_LIST" && rc=0 || rc=1
     check "Service enabled (multi-user.target.wants)" $rc
 
-    echo "$TAR_LIST" | grep -q "opt/autonomous-trust" && rc=0 || rc=1
+    grep -q "opt/autonomous-trust" <<<"$TAR_LIST" && rc=0 || rc=1
     check "Data mount point /opt/autonomous-trust in rootfs" $rc
+
+    grep -q "usr/lib/systemd/systemd$" <<<"$TAR_LIST" && rc=0 || rc=1
+    check "systemd is the init system" $rc
+
+    grep -q "sys-subsystem-net-devices-wlan0.device.wants/at-wifi.service" <<<"$TAR_LIST" && rc=0 || rc=1
+    check "Wi-Fi unit enabled (at-wifi.service on wlan0)" $rc
+
+    grep -q "etc/systemd/network/20-eth0.network" <<<"$TAR_LIST" \
+        && grep -q "etc/systemd/network/30-wlan0.network" <<<"$TAR_LIST" && rc=0 || rc=1
+    check "networkd DHCP config for eth0 and wlan0" $rc
+
+    grep -q "sbin/wpa_supplicant$" <<<"$TAR_LIST" && rc=0 || rc=1
+    check "wpa_supplicant in rootfs" $rc
+
+    grep -q "lib/firmware/brcm/brcmfmac43455-sdio.bin" <<<"$TAR_LIST" && rc=0 || rc=1
+    check "CYW43455 Wi-Fi firmware in rootfs" $rc
+
+    grep -q "lib/firmware/regulatory.db$" <<<"$TAR_LIST" && rc=0 || rc=1
+    check "Wireless regulatory database in rootfs" $rc
+
+    # Modules are signed and the kernel refuses unsigned ones, so a module
+    # that lost its signature (e.g. to a strip pass) would never load
+    BRCMFMAC_KO=$(grep -m1 "/brcmfmac.ko$" <<<"$TAR_LIST" || true)
+    if [ -n "$BRCMFMAC_KO" ]; then
+        tar xf "$ROOTFS_TAR" -O "$BRCMFMAC_KO" 2>/dev/null | tail -c 28 \
+            | grep -q "~Module signature appended~" && rc=0 || rc=1
+    else
+        rc=1
+    fi
+    check "brcmfmac.ko present and signed" $rc
 
     # Check fstab
     FSTAB=$(tar xf "$ROOTFS_TAR" -O ./etc/fstab 2>/dev/null || true)
@@ -266,7 +335,7 @@ fi
 rm -f "${TMP_BIN:-}" 2>/dev/null || true
 
 # -----------------------------------------------------------------------
-# 4. dm-verity
+# 5. dm-verity
 # -----------------------------------------------------------------------
 step "dm-verity"
 
@@ -305,7 +374,7 @@ else
 fi
 
 # -----------------------------------------------------------------------
-# 5. Size summary
+# 6. Size summary
 # -----------------------------------------------------------------------
 step "Size summary"
 

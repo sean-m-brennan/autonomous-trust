@@ -132,6 +132,13 @@ typedef struct
      * leave verified=false but only the latter is a security event. */
     bool verified;
     bool has_signature;
+    /* The signature itself (valid iff has_signature). A sender the network
+     * did not yet hold leaves verified false; the identity process checks the
+     * signature again once the sender is a known peer
+     * (id_proc.c _reverify_held), against that peer's stored key. The pre-image
+     * is rebuilt from process, function and obj (net_message_signed_content).
+     * Mirrors Python Message.wire_signature. */
+    uint8_t signature[crypto_sign_BYTES];
     /* On a gateway, the uuid (hyphenated, lowercase) of the child cohort the
      * sender belongs to, set by net_proc on receipt; empty for a frame from the
      * primary cohort, a stranger, or on any node with no child group. Identity
@@ -502,6 +509,9 @@ typedef struct {
      *  slashed or off the roster. */
     bool    bounded;
     int32_t verdicts;
+    /** The peer's latest probe of ours failed and one more failure would
+     *  hold it below tier 1 (reputation_probe_hold): probe it again now. */
+    bool    suspect;
 } peer_probe_count_msg_t;
 
 /** Members an @ref ANCHORED_COHORT message can name. */

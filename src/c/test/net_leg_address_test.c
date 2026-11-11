@@ -35,6 +35,7 @@
 
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
+#include "network/net_ext.h"
 #include "network/net_message.h"
 #include "network/net_proc_priv.h"
 #include "network/net_transport.h"
@@ -93,6 +94,8 @@ static hybrid_config_t g_cfg;
 static char g_leg_from[2][64];
 static int g_leg_sends[2];
 static char g_unicast_from[64];
+static int g_fanouts;
+static char g_fanout_from[64];
 
 static void from_address_of(const uint8_t *wire, size_t len, char *out, size_t out_len)
 {
@@ -146,6 +149,18 @@ static int t_address_for_target(const net_transport_ctx_t *ctx, const char *targ
     (void)ctx;
     return hybrid_envelope_address(&g_cfg, target, out, len);
 }
+/* An extension that records each fanout. Registered once for the binary; the
+ * counters reset per test. */
+static void t_fanout(net_channel_t ch, const char *process, const char *function,
+                     const group_t *grp, const uint8_t *buf, size_t len)
+{
+    (void)process; (void)function; (void)grp;
+    g_fanouts++;
+    if (ch == NET_CHAN_BROADCAST)
+        from_address_of(buf, len, g_fanout_from, sizeof(g_fanout_from));
+}
+static const net_ext_t T_FANOUT_EXT = {.name = "t_fanout", .fanout = t_fanout};
+
 static const net_transport_t T_TWO_LEGS = {
     .name = "t_two_legs",
     .send_unicast = t_send_unicast,
@@ -186,6 +201,10 @@ static void _reset(void)
     memset(g_leg_from, 0, sizeof(g_leg_from));
     memset(g_leg_sends, 0, sizeof(g_leg_sends));
     g_unicast_from[0] = '\0';
+    g_fanouts = 0;
+    g_fanout_from[0] = '\0';
+    if (!net_ext_present("t_fanout"))
+        ck_assert_int_eq(net_ext_register(&T_FANOUT_EXT), 0);
 }
 
 DEFINE_TEST(test_broadcast_names_each_legs_own_address)
@@ -200,12 +219,17 @@ DEFINE_TEST(test_broadcast_names_each_legs_own_address)
     ck_assert_str_eq(g_leg_from[0], "10.0.0.7");
     ck_assert_str_eq(g_leg_from[1], "172.20.0.7");
     ck_assert_str_eq(w.from_whom.address, "10.0.0.7");   /* the caller's message is untouched */
+    /* The extensions see the broadcast once, as built, not once per leg. */
+    ck_assert_int_eq(g_fanouts, 1);
+    ck_assert_str_eq(g_fanout_from, "10.0.0.7");
     free(w.function);
     free(w.data);
 }
 END_TEST_DEFINITION()
 
-DEFINE_TEST(test_group_frames_go_leg_by_leg)
+/* A group with no other member names no network, so its frame goes on every
+ * leg. */
+DEFINE_TEST(test_a_memberless_group_frame_goes_on_every_leg)
 {
     _reset();
     identity_t *me = _mk("gw", "10.0.0.7");
@@ -219,9 +243,51 @@ DEFINE_TEST(test_group_frames_go_leg_by_leg)
                                                     27787, NET_WIRE_JSON, NULL), 0);
     ck_assert_int_eq(g_leg_sends[0], 1);
     ck_assert_int_eq(g_leg_sends[1], 1);
+    ck_assert_int_eq(g_fanouts, 1);
     free(w.function);
     free(w.data);
     map_free(&grp.address_map);
+}
+END_TEST_DEFINITION()
+
+/* A group stops at the gateway, so its members sit on one of our networks and
+ * its frame goes on that leg only: the command group's ciphertext has no
+ * business on the field network. Mirrors Python
+ * NetworkProcess._send_group_message, which sends to the members. */
+static void _group_on(const char *member_addr, int expect_leg)
+{
+    _reset();
+    identity_t *me = _mk("gw", "10.0.0.7"), *member = _mk("m", member_addr);
+    group_t grp = {0};
+    char gaddr[] = "group-addr";
+    ck_assert_int_eq(group_init(NULL, gaddr, &grp), 0);
+    char u[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(me->uuid, u);
+    group_add_address(&grp, u, me->address);
+    uuid_unparse_lower(member->uuid, u);
+    group_add_address(&grp, u, member->address);
+    net_wire_msg_t w;
+    _msg(&w, me, RECIPIENT_GROUP, "presence");
+    w.encrypt = true;
+    ck_assert_int_eq(net_proc_test_encrypt_and_send(me, &grp, &w, &T_TWO_LEGS, NULL,
+                                                    27787, NET_WIRE_JSON, NULL), 0);
+    ck_assert_int_eq(g_leg_sends[expect_leg], 1);
+    ck_assert_int_eq(g_leg_sends[1 - expect_leg], 0);
+    ck_assert_int_eq(g_fanouts, 1);
+    free(w.function);
+    free(w.data);
+    map_free(&grp.address_map);
+}
+
+DEFINE_TEST(test_a_command_group_frame_stays_on_the_command_leg)
+{
+    _group_on("10.0.0.3", 0);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_a_field_group_frame_stays_on_the_field_leg)
+{
+    _group_on("172.20.4.4", 1);
 }
 END_TEST_DEFINITION()
 
@@ -248,5 +314,7 @@ RUN_TESTS(Net_Leg_Address,
           test_leg_address_strips_the_prefix,
           test_envelope_address_is_the_routed_legs,
           test_broadcast_names_each_legs_own_address,
-          test_group_frames_go_leg_by_leg,
+          test_a_memberless_group_frame_goes_on_every_leg,
+          test_a_command_group_frame_stays_on_the_command_leg,
+          test_a_field_group_frame_stays_on_the_field_leg,
           test_unicast_names_the_routed_legs_address)

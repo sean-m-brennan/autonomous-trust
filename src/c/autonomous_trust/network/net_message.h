@@ -231,6 +231,20 @@ int net_message_from_wire_proto(const uint8_t *data, size_t len,
                                 net_wire_msg_t *msg_out);
 
 
+/**
+ * @brief Check a signature over a message's pre-image
+ *        (`process|function|base64(data)`, as the sender signed it) against
+ *        @p public_key.
+ *
+ * For a message whose sender the network did not hold on receipt: the
+ * identity process checks it again against the peer it holds once it holds
+ * one. Mirrors Python Message.reverify.
+ */
+bool net_message_verify_signature(const char *process, const char *function,
+                                  const uint8_t *data, size_t data_len,
+                                  const uint8_t signature[crypto_sign_BYTES],
+                                  const unsigned char public_key[crypto_sign_PUBLICKEYBYTES]);
+
 /** @} */ /* end of internal_network */
 
 #endif  /* NET_MESSAGE_H */

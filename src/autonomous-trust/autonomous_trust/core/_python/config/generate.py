@@ -65,6 +65,33 @@ def _subsystems(net_impl):
     return pt
 
 
+#: Env var carrying a provisioned identity uuid. A deployment generator that
+#: writes a deployment manifest (RD_13.4 §3.3) has to know each node's uuid
+#: before the node exists, so it sets this and the node adopts it. Mirrors C
+#: AT_IDENTITY_UUID_ENV in config/generate.c.
+IDENTITY_UUID_ENV = 'AT_IDENTITY_UUID'
+
+
+def provisioned_uuid():
+    """The uuid ``AT_IDENTITY_UUID`` provisions, or None when it is unset.
+
+    Only the canonical form (lowercase, hyphenated) is accepted, the same rule
+    the deployment manifest applies to its members; anything else raises
+    ValueError, because an identity that quietly drew a random uuid instead
+    would no longer match the manifest that names it."""
+    import uuid as uuid_mod
+    raw = os.environ.get(IDENTITY_UUID_ENV, '').strip()
+    if not raw:
+        return None
+    try:
+        value = uuid_mod.UUID(raw)
+    except ValueError:
+        value = None
+    if value is None or str(value) != raw:
+        raise ValueError('%s=%r is not a canonical uuid' % (IDENTITY_UUID_ENV, raw))
+    return value
+
+
 def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve=False, defaults=False, peers=False):
     if seed is not None:
         try:
@@ -125,7 +152,8 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
         net_cfg = Network.initialize(_as_cidr(ip4_address, addresses['ip4_subnet']),
                                      _as_cidr(ip6_address, addresses['ip6_subnet']),
                                      mac_address)
-        ident_cfg = Identity.initialize(nickname, petname, address)
+        ident_cfg = Identity.initialize(nickname, petname, address,
+                                        uuid=provisioned_uuid())
         sub_sys_cfg = _subsystems(communications)
         if not os.path.exists(net_file):
             net_cfg.to_file(net_file)
@@ -190,7 +218,8 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
     else:
         net_cfg = Network.from_file(net_file)
     if not os.path.exists(ident_file) or not preserve:
-        ident_cfg = Identity.initialize(nickname, petname, net_cfg.ip4)  # noqa
+        ident_cfg = Identity.initialize(nickname, petname, net_cfg.ip4,  # noqa
+                                        uuid=provisioned_uuid())
     else:
         ident_cfg = Identity.from_file(ident_file)
     if not os.path.exists(sub_sys_file) or not preserve:

@@ -238,6 +238,11 @@ DEFINE_TEST(test_net_msg_proto_carries_the_signature_verdict)
         original.encrypt = true;
         original.verified = (verdict == 1);
         original.has_signature = (verdict == 1);
+        /* The signature itself crosses too, so identity can check it again
+         * once it holds the sender (net_msg_t.signature). */
+        if (verdict == 1)
+            for (int i = 0; i < crypto_sign_BYTES; i++)
+                original.signature[i] = (uint8_t)(i + 1);
         uuid_generate(original.from_whom.uuid);
         strncpy(original.from_whom.nickname, "Alice", NAME_LEN);
 
@@ -254,6 +259,7 @@ DEFINE_TEST(test_net_msg_proto_carries_the_signature_verdict)
         ck_assert_ret_ok(proto_to_net_msg(data, data_len, &restored));
         ck_assert_int_eq((int)restored.verified, verdict);
         ck_assert_int_eq((int)restored.has_signature, verdict);
+        ck_assert_mem_eq(restored.signature, original.signature, crypto_sign_BYTES);
 
         free(data);
         net_msg_free_obj(&original);

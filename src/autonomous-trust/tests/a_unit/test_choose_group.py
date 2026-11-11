@@ -290,3 +290,62 @@ def test_a_welcome_is_re_sent_after_the_delays(monkeypatch):
     node._resend_welcomes(queues)
     node._resend_welcomes(queues)
     assert _sent(queues) == [grant, history, grant, history]
+
+
+# ---- a history that arrives once the group is settled ------------------------
+#
+# Python's receive_history used to start choose_group again for every history
+# that arrived after the choice, and the rerun adopted the longest stashed one
+# wholesale: a snapshot of our own group from before its last rotations. In
+# the 16-colluder hostile-join run of 2026-11-05 that took almost every node's
+# key from epoch 16 back to 14, several times each, and the two nodes it
+# missed were left outside everyone else's group for the run. C never reran
+# the choice: a settled node only tells a group that admitted it too.
+
+def _settled(me, group):
+    node = _chooser(me)
+    node.phase = 3
+    node.group = group
+    node.self_bootstrapped = False
+    node.merging = False
+    node._pending_joins = set()
+    node._spawn = MagicMock()
+    node.histories = []
+    return node
+
+
+def _history_message(group, steps=('s1', 's2', 's3')):
+    from autonomous_trust.core.config import to_json_string
+    from autonomous_trust.core.network import Message
+    return Message('identity', IdentityProtocol.history,
+                   to_json_string((group.to_canonical(), list(steps), [])))
+
+
+def test_a_late_history_of_our_own_group_does_not_rerun_the_choice():
+    me, a = _peer('me'), _peer('a')
+    group = _group(me, a)
+    stale = Group.from_canonical(group.to_canonical())
+    group.rotate_key()
+    group.rotate_key()
+    node = _settled(me, group)
+    assert node.receive_history(_queues(), _history_message(stale)) is True
+    node._spawn.assert_not_called()
+    assert node.group is group and node.group.key_epoch == stale.key_epoch + 2
+
+
+def test_a_late_history_of_another_group_tells_that_group():
+    me, a, b = _peer('me'), _peer('a'), _peer('b')
+    node = _settled(me, _group(me, a))
+    other = _group(b, me, name='other')
+    node.receive_history(_queues(), _history_message(other))
+    node._spawn.assert_not_called()
+    told = node._tell_bridged_group.call_args.args[1]
+    assert told['uuid'] == str(other.uuid)
+
+
+def test_a_history_before_the_choice_still_starts_it():
+    me, a = _peer('me'), _peer('a')
+    node = _settled(me, None)
+    node.phase = 2
+    node.receive_history(_queues(), _history_message(_group(a)))
+    assert node._spawn.call_args.args[0] == node.choose_group

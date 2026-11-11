@@ -28,6 +28,7 @@
 #   --hacked-sensors N  Hacked sensors       (default: 2)
 #   --port N            Dash port            (default: 8050)
 #   --speed X           1.0|2.0|5.0|10.0     (default: 1.0)
+#   --theme dark|light  Dashboard colors     (default: dark, or $AT_THEME)
 #   --no-mq800 --no-jet --no-command         Drop those roles (match the run)
 #   ... any other flag (e.g. --no-auto-pause, --paused, --log-level debug)
 #       is forwarded verbatim to the playback module.
@@ -96,8 +97,11 @@ while (( $# )); do
         --port=*)          PORT="${1#*=}";      shift;;
         --speed)           SPEED="$2";          shift 2;;
         --speed=*)         SPEED="${1#*=}";     shift;;
+        # Own arm so a bare value (--theme light) isn't taken for the file.
+        --theme)           PASSTHRU+=(--theme "$2"); shift 2;;
+        --theme=*)         PASSTHRU+=(--theme "${1#*=}"); shift;;
         -h|--help)
-            sed -n '8,46p' "$self" | sed 's/^# \{0,1\}//'
+            sed -n '8,45p' "$self" | sed 's/^# \{0,1\}//'
             exit 0;;
         -*)                PASSTHRU+=("$1");    shift;;   # forward unknown flags
         *)                 RECORDING="$1"; GOT_FILE=1; shift;;

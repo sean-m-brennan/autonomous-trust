@@ -35,6 +35,7 @@ from ..identity import Identity
 from ..identity.identity import public_identity_to_canonical
 from ..identity.protocol import IdentityProtocol, BOOTSTRAP_VERBS
 from ..plaintext_verbs import is_broadcast, is_unencrypted
+from .. import deployment_manifest
 from ..app_verbs import is_local_app_verb, refuse_remote_app_verb
 from ..processes import Process, ProcMeta
 from ..extensions import (configure_plaintext_verbs, load_extensions,
@@ -692,6 +693,10 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 self._crypto_error_counts[name] = count
                 if count == 1 or count % 10 == 0:
                     self.logger.error('CryptoError decrypting message from %s (count: %d)', name, count)
+                # A member we hold sent a frame our key will not open: it holds
+                # a key we lack. Identity asks it for the group.
+                if from_whom is not None and not getattr(self, '_via_ext', False):
+                    self._signal_key_stale(queues, from_addr)
                 if retry:
                     self.logger.info('Held group frame from %s still does not open '
                                      'after a key change; dropped', name)
@@ -972,6 +977,31 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             _probes.counter('net.group', 'partition_signal_emitted', from_addr)
         except Full:
             _probes.counter('net.group', 'partition_signal_drop', 'queue_full')
+
+    _KEY_STALE_SIGNAL_COOLDOWN = 5.0  # seconds, per from_addr
+
+    def _signal_key_stale(self, queues, from_addr):
+        """Tell IdentityProcess that a group frame from ``from_addr``, a peer we
+        hold, would not open: that member holds a key we lack, and identity
+        asks it for the current group (``group_key_query``). Local IPC only,
+        naming no sender. One signal per address per cooldown. Twin of C
+        _net_signal_key_stale."""
+        lru = self.__dict__.setdefault('_key_stale_signal_lru', {})
+        tick = time.monotonic()
+        last = lru.get(from_addr)
+        if last is not None and tick - last < self._KEY_STALE_SIGNAL_COOLDOWN:
+            return
+        lru[from_addr] = tick
+        target = queues.get(CfgIds.identity)
+        if target is None:
+            return
+        signal = Message(CfgIds.identity, IdentityProtocol.key_stale, from_addr,
+                         encrypt=False)
+        try:
+            target.put(signal, block=True, timeout=self.q_cadence)
+            _probes.counter('net.group', 'key_stale_signal_emitted', from_addr)
+        except Full:
+            _probes.counter('net.group', 'key_stale_signal_drop', 'queue_full')
 
     def _ensure_ping_at_pool(self):
         """Lazily instantiate the ping thread pool inside the subprocess.
@@ -1712,6 +1742,9 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         # node's start already checked it (extensions.check_config), but module
         # state does not survive the forkserver, so apply it again here.
         configure_plaintext_verbs(logger=self.logger)
+        # The deployment manifest, likewise checked at start (automate) and
+        # re-applied here for the same reason (RD_13.4 §3.3).
+        deployment_manifest.configure()
         # Re-establish receiver-socket timeouts here, in the worker
         # subprocess. The sockets are created in __init__ (which runs
         # in the parent) and transferred via fd-passing during the

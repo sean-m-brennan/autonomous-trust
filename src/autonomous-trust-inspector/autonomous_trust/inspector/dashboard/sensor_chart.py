@@ -39,6 +39,8 @@ import plotly.graph_objects as go
 
 from autonomous_trust.services.data import Reading
 
+from .theme import current as current_theme
+
 
 @dataclass
 class _PeerTrace:
@@ -115,13 +117,14 @@ class SensorComparisonChart:
 
     def figure(self, width: int = 900, height: int = 300) -> go.Figure:
         """Build the Plotly figure."""
+        th = current_theme()
         fig_width, fig_height = width, height
         fig = go.Figure()
 
         # Determine current time window
         all_t = [t for tr in self._traces.values() for t in tr.times]
         if not all_t:
-            fig.update_layout(title=self._title, template="plotly_dark")
+            fig.update_layout(title=self._title, template=th.plotly_template)
             return fig
 
         t_max = max(all_t)
@@ -169,7 +172,7 @@ class SensorComparisonChart:
                     x=list(time_set), y=mins,
                     mode="lines", line=dict(width=0),
                     fill="tonexty",
-                    fillcolor="rgba(100,200,100,0.15)",
+                    fillcolor=th.data("rgba(100,200,100,0.15)"),
                     name="Consensus Band",
                     showlegend=True,
                 ))
@@ -185,9 +188,9 @@ class SensorComparisonChart:
                 dash = "dash"
                 line_width = 3
 
-            color = trace.color
+            color = th.data(trace.color)
             if name == self._highlight_peer:
-                color = self._highlight_color
+                color = th.data(self._highlight_color)
                 line_width = max(line_width, 3)
 
             fig.add_trace(go.Scatter(
@@ -202,11 +205,11 @@ class SensorComparisonChart:
             if trace.anomalous_since is not None:
                 fig.add_vrect(
                     x0=trace.anomalous_since, x1=t_max,
-                    fillcolor="rgba(239,68,68,0.1)",
+                    fillcolor=th.data("rgba(239,68,68,0.1)"),
                     line_width=0,
                     annotation_text="Anomaly Detected",
                     annotation_position="top left",
-                    annotation_font_color="#EF4444",
+                    annotation_font_color=th.data("#EF4444"),
                     annotation_font_size=10,
                 )
                 break  # only one shading region
@@ -216,7 +219,7 @@ class SensorComparisonChart:
             xaxis_title="Time (seconds)",
             xaxis=dict(range=[t_min, t_max]),
             yaxis_title=f"{self._data_type.replace('_', ' ').title()} ({self._unit})",
-            template="plotly_dark",
+            template=th.plotly_template,
             width=fig_width,
             height=fig_height,
             legend=dict(

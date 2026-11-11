@@ -265,9 +265,11 @@ typedef struct net_transport_s {
      *
      * A frame names its sender's address, and a node on several networks has
      * one address per network: each side reaches it only at the address it
-     * holds there. With more than one leg, net_proc serializes a broadcast or
-     * group frame once per leg, naming that leg's address (@ref leg_address),
-     * and sends it with @ref send_on_leg. NULL for single-leg transports.
+     * holds there. With more than one leg, net_proc serializes a broadcast
+     * once per leg, naming that leg's address (@ref leg_address), and sends it
+     * with @ref send_on_leg. A group frame goes only on the leg that reaches
+     * the group's members, or on every leg when no member names one. NULL for
+     * single-leg transports.
      */
     size_t (*leg_count)(const net_transport_ctx_t *ctx);
 

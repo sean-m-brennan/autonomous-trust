@@ -82,7 +82,10 @@ typedef struct {
 
 static struct {
     pthread_mutex_t lock;
-    sel_proc_t procs[SEL_PROCS_MAX];
+    /* One per process that selects, allocated when it first does (about 19 KB
+     * each). A fixed array of SEL_PROCS_MAX put 300 KB in static memory for
+     * the one or two a node actually uses. */
+    sel_proc_t *procs[SEL_PROCS_MAX];
     bool model_loaded;
     at_selection_model_t model;
 } S = { .lock = PTHREAD_MUTEX_INITIALIZER };
@@ -111,19 +114,26 @@ static const at_selection_model_t *_env_model_locked(void)
 
 static sel_proc_t *_proc_locked(const process_t *proc, bool create)
 {
-    sel_proc_t *free_slot = NULL;
+    int free_slot = -1;
     for (int i = 0; i < SEL_PROCS_MAX; i++)
     {
-        if (S.procs[i].proc == proc)
-            return &S.procs[i];
-        if (S.procs[i].proc == NULL && free_slot == NULL)
-            free_slot = &S.procs[i];
+        if (S.procs[i] != NULL && S.procs[i]->proc == proc)
+            return S.procs[i];
+        if (S.procs[i] == NULL && free_slot < 0)
+            free_slot = i;
     }
-    if (!create || free_slot == NULL)
+    if (!create || free_slot < 0)
         return NULL;
-    memset(free_slot, 0, sizeof(*free_slot));
-    free_slot->proc = proc;
-    return free_slot;
+    sel_proc_t *sp = calloc(1, sizeof(*sp));
+    if (sp == NULL)
+    {
+        fprintf(stderr, "selection: no memory for a process's state; "
+                        "selecting nothing for it\n");
+        return NULL;
+    }
+    sp->proc = proc;
+    S.procs[free_slot] = sp;
+    return sp;
 }
 
 static const at_selection_model_t *_model_of(const sel_proc_t *sp)
@@ -501,10 +511,13 @@ static void _reset(void)
     pthread_mutex_lock(&S.lock);
     for (int i = 0; i < SEL_PROCS_MAX; i++)
     {
-        if (S.procs[i].have_req)
-            at_sel_requestor_close(&S.procs[i].req);
-        at_sel_peer_free(&S.procs[i].peer);
-        memset(&S.procs[i], 0, sizeof(S.procs[i]));
+        if (S.procs[i] == NULL)
+            continue;
+        if (S.procs[i]->have_req)
+            at_sel_requestor_close(&S.procs[i]->req);
+        at_sel_peer_free(&S.procs[i]->peer);
+        free(S.procs[i]);
+        S.procs[i] = NULL;
     }
     S.model_loaded = false;
     pthread_mutex_unlock(&S.lock);

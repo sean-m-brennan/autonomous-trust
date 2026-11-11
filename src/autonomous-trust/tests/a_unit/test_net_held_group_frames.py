@@ -164,3 +164,50 @@ def test_an_injected_frame_retried_from_outside_the_group_raises_no_signal():
     node._groups_containing = lambda addr: []
     assert node._retry_held_group_frames({}) == 1
     node._signal_partition.assert_called_once()
+
+
+class _Queue:
+    def __init__(self):
+        self.items = []
+
+    def put(self, item, **_kwargs):
+        self.items.append(item)
+
+
+def _stale_signals(queues):
+    from autonomous_trust.core.identity.protocol import IdentityProtocol
+    return [m for m in queues['identity'].items
+            if getattr(m, 'function', None) == IdentityProtocol.key_stale]
+
+
+def test_a_frame_that_will_not_open_tells_identity_the_sender_is_ahead():
+    # Hostile-join run, 2026-11-03: a joiner behind on the key decrypted none of
+    # the cohort's frames for ten minutes and never asked for the key. Identity
+    # now hears of it and asks that member (group_key_query).
+    ours = Group.initialize({'me': '10.0.0.1'}, 'cohort')
+    node = _node(ours)
+    node.q_cadence = 0.01
+    queues = {'identity': _Queue()}
+    node._inbound_group(queues, _frame(_rotated(ours)), SENDER)
+    [signal] = _stale_signals(queues)
+    assert signal.obj == SENDER and signal.from_whom is None
+
+
+def test_the_stale_signal_is_rate_limited_per_sender():
+    ours = Group.initialize({'me': '10.0.0.1'}, 'cohort')
+    node = _node(ours)
+    node.q_cadence = 0.01
+    queues = {'identity': _Queue()}
+    for _ in range(5):
+        node._inbound_group(queues, _frame(_rotated(ours)), SENDER)
+    assert len(_stale_signals(queues)) == 1
+
+
+def test_no_stale_signal_for_a_sender_we_do_not_hold():
+    ours = Group.initialize({'me': '10.0.0.1'}, 'cohort')
+    node = _node(ours)
+    node.q_cadence = 0.01
+    node.protocol = SimpleNamespace(peers=SimpleNamespace(find_by_address=lambda addr: None))
+    queues = {'identity': _Queue()}
+    node._inbound_group(queues, _frame(_rotated(ours)), SENDER)
+    assert _stale_signals(queues) == []

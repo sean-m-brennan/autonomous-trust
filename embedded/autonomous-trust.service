@@ -43,6 +43,8 @@ ProtectSystem=strict
 ReadWritePaths=/opt/autonomous-trust
 ProtectHome=true
 PrivateTmp=true
+# The data directory holds the node's identity seeds and subsystem sockets
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

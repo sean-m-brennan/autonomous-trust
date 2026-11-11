@@ -267,10 +267,14 @@ dod-mission options:
                          (compose: ./recording/FILE beside the compose file;
                          k8s: on the node). Play back with
                          'python -m examples.dod_mission --playback FILE'.
+  --theme dark|light     Dashboard colors (default dark). Exported as
+                         AT_THEME, which the playback dashboards and the
+                         compose/k8s coordinators read.
 
 Environment overrides: VARIANT, NAMESPACE, INSPECTOR_PORT, DEPLOY_DIR,
                        REGISTRY, IMAGE_TAG, LOG_LEVEL, TILT_LOG,
                        AT_RECORD, AT_RECORD_HOST_DIR, AT_RECORD_NODE_PATH,
+                       AT_THEME,
                        AT_KEEP_SUPERSEDED (=1 keeps the image generation a
                        rebuild replaces, instead of reclaiming it)
 EOF
@@ -300,6 +304,8 @@ while [[ $# -gt 0 ]]; do
         --record)                BACKEND_MODE="record";   RECORD_FILE="$2";   shift 2;;
         --record-to=*)           RECORD_TO="${1#*=}";        shift;;
         --record-to)             RECORD_TO="$2";             shift 2;;
+        --theme=*)               THEME="${1#*=}";            shift;;
+        --theme)                 THEME="$2";                 shift 2;;
         --namespace=*)           NAMESPACE="${1#*=}";        shift;;
         --namespace)             NAMESPACE="$2";             shift 2;;
         --port=*)                INSPECTOR_PORT="${1#*=}"; PORT_EXPLICIT=1; shift;;
@@ -339,6 +345,13 @@ while [[ $# -gt 0 ]]; do
         *)  POSITIONAL_ARGS+=("$1"); shift;;
     esac
 done
+
+if [[ -n "${THEME:-}" ]]; then
+    case "$THEME" in
+        dark|light) export AT_THEME="$THEME";;
+        *) err "--theme must be dark or light (got: $THEME)"; exit 1;;
+    esac
+fi
 
 # python/c take an optional positional NUM_NODES.
 if (( ${#POSITIONAL_ARGS[@]} > 0 )); then

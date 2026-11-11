@@ -16,6 +16,7 @@
 
 #define _DEFAULT_SOURCE
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdbool.h>
 #include <errno.h>
 #include <unistd.h>
@@ -183,8 +184,11 @@ int at_route_queue_msg(array_t *unhandled, generic_msg_t *msg)
  * a co-sign ask) was lost. Now, while nothing is bound, a state event the
  * roster pull re-emits is counted and dropped, and a one-time event is held,
  * oldest dropped past AT_APP_HELD_MAX, and sent in order once an app binds.
- * One line reports each gap when it ends. */
-static generic_msg_t g_app_held[AT_APP_HELD_MAX];
+ * One line reports each gap when it ends. Each held event is allocated when it
+ * is held: a generic_msg_t is about 8 KB, so a fixed array of AT_APP_HELD_MAX
+ * of them put half a megabyte in static memory that nearly every node leaves
+ * empty. */
+static generic_msg_t *g_app_held[AT_APP_HELD_MAX];
 static size_t g_app_held_n = 0;
 static bool g_app_attached = false;     /* until a send or a probe says so */
 static size_t g_gap_state = 0;          /* state events dropped this gap */
@@ -229,16 +233,20 @@ static void _app_hold(const generic_msg_t *msg, logger_t *logger)
     }
     if (g_app_held_n == AT_APP_HELD_MAX)
     {
-        at_msg_copy_release(&g_app_held[0]);
+        at_msg_copy_release(g_app_held[0]);
+        free(g_app_held[0]);
         memmove(&g_app_held[0], &g_app_held[1],
                 (AT_APP_HELD_MAX - 1) * sizeof(g_app_held[0]));
         g_app_held_n--;
+        g_app_held[AT_APP_HELD_MAX - 1] = NULL;
         g_gap_overflow++;
     }
-    if (at_msg_copy(msg, &g_app_held[g_app_held_n]) == 0)
-        g_app_held_n++;
+    generic_msg_t *slot = calloc(1, sizeof(*slot));
+    if (slot != NULL && at_msg_copy(msg, slot) == 0)
+        g_app_held[g_app_held_n++] = slot;
     else
     {
+        free(slot);
         g_gap_overflow++;
         log_warn(logger, "AutonomousTrust: could not hold an app event of type "
                  "%ld for the app; it is lost\n", msg->type);
@@ -254,14 +262,18 @@ size_t at_app_flush_held(const char *q_out, logger_t *logger)
     {
         /* 0 is sent or kept (a full app queue files it with send_retry, which
          * keeps the order); anything else leaves the rest for the next pass. */
-        if (at_send(NULL, q_out, &g_app_held[sent], "a held app event", q_out,
+        if (at_send(NULL, q_out, g_app_held[sent], "a held app event", q_out,
                     AT_SEND_NOW, NULL, NULL, 0) != 0)
             break;
-        at_msg_copy_release(&g_app_held[sent]);
+        at_msg_copy_release(g_app_held[sent]);
+        free(g_app_held[sent]);
+        g_app_held[sent] = NULL;
         sent++;
     }
     memmove(&g_app_held[0], &g_app_held[sent],
             (g_app_held_n - sent) * sizeof(g_app_held[0]));
+    for (size_t i = g_app_held_n - sent; i < g_app_held_n; i++)
+        g_app_held[i] = NULL;
     g_app_held_n -= sent;
     if (g_app_held_n > 0)
         return sent;    /* still flushing; the gap ends when it is empty */
@@ -286,7 +298,11 @@ size_t at_app_held_count(void)
 void at_app_hold_reset(void)
 {
     for (size_t i = 0; i < g_app_held_n; i++)
-        at_msg_copy_release(&g_app_held[i]);
+    {
+        at_msg_copy_release(g_app_held[i]);
+        free(g_app_held[i]);
+        g_app_held[i] = NULL;
+    }
     g_app_held_n = 0;
     g_app_attached = false;
     g_gap_state = 0;

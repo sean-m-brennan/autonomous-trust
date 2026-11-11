@@ -482,7 +482,7 @@ class TestTransaction:
         tx = Transaction(task_id=uuid4())
         pid = uuid4()
         tx.add(pid, 700)
-        assert tx.p1_id == pid
+        assert tx.p1_id == str(pid)
         assert tx.p1_score_milli == 700
         assert len(tx) == 1
 
@@ -491,7 +491,7 @@ class TestTransaction:
         p1, p2 = uuid4(), uuid4()
         tx.add(p1, 700)
         tx.add(p2, 900)
-        assert tx.p2_id == p2
+        assert tx.p2_id == str(p2)
         assert tx.p2_score_milli == 900
         assert len(tx) == 2
 
@@ -508,8 +508,8 @@ class TestTransactionHistory:
         th.update(tid, p1, 800)
         th.update(tid, p2, 900)
         assert len(th) == 1
-        assert th[tid].p1_id == p1
-        assert th[tid].p2_id == p2
+        assert th[tid].p1_id == str(p1)
+        assert th[tid].p2_id == str(p2)
 
     def test_update_ignores_duplicate(self):
         th = TransactionHistory()
@@ -518,7 +518,7 @@ class TestTransactionHistory:
         th.update(tid, p1, 800)
         th.update(tid, p2, 900)
         th.update(tid, p3, 500)  # ignored since already 2 participants
-        assert th[tid].p2_id == p2  # unchanged
+        assert th[tid].p2_id == str(p2)  # unchanged
 
     def test_by_peer(self):
         th = TransactionHistory()
@@ -859,7 +859,7 @@ class TestChainForkReconcile:
         assert [t.task_id for t in res.dropped] == [self.tasks['x'],
                                                      self.tasks['y']]
         x = res.dropped[0]
-        assert x.p1_id == self.p1 and x.p2_id == self.p2
+        assert x.p1_id == str(self.p1) and x.p2_id == str(self.p2)
         assert x.p1_score_milli == 300 + 20 * (ord('x') - ord('a'))
         assert x.index == 2
         assert ours.catchup(self._wire(theirs)).dropped == []
@@ -1071,15 +1071,15 @@ class TestContriteTitForTat:
     # standing what the peer gave us (RD_14.4 plan, Phase 4).
 
     def test_cooperative_self_p1(self):
-        """Self enters as p1, peer as p2, both cooperate. Falls into
-        the cooperate branch → max(0.51, peer_standing) = 0.8."""
+        """Self enters as p1, peer as p2, both cooperate: our 0.8 of it,
+        shrunk toward neutral, (0.8 + 3 * 0.2) / 4 = 0.35."""
         self_id, peer_id, task = uuid4(), uuid4(), uuid4()
         stub = _stub_proc(self_id)
         stub.history.update(task, self_id, 800)  # self → p1, our rating of peer
         stub.history.update(task, peer_id, 900)  # peer → p2, its rating of us
         score = ReputationProcess._contrite_tit_for_tat(
             stub, SimpleNamespace(uuid=peer_id))
-        assert score == pytest.approx(0.8, abs=0.001)
+        assert score == pytest.approx(0.35, abs=0.001)
 
     def test_cooperative_self_p2(self):
         """Peer enters as p1, self as p2.  Same expected output — the
@@ -1092,23 +1092,23 @@ class TestContriteTitForTat:
         stub.history.update(task, self_id, 800)  # self → p2, our rating of peer
         score = ReputationProcess._contrite_tit_for_tat(
             stub, SimpleNamespace(uuid=peer_id))
-        assert score == pytest.approx(0.8, abs=0.001)
+        assert score == pytest.approx(0.35, abs=0.001)
 
     def test_peer_rating_of_us_is_not_its_standing(self):
         """The same two scores the other way round: the peer rates us 0.8,
-        we rate it 0.9, and its standing is ours of it, 0.9."""
+        we rate it 0.9, and its standing is ours of it, 0.9, shrunk: 0.375."""
         self_id, peer_id, task = uuid4(), uuid4(), uuid4()
         stub = _stub_proc(self_id)
         stub.history.update(task, self_id, 900)
         stub.history.update(task, peer_id, 800)
         score = ReputationProcess._contrite_tit_for_tat(
             stub, SimpleNamespace(uuid=peer_id))
-        assert score == pytest.approx(0.9, abs=0.001)
+        assert score == pytest.approx(0.375, abs=0.001)
 
-    def test_retaliation_branch(self):
-        """We judged the peer to have defected on the last tx (0.2) and its
-        rating of us is good (mean 0.9) → retaliation branch →
-        min(0.49, peer_standing)."""
+    def test_our_low_score_is_its_record_not_a_defection(self):
+        """We scored the peer 0.2 on the last tx and it rated us well both
+        times: a defection is the peer's score of us, so there is none, and
+        its standing is our scores shrunk toward neutral."""
         self_id, peer_id = uuid4(), uuid4()
         stub = _stub_proc(self_id)
         t1, t2 = uuid4(), uuid4()
@@ -1118,13 +1118,12 @@ class TestContriteTitForTat:
         stub.history.update(t2, peer_id, 900)
         score = ReputationProcess._contrite_tit_for_tat(
             stub, SimpleNamespace(uuid=peer_id))
-        # peer_standing = (0.8 + 0.2) / 2 = 0.5; my_standing = 0.9.
-        # peer_last < 0.5, my_standing >= 0.5 → min(0.49, 0.5) = 0.49.
-        assert score == pytest.approx(0.49, abs=0.001)
+        # (0.8 + 0.2 + 3 * 0.2) / 5 = 0.32.
+        assert score == pytest.approx(0.32, abs=0.001)
 
-    def test_contrition_branch(self):
-        """Peer defected on last tx but my standing is also poor →
-        contrition branch → max(0.51, peer_standing)."""
+    def test_a_repeat_defection_has_no_floor(self):
+        """The peer scored us low twice running: a repeat defection, held at
+        min(0.49, standing). There is no 0.51 floor any more."""
         self_id, peer_id = uuid4(), uuid4()
         stub = _stub_proc(self_id)
         t1, t2 = uuid4(), uuid4()
@@ -1134,9 +1133,8 @@ class TestContriteTitForTat:
         stub.history.update(t2, peer_id, 200)
         score = ReputationProcess._contrite_tit_for_tat(
             stub, SimpleNamespace(uuid=peer_id))
-        # peer_standing = (0.3 + 0.4) / 2 = 0.35; my_standing = 0.2
-        # peer_last < 0.5, my_standing < 0.5 → max(0.51, 0.35) = 0.51.
-        assert score == pytest.approx(0.51, abs=0.001)
+        # (0.3 + 0.4 + 3 * 0.2) / 5 = 0.26, below the 0.49 cap.
+        assert score == pytest.approx(0.26, abs=0.001)
 
     def test_third_party_transactions_inform_prior(self):
         """Third-party transactions (peer ↔ other, no self involvement) do
@@ -1321,9 +1319,9 @@ class TestProposerHistoryBilateral:
 
         tx = history[task]
         # Both slots filled and the two peers are distinct.
-        assert {tx.p1_id, tx.p2_id} == {self_id, peer_id}
+        assert {tx.p1_id, tx.p2_id} == {str(self_id), str(peer_id)}
         # Score for self is 0.9, for peer is 0.3.
-        if tx.p1_id == self_id:
+        if tx.p1_id == str(self_id):
             assert tx.p1_score_milli == 900
             assert tx.p2_score_milli == 300
         else:
@@ -1376,7 +1374,7 @@ class TestProposerHistoryBilateral:
 
         # Acceptor pooled the proposer's half, to be placed.
         tx = history.pooled(task)
-        assert tx.p1_id == peer_id
+        assert tx.p1_id == str(peer_id)
         assert tx.p1_score_milli == 700
         assert tx.p2_id is None  # only the proposer's slot is filled
 
@@ -1411,7 +1409,7 @@ class TestProposerHistoryBilateral:
         #    (task, self, 0.9).  We simulate that with record_half.
         history.record_half(task, self_id, 900)
         assert {history.pooled(task).p1_id,
-                history.pooled(task).p2_id} == {self_id, None}
+                history.pooled(task).p2_id} == {str(self_id), None}
 
         # 2. Peer's committed broadcast arrives.  Our handle_committed
         #    fills the second slot.
@@ -1439,7 +1437,7 @@ class TestProposerHistoryBilateral:
         ReputationProcess.handle_committed(stub, {}, msg)
 
         tx = history.pooled(task)
-        assert {tx.p1_id, tx.p2_id} == {self_id, peer_id}
+        assert {tx.p1_id, tx.p2_id} == {str(self_id), str(peer_id)}
 
     def test_forward_transaction_does_not_write_history(self):
         """Direct guard against Bug 4 regressing: forward_transaction
@@ -1457,6 +1455,7 @@ class TestProposerHistoryBilateral:
             error=lambda *a, **k: None, debug=lambda *a, **k: None)
         stub._start_paxos = lambda q, m: start_paxos_calls.append((q, m))
         stub.admit_new_half = lambda m: True   # §2.60 probe gate: not under test
+        stub._record_lone_verdict = lambda m: None   # lone verdicts: not under test
 
         task = uuid4()
         ts = TransactionScore(task_id=task, score=0.9, subject_uuid=uuid4())

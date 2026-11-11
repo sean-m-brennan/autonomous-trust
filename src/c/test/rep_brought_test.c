@@ -235,8 +235,10 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_own_evidence_min_lifts_the_bound)
 {
+    /* Ten cooperative entries lift CTFT's shrunk standing (0.74) past
+     * COOP_ENTER, so brought is the mean of ours, 0.9. */
     process_t *proc = _begin(true);
-    _own(3, 0.9, NULL);
+    _own(10, 0.9, NULL);
     _told(3, 0.3);
     _sweep(proc, 0.9);
     double v = 0.0;
@@ -256,7 +258,8 @@ DEFINE_TEST(test_short_of_own_evidence_min_stays_capped)
     _sweep(proc, 0.9);
     double v = 0.0;
     ck_assert_ret_ok(reputation_get_brought(them->uuid, &v));
-    ck_assert_double_eq_tol(v, 0.9, 1e-3);
+    /* Two entries: CTFT's shrunk standing, (1.8 + 3 * 0.2) / 5. */
+    ck_assert_double_eq_tol(v, 0.48, 1e-3);
     ck_assert_int_eq(g_last_tier, 1);
     _end();
 }
@@ -277,12 +280,38 @@ DEFINE_TEST(test_an_anchored_peer_reads_told)
 }
 END_TEST_DEFINITION()
 
+/* Hostile-join run, 2026-11-04: an anchor read told uncapped, and the
+ * colluders' low scores of it pulled an honest joiner from 0.9 to 0.573 while
+ * every transaction between the joiners scored 0.9. Once this node holds
+ * own_evidence_min entries of its own, an anchor reads brought as any peer
+ * does. Mirrors test_brought_told.py. */
+DEFINE_TEST(test_an_anchored_peer_with_own_evidence_reads_brought)
+{
+    process_t *proc = _begin(true);
+    _own(10, 0.9, NULL);
+    _told(20, 0.1);
+    reputation_set_anchored(them->uuid, true);
+    _sweep(proc, 0.9);
+    double v = 0.0, b = 0.0;
+    /* Told reads tit-for-tat over our ten, shrunk toward neutral: the
+     * slander cannot hold it in cooperation (reputation_coop_regime). */
+    ck_assert_ret_ok(reputation_get_peer_reputation(them->uuid, &v));
+    ck_assert(v < 0.8);
+    ck_assert_ret_ok(reputation_get_brought(them->uuid, &b));
+    ck_assert_double_eq_tol(b, 0.9, 1e-3);
+    ck_assert_ret_ok(reputation_get_bounded(them->uuid, &v));
+    ck_assert_double_eq_tol(v, b, 1e-9);
+    ck_assert_int_eq(g_last_tier, 4);
+    _end();
+}
+END_TEST_DEFINITION()
+
 /* Phase 5 (the user's call, 2026-10-27): a probe verdict is own evidence
  * under the policy, toward own_evidence_min and into brought with its score. */
 DEFINE_TEST(test_a_probe_verdict_is_own_evidence)
 {
     process_t *proc = _begin(true);
-    _own(3, 0.9, TX_CHANNEL_PROBE);
+    _own(10, 0.9, TX_CHANNEL_PROBE);
     _told(3, 0.3);
     _sweep(proc, 0.3);
     double v = 0.0;
@@ -411,16 +440,17 @@ DEFINE_TEST(test_brought_reads_our_scores_not_the_peers)
     _sweep(proc, -1.0);
     double v = 0.0;
     ck_assert_ret_ok(reputation_get_brought(them->uuid, &v));
-    ck_assert_double_eq_tol(v, 0.3, 1e-3);
+    ck_assert_double_eq_tol(v, (0.9 + 0.6) / 6, 1e-3);
     _end();
 }
 END_TEST_DEFINITION()
 
 DEFINE_TEST(test_told_alone_never_excludes)
 {
+    /* Four third-party 0.0 entries put the prior below the 0.1 cutoff. */
     process_t *proc = _begin(true);
-    _told(3, 0.0);
-    _sweep(proc, 0.95);
+    _told(4, 0.0);
+    _sweep(proc, -1.0);
     double v = 1.0;
     ck_assert_ret_ok(reputation_get_peer_reputation(them->uuid, &v));
     ck_assert(v < 0.1);
@@ -432,8 +462,8 @@ END_TEST_DEFINITION()
 DEFINE_TEST(test_told_excludes_with_the_policy_off)
 {
     process_t *proc = _begin(false);
-    _told(3, 0.0);
-    _sweep(proc, 0.95);
+    _told(4, 0.0);
+    _sweep(proc, -1.0);
     ck_assert_int_eq(g_excluded, 1);
     _end();
 }
@@ -441,8 +471,10 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_brought_below_the_cutoff_excludes)
 {
+    /* Shrunk toward neutral, three 0.0 entries read exactly the 0.1 cutoff;
+     * it takes a fourth to fall below it. */
     process_t *proc = _begin(true);
-    _own(3, 0.0, NULL);
+    _own(4, 0.0, NULL);
     _sweep(proc, -1.0);
     ck_assert_int_eq(g_excluded, 1);
     _end();
@@ -521,6 +553,7 @@ RUN_TESTS(RepBrought,
           test_own_evidence_min_lifts_the_bound,
           test_short_of_own_evidence_min_stays_capped,
           test_an_anchored_peer_reads_told,
+          test_an_anchored_peer_with_own_evidence_reads_brought,
           test_a_probe_verdict_is_own_evidence,
           test_the_burst_count_is_probe_verdicts_while_bounded,
           test_counts_publish_on_change_only,

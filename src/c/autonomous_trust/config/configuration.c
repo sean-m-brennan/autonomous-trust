@@ -21,7 +21,12 @@
 #include <errno.h>
 #include <stdio.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <dirent.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include <stdbool.h>
 
 #include <jansson.h>
@@ -371,6 +376,34 @@ int read_config_file(const char *filename, void *data_struct)
     return err;
 }
 
+/* Open a config file for writing, readable and writable by its owner only.
+ * Configs hold the node's identity seeds, so the mode is set here rather
+ * than left to the umask, and fchmod narrows a file an older build created
+ * with wider permissions. */
+static FILE *_open_config_for_write(const char *filename)
+{
+#ifdef _WIN32
+    return fopen(filename, "wb");
+#else
+    int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    if (fd < 0)
+        return NULL;
+    if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return NULL;
+    }
+    FILE *f = fdopen(fd, "wb");
+    if (f == NULL) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+    }
+    return f;
+#endif
+}
+
 /*@
   requires \valid(cfg_obj);
   requires data_struct != \null && \valid_read(data_struct);
@@ -406,7 +439,7 @@ int write_config_file(const config_t *cfg_obj, const void *data_struct, const ch
         size_t len = 0;
         int err = cfg_obj->to_proto(data_struct, &buf, &len);
         if (err != 0) return err;
-        FILE *f = fopen(filename, "wb");
+        FILE *f = _open_config_for_write(filename);
         if (f == NULL) { free(buf); return SYS_EXCEPTION(); }
         size_t wrote = fwrite(buf, 1, len, f);
         fclose(f);
@@ -420,8 +453,15 @@ int write_config_file(const config_t *cfg_obj, const void *data_struct, const ch
     if (err != 0)
         return err;
 
-    err = json_dump_file(root, filename, 0);
+    FILE *f = _open_config_for_write(filename);
+    if (f == NULL) {
+        json_decref(root);
+        return SYS_EXCEPTION();
+    }
+    err = json_dumpf(root, f, 0);
     json_decref(root); // frees created tree
+    if (fclose(f) != 0 && err == 0)
+        err = -1;
     if (err != 0)
         return EXCEPTION(EJSN_DUMP); // ECFG_BADFMT);
     return 0;

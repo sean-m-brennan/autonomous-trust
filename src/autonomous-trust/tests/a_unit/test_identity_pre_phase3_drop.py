@@ -114,3 +114,24 @@ def test_held_requests_and_updates_keep_the_latest_per_sender_and_are_capped():
     assert len({m.from_whom.uuid for m in requests}) == 16
     assert other in kept
     assert latest_bob not in kept or latest_bob in requests
+
+
+def test_a_held_message_is_logged_once_however_many_others_are_held():
+    node = _node(phase=1)
+    first = _message(IdentityProtocol.announce)
+    assert node._first_hold(first)
+    others = [_message(IdentityProtocol.announce) for _ in range(5000)]
+    for other in others:
+        assert node._first_hold(other)
+    assert not node._first_hold(first)
+
+
+def test_a_new_message_is_logged_after_an_old_one_is_released():
+    import gc
+    node = _node(phase=1)
+    for _ in range(50):
+        msg = _message(IdentityProtocol.announce)
+        assert node._first_hold(msg)
+        assert not node._first_hold(msg)
+        del msg
+        gc.collect()

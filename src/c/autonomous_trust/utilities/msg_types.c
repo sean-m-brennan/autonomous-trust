@@ -323,6 +323,13 @@ int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr
      * older peer of this serializer stays compatible. */
     json_object_set_new(root, "verified", json_boolean(msg->verified));
     json_object_set_new(root, "has_signature", json_boolean(msg->has_signature));
+    /* The signature itself, so identity can check it again once it holds the
+     * sender (see net_msg_t.signature). */
+    if (msg->has_signature) {
+        char sig_hex[crypto_sign_BYTES * 2 + 1];
+        sodium_bin2hex(sig_hex, sizeof(sig_hex), msg->signature, crypto_sign_BYTES);
+        json_object_set_new(root, "signature", json_string(sig_hex));
+    }
     /* Which child cohort the sender belongs to (gateways only); absent = none. */
     if (msg->child_group[0] != '\0')
         json_object_set_new(root, "child_group", json_string(msg->child_group));
@@ -672,6 +679,11 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
     net_msg->verified = json_boolean_value(json_object_get(root, "verified"));
     net_msg->has_signature =
         json_boolean_value(json_object_get(root, "has_signature"));
+    const char *sig_hex = json_string_value(json_object_get(root, "signature"));
+    if (sig_hex == NULL
+        || sodium_hex2bin(net_msg->signature, crypto_sign_BYTES, sig_hex,
+                          strlen(sig_hex), NULL, NULL, NULL) != 0)
+        memset(net_msg->signature, 0, crypto_sign_BYTES);
     const char *cg = json_string_value(json_object_get(root, "child_group"));
     if (cg != NULL)
         snprintf(net_msg->child_group, sizeof(net_msg->child_group), "%s", cg);

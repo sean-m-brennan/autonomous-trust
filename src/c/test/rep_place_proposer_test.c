@@ -31,6 +31,7 @@
 
 #include <pthread.h>
 #include <string.h>
+#include <math.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -58,6 +59,7 @@
 static char GRANT_FN[]    = "place grant";
 static char ACCEPTED_FN[] = "place accepted";
 static char NACK_FN[]     = "place nack";
+static char ASK_FN[]      = "place request";
 
 /* The last payload of each kind this node sent. */
 static json_t *g_request, *g_place, *g_placed, *g_grant;
@@ -381,6 +383,58 @@ DEFINE_TEST(test_a_reported_value_is_carried_instead_of_ours)
     json_t *value = json_object_get(g_place, "value");
     ck_assert_int_eq((int)json_array_size(value), 1);
     ck_assert_str_eq(json_string_value(json_object_get(json_array_get(value, 0), "task")), t);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* Hostile-join run, 2026-11-04: a joiner dropped 14,340 rounds in eight
+ * minutes on this path, and the log never said why. */
+DEFINE_TEST(test_a_value_we_cannot_carry_is_dropped_with_its_reason)
+{
+    process_t *proc = _begin();
+    char log_path[128];
+    snprintf(log_path, sizeof(log_path), "%s/rep.log", g_dir);
+    logger_t lg;
+    ck_assert_int_eq(logger_init(&lg, INFO, log_path), 0);
+    proc->logger = &lg;
+    reputation_place_start(proc);
+    char by[UUID_STRING_LEN + 1], t[UUID_STRING_LEN + 1];
+    char a[UUID_STRING_LEN + 1], b[UUID_STRING_LEN + 1];
+    uuid_t task;
+    uuid_generate(task);
+    uuid_unparse_lower(task, t);
+    uuid_unparse_lower(p[2]->uuid, by);
+    uuid_unparse_lower(p[1]->uuid, a);
+    uuid_unparse_lower(p[2]->uuid, b);
+    /* A value no acceptor should have taken: neither half is certified. */
+    json_t *entry = json_pack("{s:s, s:s, s:i, s:s, s:i}", "task", t,
+                              "p1", strcmp(a, b) < 0 ? a : b, "p1_score_milli", 900,
+                              "p2", strcmp(a, b) < 0 ? b : a, "p2_score_milli", 600);
+    json_t *extra = json_pack("{s:{s:{s:i, s:s}, s:[o]}}", "accepted", "ballot",
+                              "n", 1, "by", by, "value", entry);
+    json_t *g0 = _reply(g_request, extra);
+    json_t *g1 = _reply(g_request, NULL);
+    _send(proc, p[0], GRANT_FN, g0);
+    _send(proc, p[1], GRANT_FN, g1);
+    json_decref(g0);
+    json_decref(g1);
+    json_decref(extra);
+    ck_assert_ptr_null(g_place);
+
+    proc->logger = NULL;
+    if (lg.file != NULL)
+        fclose(lg.file);
+    FILE *f = fopen(log_path, "r");
+    ck_assert_ptr_nonnull(f);
+    char line[1024];
+    int seen = 0;
+    while (fgets(line, sizeof(line), f) != NULL)
+        if (strstr(line, "value to carry") != NULL
+            && strstr(line, "is not valid here: a half is not certified") != NULL
+            && strstr(line, by) != NULL)
+            seen++;
+    fclose(f);
+    ck_assert_int_eq(seen, 1);
     _end();
 }
 END_TEST_DEFINITION()
@@ -1163,7 +1217,159 @@ DEFINE_TEST(test_a_majority_counting_the_leader_restates_the_roster)
 }
 END_TEST_DEFINITION()
 
+/* A value stops short of PLACE_VALUE_BYTES_MAX encoded, so its `place` frame
+ * fits a datagram, and holds at least one entry. Bounded only by count, a
+ * backlog at 18 members made frames of 257 KB that no send could carry, and
+ * the 16-colluder hostile-join runs of 2026-11-05 sat on one instance to the
+ * end. Mirrors Python test_a_backlog_is_placed_in_values_that_fit_a_datagram. */
+static int _place_value_len(process_t *proc)
+{
+    uuid_t task;
+    for (int i = 0; i < 3; i++)
+        _ready_task(p[0], p[1], p[2], me, task);
+    reputation_place_start(proc);
+    ck_assert_ptr_nonnull(g_request);
+    json_t *grant = _reply(g_request, NULL);
+    _send(proc, p[0], GRANT_FN, grant);
+    _send(proc, p[1], GRANT_FN, grant);
+    json_decref(grant);
+    ck_assert_ptr_nonnull(g_place);
+    return (int)json_array_size(json_object_get(g_place, "value"));
+}
+
+DEFINE_TEST(test_a_value_holds_the_backlog_that_fits)
+{
+    process_t *proc = _begin();
+    ck_assert_int_eq(_place_value_len(proc), 3);
+    _end();
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_an_entry_too_large_alone_is_still_placed_alone)
+{
+    process_t *proc = _begin();
+    reputation_set_place_value_bytes_max(10);
+    ck_assert_int_eq(_place_value_len(proc), 1);
+    reputation_set_place_value_bytes_max(0);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* A refused proposer backs off further each time: a refusal or a stalled
+ * round at an instance counts one against it, the backoff window doubles with
+ * each to REP_PLACE_BACKOFF_CAP, and the backoff drawn also stretches the wait
+ * after hearing someone else's round. A member that promises a higher ballot
+ * than its own open round steps back from it at once. Mirrors Python
+ * test_the_backoff_window_doubles_to_its_cap and its neighbors. */
+DEFINE_TEST(test_the_backoff_window_doubles_to_its_cap)
+{
+    ck_assert(fabs(reputation_place_backoff_window(1) - 2.0) < 1e-9);
+    ck_assert(fabs(reputation_place_backoff_window(2) - 4.0) < 1e-9);
+    ck_assert(fabs(reputation_place_backoff_window(3) - 8.0) < 1e-9);
+    ck_assert(fabs(reputation_place_backoff_window(40) - 30.0) < 1e-9);
+}
+END_TEST_DEFINITION()
+
+static void _nack_our_round(process_t *proc, json_int_t promised)
+{
+    char by[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(p[2]->uuid, by);
+    json_t *extra = json_pack("{s:i, s:{s:I, s:s}}", "next", 0, "promised",
+                              "n", promised, "by", by);
+    json_t *nack = _reply(g_request, extra);
+    _send(proc, p[0], NACK_FN, nack);
+    json_decref(nack);
+    json_decref(extra);
+}
+
+DEFINE_TEST(test_refusals_at_an_instance_are_counted)
+{
+    process_t *proc = _begin();
+    uuid_t task;
+    _ready_task(p[0], p[1], p[2], me, task);
+    int k = -1, n = 0;
+    double drawn = 0.0;
+    reputation_place_start(proc);
+    json_int_t n1 = json_integer_value(json_object_get(json_object_get(g_request, "ballot"), "n"));
+    _nack_our_round(proc, n1 + 1000000);
+    ck_assert(reputation_place_fails(&k, &n, &drawn));
+    ck_assert_int_eq(k, 0);
+    ck_assert_int_eq(n, 1);
+    ck_assert(drawn >= 0.5 && drawn <= 2.0);
+    reputation_place_start(proc);
+    _nack_our_round(proc, n1 + 2000000);
+    ck_assert(reputation_place_fails(&k, &n, &drawn));
+    ck_assert_int_eq(n, 2);
+    ck_assert(drawn >= 0.5 && drawn <= 4.0);
+    _end();
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_promising_a_higher_ballot_steps_back_from_our_round)
+{
+    process_t *proc = _begin();
+    uuid_t task;
+    _ready_task(p[0], p[1], p[2], me, task);
+    reputation_place_start(proc);
+    json_int_t n1 = json_integer_value(json_object_get(json_object_get(g_request, "ballot"), "n"));
+    char by[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(p[2]->uuid, by);
+    json_t *theirs = json_pack("{s:s, s:I, s:{s:I, s:s}, s:O}",
+                               "group", "", "k", json_integer_value(json_object_get(g_request, "k")),
+                               "ballot", "n", n1 + 1000000, "by", by,
+                               "head", json_object_get(g_request, "head"));
+    _send(proc, p[2], ASK_FN, theirs);
+    json_decref(theirs);
+    int k = -1, n = 0;
+    double drawn = 0.0;
+    ck_assert(reputation_place_fails(&k, &n, &drawn));
+    ck_assert_int_eq(n, 1);
+    /* Grants for our dead round change nothing. */
+    json_t *grant = _reply(g_request, NULL);
+    _send(proc, p[0], GRANT_FN, grant);
+    _send(proc, p[1], GRANT_FN, grant);
+    json_decref(grant);
+    ck_assert_ptr_null(g_place);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* A member behind the round's instance promised nothing and cannot accept
+ * there, so its nack leaves the round open; the members that are not behind
+ * carry it. Ending the round on it let one member stuck at instance 0 stop
+ * the chain for a whole hostile-join run (pass-off-1, 2026-11-05). Mirrors
+ * Python test_a_nack_from_a_member_behind_leaves_the_round_open. */
+DEFINE_TEST(test_a_nack_from_a_member_behind_leaves_the_round_open)
+{
+    process_t *proc = _begin();
+    uuid_t task;
+    _ready_task(p[0], p[1], p[2], me, task);
+    reputation_place_start(proc);
+    json_int_t k = json_integer_value(json_object_get(g_request, "k"));
+    json_t *extra = json_pack("{s:I}", "next", k - 1);
+    json_t *nack = _reply(g_request, extra);
+    _send(proc, p[2], NACK_FN, nack);
+    json_decref(nack);
+    json_decref(extra);
+    int fk = -1, fn = 0;
+    double drawn = 0.0;
+    ck_assert(!reputation_place_fails(&fk, &fn, &drawn));
+    json_t *grant = _reply(g_request, NULL);
+    _send(proc, p[0], GRANT_FN, grant);
+    _send(proc, p[1], GRANT_FN, grant);
+    json_decref(grant);
+    ck_assert_ptr_nonnull(g_place);
+    _end();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(RepPlaceProposer,
+          test_a_nack_from_a_member_behind_leaves_the_round_open,
+          test_the_backoff_window_doubles_to_its_cap,
+          test_refusals_at_an_instance_are_counted,
+          test_promising_a_higher_ballot_steps_back_from_our_round,
+          test_a_value_holds_the_backlog_that_fits,
+          test_an_entry_too_large_alone_is_still_placed_alone,
           test_a_chain_from_before_rosters_is_reset,
           test_a_newcomer_adopts_the_history_its_group_signed,
           test_a_history_only_an_insider_signed_is_refused,
@@ -1181,6 +1387,7 @@ RUN_TESTS(RepPlaceProposer,
           test_a_child_chain_round_goes_to_that_group_alone,
           test_a_round_places_our_ready_items,
           test_a_reported_value_is_carried_instead_of_ours,
+          test_a_value_we_cannot_carry_is_dropped_with_its_reason,
           test_a_nack_ends_the_round_and_the_next_outranks_it,
           test_the_leader_restates_the_roster_a_majority_reports,
           test_a_minority_including_the_leader_restates_nothing,

@@ -41,6 +41,12 @@
 #include "processes/process_tracker.h"
 #include "utilities/util.h"
 #include "utilities/socket_helpers.h"
+#include "utilities/logger.h"
+
+/** Env var carrying a provisioned identity uuid. Mirrors Python
+ *  config/generate.py IDENTITY_UUID_ENV. */
+#define AT_IDENTITY_UUID_ENV "AT_IDENTITY_UUID"
+#define UUID_STR_LEN_CANON 36
 
 DEFINE_ERROR(EGEN_NOIF, "No suitable network interface found");
 
@@ -346,8 +352,31 @@ int generate_identity(const char *fullname, const char *cfg_dir,
             return 0;
     }
 
+    /* A provisioned uuid (AT_IDENTITY_UUID) wins over a random one: a
+     * deployment generator that writes a deployment manifest (RD_13.4 §3.3)
+     * has to know each node's uuid before the node exists. Canonical form
+     * only, as the manifest requires, and anything else refuses: an identity
+     * that drew a random uuid instead would no longer match the manifest.
+     * Mirrors Python config/generate.py provisioned_uuid. */
     uuid_t uuid;
-    uuid_generate(uuid);
+    const char *provisioned = getenv(AT_IDENTITY_UUID_ENV);
+    if (provisioned != NULL && provisioned[0] != '\0') {
+        char canon[UUID_STR_LEN_CANON + 1];
+        if (strlen(provisioned) != UUID_STR_LEN_CANON ||
+            uuid_parse(provisioned, uuid) != 0) {
+            log_error(NULL, "%s=%s is not a canonical uuid\n",
+                      AT_IDENTITY_UUID_ENV, provisioned);
+            return -1;
+        }
+        uuid_unparse_lower(uuid, canon);
+        if (strcmp(canon, provisioned) != 0) {
+            log_error(NULL, "%s=%s is not a canonical uuid\n",
+                      AT_IDENTITY_UUID_ENV, provisioned);
+            return -1;
+        }
+    } else {
+        uuid_generate(uuid);
+    }
 
     /* Check bootstrap for a provisioned address */
     char bootstrap_addr[IPV4_ADDR_LEN + 1] = {0};

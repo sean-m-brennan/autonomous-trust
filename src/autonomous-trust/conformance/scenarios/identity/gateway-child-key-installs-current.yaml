@@ -1,0 +1,54 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: gateway-child-key-installs-current
+byte_pinning: false
+description: |
+    A gateway holding only a child cohort's public key takes the child's
+    private key, and its membership, from a verified update at the epoch it
+    holds.
+
+    gw holds the child group's public key at epoch 2 and holds anchor, a child
+    member, as a peer. anchor sends a signed update for the child at epoch 2, larger by three members and carrying the
+    private key. gw installs the key, takes the larger membership, and keeps its
+    own primary group of two.
+
+participants:
+  - id: gw
+    role: border_guard
+  - id: boss
+    role: group_member
+  - id: anchor
+    role: group_member
+
+fixtures:
+  groups:
+    anchor:
+      uuid: "0c000000-0000-4000-8000-0000000000c7"
+      size: 4
+      key_epoch: 2
+  holds:
+    gw: [anchor]
+  cohort_tree:
+    nodes:
+      gw:
+        members: [boss]
+        child_group: [anchor]
+        child_uuid: "0c000000-0000-4000-8000-0000000000c7"
+        child_public_only: true
+        child_key_epoch: 2
+
+steps:
+  - id: 1
+    from: anchor
+    to: gw
+    function: group_key_update
+    payload: {}
+    description: anchor sends a verified, larger copy of the child at the current epoch.
+
+expected_state:
+  gw:
+    group_size: 2
+    child_group_size: 4
+    child_group_owns_key: true
+    child_group_key_epoch: 2

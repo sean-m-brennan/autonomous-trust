@@ -19,6 +19,7 @@ the map panel's ``set_platforms``) the callback calls with fresh state.
 from autonomous_trust.inspector.dashboard.disaster_response_graph import (
     TrustNetworkGraph,
 )
+from autonomous_trust.inspector.dashboard.theme import current as current_theme
 
 
 class TrustNetworkPanel:
@@ -85,7 +86,7 @@ class TrustNetworkPanel:
         fig.update_layout(
             title=dict(text=self._title, x=0.02, xanchor="left",
                        y=0.98, yanchor="top",
-                       font=dict(size=13, color="#e2e8f0")),
+                       font=dict(size=13, color=current_theme().text)),
             margin=dict(l=10, r=10, t=34, b=10),
             # Click-drag pans (the modebar +/- buttons zoom; see graph_config).
             # The default 'zoom' dragmode would box-select instead, which reads

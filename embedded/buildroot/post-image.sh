@@ -89,15 +89,51 @@ if [ -d "$FW_DIR" ]; then
     [ -f "$FW_DIR/cmdline.txt" ] && copy_to_boot "$FW_DIR/cmdline.txt" "cmdline.txt"
 fi
 
-# config.txt for Pi4
+# config.txt for Pi4. The firmware loads bcm2711-rpi-4-b.dtb (the mainline
+# DTB, from the kernel build) and hands it to U-Boot. enable_uart fixes the
+# core clock so the mini UART console on GPIO 14/15 keeps its baud rate.
 cat > "$IMAGES_DIR/config.txt" <<'CONFIG'
 # Autonomous Trust Pi4 boot config
 arm_64bit=1
 kernel=u-boot.bin
 enable_uart=1
-dtoverlay=disable-bt
 CONFIG
 copy_to_boot "$IMAGES_DIR/config.txt" "config.txt"
+
+# U-Boot's distro boot reads extlinux/extlinux.conf from the first
+# partition. With no fdt line, U-Boot passes on the firmware's DTB. The
+# root partition is named by PARTUUID (disk ID set by sfdisk below), because
+# the SD card's mmcblk number depends on probe order. The kernel logs to both
+# the mini UART and HDMI (tty1); the last console= is /dev/console, so
+# systemd's boot status shows on HDMI. earlycon prints on the mini UART from
+# the kernel's first instructions, before its UART driver loads.
+# net.ifnames=0 keeps the kernel's eth0 and wlan0: systemd would otherwise
+# rename the Ethernet port end0 (from the device tree's ethernet0 alias), and
+# the .network files and at-wifi.service name eth0 and wlan0.
+cat > "$IMAGES_DIR/extlinux.conf" <<'EXTLINUX'
+default at
+timeout 0
+
+label at
+    kernel /Image
+    append root=PARTUUID=41540001-02 rootfstype=ext4 rootwait ro net.ifnames=0 earlycon=uart8250,mmio32,0xfe215040 console=ttyS1,115200 console=tty1
+EXTLINUX
+mmd_boot "extlinux"
+copy_to_boot "$IMAGES_DIR/extlinux.conf" "extlinux/extlinux.conf"
+
+# Wi-Fi credentials are not built in. Copy this file to wpa_supplicant.conf
+# on the boot partition and fill in the network; at-wifi.service reads it.
+cat > "$IMAGES_DIR/wpa_supplicant.conf.example" <<'WPA'
+# Copy to wpa_supplicant.conf on this partition and fill in your network.
+# Use plain LF line endings.
+country=US
+
+network={
+    ssid="YOUR-SSID"
+    psk="YOUR-PASSPHRASE"
+}
+WPA
+copy_to_boot "$IMAGES_DIR/wpa_supplicant.conf.example" "wpa_supplicant.conf.example"
 
 # U-Boot
 [ -f "$IMAGES_DIR/u-boot.bin" ] && copy_to_boot "$IMAGES_DIR/u-boot.bin" "u-boot.bin"
@@ -136,9 +172,11 @@ TOTAL_SECTORS=$((DATA_START + DATA_SECTORS + 2048))
 # Create empty image
 dd if=/dev/zero of="$SD_IMG" bs=512 count="$TOTAL_SECTORS"
 
-# Create partition table
+# Create partition table. The fixed disk ID gives the partitions the
+# PARTUUIDs 41540001-01/02/03 that extlinux.conf and fstab mount by.
 sfdisk "$SD_IMG" <<PARTS
 label: dos
+label-id: 0x41540001
 unit: sectors
 
 ${SD_IMG}1 : start=$BOOT_START, size=$BOOT_SECTORS, type=c

@@ -28,6 +28,7 @@ Usage:
 
 from __future__ import annotations
 
+import collections
 import os
 import sys
 import queue
@@ -99,6 +100,23 @@ try:
     from autonomous_trust.services.data.server import (  # noqa
         DataProcess as _DQ_DataProcess, DataProtocol as _DQ_DataProtocol,
     )
+    from autonomous_trust.services.envdata import (
+        AirQualityStreamProcess as _DQ_AirQuality,
+        DataFusionProcess as _DQ_Fusion,
+        SeismicStreamProcess as _DQ_Seismic,
+        SituationReportProcess as _DQ_SitRep,
+        WeatherStreamProcess as _DQ_Weather,
+    )
+
+    # Capability -> the remote process that serves it, for every stream the
+    # data sink subscribes to. The disaster-response peers advertise their
+    # role stream (weather_stream, served by weather-stream, ...), never the
+    # generic 'data'; 'data' stays for peers that do offer it.
+    _STREAM_CAP_TO_PROC = {
+        cls.capability_name: cls.name
+        for cls in (_DQ_DataProcess, _DQ_Weather, _DQ_Seismic,
+                    _DQ_AirQuality, _DQ_SitRep, _DQ_Fusion)
+    }
 
     class DiagDataRcvr(DataRcvr, metaclass=ProcMeta,
                        proc_name='data-sink',
@@ -162,24 +180,36 @@ try:
                 sys.stderr.flush()
                 raise
 
-        def _patched_process(self, queues, signal):
-            cap = _DQ_DataProcess.capability_name
-            while self.keep_running(signal):
-                if cap in self.protocol.peer_capabilities:
-                    for ref in self.protocol.peer_capabilities[cap]:
-                        ident = self._resolve_identity(ref)
-                        if ident is None or ident in self.servicers:
-                            continue
+        def _subscribe_new_streams(self, queues):
+            """Ask each peer serving one of _STREAM_CAP_TO_PROC for its
+            readings, once per (capability, peer). A peer whose Identity
+            has not reached us yet is tried again on the next pass."""
+            subscribed = self.__dict__.setdefault('_subscribed', set())
+            peer_caps = self.protocol.peer_capabilities
+            for cap, proc_target in _STREAM_CAP_TO_PROC.items():
+                if cap not in peer_caps:
+                    continue
+                for ref in peer_caps[cap]:
+                    key = (cap, str(getattr(ref, 'uuid', ref)))
+                    if key in subscribed:
+                        continue
+                    ident = self._resolve_identity(ref)
+                    if ident is None:
+                        continue
+                    msg = _DQ_Message(proc_target, _DQ_DataProtocol.request,
+                                      self.name, ident)
+                    queues[_DQ_CfgIds.network].put(
+                        msg, block=True, timeout=self.q_cadence)
+                    subscribed.add(key)
+                    if ident not in self.servicers:
                         self.servicers.append(ident)
-                        msg = _DQ_Message(
-                            _DQ_DataProcess.name,
-                            _DQ_DataProtocol.request,
-                            self.name, ident)
-                        queues[_DQ_CfgIds.network].put(
-                            msg, block=True, timeout=self.q_cadence)
-                        self.logger.info(
-                            "DiagDataRcvr: subscribed to %s",
-                            _roster_name_of(ident) or ident)
+                    self.logger.info(
+                        "DiagDataRcvr: subscribed to %s (%s)",
+                        _roster_name_of(ident) or ident, cap)
+
+        def _patched_process(self, queues, signal):
+            while self.keep_running(signal):
+                self._subscribe_new_streams(queues)
                 try:
                     message = queues[self.name].get(
                         block=True, timeout=self.q_cadence)
@@ -232,7 +262,14 @@ except ImportError as _exc:
 
 # Dashboard imports — PYTHONPATH=/app:... in the demo image (see
 # deploy/Dockerfile), so the package-qualified imports work directly.
-from examples.multi_agency.scenario import DisasterResponseScenario  # noqa: E402
+# The scenario the compose/k8s generators deploy (and --playback and
+# --log-harvest replay), so the map, trust graph and roster carry the names and
+# positions of the peers actually running. examples/multi_agency/scenario.py is
+# a different roster (Hurricane Helene, North Carolina); with it only the FEMA
+# names matched live data.
+from autonomous_trust.evaluation.scenarios.disaster_response import (  # noqa: E402
+    DisasterResponseScenario,
+)
 # NOTE: the coordinator now HOSTS the full demo.py dashboard in-process
 # (feeding it the same bridge-tuple stream the standalone inspector's bridge
 # subprocess used to produce), rather than the older, simpler live_server
@@ -353,6 +390,19 @@ class MultiAgencyCoordinator(TransitiveTrustMixin, AutonomousTrust):
         # 4 ticks ≈ 2 seconds at 500ms cadence — enough to see all
         # readings in a single 1Hz batch before scoring.
         self._batch_settle_ticks = 4
+        # (peer, outcome) -> batch count, for the periodic verdict summary:
+        # how each sender's batches were scored, or why they were not.
+        self._verdict_counts: collections.Counter = collections.Counter()
+        # Sticky suspicion. The validators catch the compromised sensor on
+        # an occasional reading of one data type, so scoring each batch on
+        # its own left nearly all of its batches clean and its reputation
+        # never fell. After an anomaly, every batch first seen from that
+        # sender within the window is scored as anomalous, whatever its data
+        # type; another anomaly restarts the window. peer name -> last tick
+        # of suspicion, at the 500 ms tick.
+        self._suspect_until: dict[str, int] = {}
+        self._suspicion_ticks = int(
+            float(os.environ.get("AT_SUSPICION_SEC", "60")) / 0.5)
         # Per-batch TS decimation (matches DoD default). Once the
         # multi-agency participant grows a sender-side TS half, the
         # filter MUST stay in lockstep on both sides to form
@@ -461,6 +511,11 @@ class MultiAgencyCoordinator(TransitiveTrustMixin, AutonomousTrust):
         # record_file=None on the hosted demo: canned-playback recording is
         # the coordinator's own EventRecorder job (see _on_scenario_event /
         # _feed_timeline / submit_reading_for_validation), not the demo's.
+        # Dashboard colors come from AT_THEME (run-demo.sh --theme, forwarded
+        # by the compose/k8s generators); unset or invalid means dark.
+        from autonomous_trust.inspector.dashboard import theme
+        theme.set_theme(theme.resolve_theme(None,
+                                            os.environ.get(theme.THEME_ENV)))
         iface = PlaybackInterface(self.scenario, bridge_queue=self._ui_queue)
         self._demo = MultiAgencyDemo(iface, port=self._dashboard_port)
         threading.Thread(
@@ -787,11 +842,26 @@ class MultiAgencyCoordinator(TransitiveTrustMixin, AutonomousTrust):
                 )
                 self._feed_event_log(record)
 
+        if anomalous_this_reading:
+            self._mark_suspect(reading.peer_name)
+            state = self._batch_state.get(batch_id) if batch_id else None
+            logger.info(
+                "Verdict: anomaly on %s batch=%s state=%s kept=%s",
+                reading.peer_name, batch_id,
+                "none" if state is None else
+                ("submitted" if state["submitted"] else "open"),
+                batch_id is not None
+                and _ts_keep(batch_id, self._ts_decimation))
         if batch_id is not None and anomalous_this_reading:
             self._batch_state[batch_id]["anomalous"] = True
 
         if queues is not None:
             self._maybe_submit_batch_scores(queues)
+
+    def _mark_suspect(self, peer_name: str) -> None:
+        """Start, or restart, the suspicion window for ``peer_name``."""
+        self._suspect_until[peer_name] = (self._tick_count
+                                          + self._suspicion_ticks)
 
     def _maybe_submit_batch_scores(self, queues):
         """Submit a TransactionScore tagged with capability_name=
@@ -808,10 +878,13 @@ class MultiAgencyCoordinator(TransitiveTrustMixin, AutonomousTrust):
             if (self._tick_count - state["first_tick"]
                     < self._batch_settle_ticks):
                 continue
+            peer_name = state.get("peer_name")
+            is_anomaly = bool(state["anomalous"]) or (
+                state["first_tick"] <= self._suspect_until.get(peer_name, -1))
             if not _ts_keep(batch_id, self._ts_decimation):
                 state["submitted"] = True
+                self._verdict_counts[(peer_name, "not kept")] += 1
                 continue
-            is_anomaly = bool(state["anomalous"])
             score = 0.3 if is_anomaly else 0.8
             # One pair per consumer: our half names the sender, under the
             # batch's pair id with us, which is the id the sender's half for
@@ -821,6 +894,11 @@ class MultiAgencyCoordinator(TransitiveTrustMixin, AutonomousTrust):
             me = getattr(getattr(self, 'identity', None), 'uuid', None)
             if sender is None or me is None:
                 state["submitted"] = True
+                self._verdict_counts[(peer_name, "no sender")] += 1
+                if is_anomaly:
+                    logger.info("Verdict: %s batch=%s anomalous, not scored "
+                                "(sender=%s me=%s)", peer_name, batch_id,
+                                sender, me)
                 continue
             ts = TransactionScore(task_id=pair_task_id(batch_id, me),
                                   score=score,
@@ -830,6 +908,10 @@ class MultiAgencyCoordinator(TransitiveTrustMixin, AutonomousTrust):
                 queues[CfgIds.reputation].put(
                     ts, block=True, timeout=queue_cadence)
                 state["submitted"] = True
+                self._verdict_counts[(peer_name, f"scored {score:.1f}")] += 1
+                if is_anomaly:
+                    logger.info("Verdict: %s batch=%s scored %.1f",
+                                peer_name, batch_id, score)
                 if not MultiAgencyCoordinator._logged_first_batch_submit:
                     logger.info(
                         "Coordinator: first batch TransactionScore "
@@ -841,6 +923,10 @@ class MultiAgencyCoordinator(TransitiveTrustMixin, AutonomousTrust):
                 logger.warning(
                     "Reputation queue full; deferring batch %s",
                     batch_id)
+        if self._tick_count % 120 == 0 and self._verdict_counts:
+            logger.info("Verdict summary: %s", ", ".join(
+                f"{p}/{o}={n}" for (p, o), n in sorted(
+                    self._verdict_counts.items(), key=str)))
 
     def _query_reputations(self, queues):
         """Fan out consensus_rep_req for every known peer, then drain

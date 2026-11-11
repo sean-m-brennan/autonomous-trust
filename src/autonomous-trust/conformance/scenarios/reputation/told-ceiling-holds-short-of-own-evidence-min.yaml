@@ -7,9 +7,10 @@ description: |
     Own evidence below own_evidence_min does not lift the told ceiling
     (RD_14.4_HOSTILE_JOIN_PLAN.md Phase 4). bob has two transactions of his
     own with subject, giving it 0.9 each time, and nothing else about it:
-    told and brought are both 0.9, but two entries are short of the three
-    the policy asks for, so bounded is told capped at the tier-1 ceiling,
-    just under 0.65.
+    told is 0.9 and brought, by contrite tit-for-tat over two entries,
+    (1.8 + 0.6) / 5 = 0.48. Two entries are short of the three the policy
+    asks for, so bounded is told capped at the tier-1 ceiling, just under
+    0.65.
 
 participants:
   - id: alice
@@ -51,6 +52,6 @@ expected_state:
     reputation_of:
       subject: 0.9
     brought_of:
-      subject: 0.9
+      subject: 0.48
     bounded_of:
       subject: 0.65

@@ -5,13 +5,18 @@
 BR2_aarch64=y
 BR2_cortex_a72=y
 
-# Toolchain: internal, musl libc (smaller than glibc)
-BR2_TOOLCHAIN_BUILDROOT_MUSL=y
+# Toolchain: internal, glibc. Buildroot's systemd requires glibc. at_demo is
+# built and statically linked separately (Dockerfile-c-static) and does not
+# use this libc.
+BR2_TOOLCHAIN_BUILDROOT_GLIBC=y
+BR2_KERNEL_HEADERS_6_6=y
 
 # System
 BR2_TARGET_GENERIC_HOSTNAME="at-node"
 BR2_TARGET_GENERIC_ISSUE="Autonomous Trust Node"
 BR2_INIT_SYSTEMD=y
+# BR2_TARGET_GENERIC_REMOUNT_ROOTFS_RW is not set
+BR2_INIT_SYSTEMD_VAR_OVERLAYFS=y
 BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_AT_PATH)/rootfs-overlay"
 BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_AT_PATH)/post-build.sh"
 BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_AT_PATH)/post-image.sh"
@@ -24,6 +29,8 @@ BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y
 BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE="$(BR2_EXTERNAL_AT_PATH)/kernel.defconfig"
 BR2_LINUX_KERNEL_DTS_SUPPORT=y
 BR2_LINUX_KERNEL_INTREE_DTS_NAME="broadcom/bcm2711-rpi-4-b broadcom/bcm2711-rpi-cm4-io"
+# Module signing builds the kernel's sign-file tool against OpenSSL
+BR2_LINUX_KERNEL_NEEDS_HOST_OPENSSL=y
 
 # Bootloader: U-Boot for Pi4
 BR2_TARGET_UBOOT=y
@@ -34,6 +41,8 @@ BR2_TARGET_UBOOT_BOARD_DEFCONFIG="rpi_4"
 BR2_TARGET_ROOTFS_EXT2=y
 BR2_TARGET_ROOTFS_EXT2_4=y
 BR2_TARGET_ROOTFS_EXT2_SIZE="128M"
+# The tar copy is for verify-image.sh, which inspects it without root
+BR2_TARGET_ROOTFS_TAR=y
 
 # Packages: minimal
 BR2_PACKAGE_BUSYBOX=y
@@ -44,8 +53,17 @@ BR2_PACKAGE_CRYPTSETUP=y
 BR2_PACKAGE_LVM2=y
 BR2_PACKAGE_UTIL_LINUX=y
 
-# Firmware: Pi4 bootloader
+# Firmware: Pi4 bootloader (start4.elf, fixup4.dat)
 BR2_PACKAGE_RPI_FIRMWARE=y
+BR2_PACKAGE_RPI_FIRMWARE_VARIANT_PI4=y
+
+# Wi-Fi: CYW43455 firmware, regulatory database, WPA supplicant. The SSID
+# and passphrase come from wpa_supplicant.conf on the boot partition.
+BR2_PACKAGE_BRCMFMAC_SDIO_FIRMWARE_RPI=y
+BR2_PACKAGE_BRCMFMAC_SDIO_FIRMWARE_RPI_WIFI=y
+BR2_PACKAGE_WIRELESS_REGDB=y
+BR2_PACKAGE_WPA_SUPPLICANT=y
+BR2_PACKAGE_WPA_SUPPLICANT_NL80211=y
 
 # Security: no debug, no docs
 # BR2_ENABLE_DEBUG is not set

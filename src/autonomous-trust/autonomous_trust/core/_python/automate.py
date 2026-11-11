@@ -331,6 +331,15 @@ class AutonomousTrust(Protocol):
         from .identity.join_policy import check_join_policy
         check_join_policy([ext.name for ext in all_extensions()],
                           logger=self._logger)
+        # The deployment manifest (RD_13.4 §3.3): one that exists and breaks a
+        # rule refuses the start. The network worker applies it again, since
+        # module state does not survive the forkserver.
+        from .deployment_manifest import ManifestError, configure as dm_configure
+        try:
+            dm_configure()
+        except ManifestError as err:
+            self._logger.error('%s; refusing to start', err)
+            raise
         self._logger.info('Extensions: %s',
                           ', '.join(ext.name for ext in all_extensions()) or 'none')
         self.identity = None  # of type Identity (can't import)
@@ -432,15 +441,20 @@ class AutonomousTrust(Protocol):
         Override this to register real services (Capability).
         :param queues: Interprocess communication queues to each process
         :return: None
+
+        The other processes answer peers' caps queries from what this sends
+        them, so a node that sent nothing advertised no capabilities at all,
+        not even the bootstrap probes registered in __init__. An override
+        that registers more must send them the same way.
         """
         if self.testing:
             self.capabilities.register_ability('mult', mul)
             self.capabilities.register_ability('pow', pow)
             self.capabilities.register_ability('pi', pi)
 
-            for q_name in queues:
-                if q_name != self.proc_name:
-                    queues[q_name].put(self.capabilities, block=True, timeout=queue_cadence)
+        for q_name in queues:
+            if q_name != self.proc_name:
+                queues[q_name].put(self.capabilities, block=True, timeout=queue_cadence)
 
     def init_tasking(self, queues: dict[str, QueueType]):
         """

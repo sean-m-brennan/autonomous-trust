@@ -307,6 +307,13 @@ static char ID_PROPOSE[]     = "propose_peer";
 static char ID_VOTE[]        = "vote_on_peer";
 static char ID_CONFIRM[]     = "peer_accepted";
 static char ID_UPDATE[]      = "group_key_update";
+/* Catching up on the group key: a node behind asks a member for the current
+ * group (point to point, encrypted); group_key_stale is the network process's
+ * local signal that a group frame from a peer we hold would not open. Mirror
+ * Python IdentityProtocol.key_query / key_stale; ID_KEY_STALE must match
+ * net_proc.c's NET_ID_KEY_STALE. */
+static char ID_KEY_QUERY[]   = "group_key_query";
+static char ID_KEY_STALE[]   = "group_key_stale";
 static char ID_CAPS_QUERY[]  = "peer_caps_query";
 static char ID_CAPS_RESPONSE[] = "peer_caps_response";
 /* Identity backfill for a cold/late joiner that holds a group member's
@@ -500,9 +507,22 @@ bool identity_verb_is_bootstrap(const char *verb)
  * Process state (file-scope static, thread-safe via mutex)
  ****************************/
 
+/* One cooldown entry of group_key_query bookkeeping. */
+typedef struct {
+    uuid_t uuid;
+    double at;
+    bool used;
+} id_key_mark_t;
+
 static struct {
     array_t histories;
     map_t peer_potentials;
+    /* group_key_query: the pull scheduled on reaching phase 3, and the last
+     * query sent to each member and answer sent to each asker. */
+    bool key_pull_pending;
+    double key_pull_due;
+    id_key_mark_t key_query_sent[ID_KEY_MARKS];
+    id_key_mark_t key_query_answered[ID_KEY_MARKS];
     map_t vote_collection;
     /* Pending vote finalizations: proposed-peer uuid -> the wall-clock time at
      * which we stop waiting for other members' votes and decide on what we
@@ -1902,6 +1922,20 @@ static void _confirm_group_membership(process_t *proc, directory_t *queues,
                   "of a cohort we gateway\n", new_peer->nickname);
         return;
     }
+    /* Already a member at this address: nothing changed, so nothing to tell
+     * anyone. Every member confirms each admission to every other member,
+     * and a returning member is re-admitted the same way, so each confirm of
+     * a known member used to re-send our whole group to every peer. At 16
+     * nodes one re-admission was 15 confirms x 15 updates, which kept the
+     * network and identity queues full for minutes, and the frames those
+     * queues then dropped brought on more re-admissions (fleet-16,
+     * 2026-11-09). A changed address still goes out (_readdress_member). */
+    data_t *known = NULL;
+    string_t known_addr = NULL;
+    if (map_get(&proc->protocol.group.address_map, new_uuid_str, &known) == 0
+        && known != NULL && data_string_ptr(known, &known_addr) == 0
+        && known_addr != NULL && strcmp(known_addr, new_peer->address) == 0)
+        return;
     if (group_add_address(&proc->protocol.group, new_uuid_str, (char *)new_peer->address) == 0)
     {
         /* Local-process broadcast of the updated group (Python: _record_group). */
@@ -4597,6 +4631,10 @@ void identity_reset_state(void)
      * it once at adapter init rather than on every scenario. Matches
      * reputation_reset_state's preservation semantics. */
     bool was_sync = id_state.synchronous_dispatch;
+    id_state.key_pull_pending = false;
+    id_state.key_pull_due = 0.0;
+    memset(id_state.key_query_sent, 0, sizeof(id_state.key_query_sent));
+    memset(id_state.key_query_answered, 0, sizeof(id_state.key_query_answered));
     array_free(&id_state.histories);
     array_init(&id_state.histories);
     /* No persisted group carries from one case into the next. */
@@ -5382,8 +5420,41 @@ static group_t *_child_group_for(const process_t *proc, const net_msg_t *nmsg)
  * update for it brings membership and keys, and a different group arriving
  * from that cohort changes nothing. Applied to the primary, a larger field
  * cohort won the size rule and replaced the command cohort. Rotation is gated
- * as for the primary: a higher epoch only from a verified message. Mirrors
- * Python IdentityProcess._apply_child_update. Consumes @p payload. */
+ * as for the primary: a higher epoch only from a verified message. A gateway
+ * that holds only the child's public key takes a carried key under the same
+ * gate, at the epoch it holds or a newer one: a larger membership is no reason
+ * to trust the key that comes with it. Mirrors Python
+ * IdentityProcess._apply_child_update. Consumes @p payload. */
+/* Whether @p nmsg may rotate @p group's key: its sender is a member of
+ * @p group, this node holds that member as a peer, and the signature checks
+ * against the held peer's key.
+ *
+ * nmsg->verified alone is not enough. A frame the transport cannot attribute
+ * (the broadcast channel) is verified against the key its own envelope names,
+ * and any keypair signs its own frame validly, so a stranger who knew the
+ * group uuid could hand a member a key of the stranger's choosing. Naming a
+ * real member's uuid with the stranger's own keys fails here too, because the
+ * key checked is the one held for that uuid. Mirrors Python
+ * IdentityProcess._rotation_signed_by_member. */
+static bool _rotation_signed_by_member(const process_t *proc,
+                                       const net_msg_t *nmsg,
+                                       const group_t *group)
+{
+    if (!nmsg->has_signature || group->address_map.items == NULL)
+        return false;
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, uuid_str);
+    data_t *value = NULL;
+    if (map_get((map_t *)&group->address_map, uuid_str, &value) != 0)
+        return false;
+    public_identity_t peer;
+    if (!identity_find_peer_pub(proc, nmsg->from_whom.uuid, &peer))
+        return false;
+    return net_message_verify_signature(nmsg->process, nmsg->function, nmsg->obj,
+                                        nmsg->len, nmsg->signature,
+                                        peer.signature.public);
+}
+
 static bool _apply_child_update(const process_t *proc, directory_t *queues,
                                 const net_msg_t *nmsg, group_t *child,
                                 json_t *payload)
@@ -5407,14 +5478,15 @@ static bool _apply_child_update(const process_t *proc, directory_t *queues,
         ? json_string_value(json_object_get(j_encr, "hex_seed")) : NULL;
     bool carries_key = !((j_po == NULL) ? true : json_boolean_value(j_po))
                        && seed_hex != NULL;
-    if (theirs_epoch > child->key_epoch && !nmsg->verified) {
+    bool verified = _rotation_signed_by_member(proc, nmsg, child);
+    if (theirs_epoch > child->key_epoch && !verified) {
         log_warn(proc->logger, "Identity: rejecting unverified child group key "
                  "rotation from %s\n", nmsg->from_whom.nickname);
         json_decref(payload);
         return true;
     }
     bool changed = false;
-    if (nmsg->verified && carries_key && theirs_epoch >= child->key_epoch) {
+    if (verified && carries_key && theirs_epoch >= child->key_epoch) {
         group_t theirs = {0};
         memcpy(theirs.uuid, child->uuid, sizeof(uuid_t));
         theirs.key_epoch = theirs_epoch;
@@ -5434,11 +5506,14 @@ static bool _apply_child_update(const process_t *proc, directory_t *queues,
     if (theirs_size > map_size(&child->address_map)) {
         bool owns_private = !sodium_is_zero(child->encryptor.private,
                                             crypto_box_SECRETKEYBYTES);
-        if (owns_private || carries_key) {
-            if (!owns_private)
-                (void)encryptor_init_from_private(&child->encryptor,
-                                                  (const unsigned char *)seed_hex,
-                                                  strlen(seed_hex));
+        bool takes_key = !owns_private && carries_key && verified
+                         && theirs_epoch >= child->key_epoch
+                         && encryptor_init_from_private(&child->encryptor,
+                                                        (const unsigned char *)seed_hex,
+                                                        strlen(seed_hex)) == 0;
+        if (takes_key)
+            child->key_epoch = theirs_epoch;
+        if (owns_private || takes_key) {
             const char *k;
             json_t *v;
             json_object_foreach(j_addr_map, k, v) {
@@ -5455,6 +5530,29 @@ static bool _apply_child_update(const process_t *proc, directory_t *queues,
     return true;
 }
 
+/* Check an update's signature again against the peer this node now holds for
+ * its sender. An update held through phase 2 came from members this node did
+ * not yet hold, so no signature had been checked, and the gate below refused
+ * every rotation it held (hostile-join run, 2026-11-03). The check uses the
+ * stored peer's key, never one the frame names for itself, and only a
+ * verified update raises the epoch. Mirrors Python
+ * IdentityProcess._reverify_held. */
+static void _reverify_held(const process_t *proc, net_msg_t *nmsg)
+{
+    if (nmsg->verified || !nmsg->has_signature)
+        return;
+    public_identity_t peer;
+    if (!identity_find_peer_pub(proc, nmsg->from_whom.uuid, &peer))
+        return;
+    if (net_message_verify_signature(nmsg->process, nmsg->function, nmsg->obj,
+                                     nmsg->len, nmsg->signature,
+                                     peer.signature.public)) {
+        nmsg->verified = true;
+        log_debug(proc->logger, "Identity: group update from %s verified "
+                  "against the peer we hold\n", peer.nickname);
+    }
+}
+
 static bool handle_group_update(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     if (proc->protocol.phase != 3)
@@ -5468,6 +5566,7 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
     net_msg_t *nmsg = &msg->info.net_msg;
     log_info(proc->logger, "Identity: received group update from %s\n",
              nmsg->from_whom.nickname);
+    _reverify_held(proc, nmsg);
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
@@ -5560,9 +5659,13 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
      * Only from a VERIFIED message: the epoch decides whether a key is newer, not
      * whether its sender had any business rotating, and an unauthenticated update
      * naming a higher epoch would be a way to hand a cohort a key of the attacker's
-     * choosing. Mirrors Python handle_group_update. */
+     * choosing. Verified here means signed by a member of this group that we
+     * hold, checked against the held key (_rotation_signed_by_member), never
+     * the parse-time verdict. Mirrors Python handle_group_update. */
     if (same_group)
     {
+        bool verified = _rotation_signed_by_member(proc, nmsg,
+                                                   &proc->protocol.group);
         json_t *j_epoch = json_object_get(payload, "key_epoch");
         int64_t theirs_epoch = (j_epoch != NULL && json_is_integer(j_epoch))
                                ? json_integer_value(j_epoch) : 0;
@@ -5595,7 +5698,7 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
          * briefly: widening this drop to cover the tiebreak stalled the merge
          * in the 2026-09-17 cohort.) The tiebreak simply does not fire unless
          * the update is verified. */
-        if (theirs_epoch > proc->protocol.group.key_epoch && !nmsg->verified)
+        if (theirs_epoch > proc->protocol.group.key_epoch && !verified)
         {
             log_warn(proc->logger,
                      "Identity: rejecting unverified group key rotation "
@@ -5604,7 +5707,7 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
             return true;
         }
         if ((theirs_epoch > proc->protocol.group.key_epoch || same_epoch_tiebreak)
-            && nmsg->verified)
+            && verified)
         {
             /* Only the fields group_accept_rotation reads, on the stack, so no
              * address_map is allocated to free here. */
@@ -5675,7 +5778,7 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
         }
         else if (carries_key
                  && theirs_epoch >= proc->protocol.group.key_epoch
-                 && !nmsg->verified)
+                 && !verified)
         {
             /* THE SILENT BRANCH, and the one that matters. An equal-epoch
              * update carrying a key is a simultaneous-rotation fork waiting to
@@ -7198,6 +7301,195 @@ static bool _group_has_address(group_t *group, const char *addr)
             found = true;
     map_end_for_each
     return found;
+}
+
+/****************************
+ * Catching up on the group key: group_key_query
+ * (doc/architecture/identity-protocol.md; id_proc_priv.h ID_KEY_*).
+ ****************************/
+
+/* Whether @p uuid may be acted on again under @p marks; records it when so,
+ * reusing the oldest entry when the table is full. */
+static bool _key_mark_due(id_key_mark_t *marks, const uuid_t uuid, double cooldown)
+{
+    double now = _vote_now_sec();
+    bool due = true;
+    pthread_mutex_lock(&id_state.lock);
+    id_key_mark_t *slot = NULL;
+    for (size_t i = 0; i < ID_KEY_MARKS; i++) {
+        if (marks[i].used && uuid_compare(marks[i].uuid, uuid) == 0) {
+            slot = &marks[i];
+            due = now - marks[i].at >= cooldown;
+            break;
+        }
+        if (slot == NULL && !marks[i].used)
+            slot = &marks[i];
+    }
+    if (slot == NULL) {
+        slot = &marks[0];
+        for (size_t i = 1; i < ID_KEY_MARKS; i++)
+            if (marks[i].at < slot->at)
+                slot = &marks[i];
+    }
+    if (due) {
+        uuid_copy(slot->uuid, uuid);
+        slot->at = now;
+        slot->used = true;
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return due;
+}
+
+/* Ask @p peer for the current group, at most once per cooldown. */
+static bool _send_key_query(const process_t *proc, const public_identity_t *peer)
+{
+    if (proc->protocol.group.address_map.items == NULL)
+        return false;
+    if (!_key_mark_due(id_state.key_query_sent, peer->uuid, ID_KEY_QUERY_COOLDOWN_SEC))
+        return false;
+    char gu[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(proc->protocol.group.uuid, gu);
+    json_t *body = json_pack("{s:s, s:I}", "group_uuid", gu, "epoch",
+                             (json_int_t)proc->protocol.group.key_epoch);
+    if (body == NULL)
+        return false;
+    generic_msg_t query = {0};
+    query.type = NET_MESSAGE;
+    strncpy(query.info.net_msg.process, "identity", PROC_NAME_LEN);
+    query.info.net_msg.function = ID_KEY_QUERY;
+    query.info.net_msg.encrypt = true;
+    memcpy(&query.info.net_msg.to_whom, peer, sizeof(public_identity_t));
+    net_msg_pack_json(&query.info.net_msg, body);
+    json_decref(body);
+    /* Bare on purpose: the cooldown above re-asks while the key stays stale. */
+    messaging_send("network", NET_MESSAGE, &query, false);
+    net_msg_free_obj(&query.info.net_msg);
+    log_debug(proc->logger, "Identity: asked %s for the current group (ours "
+              "epoch %lld)\n", peer->nickname,
+              (long long)proc->protocol.group.key_epoch);
+    return true;
+}
+
+void identity_schedule_key_pull(double delay_sec)
+{
+    _ensure_id_init();
+    pthread_mutex_lock(&id_state.lock);
+    id_state.key_pull_pending = true;
+    id_state.key_pull_due = _vote_now_sec() + delay_sec;
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+size_t identity_maybe_pull_key(const process_t *proc)
+{
+    if (proc == NULL || proc->protocol.phase != 3)
+        return 0;
+    pthread_mutex_lock(&id_state.lock);
+    bool due = id_state.key_pull_pending && _vote_now_sec() >= id_state.key_pull_due;
+    if (due)
+        id_state.key_pull_pending = false;
+    pthread_mutex_unlock(&id_state.lock);
+    if (!due || proc->protocol.group.address_map.items == NULL)
+        return 0;
+    const identity_t *self = identity_self_identity(proc);
+    size_t asked = 0;
+    map_key_t key;
+    data_t *value;
+    (void)value;
+    map_entries_for_each((map_t *)&proc->protocol.group.address_map, key, value)
+        if (asked >= ID_KEY_PULL_FANOUT)
+            break;
+        uuid_t u;
+        if (uuid_parse((const char *)key, u) != 0)
+            continue;
+        if (self != NULL && uuid_compare(u, self->uuid) == 0)
+            continue;
+        public_identity_t peer;
+        if (identity_find_peer_pub(proc, u, &peer) && _send_key_query(proc, &peer))
+            asked++;
+    map_end_for_each
+    return asked;
+}
+
+/* Local signal from the network process: a group frame from the address it
+ * carries would not open, so that member holds a key we lack. Refused when it
+ * names a sender: the network's own signals name none, and a peer must not be
+ * able to make us query on its say-so. Mirrors Python handle_key_stale. */
+static bool handle_key_stale(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (!uuid_is_null(nmsg->from_whom.uuid))
+        return true;
+    if (proc->protocol.phase != 3 || proc->protocol.group.address_map.items == NULL)
+        return true;
+    json_t *body = NULL;
+    char addr[ADDR_LEN + 1] = {0};
+    if (net_msg_unpack_json(nmsg, &body) == 0 && json_is_string(body))
+        at_strlcpy(addr, json_string_value(body), sizeof(addr));
+    json_decref(body);
+    if (addr[0] == '\0' || !_group_has_address((group_t *)&proc->protocol.group, addr))
+        return true;
+    public_identity_t peer;
+    bool found = false;
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers && !found; i++) {
+        if (strcmp(proc->protocol.peers[i].address, addr) == 0) {
+            memcpy(&peer, &proc->protocol.peers[i], sizeof(peer));
+            found = true;
+        }
+    }
+    peers_read_unlock(proc);
+    if (found)
+        _send_key_query(proc, &peer);
+    return true;
+}
+
+/* Answer a member of our group with the group, sealed to the key we hold for
+ * it (net_proc signs every frame). Anyone else, another group, or a node not
+ * yet in phase 3 gets nothing; one answer per asker per cooldown. Mirrors
+ * Python handle_key_query. */
+static bool handle_key_query(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (proc->protocol.phase != 3 || proc->protocol.group.address_map.items == NULL)
+        return true;
+    json_t *body = NULL;
+    char their_group[UUID_STRING_LEN + 1] = {0};
+    if (net_msg_unpack_json(nmsg, &body) == 0 && json_is_object(body)) {
+        const char *g = json_string_value(json_object_get(body, "group_uuid"));
+        if (g != NULL)
+            at_strlcpy(their_group, g, sizeof(their_group));
+    }
+    json_decref(body);
+    char gu[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(proc->protocol.group.uuid, gu);
+    if (strcasecmp(their_group, gu) != 0)
+        return true;
+    if (uuid_is_null(nmsg->from_whom.uuid)
+        || !_group_already_member((process_t *)proc, &nmsg->from_whom))
+        return true;
+    public_identity_t asker;
+    if (!identity_find_peer_pub(proc, nmsg->from_whom.uuid, &asker))
+        return true;
+    if (!_key_mark_due(id_state.key_query_answered, asker.uuid, ID_KEY_ANSWER_COOLDOWN_SEC))
+        return true;
+    json_t *grp_json = NULL;
+    if (group_to_json(&proc->protocol.group, &grp_json) != 0 || grp_json == NULL)
+        return true;
+    generic_msg_t update = {0};
+    update.type = NET_MESSAGE;
+    strncpy(update.info.net_msg.process, "identity", PROC_NAME_LEN);
+    update.info.net_msg.function = ID_UPDATE;
+    update.info.net_msg.encrypt = true;
+    memcpy(&update.info.net_msg.to_whom, &asker, sizeof(public_identity_t));
+    net_msg_pack_json(&update.info.net_msg, grp_json);
+    json_decref(grp_json);
+    identity_send_to_network(proc, &update, "group_key_update", asker.nickname);
+    net_msg_free_obj(&update.info.net_msg);
+    log_info(proc->logger, "Identity: sent the group (epoch %lld) to %s, who "
+             "asked\n", (long long)proc->protocol.group.key_epoch, asker.nickname);
+    return true;
 }
 
 /****************************
@@ -9708,6 +10000,8 @@ int identity_register_handlers(process_t *proc)
     process_register_handler(proc, ID_VOTE,     (handler_ptr_t)handle_count_vote);
     process_register_handler(proc, ID_CONFIRM,  (handler_ptr_t)handle_confirm_peer);
     process_register_handler(proc, ID_UPDATE,   (handler_ptr_t)handle_group_update);
+    process_register_handler(proc, ID_KEY_QUERY, (handler_ptr_t)handle_key_query);
+    process_register_handler(proc, ID_KEY_STALE, (handler_ptr_t)handle_key_stale);
     process_register_handler(proc, ID_CAPS_QUERY,    (handler_ptr_t)handle_caps_query);
     process_register_handler(proc, ID_CAPS_RESPONSE, (handler_ptr_t)handle_caps_response);
     process_register_handler(proc, ID_IDENTITY_QUERY,
@@ -10196,6 +10490,9 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
     proc->protocol.phase = 3;
     (void)identity_replay_held_group_updates(proc, queues);
     (void)identity_replay_held_access_requests(proc, queues);
+    /* Ask a few members for the current group once the history's peers have
+     * settled: rotations made while we were joining may never reach us. */
+    identity_schedule_key_pull(ID_KEY_PULL_SETTLE_SEC);
 
     /* Identity-specific loop: re-announce periodically until peers found */
     generic_msg_t announce_buf = {0};
@@ -10229,6 +10526,9 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
          * design and a pending admission is somebody sitting at the door. A
          * converged cohort has an empty map, so this is a no-op. */
         identity_periodic_vote_collection(proc, queues);
+
+        /* The group-key pull scheduled on reaching phase 3, once due. */
+        (void)identity_maybe_pull_key(proc);
 
         /* Welcome copies that are due (identity_resend_welcomes_at). */
         identity_resend_welcomes_at(proc, queues, _vote_now_sec());

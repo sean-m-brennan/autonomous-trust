@@ -59,13 +59,13 @@ def _raw(function, obj, sender):
     return m
 
 
-def _staged(me, other):
-    """`me` holding ENTRIES placed entries, each placement certified by
+def _staged(me, other, entries=ENTRIES):
+    """`me` holding `entries` placed entries, each placement certified by
     ada, bob and cal."""
     rp, q = _node(me, [other])
     hist = TransactionHistory()
-    for i in range(ENTRIES):
-        t, a, b = uuid4(), 300 + 10 * i, 900 - 10 * i
+    for i in range(entries):
+        t, a, b = uuid4(), 300 + 10 * (i % 60), 900 - 10 * (i % 60)
         hist.apply_placed(hist.next_index, [placement_entry(Transaction(
             t, me.uuid, a, other.uuid, b,
             half_sigs={str(me.uuid): _half(me, other, t, a),
@@ -121,6 +121,23 @@ def test_a_window_over_the_page_size_goes_in_pages():
     # Together, exactly the window an unpaged reply carries.
     assert to_json_string(joined) == to_json_string(from_json_string(whole[0]))
     assert len(joined) == ENTRIES
+
+
+def test_a_full_window_goes_even_at_one_entry_per_page():
+    """At 32 colluders an entry ran 8-12 KB and a 24 KB page held two, so a
+    window past about 130 entries needed more pages than the limit allowed
+    and was never sent; a node that fell behind never caught up (hostile-join
+    n32, 2026-11-06). The limit is the chain cap: one entry per page always
+    fits."""
+    me, bob = _id('ada', 1), _id('bob', 2)
+    full = TransactionHistory.DEFAULT_MAX_CHAIN_LEN
+    rp, q = _staged(me, bob, full)
+    pages = _ask(rp, q, bob, 1)
+    assert len(pages) == full
+    receiver, rq = _receiver()
+    for p in pages:
+        _deliver(receiver, rq, p, me)
+    assert len(receiver.history) == full
 
 
 def test_pages_are_put_together_in_any_order():

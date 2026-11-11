@@ -48,6 +48,7 @@
 #include "utilities/allocation.h"
 #include "utilities/msg_types_priv.h"
 #include <jansson.h>
+#include <sodium.h>
 
 
 static uuid_t g_member_uuid, g_field_uuid;
@@ -392,6 +393,120 @@ DEFINE_TEST(test_a_primary_member_cannot_merge_the_field_in)
 }
 END_TEST_DEFINITION()
 
+/* A gateway seeded with only a child's public key takes a carried key the way
+ * it takes a rotation: from a verified message, at the epoch it holds or a
+ * newer one. A larger membership is no reason to trust the key that comes with
+ * it. Returns the child after one tagged update. Mirrors TestChildKeyInstall. */
+static group_t *_public_child_after(bool verified, int64_t theirs_epoch)
+{
+    identity_reset_state();
+    identity_t *me = _mk_identity("gw", "10.0.0.6");
+    identity_t *anchor = _mk_identity("anchor", "172.20.0.11");
+    process_t *proc = _mk_process(me);
+    ck_assert_ret_ok(map_create(&proc->protocol.handlers));
+    ck_assert_ret_ok(identity_register_handlers(proc));
+    _add_peer(proc, anchor);
+    char u[UUID_STRING_LEN + 1];
+
+    group_t *child = calloc(1, sizeof(group_t));
+    uuid_t cu;
+    uuid_generate(cu);
+    group_init(&cu, (char *)me->address, child);
+    uuid_unparse_lower(anchor->uuid, u);
+    group_add_address(child, u, anchor->address);
+    sodium_memzero(child->encryptor.private, crypto_box_SECRETKEYBYTES);
+    child->key_epoch = 2;
+    ck_assert_ret_ok(identity_add_child_group(proc, child, NULL));
+
+    /* The same group under another key, larger by three joiners. */
+    group_t theirs = {0};
+    group_init(&cu, (char *)anchor->address, &theirs);
+    group_add_address(&theirs, u, anchor->address);
+    for (int i = 0; i < 3; i++) {
+        char addr[32], k[UUID_STRING_LEN + 1];
+        uuid_t ku;
+        uuid_generate(ku);
+        uuid_unparse_lower(ku, k);
+        snprintf(addr, sizeof(addr), "172.20.0.%d", 20 + i);
+        group_add_address(&theirs, k, addr);
+    }
+    theirs.key_epoch = theirs_epoch;
+    json_t *gj = NULL;
+    ck_assert_ret_ok(group_to_json(&theirs, &gj));
+
+    generic_msg_t msg = {0};
+    msg.type = NET_MESSAGE;
+    strncpy(msg.info.net_msg.process, "identity", PROC_NAME_LEN);
+    msg.info.net_msg.function = strdup("group_key_update");
+    public_identity_t *pub = _publish(anchor);
+    memcpy(&msg.info.net_msg.from_whom, pub, sizeof(*pub));
+    msg.info.net_msg.verified = verified;
+    uuid_unparse_lower(cu, msg.info.net_msg.child_group);
+    ck_assert_ret_ok(net_msg_pack_json(&msg.info.net_msg, gj));
+    json_decref(gj);
+    if (verified) {
+        /* Signed by anchor, a child member the gateway holds: what a carried
+         * key must be to be installed. */
+        net_msg_t *nm = &msg.info.net_msg;
+        size_t b64_len = sodium_base64_encoded_len(nm->len,
+                                                   sodium_base64_VARIANT_ORIGINAL);
+        char *b64 = malloc(b64_len);
+        sodium_bin2base64(b64, b64_len, nm->obj, nm->len,
+                          sodium_base64_VARIANT_ORIGINAL);
+        size_t pre_len = strlen("identity|group_key_update|") + strlen(b64);
+        char *pre = malloc(pre_len + 1);
+        snprintf(pre, pre_len + 1, "identity|group_key_update|%s", b64);
+        crypto_sign_detached(nm->signature, NULL, (unsigned char *)pre, pre_len,
+                             anchor->signature.private);
+        nm->has_signature = true;
+        free(pre);
+        free(b64);
+    }
+
+    directory_t *queues = _mk_queues();
+    run_message_handlers(proc, queues, NET_MESSAGE, &msg);
+
+    net_msg_free_obj(&msg.info.net_msg);
+    free(msg.info.net_msg.function);
+    smrt_deref(pub);
+    array_free(queues);
+    map_free(&theirs.address_map);
+    return child;
+}
+
+DEFINE_TEST(test_an_unverified_update_installs_no_child_key)
+{
+    group_t *child = _public_child_after(false, 1);
+    ck_assert(sodium_is_zero(child->encryptor.private, crypto_box_SECRETKEYBYTES));
+    ck_assert_uint_eq(map_size(&child->address_map), 1);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_an_older_child_key_is_not_installed)
+{
+    group_t *child = _public_child_after(true, 1);
+    ck_assert(sodium_is_zero(child->encryptor.private, crypto_box_SECRETKEYBYTES));
+    ck_assert_int_eq(child->key_epoch, 2);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_a_verified_child_key_at_our_epoch_is_installed)
+{
+    group_t *child = _public_child_after(true, 2);
+    ck_assert(!sodium_is_zero(child->encryptor.private, crypto_box_SECRETKEYBYTES));
+    ck_assert_int_eq(child->key_epoch, 2);
+    ck_assert_uint_eq(map_size(&child->address_map), 4);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_a_newer_child_key_brings_its_epoch)
+{
+    group_t *child = _public_child_after(true, 3);
+    ck_assert(!sodium_is_zero(child->encryptor.private, crypto_box_SECRETKEYBYTES));
+    ck_assert_int_eq(child->key_epoch, 3);
+}
+END_TEST_DEFINITION()
+
 static char g_child_uuid[UUID_STRING_LEN + 1];
 static size_t g_child_queries;
 
@@ -508,6 +623,10 @@ DEFINE_TEST(test_the_primary_update_skips_a_peer_the_gateway_cannot_place)
 END_TEST_DEFINITION()
 
 RUN_TESTS(GatewayUpdateScope,
+          test_an_unverified_update_installs_no_child_key,
+          test_an_older_child_key_is_not_installed,
+          test_a_verified_child_key_at_our_epoch_is_installed,
+          test_a_newer_child_key_brings_its_epoch,
           test_the_primary_update_skips_a_peer_the_gateway_cannot_place,
           test_a_gateway_skips_a_history_whose_group_spans_it,
           test_a_gateway_queries_each_child_cohort_it_lacks,

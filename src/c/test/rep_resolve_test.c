@@ -245,6 +245,30 @@ DEFINE_TEST(originating_a_query_tracks_it_even_with_nowhere_to_send)
 }
 END_TEST_DEFINITION()
 
+DEFINE_TEST(resolve_floor_reads_the_same_variable_as_python)
+{
+    /* RD_13.4 D5(a): C used to hard-code 1, so an operator who raised
+     * AT_REP_RESOLVE_MIN_SIGNERS got a stricter Python and an unchanged C.
+     * The parse rules are Python's int(_env_float(...)) under
+     * verify_resolved's max(1, ...): truncate, and anything below 1 is 1. */
+    unsetenv("AT_REP_RESOLVE_MIN_SIGNERS");
+    ck_assert_uint_eq(reputation_resolve_min_signers(), 1);
+    setenv("AT_REP_RESOLVE_MIN_SIGNERS", "2", 1);
+    ck_assert_uint_eq(reputation_resolve_min_signers(), 2);
+    setenv("AT_REP_RESOLVE_MIN_SIGNERS", "2.7", 1);
+    ck_assert_uint_eq(reputation_resolve_min_signers(), 2);
+    setenv("AT_REP_RESOLVE_MIN_SIGNERS", "0", 1);
+    ck_assert_uint_eq(reputation_resolve_min_signers(), 1);
+    setenv("AT_REP_RESOLVE_MIN_SIGNERS", "-3", 1);
+    ck_assert_uint_eq(reputation_resolve_min_signers(), 1);
+    setenv("AT_REP_RESOLVE_MIN_SIGNERS", "junk", 1);
+    ck_assert_uint_eq(reputation_resolve_min_signers(), 1);
+    setenv("AT_REP_RESOLVE_MIN_SIGNERS", "", 1);
+    ck_assert_uint_eq(reputation_resolve_min_signers(), 1);
+    unsetenv("AT_REP_RESOLVE_MIN_SIGNERS");
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS("rep_resolve",
           honest_answer_reproduces_its_root,
           withheld_entry_is_detectable,
@@ -252,4 +276,5 @@ RUN_TESTS("rep_resolve",
           score_over_the_attested_window_matches_the_chain,
           a_leaf_has_nowhere_to_forward,
           unanswered_peer_has_no_recorded_outcome,
-          originating_a_query_tracks_it_even_with_nowhere_to_send)
+          originating_a_query_tracks_it_even_with_nowhere_to_send,
+          resolve_floor_reads_the_same_variable_as_python)

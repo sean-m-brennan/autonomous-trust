@@ -266,6 +266,70 @@ int crypto_generichash_blake2b_update(crypto_generichash_blake2b_state *state,
 int crypto_generichash_blake2b_final(crypto_generichash_blake2b_state *state,
                                      unsigned char *out, size_t outlen);
 
+/* Generic-hash front end: libsodium's crypto_generichash_* is BLAKE2b. */
+typedef crypto_generichash_blake2b_state crypto_generichash_state;
+
+/*@
+  requires outlen > 0 && outlen <= 64;
+  requires \valid(out + (0 .. outlen - 1));
+  requires inlen == 0 || \valid_read(in + (0 .. inlen - 1));
+  requires key == \null || \valid_read(key + (0 .. keylen - 1));
+  assigns out[0 .. outlen - 1];
+  ensures \result == 0 || \result == -1;
+*/
+int crypto_generichash(unsigned char *out, size_t outlen,
+                       const unsigned char *in, unsigned long long inlen,
+                       const unsigned char *key, size_t keylen);
+
+/*@
+  requires \valid(state);
+  requires outlen > 0 && outlen <= 64;
+  requires key == \null || \valid_read(key + (0 .. keylen - 1));
+  assigns *state;
+  ensures \result == 0 || \result == -1;
+*/
+int crypto_generichash_init(crypto_generichash_state *state,
+                            const unsigned char *key, const size_t keylen,
+                            const size_t outlen);
+
+/*@
+  requires \valid(state);
+  requires inlen == 0 || \valid_read(in + (0 .. inlen - 1));
+  assigns *state;
+  ensures \result == 0 || \result == -1;
+*/
+int crypto_generichash_update(crypto_generichash_state *state,
+                              const unsigned char *in,
+                              unsigned long long inlen);
+
+/*@
+  requires \valid(state);
+  requires outlen > 0 && outlen <= 64;
+  requires \valid(out + (0 .. outlen - 1));
+  assigns out[0 .. outlen - 1];
+  assigns *state;
+  ensures \result == 0 || \result == -1;
+*/
+int crypto_generichash_final(crypto_generichash_state *state,
+                             unsigned char *out, const size_t outlen);
+
+/* ================================================================
+ * SHA-256
+ * ================================================================ */
+
+#ifndef crypto_hash_sha256_BYTES
+#define crypto_hash_sha256_BYTES 32U
+#endif
+
+/*@
+  requires \valid(out + (0 .. crypto_hash_sha256_BYTES - 1));
+  requires inlen == 0 || \valid_read(in + (0 .. inlen - 1));
+  assigns out[0 .. crypto_hash_sha256_BYTES - 1];
+  ensures \result == 0;
+*/
+int crypto_hash_sha256(unsigned char *out, const unsigned char *in,
+                       unsigned long long inlen);
+
 /* ================================================================
  * Short hashing – SipHash-2-4 (used by map_t)
  * ================================================================ */
@@ -414,5 +478,104 @@ uint32_t randombytes_random(void);
   ensures \result < upper_bound;
 */
 uint32_t randombytes_uniform(uint32_t upper_bound);
+
+/* ================================================================
+ * X25519 public-key derivation
+ * ================================================================ */
+
+/*@
+  requires \valid(q + (0 .. crypto_box_PUBLICKEYBYTES - 1));
+  requires \valid_read(n + (0 .. crypto_box_SECRETKEYBYTES - 1));
+  assigns q[0 .. crypto_box_PUBLICKEYBYTES - 1];
+  ensures \result == 0 || \result == -1;
+*/
+int crypto_scalarmult_base(unsigned char *q, const unsigned char *n);
+
+/* ================================================================
+ * Constant-time all-zero test
+ * ================================================================ */
+
+/*@
+  requires nlen == 0 || \valid_read(n + (0 .. nlen - 1));
+  assigns \nothing;
+  ensures \result == 0 || \result == 1;
+*/
+int sodium_is_zero(const unsigned char *n, const size_t nlen);
+
+#ifndef sodium_base64_VARIANT_URLSAFE_NO_PADDING
+#define sodium_base64_VARIANT_URLSAFE_NO_PADDING 7
+#endif
+
+/* ================================================================
+ * Password hashing – Argon2id
+ * ================================================================ */
+
+#ifndef crypto_pwhash_ALG_ARGON2ID13
+#define crypto_pwhash_ALG_ARGON2ID13 2
+#endif
+
+/*@
+  requires outlen > 0;
+  requires \valid(out + (0 .. outlen - 1));
+  requires passwdlen == 0 || \valid_read(passwd + (0 .. passwdlen - 1));
+  requires \valid_read(salt + (0 .. 15));
+  assigns out[0 .. outlen - 1];
+  ensures \result == 0 || \result == -1;
+*/
+int crypto_pwhash(unsigned char * const out, unsigned long long outlen,
+                  const char * const passwd, unsigned long long passwdlen,
+                  const unsigned char * const salt,
+                  unsigned long long opslimit, size_t memlimit, int alg);
+
+/* ================================================================
+ * AEAD – XChaCha20-Poly1305 (IETF)
+ * ================================================================ */
+
+#ifndef crypto_aead_xchacha20poly1305_ietf_ABYTES
+#define crypto_aead_xchacha20poly1305_ietf_ABYTES 16U
+#endif
+
+/*@
+  requires \valid(c + (0 .. mlen + crypto_aead_xchacha20poly1305_ietf_ABYTES - 1));
+  requires clen_p == \null || \valid(clen_p);
+  requires mlen == 0 || \valid_read(m + (0 .. mlen - 1));
+  requires adlen == 0 || \valid_read(ad + (0 .. adlen - 1));
+  requires \valid_read(npub + (0 .. 23));
+  requires \valid_read(k + (0 .. 31));
+  assigns c[0 .. mlen + crypto_aead_xchacha20poly1305_ietf_ABYTES - 1];
+  assigns *clen_p \from mlen;
+  ensures \result == 0;
+*/
+int crypto_aead_xchacha20poly1305_ietf_encrypt(unsigned char *c,
+                                               unsigned long long *clen_p,
+                                               const unsigned char *m,
+                                               unsigned long long mlen,
+                                               const unsigned char *ad,
+                                               unsigned long long adlen,
+                                               const unsigned char *nsec,
+                                               const unsigned char *npub,
+                                               const unsigned char *k);
+
+/*@
+  requires clen >= crypto_aead_xchacha20poly1305_ietf_ABYTES;
+  requires \valid(m + (0 .. clen - crypto_aead_xchacha20poly1305_ietf_ABYTES - 1));
+  requires mlen_p == \null || \valid(mlen_p);
+  requires \valid_read(c + (0 .. clen - 1));
+  requires adlen == 0 || \valid_read(ad + (0 .. adlen - 1));
+  requires \valid_read(npub + (0 .. 23));
+  requires \valid_read(k + (0 .. 31));
+  assigns m[0 .. clen - crypto_aead_xchacha20poly1305_ietf_ABYTES - 1];
+  assigns *mlen_p \from clen;
+  ensures \result == 0 || \result == -1;
+*/
+int crypto_aead_xchacha20poly1305_ietf_decrypt(unsigned char *m,
+                                               unsigned long long *mlen_p,
+                                               unsigned char *nsec,
+                                               const unsigned char *c,
+                                               unsigned long long clen,
+                                               const unsigned char *ad,
+                                               unsigned long long adlen,
+                                               const unsigned char *npub,
+                                               const unsigned char *k);
 
 #endif /* SODIUM_STUBS_H */

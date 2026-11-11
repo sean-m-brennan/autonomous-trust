@@ -197,6 +197,94 @@ class TestStepDAG:
         dag.merge('dev')
         assert 'dev' not in dag.heads
 
+    # A step that arrives over the wire is a new object with the same uuid.
+    # Merging must treat it as the step it is, or the merged chain carries the
+    # step twice with one timestamp, and every node it reaches rejects it as
+    # backdated. Cold-start cohorts hit this as soon as they merge histories.
+
+    @staticmethod
+    def _wire(step):
+        return LinkedStep(payload=step.payload, uuid=step.uuid,
+                          timestamp=step.timestamp)
+
+    @staticmethod
+    def _chain(dag, branch=None):
+        return [s.payload for s in reversed(dag.recite(branch))]
+
+    def _stamped(self, payload, seconds):
+        return LinkedStep(payload=payload,
+                          timestamp=datetime(2026, 1, 1) + timedelta(seconds=seconds))
+
+    def test_diff_matches_a_received_copy_by_uuid(self):
+        shared, mine, theirs = (self._stamped('S', 0), self._stamped('a', 1),
+                                self._stamped('b', 2))
+        dag = ConcreteDAG()
+        dag.add_step(shared)
+        dag.add_step(mine)
+        name = dag.ingest_branch([theirs, self._wire(shared)])
+        idx, root = dag.diff(name)
+        assert idx == 1
+        assert root.uuid == shared.uuid
+
+    def test_merge_of_a_received_branch_keeps_each_step_once(self):
+        shared, mine, theirs = (self._stamped('S', 0), self._stamped('a', 1),
+                                self._stamped('b', 2))
+        dag = ConcreteDAG()
+        dag.add_step(shared)
+        dag.add_step(mine)
+        dag.merge(dag.ingest_branch([theirs, self._wire(shared)]))
+        assert self._chain(dag) == ['S', 'a', 'b']
+
+    def test_merge_of_an_extension_keeps_the_shared_prefix_once(self):
+        # Their history is ours plus one step: nothing diverges inside the
+        # shorter list, so the common root is our head.
+        first, second, theirs = (self._stamped('S', 0), self._stamped('T', 1),
+                                 self._stamped('b', 2))
+        dag = ConcreteDAG()
+        dag.add_step(first)
+        dag.add_step(second)
+        name = dag.ingest_branch([theirs, self._wire(second), self._wire(first)])
+        idx, root = dag.diff(name)
+        assert idx == 2 and root.uuid == second.uuid
+        dag.merge(name)
+        assert self._chain(dag) == ['S', 'T', 'b']
+
+    def test_merge_drops_a_shared_step_found_past_the_divergence(self):
+        # The same step can sit at different positions in two histories (each
+        # node recorded its own step first). It must still appear once.
+        shared, mine, late, theirs = (self._stamped('S', 0), self._stamped('a', 1),
+                                      self._stamped('X', 2), self._stamped('b', 3))
+        dag = ConcreteDAG()
+        dag.add_step(shared)
+        dag.add_step(mine)
+        dag.add_step(late)
+        name = dag.ingest_branch([theirs, self._wire(late), self._wire(shared)])
+        dag.merge(name)
+        assert self._chain(dag) == ['S', 'a', 'X', 'b']
+
+    def test_a_second_branch_under_a_name_starts_fresh(self):
+        # The identity process ingests each history diff under its sender's
+        # name. A name reused after its branch was merged (or its head
+        # dropped) must not carry the earlier diff's steps, or the second diff
+        # validates as both run together and fails as backdated.
+        class Strict(StepDAG):
+            def _validate(self, branch):
+                steps = self._StepDAG__branch_lists[branch]
+                return all(steps[i - 1].timestamp < steps[i].timestamp
+                           for i in range(1, len(steps)))
+        dag = Strict()
+        dag.add_step(self._stamped('S', 0))
+        first = [self._stamped('a2', 20), self._stamped('a1', 10)]
+        name = dag.ingest_branch(first, 'peer')
+        assert dag._validate(name)
+        dag.merge(name)
+        second = [self._stamped('b2', 15), self._stamped('b1', 5)]
+        name = dag.ingest_branch(second, 'peer')
+        assert dag._validate(name)
+        del dag.heads['peer']
+        third = [self._stamped('c1', 3)]
+        assert dag._validate(dag.ingest_branch(third, 'peer'))
+
     def test_merge_keep(self):
         dag = ConcreteDAG()
         s1 = self._make_step('shared')

@@ -32,6 +32,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Optional
 
+from .theme import current as current_theme
+
 
 @dataclass
 class NarrationAnchor:
@@ -108,6 +110,24 @@ STYLE_COLORS = {
                 "text": "#BFDBFE"},
 }
 
+# Light-page counterparts: pale tint of the same hue, dark text.
+LIGHT_STYLE_COLORS = {
+    "default": {"bg": "rgba(255,255,255,0.95)", "border": "#2563EB",
+                "text": "#0F172A"},
+    "alert":   {"bg": "rgba(254,226,226,0.95)", "border": "#B91C1C",
+                "text": "#7F1D1D"},
+    "success": {"bg": "rgba(209,250,229,0.95)", "border": "#047857",
+                "text": "#064E3B"},
+    "info":    {"bg": "rgba(219,234,254,0.95)", "border": "#2563EB",
+                "text": "#1E3A8A"},
+}
+
+
+def style_colors(style: str) -> dict:
+    """bg/border/text for a narration style under the current theme."""
+    table = LIGHT_STYLE_COLORS if current_theme().light else STYLE_COLORS
+    return table.get(style, table["default"])
+
 
 class NarrationOverlay:
     """Manages timed narration blocks and renders the current overlay.
@@ -159,7 +179,7 @@ class NarrationOverlay:
             return ""
 
         block = self._current
-        colors = STYLE_COLORS.get(block.style, STYLE_COLORS["default"])
+        colors = style_colors(block.style)
 
         subtext_html = ""
         if block.subtext:

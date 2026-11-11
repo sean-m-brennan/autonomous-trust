@@ -163,6 +163,17 @@ void reputation_install_round_group(int64_t id1, int64_t id2,
  *  the next case. */
 void reputation_set_placement_dir(const char *dir);
 
+/** Bound a placement value at @p bytes encoded rather than
+ *  PLACE_VALUE_BYTES_MAX, or 0 for PLACE_VALUE_BYTES_MAX. Test seam. */
+void reputation_set_place_value_bytes_max(size_t bytes);
+
+/** The longest placement backoff after @p fails refusals at one instance. */
+double reputation_place_backoff_window(int fails);
+
+/** The primary chain's refusals: the instance, how many, and the backoff last
+ *  drawn. False when none are counted. Test seam. */
+bool reputation_place_fails(int *k, int *n, double *drawn);
+
 /** Stage the primary chain's promised placement ballot (@p n, @p by). */
 void reputation_install_place_promise(int64_t n, const uuid_t by);
 
@@ -451,6 +462,35 @@ int reputation_rescore_sweep(const process_t *proc, double present,
  *  the next rescore sweep), without driving a Paxos round. Test hook. */
 void reputation_note_interaction(const uuid_t peer_uuid);
 
+/** Keep @p self_uuid's own entries aside when they leave the primary window
+ *  and every child chain's (tx_history_set_keep_party). The process does this
+ *  once it resolves itself; the conformance harness calls it up front. */
+void reputation_set_keep_party(const uuid_t self_uuid);
+
+/** How many own entries chain @p chain_key ("" or NULL: primary) holds past
+ *  its window. Test and conformance hook. */
+int reputation_retained_count(const char *chain_key);
+
+/** Lone probe verdicts (the user's call, 2026-11-06): how many are held about
+ *  @p subject (NULL: in all); write and reload the store as the process does
+ *  at checkpoint finalization and startup. */
+int reputation_lone_verdict_count(const uuid_t subject);
+/** Hold a lone verdict of @p score about @p subject from the probe of @p task
+ *  (conformance fixtures). */
+void reputation_install_lone_verdict(const uuid_t task, const uuid_t subject,
+                                     double score);
+void reputation_persist_lone_verdicts(const process_t *proc);
+void reputation_load_lone_verdicts(const process_t *proc);
+/** How many own entries this node holds about @p peer_uuid (Python
+ *  _own_count), and the told contrite tit-for-tat of it. */
+int reputation_own_count(const uuid_t peer_uuid);
+double reputation_told_ctft(const uuid_t self_uuid, const uuid_t peer_uuid);
+/** A TRANSACTION_SCORE from this node's own subsystems, as the process loop
+ *  handles it. */
+void reputation_handle_local_tx_score(const process_t *proc,
+                                      const generic_msg_t *msg,
+                                      const uuid_t self_uuid);
+
 /** Pre-install the coop-mode latch entry for @p peer_uuid. When @p
  *  in_coop is true, the next compute uses COOP_EXIT (0.45) as the
  *  pure-vs-CTFT gate; when false, COOP_ENTER (0.55). Mirrors Python's
@@ -479,6 +519,11 @@ void reputation_set_anchored_cohort(const anchored_cohort_msg_t *m);
  *  the told ceiling), and if so the probe verdicts held about it, into
  *  @p verdicts. False with the policy off. */
 bool reputation_burst_count(const uuid_t peer_uuid, int *verdicts);
+
+/** Whether @p peer_uuid is a suspect: our latest probe verdict of it failed
+ *  and one more failure would hold it below tier 1 (reputation_probe_hold).
+ *  False with the policy off. */
+bool reputation_is_suspect(const uuid_t peer_uuid);
 
 /** One pass of the join burst's count publisher at @p present: a
  *  PEER_PROBE_COUNT to negotiation for each peer whose count changed,

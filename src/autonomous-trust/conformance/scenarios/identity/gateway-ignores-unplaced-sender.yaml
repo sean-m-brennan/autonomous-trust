@@ -1,0 +1,48 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: gateway-ignores-unplaced-sender
+byte_pinning: false
+description: |
+    A gateway's primary group changes only through its own members.
+
+    gw's primary group is itself and boss, and it bridges a cohort that lists
+    anchor. stranger is in neither group: a field joiner the gateway has heard
+    from but not yet placed. Its update names a group of five, which the size
+    rule would have gw adopt over its two. That is how a field joiner's group
+    replaced a gateway's command cohort. The update carries no child tag,
+    because stranger is in no child map, and gw ignores it.
+
+participants:
+  - id: gw
+    role: border_guard
+  - id: boss
+    role: group_member
+  - id: anchor
+    role: group_member
+  - id: stranger
+    role: group_member
+
+fixtures:
+  groups:
+    stranger:
+      uuid: "0c000000-0000-4000-8000-0000000000d1"
+      size: 5
+  cohort_tree:
+    nodes:
+      gw:
+        members: [boss]
+        child_group: [anchor]
+
+steps:
+  - id: 1
+    from: stranger
+    to: gw
+    function: group_key_update
+    payload: {}
+    description: stranger, in neither group, sends gw a larger group.
+
+expected_state:
+  gw:
+    group_size: 2
+    child_group_count: 1

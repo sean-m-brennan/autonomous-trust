@@ -178,9 +178,11 @@ def test_real_reading_overrides_the_seed():
 
 
 def test_cold_start_reading_for_cohort_subject_still_draws_edge():
-    # A returned reading that is the cold-start neutral (0.0 CTFT or 0.5 pure)
-    # is substituted to the seed rather than pruned, so a queried-but-unhistoried
-    # cohort pair still shows an edge (not a disconnected node).
+    # A returned reading that is the cold-start neutral is substituted to the
+    # seed rather than pruned, so a queried-but-unhistoried cohort pair still
+    # shows an edge (not a disconnected node). Both rep_req paths (tit-for-tat
+    # and pure mode) return the same neutral on the [0, 1] scale; read it from
+    # the module rather than as a literal, since AT_REP_NEUTRAL can move it.
     stub = _make_stub()
     stub.peers = NS(all=[_peer("u-cap", "squad-captain"),
                          _peer("u-m1", "microdrone-1")])
@@ -189,8 +191,8 @@ def test_cold_start_reading_for_cohort_subject_still_draws_edge():
         return NS(score=v)
 
     stub.latest_reputation_pairs = {
-        ("u-cap", "u-m1"): rep(0.0),   # CTFT cold-start
-        ("u-m1", "u-cap"): rep(0.5),   # pure-mode no-history
+        ("u-cap", "u-m1"): rep(rw.PREREP_NEUTRAL),   # CTFT cold-start
+        ("u-m1", "u-cap"): rep(rw.NEUTRAL_REP),      # pure-mode no-history
     }
     edges = _edges(stub, 0.0)
     assert edges[("microdrone-1", "squad-captain")] == rw.SEED_REPUTATION

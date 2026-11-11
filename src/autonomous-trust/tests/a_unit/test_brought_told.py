@@ -18,7 +18,7 @@
 Under an enabled join policy a node keeps, beside the told score, a brought
 score built from its own evidence alone, and each reader names the one it
 reads: decisions read bounded (brought once the peer has own_evidence_min own
-entries, else told capped at told_tier; an anchored peer reads told), and
+entries, else told capped at told_tier, or uncapped for an anchored peer), and
 exclusion reads brought + slash. With the policy off nothing changes. The C
 twin is src/c/test/rep_brought_test.c.
 """
@@ -95,8 +95,10 @@ def test_no_own_evidence_no_brought_and_bounded_capped():
 
 
 def test_own_evidence_min_lifts_the_bound_to_brought():
+    # Ten cooperative entries lift CTFT's shrunk standing (0.74) past
+    # COOP_ENTER, so brought is the mean of ours, 0.9.
     rp, peer = _rp(), uuid4()
-    _own(rp, peer, 3, 0.9)
+    _own(rp, peer, 10, 0.9)
     _told(rp, peer, 3, 0.3)
     told = _score(rp, peer, told=0.9, coop=True)
     assert rp.reputations.brought[str(peer)] == pytest.approx(0.9)
@@ -107,7 +109,8 @@ def test_short_of_own_evidence_min_stays_capped():
     rp, peer = _rp(), uuid4()
     _own(rp, peer, 2, 0.9)
     told = _score(rp, peer, told=0.9, coop=True)
-    assert rp.reputations.brought[str(peer)] == pytest.approx(0.9)
+    # Two entries: CTFT's shrunk standing, (1.8 + 3 * 0.2) / 5.
+    assert rp.reputations.brought[str(peer)] == pytest.approx(0.48)
     assert rp._bounded(peer, told) == pytest.approx(TIER1_CAP, abs=1e-6)
 
 
@@ -115,7 +118,7 @@ def test_own_evidence_min_is_declared():
     rp, peer = _rp(JoinPolicy(enabled=True, own_evidence_min=2)), uuid4()
     _own(rp, peer, 2, 0.9)
     told = _score(rp, peer, told=0.9, coop=True)
-    assert rp._bounded(peer, told) == pytest.approx(0.9)
+    assert rp._bounded(peer, told) == pytest.approx(0.48)
 
 
 def test_told_tier_is_declared():
@@ -133,6 +136,25 @@ def test_an_anchored_peer_reads_told():
     assert rp._bounded(peer, told) == pytest.approx(0.95)
 
 
+def test_an_anchored_peer_with_own_evidence_reads_brought():
+    """Hostile-join run, 2026-11-04: an anchor read told uncapped, and the
+    colluders' low scores of it pulled an honest joiner from 0.9 to 0.573
+    while every transaction between the joiners scored 0.9. Once this node
+    holds own_evidence_min entries of its own, an anchor reads brought as any
+    peer does."""
+    rp, peer = _rp(), uuid4()
+    _own(rp, peer, 10, 0.9)
+    _told(rp, peer, 20, 0.1)
+    told = _score(rp, peer, told=0.9, coop=True)
+    rp.protocol.anchored = frozenset({str(peer)})
+    # Told reads tit-for-tat over our ten, shrunk toward neutral: the slander
+    # cannot hold it in cooperation (coop_regime_of).
+    assert told < 0.8
+    assert rp._bounded(peer, told) == pytest.approx(
+        rp.reputations.brought[str(peer)])
+    assert rp._bounded(peer, told) == pytest.approx(0.9)
+
+
 def _probe(rp, peer, n, score=0.9):
     """``n`` probes of ours: bilateral entries whose half of ours is on the
     probe channel."""
@@ -144,10 +166,10 @@ def test_a_probe_verdict_is_own_evidence_under_the_policy():
     """Phase 5 (the user's call, 2026-10-27): a verdict counts toward
     own_evidence_min and into brought, with its score."""
     rp, peer = _rp(), uuid4()
-    _probe(rp, peer, 3, 0.9)
+    _probe(rp, peer, 10, 0.9)
     _told(rp, peer, 3, 0.3)
     told = _score(rp, peer, told=0.3)
-    assert rp._own_count(peer) == 3
+    assert rp._own_count(peer) == 10
     assert rp.reputations.brought[str(peer)] > TIER1_CAP
     assert rp._bounded(peer, told) == rp.reputations.brought[str(peer)]
 
@@ -165,7 +187,7 @@ def test_brought_reads_our_scores_not_the_peers():
     for _ in range(3):
         _pair(rp, rp.identity.uuid, 0.3, peer, 1.0)
     _score(rp, peer)
-    assert rp.reputations.brought[str(peer)] == pytest.approx(0.3)
+    assert rp.reputations.brought[str(peer)] == pytest.approx((0.9 + 0.6) / 6)
 
 
 def test_policy_off_keeps_no_brought_and_reads_told():
@@ -179,9 +201,10 @@ def test_policy_off_keeps_no_brought_and_reads_told():
 
 
 def test_told_alone_never_excludes():
+    # Four third-party 0.0 entries put the prior below the 0.1 cutoff.
     rp, peer = _rp(), uuid4()
-    _told(rp, peer, 3, 0.0)
-    told = _score(rp, peer, told=0.95, coop=True)
+    _told(rp, peer, 4, 0.0)
+    told = _score(rp, peer)
     assert rp._is_excluded(told)
     assert rp._exclusion_score(peer, told) is None
     net = queue.Queue()
@@ -191,8 +214,10 @@ def test_told_alone_never_excludes():
 
 
 def test_brought_below_the_cutoff_excludes():
+    # Shrunk toward neutral, three 0.0 entries read exactly the 0.1 cutoff;
+    # it takes a fourth to fall below it.
     rp, peer = _rp(), uuid4()
-    _own(rp, peer, 3, 0.0)
+    _own(rp, peer, 4, 0.0)
     told = _score(rp, peer)
     assert rp._is_excluded(rp._exclusion_score(peer, told))
 

@@ -1,9 +1,14 @@
 # Minimal Linux kernel config for Autonomous Trust on Pi4/CM4
-# Base: bcm2711_defconfig, stripped for single-purpose appliance
+# Mainline 6.6 (kernel.org). Buildroot copies this file to .config and runs
+# olddefconfig, so every driver the board needs is named here; anything not
+# named takes its Kconfig default, which for drivers is almost always off.
+# The firmware boots U-Boot, and U-Boot boots this kernel with the
+# firmware-supplied mainline DTB (bcm2711-rpi-4-b.dtb).
 
 # Architecture
-CONFIG_ARCH_BCM2835=y
 CONFIG_ARM64=y
+CONFIG_ARCH_BCM=y
+CONFIG_ARCH_BCM2835=y
 CONFIG_SMP=y
 CONFIG_NR_CPUS=4
 
@@ -12,6 +17,67 @@ CONFIG_PREEMPT=y
 CONFIG_HIGH_RES_TIMERS=y
 CONFIG_CGROUPS=y
 CONFIG_NAMESPACES=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_OVERLAY_FS=y
+CONFIG_EFI=n
+
+# systemd mounts /run, /dev/shm and the /var overlay's upper layer as tmpfs
+# with mode= options. Without TMPFS the kernel's minimal shmem mount rejects
+# every option, and systemd freezes at "Failed to mount API filesystems".
+CONFIG_TMPFS=y
+CONFIG_TMPFS_POSIX_ACL=y
+CONFIG_TMPFS_XATTR=y
+
+# Optional for systemd 254, but units fail or log errors without them
+CONFIG_POSIX_MQUEUE=y
+CONFIG_BPF_SYSCALL=y
+CONFIG_CGROUP_BPF=y
+CONFIG_MEMCG=y
+
+# Loadable modules: only cfg80211 and brcmfmac are modules, so that brcmfmac
+# loads after the rootfs (and its firmware) is mounted. Every module is
+# signed at build time with a throwaway key and unsigned modules are refused.
+CONFIG_MODULES=y
+CONFIG_MODULE_UNLOAD=y
+CONFIG_MODULE_SIG=y
+CONFIG_MODULE_SIG_FORCE=y
+CONFIG_MODULE_SIG_ALL=y
+CONFIG_MODULE_SIG_SHA256=y
+
+# SoC plumbing: VideoCore firmware mailbox, clocks, power domains, resets
+CONFIG_MAILBOX=y
+CONFIG_BCM2835_MBOX=y
+CONFIG_RASPBERRYPI_FIRMWARE=y
+CONFIG_RASPBERRYPI_POWER=y
+CONFIG_BCM2835_POWER=y
+CONFIG_COMMON_CLK=y
+CONFIG_CLK_BCM2835=y
+CONFIG_CLK_RASPBERRYPI=y
+CONFIG_CLK_BCM2711_DVP=y
+CONFIG_RESET_CONTROLLER=y
+CONFIG_RESET_RASPBERRYPI=y
+CONFIG_DMADEVICES=y
+CONFIG_DMA_BCM2835=y
+
+# GPIO and regulators: the SD card's power and 1.8 V signalling regulators
+# and the Wi-Fi chip's enable line sit on the firmware GPIO expander
+CONFIG_GPIOLIB=y
+CONFIG_OF_GPIO=y
+CONFIG_GPIO_RASPBERRYPI_EXP=y
+CONFIG_REGULATOR=y
+CONFIG_REGULATOR_FIXED_VOLTAGE=y
+CONFIG_REGULATOR_GPIO=y
+
+# Watchdog (reboot goes through it), thermal sensor, hardware RNG
+CONFIG_WATCHDOG=y
+CONFIG_BCM2835_WDT=y
+CONFIG_THERMAL=y
+CONFIG_THERMAL_OF=y
+CONFIG_MFD_SYSCON=y
+CONFIG_BCM2711_THERMAL=y
+CONFIG_HW_RANDOM=y
+CONFIG_HW_RANDOM_IPROC_RNG200=y
 
 # Networking (essential for AT)
 CONFIG_NET=y
@@ -20,30 +86,69 @@ CONFIG_IPV6=y
 CONFIG_PACKET=y
 CONFIG_UNIX=y
 CONFIG_IP_MULTICAST=y
-CONFIG_IP_UDP=y
 CONFIG_NETFILTER=n
 
+# Ethernet: on-chip GENET MAC with the BCM54213PE PHY
+CONFIG_NETDEVICES=y
+CONFIG_ETHERNET=y
+CONFIG_NET_VENDOR_BROADCOM=y
+CONFIG_BCMGENET=y
+CONFIG_PHYLIB=y
+CONFIG_BROADCOM_PHY=y
+CONFIG_MDIO_BCM_UNIMAC=y
+
+# Wi-Fi: CYW43455 on the SDIO bus, driven by brcmfmac
+CONFIG_WIRELESS=y
+CONFIG_CFG80211=m
+CONFIG_WLAN=y
+CONFIG_WLAN_VENDOR_BROADCOM=y
+CONFIG_BRCMFMAC=m
+CONFIG_BRCMFMAC_SDIO=y
+CONFIG_PWRSEQ_SIMPLE=y
+
 # Device mapper + dm-verity
+CONFIG_MD=y
 CONFIG_BLK_DEV_DM=y
 CONFIG_DM_VERITY=y
 CONFIG_DM_VERITY_VERIFY_ROOTHASH_SIG=y
 CONFIG_CRYPTO_SHA256=y
 
-# Storage
+# Storage: emmc2 drives the SD card, sdhci drives the Wi-Fi SDIO bus; both
+# use sdhci-iproc
 CONFIG_MMC=y
+CONFIG_MMC_BLOCK=y
+CONFIG_MMC_SDHCI=y
+CONFIG_MMC_SDHCI_PLTFM=y
+CONFIG_MMC_SDHCI_IPROC=y
 CONFIG_MMC_BCM2835=y
 CONFIG_EXT4_FS=y
 CONFIG_VFAT_FS=y
+CONFIG_FAT_DEFAULT_IOCHARSET="ascii"
+CONFIG_NLS_CODEPAGE_437=y
+CONFIG_NLS_ASCII=y
 
-# Serial / console
+# Serial / console: the mainline DT puts the console on the mini UART
+# (uart1, ttyS1) on GPIO 14/15; the PL011 (uart0) belongs to Bluetooth
 CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_SERIAL_8250_EXTENDED=y
+CONFIG_SERIAL_8250_SHARE_IRQ=y
+CONFIG_SERIAL_8250_BCM2835AUX=y
+CONFIG_SERIAL_OF_PLATFORM=y
 CONFIG_SERIAL_AMBA_PL011=y
 CONFIG_SERIAL_AMBA_PL011_CONSOLE=y
 
-# USB (for initial provisioning)
+# USB (for initial provisioning): the Pi 4's USB-A ports hang off a VL805
+# controller on PCIe; the USB-C port is the DWC2 OTG controller
+CONFIG_PCI=y
+CONFIG_PCI_MSI=y
+CONFIG_PCIE_BRCMSTB=y
 CONFIG_USB=y
 CONFIG_USB_XHCI_HCD=y
+CONFIG_USB_XHCI_PCI=y
 CONFIG_USB_DWC2=y
+CONFIG_SCSI=y
+CONFIG_BLK_DEV_SD=y
 CONFIG_USB_STORAGE=y
 
 # Virtio (for QEMU testing)
@@ -53,18 +158,37 @@ CONFIG_VIRTIO_BLK=y
 CONFIG_VIRTIO_NET=y
 CONFIG_VIRTIO_CONSOLE=y
 
+# Kernel console on HDMI. The Pi's U-Boot leaves the firmware framebuffer
+# running and describes it to the kernel as a simple-framebuffer node, which
+# simpledrm drives. Output only: there are no keyboard or HID drivers.
+CONFIG_DRM=y
+CONFIG_DRM_SIMPLEDRM=y
+CONFIG_DRM_FBDEV_EMULATION=y
+CONFIG_FRAMEBUFFER_CONSOLE=y
+
+# Green ACT LED: the device tree gives it the heartbeat trigger, so it blinks
+# for as long as the kernel is alive
+CONFIG_NEW_LEDS=y
+CONFIG_LEDS_CLASS=y
+CONFIG_LEDS_GPIO=y
+CONFIG_LEDS_TRIGGERS=y
+CONFIG_LEDS_TRIGGER_HEARTBEAT=y
+
+# Embed this config in the kernel, readable at /proc/config.gz
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y
+
 # Disable unnecessary subsystems
 CONFIG_SOUND=n
-CONFIG_DRM=n
 CONFIG_FB=n
 CONFIG_VGA_CONSOLE=n
 CONFIG_INPUT_MOUSEDEV=n
 CONFIG_INPUT_JOYDEV=n
 CONFIG_INPUT_TOUCHSCREEN=n
+CONFIG_USB_HID=n
 CONFIG_HID=n
 CONFIG_MEDIA_SUPPORT=n
-CONFIG_WLAN=n
-CONFIG_BLUETOOTH=n
+CONFIG_BT=n
 CONFIG_NFS_FS=n
 CONFIG_CIFS=n
 CONFIG_DEBUG_KERNEL=n

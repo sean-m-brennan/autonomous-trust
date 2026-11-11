@@ -86,6 +86,7 @@ typedef struct {
     bool valid;
     int chain_len;
     int committed_tx_count;
+    int retained_count;
     char window_root[TX_HASH_HEX_LEN + 1];
     char checkpoint_root[TX_HASH_HEX_LEN + 1];
     /* Checkpoint proposals parked for a later co-sign (ISSUES §2.29). */
@@ -746,6 +747,13 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
      * directory, a roster of every participant): json_object_get on a NULL
      * g_fixtures reads every fixture as absent. */
     if (target_id == NULL) return;
+    /* The target keeps its own entries past the window, as the process does
+     * once it resolves itself. */
+    {
+        uuid_t self;
+        _uuid5("rep:", target_id, self);
+        reputation_set_keep_party(self);
+    }
 
     /* attest_conflicts: [[<pid>, ...], ...] -- the teams whose members do not
      * witness for each other (ISSUES §2.54). Scenario-level: every node holds
@@ -837,6 +845,25 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
         }
         else
             unsetenv("AT_REP_N_MIN");
+    }
+
+    /* resolve_min_signers: { "<pid>": N } -- the floor of verified, trusted
+     * co-signers the participant this step is delivered to demands of a
+     * rep_resolved answer (AT_REP_RESOLVE_MIN_SIGNERS; RD_13.4 D5). Set or
+     * cleared on every install, like AT_REP_N_MIN. Mirrors the Python
+     * adapter, which sets each process's RESOLVE_MIN_SIGNERS. */
+    {
+        json_t *ms = json_object_get(json_object_get(g_fixtures,
+                                                     "resolve_min_signers"),
+                                     target_id);
+        if (json_is_integer(ms))
+        {
+            char buf[24];
+            snprintf(buf, sizeof(buf), "%lld", (long long)json_integer_value(ms));
+            setenv("AT_REP_RESOLVE_MIN_SIGNERS", buf, 1);
+        }
+        else
+            unsetenv("AT_REP_RESOLVE_MIN_SIGNERS");
     }
 
     /* Every group places its order. Placement state lives in a directory of
@@ -1136,6 +1163,30 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
                 if (u)
                     reputation_install_coop_mode(*u, b);
             }
+        }
+    }
+
+    /* lone_verdicts: { "<pid>": [ {task_id, subject, score}, ... ] } — the
+     * verdicts this participant holds from its own probes without the probed
+     * peer's half (lone probe verdicts, 2026-11-06), oldest first. Mirrors the
+     * Python adapter. */
+    json_t *lvs = json_object_get(g_fixtures, "lone_verdicts");
+    if (json_is_object(lvs))
+    {
+        json_t *list = json_object_get(lvs, target_id);
+        size_t li;
+        json_t *lv;
+        json_array_foreach(list, li, lv)
+        {
+            const char *slug = json_string_value(json_object_get(lv, "task_id"));
+            const char *subj = json_string_value(json_object_get(lv, "subject"));
+            const uuid_t *u = subj ? _uuid_of(ctx, subj) : NULL;
+            if (slug == NULL || u == NULL)
+                continue;
+            uuid_t task_uuid;
+            _uuid5("tx:", slug, task_uuid);
+            reputation_install_lone_verdict(task_uuid, *u,
+                json_number_value(json_object_get(lv, "score")));
         }
     }
 
@@ -1715,6 +1766,28 @@ static int _rp_place_value(sce_run_ctx_t *ctx, json_t *payload, json_t **out_val
                                     _rp_cosignatures(ctx, who, desig, dlen, NULL));
             }
             json_decref(who);
+            /* cert_roster: [ids] names the roster both certificates were
+             * collected under. Mirrors the Python adapter. */
+            json_t *cr = json_object_get(e, "cert_roster");
+            if (json_is_array(cr))
+            {
+                json_t *members = json_array();
+                size_t mi;
+                json_t *mp;
+                json_array_foreach(cr, mi, mp)
+                {
+                    json_t *m = _rp_roster_member(ctx, json_string_value(mp));
+                    if (m != NULL)
+                        json_array_append_new(members, m);
+                }
+                char dg[TX_HASH_HEX_LEN + 1];
+                if (roster_digest(members, dg, NULL) == 0)
+                {
+                    json_object_set_new(d, "p1_cert_roster", json_string(dg));
+                    json_object_set_new(d, "p2_cert_roster", json_string(dg));
+                }
+                json_decref(members);
+            }
         }
         /* Each scorer signs its own half naming the other (R+D.md §14.2),
          * unless the spec says `unsigned`. */
@@ -2004,6 +2077,29 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                                                      dlen, NULL));
                 _rp_half_elements(ctx, payload, to_id, proposer_id, task_slug,
                                   task_uuid, score, channel, body);
+                /* cert_roster: the roster the certificate names -- participant
+                 * ids (their roster's digest) or a literal digest. Mirrors
+                 * the Python adapter. */
+                json_t *cr = json_object_get(payload, "cert_roster");
+                if (json_is_string(cr))
+                    json_object_set_new(body, "roster",
+                                        json_string(json_string_value(cr)));
+                else if (json_is_array(cr))
+                {
+                    json_t *members = json_array();
+                    size_t mi;
+                    json_t *mp;
+                    json_array_foreach(cr, mi, mp)
+                    {
+                        json_t *m = _rp_roster_member(ctx, json_string_value(mp));
+                        if (m != NULL)
+                            json_array_append_new(members, m);
+                    }
+                    char d[TX_HASH_HEX_LEN + 1];
+                    if (roster_digest(members, d, NULL) == 0)
+                        json_object_set_new(body, "roster", json_string(d));
+                    json_decref(members);
+                }
             }
         }
     }
@@ -2648,6 +2744,7 @@ static int _dispatch(sce_run_ctx_t *ctx,
     {
         s->chain_len     = reputation_get_chain_len();
         s->committed_tx_count = reputation_get_committed_tx_count();
+        s->retained_count = reputation_retained_count("");
         reputation_get_commit_cert_counts(&s->halves_held, &s->certified_halves);
         s->signed_halves = reputation_get_signed_half_count();
         s->cohort_halves_held = reputation_get_cohort_half_count();
@@ -2887,6 +2984,18 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                 {
                     snprintf(ctx->err, sizeof(ctx->err), "%s: %s=%d, expected %d",
                              pid, key, have, want);
+                    return -1;
+                }
+            }
+            else if (strcmp(key, "retained_count") == 0)
+            {
+                /* Own entries held past the primary window. */
+                int want = (int)json_integer_value(val);
+                if (snap->retained_count != want)
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: retained_count=%d, expected %d",
+                             pid, snap->retained_count, want);
                     return -1;
                 }
             }
