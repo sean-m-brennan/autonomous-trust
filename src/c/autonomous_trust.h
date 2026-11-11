@@ -43,12 +43,14 @@ extern "C" {
  */
 
 /**
- * @brief Run an AutonomousTrust daemon in the current process.
+ * @brief Start an AutonomousTrust daemon.
  *
- * Blocks until the daemon exits (on signal or fatal error). Most embedders
- * should prefer the higher-level @ref at_node_init / @ref at_node_start
- * lifecycle in `node.h`, which forks this routine into a child process and
- * wires up the IPC queues for the caller.
+ * Normally this forks the daemon and returns its pid at once; the daemon
+ * process exits when it shuts down and never returns from this call. When
+ * messaging_in_process() is set, the calling process is the daemon and this
+ * blocks until it exits (on signal or fatal error). Most embedders should
+ * prefer the higher-level @ref at_node_init / @ref at_node_start lifecycle in
+ * `node.h`, which wires up the IPC queues for the caller.
  *
  * @param q_in          IPC queue name used for messages **into** the daemon
  *                      (application → AT). NUL-terminated.
@@ -61,7 +63,9 @@ extern "C" {
  *                      @p capabilities is `NULL`.
  * @param log_level     Minimum severity to emit (see @ref log_level_t).
  * @param log_file      Path to the log file; empty string routes to stderr.
- * @return 0 on clean shutdown, non-zero on startup or runtime failure.
+ * @return The daemon's pid when it was forked, or a negative error if the
+ *         fork failed. In-process: 0 on clean shutdown, non-zero on startup
+ *         or runtime failure.
  */
 int run_autonomous_trust(char *q_in, char *q_out,
                          void *capabilities, size_t cap_len,
