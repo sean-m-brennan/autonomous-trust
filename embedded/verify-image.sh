@@ -25,6 +25,10 @@
 #   ./verify-image.sh                          # auto-detect from build dir
 #   ./verify-image.sh --images-dir path/to/images
 #   ./verify-image.sh --pubkey path/to/key.pub
+#   ./verify-image.sh --devel                  # the devel image's build
+#
+# The locked-down image must have no login and none of the devel image's
+# debugging aids; the devel image must have all of them.
 
 set -euo pipefail
 
@@ -33,6 +37,7 @@ BUILD_DIR="$SCRIPT_DIR/.buildroot-build"
 
 IMAGES_DIR=""
 PUBKEY="$SCRIPT_DIR/signing.pub"
+DEVEL=false
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -63,12 +68,14 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --images-dir) IMAGES_DIR="$2"; shift 2 ;;
         --pubkey)     PUBKEY="$2"; shift 2 ;;
+        --devel)      DEVEL=true; shift ;;
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
             echo
             echo "Options:"
             echo "  --images-dir DIR  Buildroot images directory"
             echo "  --pubkey PATH     Public key for binary signature check"
+            echo "  --devel           Check the devel image (default: the locked-down one)"
             exit 0 ;;
         *) error "Unknown option: $1"; exit 1 ;;
     esac
@@ -76,8 +83,24 @@ done
 
 # Auto-detect images directory
 if [ -z "$IMAGES_DIR" ]; then
-    IMAGES_DIR="$BUILD_DIR/output/images"
+    if $DEVEL; then
+        IMAGES_DIR="$BUILD_DIR/output-devel/images"
+    else
+        IMAGES_DIR="$BUILD_DIR/output/images"
+    fi
 fi
+info "Checking the $($DEVEL && echo devel || echo locked-down) image in $IMAGES_DIR"
+
+# Assert a check only the devel image passes: required there, refused here
+devel_only() {
+    local desc="$1" present="$2"
+    if $DEVEL; then
+        check "$desc" "$present"
+    else
+        [ "$present" -ne 0 ] && rc=0 || rc=1
+        check "No $desc (locked-down)" $rc
+    fi
+}
 
 if [ ! -d "$IMAGES_DIR" ]; then
     error "Images directory not found: $IMAGES_DIR"
@@ -156,6 +179,15 @@ if [ -f "$BOOT_IMG" ]; then
         grep -qi "wpa_supplicant.conf.example" <<<"$BOOT_LIST" && rc=0 || rc=1
         check "wpa_supplicant.conf.example present in boot" $rc
 
+        grep -qi "at-address.conf.example" <<<"$BOOT_LIST" && rc=0 || rc=1
+        check "at-address.conf.example present in boot" $rc
+
+        EXTLINUX=$(timeout 5 mtype -i "$BOOT_IMG" ::extlinux/extlinux.conf </dev/null 2>/dev/null || true)
+        grep -q "console=tty1" <<<"$EXTLINUX" && rc=0 || rc=1
+        devel_only "kernel console on HDMI (console=tty1)" $rc
+        grep -q "earlycon=" <<<"$EXTLINUX" && rc=0 || rc=1
+        devel_only "early console (earlycon=)" $rc
+
         # Extract and display config.txt (timeout prevents mcopy hangs)
         if command -v mcopy &>/dev/null; then
             TMP_CFG=$(mktemp)
@@ -193,30 +225,43 @@ else
 fi
 
 # -----------------------------------------------------------------------
-# 3. Kernel config (embedded in the Image by CONFIG_IKCONFIG)
+# 3. Kernel config
 # -----------------------------------------------------------------------
 step "Kernel config"
 
-# The config sits gzipped between the IKCFG_ST and IKCFG_ED markers. Each
-# option below is one the image cannot boot or be seen without.
+# The devel kernel embeds its config (CONFIG_IKCONFIG), gzipped between the
+# IKCFG_ST and IKCFG_ED markers. The locked-down kernel does not, so its
+# config is read from the build tree beside the images directory.
 KERNEL_IMAGE="$IMAGES_DIR/Image"
 KCONFIG=""
+EMBEDDED=1
 if [ -f "$KERNEL_IMAGE" ]; then
     KCFG_OFF=$(grep -abo IKCFG_ST "$KERNEL_IMAGE" | head -1 | cut -d: -f1 || true)
     if [ -n "$KCFG_OFF" ]; then
         KCONFIG=$(tail -c +$((KCFG_OFF + 9)) "$KERNEL_IMAGE" | gzip -dc 2>/dev/null || true)
+        [ -n "$KCONFIG" ] && EMBEDDED=0
     fi
+fi
+devel_only "kernel config embedded in the Image (CONFIG_IKCONFIG)" $EMBEDDED
+if [ -z "$KCONFIG" ]; then
+    BUILD_KCONFIG=$(find "$IMAGES_DIR/../build" -maxdepth 2 -path '*/linux-[0-9]*/.config' 2>/dev/null | head -1)
+    [ -n "$BUILD_KCONFIG" ] && KCONFIG=$(cat "$BUILD_KCONFIG")
 fi
 
 if [ -n "$KCONFIG" ]; then
+    # Options the image cannot boot or run without
     for opt in TMPFS TMPFS_POSIX_ACL DEVTMPFS CGROUPS INOTIFY_USER FHANDLE \
-               MMC_SDHCI_IPROC BCMGENET MODULE_SIG_FORCE \
-               DRM_SIMPLEDRM DRM_FBDEV_EMULATION FRAMEBUFFER_CONSOLE; do
+               MMC_SDHCI_IPROC BCMGENET MODULE_SIG_FORCE; do
         grep -qx "CONFIG_$opt=y" <<<"$KCONFIG" && rc=0 || rc=1
         check "Kernel built with CONFIG_$opt=y" $rc
     done
+    # The devel image's debugging aids
+    for opt in DRM_SIMPLEDRM FRAMEBUFFER_CONSOLE LEDS_TRIGGER_HEARTBEAT IKCONFIG_PROC; do
+        grep -qx "CONFIG_$opt=y" <<<"$KCONFIG" && rc=0 || rc=1
+        devel_only "kernel CONFIG_$opt" $rc
+    done
 else
-    check "Kernel Image carries its config (CONFIG_IKCONFIG)" 1
+    check "Kernel config readable (embedded or in the build tree)" 1
 fi
 
 # -----------------------------------------------------------------------
@@ -264,6 +309,54 @@ if [ -f "$ROOTFS_TAR" ]; then
     grep -q "lib/firmware/regulatory.db$" <<<"$TAR_LIST" && rc=0 || rc=1
     check "Wireless regulatory database in rootfs" $rc
 
+    grep -q "network-online.target.wants/systemd-networkd-wait-online.service" <<<"$TAR_LIST" && rc=0 || rc=1
+    check "DHCP gets a head start (systemd-networkd-wait-online enabled)" $rc
+
+    grep -q "etc/systemd/system/at-address.service$" <<<"$TAR_LIST" \
+        && grep -q "usr/libexec/at-address$" <<<"$TAR_LIST" \
+        && grep -q "autonomous-trust.service.d/address.conf$" <<<"$TAR_LIST" && rc=0 || rc=1
+    check "AT waits for its static address (at-address.service)" $rc
+
+    grep -q "etc/wpa_supplicant/at-adhoc.conf$" <<<"$TAR_LIST" \
+        && grep -q "at-wifi.service.wants/at-wifi-prefer-ap.timer" <<<"$TAR_LIST" \
+        && grep -q "usr/libexec/at-wifi-prefer-ap$" <<<"$TAR_LIST" \
+        && grep -q "bin/wpa_cli$" <<<"$TAR_LIST" && rc=0 || rc=1
+    check "Wi-Fi falls back to the ad-hoc cell and back (at-adhoc.conf, prefer-ap timer, wpa_cli)" $rc
+
+    grep -q "sysinit.target.wants/systemd-time-wait-sync.service" <<<"$TAR_LIST" \
+        && grep -q "etc/systemd/system/autonomous-trust.service.d/time-sync.conf" <<<"$TAR_LIST" && rc=0 || rc=1
+    check "AT waits for the clock to sync (systemd-time-wait-sync enabled)" $rc
+
+    grep -q "local-fs-pre.target.wants/at-grow-data.service" <<<"$TAR_LIST" \
+        && grep -q "usr/libexec/at-grow-data$" <<<"$TAR_LIST" \
+        && grep -q "sbin/sfdisk$" <<<"$TAR_LIST" \
+        && grep -q "bin/partx$" <<<"$TAR_LIST" \
+        && grep -q "lib/systemd/systemd-growfs$" <<<"$TAR_LIST" && rc=0 || rc=1
+    check "Data partition grows to fill the card (at-grow-data, sfdisk, partx, growfs)" $rc
+
+    # Variant: the locked-down image has no way in; the devel image has SSH,
+    # a serial login and the /DEVELOPMENT marker
+    TAR_LONG=$(tar tvf "$ROOTFS_TAR")
+    grep -q "^\./DEVELOPMENT$" <<<"$TAR_LIST" && rc=0 || rc=1
+    devel_only "/DEVELOPMENT marker" $rc
+    grep -q "sbin/dropbear$" <<<"$TAR_LIST" \
+        && grep -q "multi-user.target.wants/dropbear.service" <<<"$TAR_LIST" && rc=0 || rc=1
+    devel_only "SSH server (Dropbear, enabled)" $rc
+    grep -q "root/.ssh/authorized_keys -> /boot/authorized_keys" <<<"$TAR_LONG" && rc=0 || rc=1
+    devel_only "root's SSH keys read from /boot/authorized_keys" $rc
+    grep -q "bin/tcpdump$" <<<"$TAR_LIST" && rc=0 || rc=1
+    devel_only "tcpdump" $rc
+    if ! $DEVEL; then
+        rc=0
+        for unit in getty@.service serial-getty@.service console-getty.service autovt@.service; do
+            grep -q "etc/systemd/system/$unit -> /dev/null" <<<"$TAR_LONG" || rc=1
+        done
+        check "Every getty masked (no login prompt on any terminal)" $rc
+        ROOT_PW=$(tar xf "$ROOTFS_TAR" -O ./etc/shadow 2>/dev/null | awk -F: '$1 == "root" {print $2}')
+        [ "${ROOT_PW:0:1}" = "*" ] || [ "${ROOT_PW:0:1}" = "!" ] && rc=0 || rc=1
+        check "Root account locked" $rc
+    fi
+
     # Modules are signed and the kernel refuses unsigned ones, so a module
     # that lost its signature (e.g. to a strip pass) would never load
     BRCMFMAC_KO=$(grep -m1 "/brcmfmac.ko$" <<<"$TAR_LIST" || true)
@@ -284,6 +377,8 @@ if [ -f "$ROOTFS_TAR" ]; then
         check "Root filesystem marked read-only in fstab" $rc
         echo "$FSTAB" | grep -q "/opt/autonomous-trust" && rc=0 || rc=1
         check "Data partition in fstab" $rc
+        echo "$FSTAB" | grep "/opt/autonomous-trust" | grep -q "x-systemd.growfs" && rc=0 || rc=1
+        check "Data filesystem grows with its partition (x-systemd.growfs)" $rc
     fi
 
     # Verify static binary

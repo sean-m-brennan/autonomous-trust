@@ -1,0 +1,42 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+# ******************
+
+# Associates wlan0 with the network named in wpa_supplicant.conf on the FAT
+# boot partition. The file is written from any PC after flashing, so no
+# credentials are built into the image. Without the file, wlan0 stays down.
+#
+# /etc/wpa_supplicant/at-adhoc.conf adds the ad-hoc cell that AT nodes fall
+# back to when that network is out of range, and the control socket that
+# at-wifi-prefer-ap.timer uses to move back to it. A file with no network
+# block at all, only country=, puts the node straight into the ad-hoc cell.
+
+[Unit]
+Description=Wi-Fi association for wlan0 (/boot/wpa_supplicant.conf)
+BindsTo=sys-subsystem-net-devices-wlan0.device
+After=sys-subsystem-net-devices-wlan0.device boot.mount
+Requires=boot.mount
+Before=network.target
+Wants=network.target
+ConditionPathExists=/boot/wpa_supplicant.conf
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/wpa_supplicant -i wlan0 -D nl80211 -c /boot/wpa_supplicant.conf -I /etc/wpa_supplicant/at-adhoc.conf
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=sys-subsystem-net-devices-wlan0.device

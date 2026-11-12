@@ -340,6 +340,53 @@ class TestContinuousProbing:
         worker._probes_by_peer = {uuids[0]: 10, uuids[1]: 10, uuids[2]: 0}
         assert str(worker._select_target(peers).uuid) == uuids[2]
 
+    def _overdue_setup(self, ages_sec):
+        """Three peers, the first probed far more than the rest, each last
+        probed ``ages_sec[i]`` seconds ago."""
+        from autonomous_trust.core.system import now
+        worker, _ = self._closed_window_worker(
+            **{'AT_PROBE_INTERVAL_SEC': '60'})
+        peers = list(worker.peers.all)
+        uuids = sorted(str(p.uuid) for p in peers)
+        worker._probes_issued = 40
+        worker._probes_by_peer = {uuids[0]: 30, uuids[1]: 5, uuids[2]: 5}
+        current = now()
+        worker._last_probed_at = {
+            u: current - timedelta(seconds=age)
+            for u, age in zip(uuids, ages_sec)}
+        return worker, peers, uuids
+
+    def test_a_peer_unprobed_for_a_round_and_one_is_chosen_first(self, setup_teardown):
+        """A gamer probed often while it behaved had the highest count, and
+        UCB left it alone for the twelve minutes after it defected (red-team
+        repeat, 2026-11-11: 6 of 36 honest nodes). Three peers at 60 s: past
+        (3 + 1) x 60 s unprobed, a peer goes first whatever its count."""
+        worker, peers, uuids = self._overdue_setup([241, 10, 10])
+        assert str(worker._select_target(peers).uuid) == uuids[0]
+
+    def test_a_peer_within_the_bound_waits_its_turn(self, setup_teardown):
+        worker, peers, uuids = self._overdue_setup([200, 10, 10])
+        assert str(worker._select_target(peers).uuid) == uuids[1]
+
+    def test_the_stalest_overdue_peer_goes_first(self, setup_teardown):
+        worker, peers, uuids = self._overdue_setup([300, 250, 10])
+        assert str(worker._select_target(peers).uuid) == uuids[0]
+
+    def test_a_peer_never_probed_goes_before_an_overdue_one(self, setup_teardown):
+        worker, peers, uuids = self._overdue_setup([300, 10, 10])
+        del worker._last_probed_at[uuids[2]]
+        worker._probes_by_peer[uuids[2]] = 0
+        assert str(worker._select_target(peers).uuid) == uuids[2]
+
+    def test_every_probe_stamps_its_peer(self, setup_teardown):
+        """The join burst's and the suspect re-probes' count as well as the
+        steady probes'."""
+        worker, _ = self._closed_window_worker()
+        peer = list(worker.peers.all)[1]
+        queues = {CfgIds.negotiation: queue.Queue()}
+        assert worker._try_issue_probe(queues, target=peer)
+        assert str(peer.uuid) in worker._last_probed_at
+
     def test_heavier_capability_is_probed_more_but_not_exclusively(self, setup_teardown):
         """weight * uncertainty, not weight alone: a pure weight ranking would
         probe the heaviest cap forever, losing coverage and leaving an

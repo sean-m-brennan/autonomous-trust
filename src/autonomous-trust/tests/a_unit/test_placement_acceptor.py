@@ -468,6 +468,12 @@ class TestPropose:
                   if 'value to carry' in c.args[0]]
         assert 'not one of each task, by task id' in line
         assert str(four[3].uuid).lower()[:8] in line
+        # And it counts as a refused round, so this node backs off. Without it,
+        # a Pi left out of a two-member genesis that both members had accepted
+        # dropped a round every two seconds (Wi-Fi cohort, 2026-11-11), and the
+        # two members that could carry the genesis kept hearing a live round
+        # and left it alone.
+        assert rp._place_vars()['_place_fails'][''][:2] == (req['k'], 1)
 
     def test_a_nack_ends_the_round_and_the_next_outranks_it(self, four):
         me = four[0]

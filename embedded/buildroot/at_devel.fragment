@@ -1,0 +1,25 @@
+# Applied on top of at_defconfig by build-image.sh --devel. The devel image
+# is for bringing a node up and measuring it: it adds the debugging kernel
+# options, an SSH server, a serial login and diagnostic tools, and it carries
+# /DEVELOPMENT in its root filesystem. Never field it.
+
+# Tells post-build.sh and post-image.sh which image they are assembling
+BR2_ROOTFS_POST_SCRIPT_ARGS="devel"
+
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_AT_PATH)/rootfs-overlay $(BR2_EXTERNAL_AT_PATH)/rootfs-overlay-devel"
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_AT_PATH)/kernel-devel.fragment"
+
+# Root login on the serial console (mini UART, GPIO 14/15), with no password.
+# SSH accepts keys only.
+BR2_TARGET_GENERIC_GETTY=y
+BR2_TARGET_GENERIC_GETTY_PORT="ttyS1"
+BR2_TARGET_GENERIC_GETTY_BAUDRATE_115200=y
+BR2_TARGET_ENABLE_ROOT_LOGIN=y
+
+# SSH, with root's authorized_keys read from the boot partition
+BR2_PACKAGE_DROPBEAR=y
+# BR2_PACKAGE_DROPBEAR_CLIENT is not set
+
+# Full busybox (ps, top, ip, free and the rest) and tcpdump
+BR2_PACKAGE_BUSYBOX_CONFIG="package/busybox/busybox.config"
+BR2_PACKAGE_TCPDUMP=y

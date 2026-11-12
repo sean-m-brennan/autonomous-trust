@@ -617,6 +617,25 @@ int load_config(char *filepath, config_t **config_ptr, char *cfg_name, logger_t 
                          "leaving the file to whoever owns it\n", cfg_name);
         return EXCEPTION(ECFG_NOIMPL);
     }
+    /* A registered name can still hold a file the registry does not own. A
+     * section's file is one JSON object; a top-level array is Python's
+     * ConfigJSONEncoder form, which a subsystem writes and reads for itself.
+     * group.cfg.json is the case: once a node joins a group, the identity
+     * process keeps it as [group, {"step_dag", "blacklist"}] and reads it with
+     * group_file_read. Parsing that here as the "group" section failed, and
+     * every node that had joined a group refused to start again. */
+    if (!_filename_is_proto(abspath))
+    {
+        json_t *peek = json_load_file(abspath, 0, NULL);
+        bool is_array = peek != NULL && json_is_array(peek);
+        json_decref(peek);
+        if (is_array)
+        {
+            log_info(logger, "%s is kept by its own subsystem; "
+                             "leaving the file to it\n", cfg_name);
+            return EXCEPTION(ECFG_NOIMPL);
+        }
+    }
     config->data_struct = smrt_create(config->data_len);
     if (config->data_struct == NULL)
         return EXCEPTION(ENOMEM);

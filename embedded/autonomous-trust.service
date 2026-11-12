@@ -18,6 +18,9 @@
 Description=Autonomous Trust Node
 After=network-online.target
 Wants=network-online.target
+# The node's identity and sockets live here; never start on the bare directory
+# beneath a data partition that is not mounted
+RequiresMountsFor=/opt/autonomous-trust
 Documentation=https://github.com/TekFive/autonomous-trust
 
 [Service]

@@ -169,11 +169,66 @@ DEFINE_TEST(test_target_selection_prefers_least_probed)
     w.probes_by_peer[0] = 10;
     w.probes_by_peer[1] = 10;
     w.probes_by_peer[2] = 0;
-    ck_assert_uint_eq(bootstrap_worker_select_target(&w, 3), 2);
+    ck_assert_uint_eq(bootstrap_worker_select_target(&w, 3, 0.0), 2);
     /* All equal → lowest index, so equal counts round-robin rather than
      * depending on iteration direction. */
     bootstrap_worker_init_config(&w, 999, 20, 1, false);
-    ck_assert_uint_eq(bootstrap_worker_select_target(&w, 3), 0);
+    ck_assert_uint_eq(bootstrap_worker_select_target(&w, 3, 0.0), 0);
+}
+END_TEST_DEFINITION()
+
+/* A gamer probed often while it behaved had the highest count, and UCB left it
+ * alone for the twelve minutes after it defected (red-team repeat, 2026-11-11:
+ * 6 of 36 honest nodes). Three peers at 60 s: past (3 + 1) x 60 s unprobed, a
+ * peer goes first whatever its count. */
+static void _overdue_setup(bootstrap_worker_t *w, double age0, double age1,
+                           double age2)
+{
+    bootstrap_worker_init_config(w, 999, 20, 1, false);
+    w->probe_interval_sec = 60.0;
+    w->probes_issued = 40;
+    w->probes_by_peer[0] = 30;
+    w->probes_by_peer[1] = 5;
+    w->probes_by_peer[2] = 5;
+    w->last_probed_sec[0] = 1000.0 - age0;
+    w->last_probed_sec[1] = 1000.0 - age1;
+    w->last_probed_sec[2] = 1000.0 - age2;
+}
+
+DEFINE_TEST(test_a_peer_unprobed_for_a_round_and_one_goes_first)
+{
+    bootstrap_worker_t w;
+    _overdue_setup(&w, 241.0, 10.0, 10.0);
+    ck_assert_uint_eq(bootstrap_worker_select_target(&w, 3, 1000.0), 0);
+    _overdue_setup(&w, 200.0, 10.0, 10.0);            /* within the bound */
+    ck_assert_uint_eq(bootstrap_worker_select_target(&w, 3, 1000.0), 1);
+    _overdue_setup(&w, 300.0, 250.0, 10.0);           /* stalest first */
+    ck_assert_uint_eq(bootstrap_worker_select_target(&w, 3, 1000.0), 0);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_a_peer_never_probed_or_skipped_bends_the_bound)
+{
+    bootstrap_worker_t w;
+    /* A peer never probed: UCB decides, and chooses it. */
+    _overdue_setup(&w, 300.0, 10.0, 10.0);
+    w.probes_by_peer[2] = 0;
+    ck_assert_uint_eq(bootstrap_worker_select_target(&w, 3, 1000.0), 2);
+    /* An overdue peer that is absent is not chosen. */
+    _overdue_setup(&w, 300.0, 10.0, 10.0);
+    bool skip[3] = { true, false, false };
+    w.skip_peer = skip;
+    ck_assert_uint_eq(bootstrap_worker_select_target(&w, 3, 1000.0), 1);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_every_probe_stamps_its_peer)
+{
+    bootstrap_worker_t w;
+    bootstrap_worker_init_config(&w, 999, 0, 1, false);
+    probe_ctx_t p = {0};
+    ck_assert(bootstrap_worker_try_issue_probe(&w, 3, 500.0, _capture_probe, &p));
+    ck_assert(fabs(w.last_probed_sec[0] - 500.0) < 1e-9);
 }
 END_TEST_DEFINITION()
 
@@ -257,7 +312,7 @@ DEFINE_TEST(test_a_skipped_peer_is_never_probed_and_starves_nobody)
     w.probe_interval_sec = 0.0;
     bool skip[3] = { true, false, false };   /* peer 0 is the least probed */
     w.skip_peer = skip;
-    ck_assert_uint_eq(bootstrap_worker_select_target(&w, 3), 1);
+    ck_assert_uint_eq(bootstrap_worker_select_target(&w, 3, 0.0), 1);
     probe_ctx_t p = {0};
     for (int i = 0; i < 4; i++)
         bootstrap_worker_tick_all(&w, 3, 0.0, NULL, _capture_probe, &p);
@@ -269,9 +324,9 @@ DEFINE_TEST(test_a_skipped_peer_is_never_probed_and_starves_nobody)
     /* Everyone skipped: no target, no probe, nothing counted. */
     bool all[3] = { true, true, true };
     w.skip_peer = all;
-    ck_assert_uint_eq(bootstrap_worker_select_target(&w, 3), 3);
+    ck_assert_uint_eq(bootstrap_worker_select_target(&w, 3, 0.0), 3);
     int before = w.probes_issued;
-    ck_assert(!bootstrap_worker_try_issue_probe(&w, 3, _capture_probe, &p));
+    ck_assert(!bootstrap_worker_try_issue_probe(&w, 3, 0.0, _capture_probe, &p));
     ck_assert_int_eq(w.probes_issued, before);
 
     /* The round-robin used past AT_PROBE_MAX_TRACKED_PEERS passes a skipped
@@ -280,7 +335,7 @@ DEFINE_TEST(test_a_skipped_peer_is_never_probed_and_starves_nobody)
     w.skip_peer = many;
     w.probes_issued = 0;
     many[0] = true;
-    ck_assert_uint_eq(bootstrap_worker_select_target(&w, AT_PROBE_MAX_TRACKED_PEERS + 2), 1);
+    ck_assert_uint_eq(bootstrap_worker_select_target(&w, AT_PROBE_MAX_TRACKED_PEERS + 2, 0.0), 1);
 }
 END_TEST_DEFINITION()
 
@@ -436,6 +491,9 @@ RUN_TESTS(BootstrapWorker,
           test_probe_rate_limit_spaces_probes,
           test_ucb_bonus_widest_for_unprobed,
           test_target_selection_prefers_least_probed,
+          test_a_peer_unprobed_for_a_round_and_one_goes_first,
+          test_a_peer_never_probed_or_skipped_bends_the_bound,
+          test_every_probe_stamps_its_peer,
           test_probes_spread_across_peers,
           test_capability_allocation_covers_all_and_is_proportional,
           test_unregistered_caps_are_not_probed,

@@ -1,5 +1,8 @@
 # Buildroot defconfig for Autonomous Trust hardened Pi4/CM4 image
 # Based on Buildroot 2024.02.x
+#
+# This is the locked-down image. build-image.sh --devel applies
+# at_devel.fragment on top of it.
 
 # Target
 BR2_aarch64=y
@@ -17,6 +20,9 @@ BR2_TARGET_GENERIC_ISSUE="Autonomous Trust Node"
 BR2_INIT_SYSTEMD=y
 # BR2_TARGET_GENERIC_REMOUNT_ROOTFS_RW is not set
 BR2_INIT_SYSTEMD_VAR_OVERLAYFS=y
+# No login anywhere: no getty, and the root account is locked
+# BR2_TARGET_GENERIC_GETTY is not set
+# BR2_TARGET_ENABLE_ROOT_LOGIN is not set
 BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_AT_PATH)/rootfs-overlay"
 BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_AT_PATH)/post-build.sh"
 BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_AT_PATH)/post-image.sh"
@@ -52,6 +58,9 @@ BR2_PACKAGE_BUSYBOX_CONFIG="package/busybox/busybox-minimal.config"
 BR2_PACKAGE_CRYPTSETUP=y
 BR2_PACKAGE_LVM2=y
 BR2_PACKAGE_UTIL_LINUX=y
+# sfdisk and partx grow the data partition to fill the card on first boot
+BR2_PACKAGE_UTIL_LINUX_BINARIES=y
+BR2_PACKAGE_UTIL_LINUX_PARTX=y
 
 # Firmware: Pi4 bootloader (start4.elf, fixup4.dat)
 BR2_PACKAGE_RPI_FIRMWARE=y
@@ -64,6 +73,9 @@ BR2_PACKAGE_BRCMFMAC_SDIO_FIRMWARE_RPI_WIFI=y
 BR2_PACKAGE_WIRELESS_REGDB=y
 BR2_PACKAGE_WPA_SUPPLICANT=y
 BR2_PACKAGE_WPA_SUPPLICANT_NL80211=y
+# wpa_cli and the control socket: at-wifi-prefer-ap uses them to move from
+# the ad-hoc cell back to the router
+BR2_PACKAGE_WPA_SUPPLICANT_CLI=y
 
 # Security: no debug, no docs
 # BR2_ENABLE_DEBUG is not set

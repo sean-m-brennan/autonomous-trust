@@ -158,27 +158,10 @@ CONFIG_VIRTIO_BLK=y
 CONFIG_VIRTIO_NET=y
 CONFIG_VIRTIO_CONSOLE=y
 
-# Kernel console on HDMI. The Pi's U-Boot leaves the firmware framebuffer
-# running and describes it to the kernel as a simple-framebuffer node, which
-# simpledrm drives. Output only: there are no keyboard or HID drivers.
-CONFIG_DRM=y
-CONFIG_DRM_SIMPLEDRM=y
-CONFIG_DRM_FBDEV_EMULATION=y
-CONFIG_FRAMEBUFFER_CONSOLE=y
-
-# Green ACT LED: the device tree gives it the heartbeat trigger, so it blinks
-# for as long as the kernel is alive
-CONFIG_NEW_LEDS=y
-CONFIG_LEDS_CLASS=y
-CONFIG_LEDS_GPIO=y
-CONFIG_LEDS_TRIGGERS=y
-CONFIG_LEDS_TRIGGER_HEARTBEAT=y
-
-# Embed this config in the kernel, readable at /proc/config.gz
-CONFIG_IKCONFIG=y
-CONFIG_IKCONFIG_PROC=y
-
-# Disable unnecessary subsystems
+# Disable unnecessary subsystems. The devel image adds the HDMI console, the
+# ACT heartbeat LED and the embedded config back (kernel-devel.fragment).
+CONFIG_DRM=n
+CONFIG_IKCONFIG=n
 CONFIG_SOUND=n
 CONFIG_FB=n
 CONFIG_VGA_CONSOLE=n

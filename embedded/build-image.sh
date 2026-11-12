@@ -23,6 +23,13 @@
 #   3. Runs Buildroot to produce a minimal Linux image with dm-verity
 #   4. Outputs: embedded/dist/autonomous-trust.img
 #
+# The default image is locked down: no SSH, no login on any console. --devel
+# builds embedded/dist/autonomous-trust-devel.img instead, which adds SSH, a
+# serial login, the HDMI console and diagnostic tools (buildroot/at_devel.fragment)
+# and carries /DEVELOPMENT in its root filesystem. Each variant keeps its own
+# Buildroot output directory, so switching between them does not rebuild the
+# other.
+#
 # Prerequisites:
 #   - Docker with buildx
 #   - ~10GB disk space for Buildroot build cache
@@ -31,6 +38,7 @@
 #   ./build-image.sh                    # full build
 #   ./build-image.sh --skip-binary      # reuse existing static binary
 #   ./build-image.sh --sign             # sign binary (requires signing key)
+#   ./build-image.sh --devel            # the devel image
 
 set -euo pipefail
 
@@ -44,6 +52,7 @@ BR_VERSION="2024.02.10"
 SKIP_BINARY=false
 SIGN=false
 FORCE=false
+DEVEL=false
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -61,6 +70,7 @@ while [[ $# -gt 0 ]]; do
         --skip-binary) SKIP_BINARY=true; shift ;;
         --sign)        SIGN=true; shift ;;
         --force)       FORCE=true; shift ;;
+        --devel)       DEVEL=true; shift ;;
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
             echo
@@ -68,10 +78,19 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-binary    Reuse existing static binary in dist/"
             echo "  --sign           Sign binary with Ed25519 key"
             echo "  --force          Rebuild everything from scratch"
+            echo "  --devel          Build the devel image (SSH, serial login, debugging)"
             exit 0 ;;
         *) error "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+if $DEVEL; then
+    SUFFIX="-devel"
+    BR_OUTPUT="$BR_BUILD_DIR/output-devel"
+else
+    SUFFIX=""
+    BR_OUTPUT="$BR_BUILD_DIR/output"
+fi
 
 # Check disk space
 AVAIL_GB=$(df -BG "$SCRIPT_DIR" | tail -1 | awk '{print $4}' | tr -d 'G')
@@ -158,7 +177,7 @@ fi
 step "Buildroot build (in Docker)"
 
 # Persistent directories for Buildroot build cache and downloads
-mkdir -p "$BR_BUILD_DIR/output" "$BR_BUILD_DIR/dl"
+mkdir -p "$BR_OUTPUT" "$BR_BUILD_DIR/dl"
 
 # Inside the container:
 #   /buildroot     = Buildroot source (baked into image)
@@ -169,27 +188,50 @@ mkdir -p "$BR_BUILD_DIR/output" "$BR_BUILD_DIR/dl"
 # BR2_EXTERNAL_AT_PATH points to /work so the defconfig can reference
 # $(BR2_EXTERNAL_AT_PATH)/rootfs-overlay, post-build.sh, etc.
 #
+# The devel defconfig is at_defconfig with at_devel.fragment appended; a later
+# line overrides an earlier one. Buildroot does not rebuild a package whose
+# options change, so when the configs differ from the last build's, the
+# output directory is cleaned first. Overlay and script changes need no clean,
+# since every build reapplies them.
+#
 # Both defconfig and build run in a single container so they share state.
 
-info "Loading defconfig and building ..."
+DEFCONFIG_PARTS="/work/at_defconfig"
+CONFIG_INPUTS="/work/at_defconfig /work/kernel.defconfig"
+if $DEVEL; then
+    DEFCONFIG_PARTS="$DEFCONFIG_PARTS /work/at_devel.fragment"
+    CONFIG_INPUTS="$CONFIG_INPUTS /work/at_devel.fragment /work/kernel-devel.fragment"
+fi
+BUILD_DESC="$(git -C "$REPO_DIR" describe --tags --always --dirty 2>/dev/null || echo unknown)"
+
+info "Loading defconfig and building$($DEVEL && echo " (devel)") ..."
 docker run --rm \
     --network host \
+    -e AT_BUILD_DESC="$BUILD_DESC" \
+    -e AT_BUILD_DATE="$(date -u +%Y-%m-%dT%H:%MZ)" \
     -v "$BR_DIR:/work" \
-    -v "$BR_BUILD_DIR/output:/output" \
+    -v "$BR_OUTPUT:/output" \
     -v "$BR_BUILD_DIR/dl:/buildroot/dl" \
     "$BR_DOCKER_IMAGE" \
     "apt-get update -qq && apt-get install -y -qq libssl-dev mtools >/dev/null 2>&1; \
      cd /buildroot && \
-     make O=/output BR2_EXTERNAL_AT_PATH=/work BR2_DEFCONFIG=/work/at_defconfig defconfig && \
-     make O=/output BR2_EXTERNAL_AT_PATH=/work -j\$(nproc)"
+     cat $DEFCONFIG_PARTS > /output/.at_defconfig && \
+     cat $CONFIG_INPUTS | sha256sum > /output/.at_config.sum.new && \
+     if [ -d /output/build ] && ! cmp -s /output/.at_config.sum.new /output/.at_config.sum; then \
+         echo '[build-image] Configuration changed since the last build; cleaning'; \
+         make O=/output clean; \
+     fi && \
+     make O=/output BR2_EXTERNAL_AT_PATH=/work BR2_DEFCONFIG=/output/.at_defconfig defconfig && \
+     make O=/output BR2_EXTERNAL_AT_PATH=/work -j\$(nproc) && \
+     mv /output/.at_config.sum.new /output/.at_config.sum"
 
 # -----------------------------------------------------------------------
 # Step 5: Collect output
 # -----------------------------------------------------------------------
 step "Collecting output"
 
-BUILD_OUTPUT="$BR_BUILD_DIR/output"
-FINAL_IMG="$DIST_DIR/autonomous-trust.img"
+BUILD_OUTPUT="$BR_OUTPUT"
+FINAL_IMG="$DIST_DIR/autonomous-trust$SUFFIX.img"
 if [ -f "$BUILD_OUTPUT/images/autonomous-trust.img" ]; then
     cp "$BUILD_OUTPUT/images/autonomous-trust.img" "$FINAL_IMG"
     info "SD card image: $FINAL_IMG ($(du -h "$FINAL_IMG" | cut -f1))"
@@ -202,7 +244,7 @@ fi
 if [ -f "$BUILD_OUTPUT/images/root-hash.txt" ]; then
     ROOT_HASH=$(cat "$BUILD_OUTPUT/images/root-hash.txt")
     info "dm-verity root hash: $ROOT_HASH"
-    cp "$BUILD_OUTPUT/images/root-hash.txt" "$DIST_DIR/"
+    cp "$BUILD_OUTPUT/images/root-hash.txt" "$DIST_DIR/root-hash$SUFFIX.txt"
 fi
 
 info ""

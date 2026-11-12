@@ -1,0 +1,11 @@
+[Match]
+Name=wlan0
+
+[Network]
+DHCP=yes
+
+[DHCPv4]
+# The machine ID is regenerated every boot on the read-only rootfs, so use
+# the MAC for a stable lease
+ClientIdentifier=mac
+RouteMetric=600

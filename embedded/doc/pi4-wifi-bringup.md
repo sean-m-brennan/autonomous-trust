@@ -13,10 +13,10 @@ associated with it. ipvlan shares `wlan0`'s MAC and gives each namespace its
 own IP, which the access point accepts.
 
 The steps below run the Pi on Raspberry Pi OS Lite, because steps 4, 5 and
-10 need a shell on it over SSH. The hardened Buildroot image
-(`embedded/buildroot/`) has no SSH server. It does have Ethernet and Wi-Fi, and
-it can stand in for the Pi once the plan has worked on Pi OS; see "Using the
-hardened image" at the end.
+10 need a shell on it over SSH. The Buildroot images (`embedded/buildroot/`)
+can stand in for Pi OS: the devel image has SSH and the tools step 10 uses,
+and the locked-down image has no way in at all. See "Using the Buildroot
+images" at the end.
 
 Values used below:
 
@@ -200,10 +200,13 @@ Allow a minute or two for admission and group-key exchange, then:
 ~/Software/continuous-space/lib/muudd/lib/autonomous_trust/embedded/wifi-fleet.sh status --pi at@$PI
 ```
 
-`status` reads each host node's `group.cfg.json` and, over SSH, the Pi's. It
-passes when every unit is active, every node and the Pi report the same group
-UUID, every group lists at least five members (four host nodes and the Pi), and
-the Pi's group lists every host node's address. For one node's log:
+`status` reads each host node's group UUID from its `group.cfg.json` and the
+peers it has added from its journal, and over SSH reads the Pi's address and
+group. It passes when every unit is active, every node and the Pi report the
+same group UUID, and every host node has added at least four peers (the other
+three host nodes and the Pi), the Pi among them. The group's address map is
+not a member list, since a member can hold the group key without appearing in
+it, so `status` does not count it. For one node's log:
 
 ```bash
 sudo ~/Software/continuous-space/lib/muudd/lib/autonomous_trust/embedded/wifi-fleet.sh logs 1
@@ -246,6 +249,39 @@ Read the byte counters twice, a few minutes apart, to get the rate. The Docker
 measurement on the host (16 and 32 nodes, x86) gave 33-54 MiB RSS, about 1% of
 one core and about 9-21 kB/s each way per node, for comparison.
 
+## 10a. Time detection and exclusion
+
+One host node can be made to misbehave so that the cohort, the Pi included,
+can be timed detecting and excluding it. It runs a red-team build of
+`at_demo`, configured with `-DAT_REDTEAM=ON`, which from a set time answers the
+handshake and echo probes wrongly. Peers score each wrong answer 0.1. A release
+build, which is what both Pi images and the tarballs carry, ignores the switch,
+and `up` refuses a bad-node binary that lacks it. Build one on the host:
+
+```bash
+cmake -S ~/Software/continuous-space/lib/muudd/lib/autonomous_trust/examples -B /tmp/at-redteam -DCMAKE_BUILD_TYPE=Release -DAT_FLEET_LIB=ON -DAT_DATA_SOURCE_LIB=ON -DAT_REDTEAM=ON -DAT_TESTS=OFF && cmake --build /tmp/at-redteam -j4 --target at_demo
+```
+
+Start the fleet with node 4 as the bad node, defecting five minutes after it
+starts:
+
+```bash
+sudo ~/Software/continuous-space/lib/muudd/lib/autonomous_trust/embedded/wifi-fleet.sh up --nodes 4 --bad-node 4 --bad-bin /tmp/at-redteam/at_demo --defect-after 300
+```
+
+Then, at any time after the defection:
+
+```bash
+~/Software/continuous-space/lib/muudd/lib/autonomous_trust/embedded/wifi-fleet.sh latency --pi root@$PI
+```
+
+For each honest host node and the Pi, `latency` gives the seconds from the
+defection to that observer's first 0.10 probe score for the bad node
+("detected") and to its excluding the bad node at the network layer, once its
+reputation falls below the 0.1 communication cut-off ("excluded"). Each node
+probes one peer a minute, so with five peers a given peer is probed about
+every five minutes, and exclusion takes several wrong answers. Allow an hour.
+
 ## 11. Tear down
 
 ```bash
@@ -257,15 +293,23 @@ links. The node identities stay in `embedded/.wifi-fleet/` and the next `up`
 reuses them; `down --purge` deletes them. On the Pi,
 `sudo systemctl disable --now autonomous-trust` stops AT.
 
-## Using the hardened image
+## Using the Buildroot images
 
-`embedded/build-image.sh` builds `embedded/dist/autonomous-trust.img`, the
-Buildroot image with `at_demo` already installed and enabled. It brings up
-Ethernet and Wi-Fi with DHCP, but it has no SSH server and no Wi-Fi
-credentials, so you supply the network after flashing:
+`embedded/build-image.sh` builds two images, each with `at_demo` already
+installed and enabled. Both bring up Ethernet and Wi-Fi with DHCP, and both
+grow their data partition to fill the card on the first boot.
+
+| Image | Built by | What it has |
+|---|---|---|
+| `dist/autonomous-trust.img` | `build-image.sh` | Locked down: no SSH, no login on any console, root locked. The kernel logs to the mini UART. |
+| `dist/autonomous-trust-devel.img` | `build-image.sh --devel` | SSH (root, keys only), a root login with no password on the serial console, the kernel console on HDMI, the ACT LED heartbeat, `/proc/config.gz`, full busybox and tcpdump. `/DEVELOPMENT` in its root says so, with the commit and date it was built from. |
+
+Use the devel image for bring-up and for step 10's measurements, and the
+locked-down one for anything that stands for a fielded node. Neither has
+Wi-Fi credentials, so you supply the network after flashing:
 
 ```bash
-sudo ~/Software/continuous-space/lib/muudd/lib/autonomous_trust/embedded/flash.sh ~/Software/continuous-space/lib/muudd/lib/autonomous_trust/embedded/dist/autonomous-trust.img /dev/sdX
+sudo ~/Software/continuous-space/lib/muudd/lib/autonomous_trust/embedded/flash.sh ~/Software/continuous-space/lib/muudd/lib/autonomous_trust/embedded/dist/autonomous-trust-devel.img /dev/sdX
 ```
 
 Mount the card's first (FAT) partition on the host, copy
@@ -274,14 +318,61 @@ and put in the SSID and passphrase. Keep Unix line endings. The Pi mounts this
 partition read-only and readable by root only. Without the file, `wlan0`
 stays down and the node uses Ethernet alone.
 
-On boot the node gets an address by DHCP and starts AT on its own. If
-Ethernet and Wi-Fi are both connected, AT binds whichever address it finds
-first, so connect only the one you are testing. Check it from the host with
-steps 6 to 8, leaving out `--pi`, since `status --pi` reads the Pi's config
-over SSH. The host nodes' groups should list the Pi's address.
+The router is optional. When the network in `wpa_supplicant.conf` is out of
+range, or goes away, the node joins the AT ad-hoc cell (an open cell, SSID
+`autonomous-trust`, channel 6), or starts it if no other node has. Within a
+minute of the router coming back in range, the node moves back to it. For a
+fleet with no router at all, keep only the `country=` line in
+`wpa_supplicant.conf`.
 
-The kernel and systemd print their boot messages on an HDMI monitor, and
-the green LED blinks a heartbeat while the kernel runs. The screen is output
-only, since the image has no keyboard drivers. The kernel also logs to the
-mini UART on GPIO 14 (TX) and 15 (RX), 115200 baud, through a 3.3 V
-USB-serial adapter, from its first instructions on.
+Every node keeps one address on both networks, because AT records its address
+when it first starts and keeps it. Without a router there is no DHCP, so give
+each node its address: copy `at-address.conf.example` to `at-address.conf` on
+the same partition and set `ADDRESS`, such as `10.42.0.11/16`, unique to the
+node and in one subnet shared by the fleet. Without `at-address.conf` the node
+takes its first DHCP lease as its address and saves it on the data partition,
+so it then needs a router on its first boot only. With neither, AT does not
+start, and the journal says why every minute:
+
+```bash
+journalctl -u at-address
+```
+
+The host nodes from `wifi-fleet.sh` join the router's network only, and take
+addresses in the host's own Wi-Fi subnet. For a mixed-fleet check, give the
+Pis addresses in that subnet too: their DHCP leases, or `at-address.conf`
+addresses outside the router's DHCP pool.
+
+The Pi has no real-time clock. With no router it cannot reach a time server,
+and its clock starts from a fixed date set when the image was built.
+
+For the devel image, also copy your public key to `authorized_keys` on the
+same partition, and log in as root:
+
+```bash
+ssh root@$PI
+```
+
+On boot the node puts its address on its link, from `at-address.conf` or its
+saved DHCP lease, or waits for its first lease, then starts AT. It generates
+its identity on the first boot, with that address as its own, and keeps it. If Ethernet and Wi-Fi are both connected, AT binds whichever
+address it finds first, so connect only the one you are testing. Check it from
+the host with steps 6 to 8. On the devel image, `status --pi root@$PI` works
+as written. The locked-down image has no SSH, so give `status` the Pi's
+address instead:
+
+```bash
+~/Software/continuous-space/lib/muudd/lib/autonomous_trust/embedded/wifi-fleet.sh status --pi-addr $PI
+```
+
+`--pi-addr` counts the peers each host node has added since its unit started,
+so a Pi that joined once still counts after it has left or been reflashed.
+After reflashing the Pi, restart the host nodes (`down`, then `up`) before
+trusting it. `--pi` does not have this gap, since it also reads the Pi's own
+group.
+
+Both kernels log to the mini UART on GPIO 14 (TX) and 15 (RX), 115200 baud,
+through a 3.3 V USB-serial adapter. The devel kernel logs there from its first
+instructions on, also prints boot messages on an HDMI monitor (output only,
+since the image has no keyboard drivers), and blinks the green LED in a
+heartbeat while it runs.

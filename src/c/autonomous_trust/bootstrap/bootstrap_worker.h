@@ -115,6 +115,9 @@ typedef struct {
     int      probes_issued;
     double   last_probe_sec;
     bool     probed_ever;
+    /* When any probe last went to each tracked peer; meaningful only where
+     * probes_by_peer is above 0. */
+    double   last_probed_sec[AT_PROBE_MAX_TRACKED_PEERS];
     /* Peers not to probe, by index, @c peer_count entries; NULL = none.
      * Borrowed for one tick: negotiation points it at a snapshot of the
      * peers the network process reports absent
@@ -237,9 +240,20 @@ double bootstrap_ucb_bonus(int count, int total);
  *  uncertainty-directed. Returns 0 when @p peer_count is 0.
  *
  *  A peer marked in @c skip_peer is never chosen. When every peer is, the
- *  result is @p peer_count, which names nobody. */
+ *  result is @p peer_count, which names nobody.
+ *
+ *  A tracked peer left unprobed at @p now_sec longer than one round and one
+ *  interval, `(peer_count + 1) * probe_interval_sec`, goes first whatever its
+ *  count, the stalest of several first. While any unskipped peer has never
+ *  been probed the bound waits and UCB, which chooses that peer, decides. The
+ *  counts are lifetime, so without the bound a peer probed often while it
+ *  behaved waited until every other peer caught up, however long it
+ *  misbehaved meanwhile: a gamer that defected after eight minutes went
+ *  unprobed for the next twelve on 6 of 36 honest nodes (red-team repeat,
+ *  2026-11-11). A healthy round-robin probes every peer within a round, so the
+ *  bound does not fire there. Mirrors Python BootstrapWorker._select_target. */
 size_t bootstrap_worker_select_target(const bootstrap_worker_t *w,
-                                      size_t peer_count);
+                                      size_t peer_count, double now_sec);
 
 /** The capability to probe with: argmax of `weight / (per-cap count + 1)`
  *  over REGISTERED caps, or NULL if none are registered.
@@ -257,10 +271,11 @@ size_t bootstrap_worker_select_target(const bootstrap_worker_t *w,
  *  probes. Mirrors Python BootstrapWorker._select_capability. */
 const char *bootstrap_worker_select_capability(const bootstrap_worker_t *w);
 
-/** Issue one directed probe. Returns true iff one was emitted (and counted).
- *  False on: no peers, no peer that is not skipped, no registered caps, or
- *  @p emit reporting queue-full. */
+/** Issue one directed probe at @p now_sec. Returns true iff one was emitted
+ *  (and counted). False on: no peers, no peer that is not skipped, no
+ *  registered caps, or @p emit reporting queue-full. */
 bool bootstrap_worker_try_issue_probe(bootstrap_worker_t *w, size_t peer_count,
+                                     double now_sec,
                                      bootstrap_probe_emit_fn emit, void *ctx);
 
 /** One main-loop pass covering BOTH phases: the bootstrap window first, then

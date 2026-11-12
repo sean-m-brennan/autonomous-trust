@@ -15793,7 +15793,14 @@ static bool handle_place_grant(const process_t *proc, directory_t *queues,
         pthread_mutex_lock(&rep_state.lock);
         rep_place_state_t *again = _place_state_locked(proc, key);
         if (again != NULL)
+        {
             _place_round_close(again);
+            /* A value we cannot carry refuses our round as surely as a nack.
+             * Retrying at once keeps a live round in every member's ear, and
+             * a member that could carry the value leaves it to us for good. */
+            if (best != NULL)
+                _place_failed_locked(again, k);
+        }
         pthread_mutex_unlock(&rep_state.lock);
         json_decref(value);
         json_decref(payload);

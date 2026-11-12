@@ -1,0 +1,2 @@
+# Keys only: no password logins, and root has no password on this image
+DROPBEAR_ARGS="-s"

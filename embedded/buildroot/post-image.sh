@@ -18,7 +18,8 @@
 # Buildroot post-image script: generate dm-verity hash tree and assemble SD image
 set -euo pipefail
 
-IMAGES_DIR="$1"  # Buildroot passes the images directory
+IMAGES_DIR="$1"        # Buildroot passes the images directory
+VARIANT="${2:-locked}" # BR2_ROOTFS_POST_SCRIPT_ARGS: "devel" from at_devel.fragment
 ROOTFS="$IMAGES_DIR/rootfs.ext4"
 
 echo "[post-image] Generating dm-verity hash tree ..."
@@ -103,20 +104,28 @@ copy_to_boot "$IMAGES_DIR/config.txt" "config.txt"
 # U-Boot's distro boot reads extlinux/extlinux.conf from the first
 # partition. With no fdt line, U-Boot passes on the firmware's DTB. The
 # root partition is named by PARTUUID (disk ID set by sfdisk below), because
-# the SD card's mmcblk number depends on probe order. The kernel logs to both
-# the mini UART and HDMI (tty1); the last console= is /dev/console, so
-# systemd's boot status shows on HDMI. earlycon prints on the mini UART from
-# the kernel's first instructions, before its UART driver loads.
-# net.ifnames=0 keeps the kernel's eth0 and wlan0: systemd would otherwise
-# rename the Ethernet port end0 (from the device tree's ethernet0 alias), and
-# the .network files and at-wifi.service name eth0 and wlan0.
-cat > "$IMAGES_DIR/extlinux.conf" <<'EXTLINUX'
+# the SD card's mmcblk number depends on probe order. net.ifnames=0 keeps the
+# kernel's eth0 and wlan0: systemd would otherwise rename the Ethernet port
+# end0 (from the device tree's ethernet0 alias), and the .network files and
+# at-wifi.service name eth0 and wlan0.
+#
+# The kernel logs to the mini UART (ttyS1). The devel image also logs to HDMI
+# (tty1); the last console= is /dev/console, so systemd's boot status shows
+# there. Its earlycon prints on the mini UART from the kernel's first
+# instructions, before the UART driver loads.
+CMDLINE="root=PARTUUID=41540001-02 rootfstype=ext4 rootwait ro net.ifnames=0"
+if [ "$VARIANT" = devel ]; then
+    CMDLINE="$CMDLINE earlycon=uart8250,mmio32,0xfe215040 console=ttyS1,115200 console=tty1"
+else
+    CMDLINE="$CMDLINE console=ttyS1,115200"
+fi
+cat > "$IMAGES_DIR/extlinux.conf" <<EXTLINUX
 default at
 timeout 0
 
 label at
     kernel /Image
-    append root=PARTUUID=41540001-02 rootfstype=ext4 rootwait ro net.ifnames=0 earlycon=uart8250,mmio32,0xfe215040 console=ttyS1,115200 console=tty1
+    append $CMDLINE
 EXTLINUX
 mmd_boot "extlinux"
 copy_to_boot "$IMAGES_DIR/extlinux.conf" "extlinux/extlinux.conf"
@@ -126,6 +135,10 @@ copy_to_boot "$IMAGES_DIR/extlinux.conf" "extlinux/extlinux.conf"
 cat > "$IMAGES_DIR/wpa_supplicant.conf.example" <<'WPA'
 # Copy to wpa_supplicant.conf on this partition and fill in your network.
 # Use plain LF line endings.
+#
+# When the network is out of range, the node joins or starts the AT ad-hoc
+# cell, and it moves back here once the network is in range again. To run
+# with no router at all, keep only the country line.
 country=US
 
 network={
@@ -134,6 +147,24 @@ network={
 }
 WPA
 copy_to_boot "$IMAGES_DIR/wpa_supplicant.conf.example" "wpa_supplicant.conf.example"
+
+# The node's address. Without at-address.conf the node keeps its first DHCP
+# lease as its address, so it needs a router on its first boot.
+cat > "$IMAGES_DIR/at-address.conf.example" <<'ADDR'
+# Copy to at-address.conf on this partition to give this node a fixed
+# address. Use plain LF line endings.
+#
+# AT keeps the address it first starts with, on the router's network and in
+# the ad-hoc cell alike. Give every node an address in one subnet, unique to
+# the node; without a router it must not overlap anything else on the air.
+# Without this file the node uses its first DHCP lease, so it needs a router
+# on its first boot.
+ADDRESS=10.42.0.11/16
+
+# wlan0 when wpa_supplicant.conf is on this partition, eth0 otherwise
+#INTERFACE=wlan0
+ADDR
+copy_to_boot "$IMAGES_DIR/at-address.conf.example" "at-address.conf.example"
 
 # U-Boot
 [ -f "$IMAGES_DIR/u-boot.bin" ] && copy_to_boot "$IMAGES_DIR/u-boot.bin" "u-boot.bin"
@@ -146,7 +177,9 @@ done
 
 echo "[post-image] Assembling SD card image ..."
 
-# Create the data partition (empty ext4, writable)
+# Create the data partition (empty ext4, writable). It is small so that the
+# image fits any card; at-grow-data.service grows it to fill the card on the
+# first boot.
 DATA_IMG="$IMAGES_DIR/data.ext4"
 dd if=/dev/zero of="$DATA_IMG" bs=1M count=64
 mkfs.ext4 -q -L "at-data" "$DATA_IMG"

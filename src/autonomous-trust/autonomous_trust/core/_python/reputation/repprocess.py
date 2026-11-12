@@ -289,6 +289,18 @@ def bilateral_scores(tx, peer_uuid, me):
     return theirs[0], ours[0]
 
 
+
+def _ladder_demotion_epsilon(logger) -> float:
+    """The trust ladder's tier_demotion_epsilon, or its default when the
+    ladder cannot be read. A broken ladder must not stop reputation."""
+    from ..trust_ladder import DEFAULT_TIER_DEMOTION_EPSILON, load_trust_ladder
+    try:
+        return float(load_trust_ladder().tier_demotion_epsilon)
+    except Exception as err:  # noqa: BLE001 -- any parse failure degrades
+        logger.warning('trust ladder unreadable (%s); tier demotion margin '
+                       '%.2f', err, DEFAULT_TIER_DEMOTION_EPSILON)
+        return DEFAULT_TIER_DEMOTION_EPSILON
+
 class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                         proc_name=CfgIds.reputation, description='Reputation tracking', cfg_name=CfgIds.reputation):
     expiration = 300
@@ -805,6 +817,10 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         # Last published trust tier per peer uuid-string. Suppresses
         # redundant tier_update IPC when the tier hasn't changed.
         self.peer_tiers: dict[str, int] = {}
+        # How far below a tier's floor a peer that holds the tier may fall
+        # before it loses it; promotion still happens at the floor. Read
+        # from the trust ladder (AT_TRUST_LADDER), 0.02 by default.
+        self.tier_demotion_epsilon = _ladder_demotion_epsilon(self.logger)
         # Per-task transaction_weight cache (task_id_str -> int). Populated
         # when a TransactionScore enters the system (locally submitted via
         # _start_paxos, or arriving via handle_transaction). Read by
@@ -5459,6 +5475,34 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 return tier
         return 0
 
+    def _held_tier(self, peer_uuid, score: float, prior) -> int:
+        """The tier to publish for a peer last published at ``prior``.
+
+        Promotion happens at the floor. A peer that holds a tier keeps it
+        until its score falls below that floor less
+        ``tier_demotion_epsilon``, so a score hovering on a floor does not
+        flap across it. The margin never outranks a bound that exists to
+        deny a tier: a tenure hold or a standing ceiling below a tier's
+        floor takes the tier away at once, though the capped score sits
+        inside the margin.
+        """
+        tier = self._trust_tier(score)
+        if prior is None or prior <= tier:
+            return tier
+        cap = self._tenure_bound(peer_uuid, 1.0)
+        ceiling = self._standing_ceiling(peer_uuid)
+        if ceiling is not None:
+            cap = min(cap, ceiling)
+        allowed = self._trust_tier(cap)
+        for floor, held in reversed(self.TIER_FLOORS):
+            if held <= tier:
+                break
+            if held > prior or held > allowed:
+                continue
+            if score >= floor - self.tier_demotion_epsilon:
+                return held
+        return tier
+
     @classmethod
     def _tier_ceiling(cls, tier: int) -> float:
         """The highest score that still maps to ``tier`` -- i.e. the next
@@ -5923,8 +5967,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             elif was_excluded and not now_excluded:
                 self._excluded.discard(key)
                 self._publish_exclusion(queues, peer_uuid, False)
-            new_tier = self._trust_tier(score)
             old_tier = self.peer_tiers.get(key)
+            new_tier = self._held_tier(peer_uuid, score, old_tier)
             if old_tier == new_tier:
                 return
             # Capture demotion before storing the new tier so

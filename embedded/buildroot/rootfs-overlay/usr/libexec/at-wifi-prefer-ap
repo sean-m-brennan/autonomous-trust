@@ -1,0 +1,36 @@
+#!/bin/sh
+# Move wlan0 from the ad-hoc cell back to the router once the router is in
+# range again. wpa_supplicant falls back to the ad-hoc cell by itself when the
+# router goes, but once in the cell it stops looking for the router. Run from
+# at-wifi-prefer-ap.timer: when wlan0 is in the cell, scan, and if a network
+# from /boot/wpa_supplicant.conf is in the results, reassociate, which picks
+# that network over the cell by priority.
+set -eu
+
+IFACE=wlan0
+cli() { wpa_cli -p /run/wpa_supplicant -i "$IFACE" "$@"; }
+
+mode="$(cli status 2>/dev/null | sed -n 's/^mode=//p')"
+[ "$mode" = "IBSS" ] || exit 0
+
+# SSIDs of the configured networks that are not ad-hoc; wpa_cli returns them
+# quoted
+wanted=""
+for id in $(cli list_networks | sed '1d' | cut -f1); do
+    [ "$(cli get_network "$id" mode)" = "1" ] && continue
+    ssid="$(cli get_network "$id" ssid | sed 's/^"\(.*\)"$/\1/')"
+    wanted="$wanted
+$ssid"
+done
+[ -n "$wanted" ] || exit 0
+
+cli scan > /dev/null
+sleep 5
+# scan_results: bssid, frequency, signal, flags, ssid, tab-separated
+cli scan_results | sed '1d' | cut -f5 | while IFS= read -r seen; do
+    if printf '%s\n' "$wanted" | grep -qxF -- "$seen"; then
+        echo "<5>$seen is in range again; leaving the ad-hoc cell for it" >&2
+        cli reassociate > /dev/null
+        break
+    fi
+done

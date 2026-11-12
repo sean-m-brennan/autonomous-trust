@@ -2,9 +2,16 @@
 # not enabled here are disabled by systemd's catch-all preset.
 enable autonomous-trust.service
 enable at-wifi.service
+enable at-wifi-prefer-ap.timer
+enable at-grow-data.service
 enable systemd-networkd.service
+# at-address.service holds AT back until it has its address; wait-online gives
+# DHCP a short head start before it, so a node with a router saves its lease
+enable systemd-networkd-wait-online.service
 enable systemd-resolved.service
 enable systemd-timesyncd.service
+# Makes time-sync.target wait for timesyncd's first sync
+enable systemd-time-wait-sync.service
 # The WPA package's own preset enables its D-Bus service; at-wifi.service runs
 # wpa_supplicant directly, so the D-Bus one would only be an idle daemon
 disable wpa_supplicant.service

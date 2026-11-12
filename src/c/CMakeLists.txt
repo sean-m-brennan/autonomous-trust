@@ -189,6 +189,17 @@ add_link_options(-pthread ${sysroot_flag})
 # Static linking option for embedded/IoT builds
 option(AT_STATIC "Link at_demo fully statically (no shared library dependencies)" OFF)
 
+# Red-team builds only. With this ON, $AT_REDTEAM_DEFECT_AT (Unix seconds) makes
+# the node answer the handshake and echo probes wrongly from that time on, so
+# that honest peers can be timed detecting and excluding it. Release builds
+# leave it OFF, and in them the variable does nothing.
+option(AT_REDTEAM "Compile in the probe-defection switch for red-team runs" OFF)
+if(AT_REDTEAM)
+    add_compile_definitions(AT_REDTEAM)
+    message(WARNING "AT_REDTEAM is ON: this build answers probes wrongly when "
+                    "AT_REDTEAM_DEFECT_AT is set. Never ship it.")
+endif()
+
 # Zero Trust Architecture integration: builds libat_zta (src/c/extensions/zta,
 # which brings OpenSSL). The core itself needs neither (FEATURE_SPLIT_PLAN Phase 6).
 option(AT_ZTA "Build the Zero Trust credential integration library (libat_zta)" OFF)
