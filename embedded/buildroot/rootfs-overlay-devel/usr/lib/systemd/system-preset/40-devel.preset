@@ -1,3 +1,0 @@
-# Devel image only. Read before 50-autonomous-trust.preset and systemd's
-# catch-all, which would otherwise disable it.
-enable dropbear.service

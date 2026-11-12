@@ -13,13 +13,13 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Unit tests for the admin-overhead M&S (SOW Task 2.4, -25% net)."""
+"""Unit tests for the admin-overhead M&S (target: -25% net)."""
 from autonomous_trust.evaluation.mns.admin import (
-    AdminConfig, MissionValorMock, run, sweep)
+    AdminConfig, MissionImpactMock, run, sweep)
 
 
-def test_missionvalor_mock_mapping():
-    mv = MissionValorMock()
+def test_mission_impact_mock_mapping():
+    mv = MissionImpactMock()
     assert mv.derive(0.95) == (4, True)
     assert mv.derive(0.80) == (3, True)
     assert mv.derive(0.50) == (2, False)

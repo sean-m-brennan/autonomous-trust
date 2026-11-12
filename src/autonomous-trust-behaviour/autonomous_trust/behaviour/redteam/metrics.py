@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Resilience/threat M&S metrics (SOW Task 3.4): detection latency, exclusion
+"""Resilience/threat M&S metrics: detection latency, exclusion
 correctness, and -- the load-bearing one -- the **false-exclusion rate against a
 realistic attack base rate** (Axelsson's base-rate fallacy).
 
@@ -76,7 +76,7 @@ class DetectorMetrics:
         d = self.fp + self.tn
         return self.fp / d if d else 0.0
 
-    #: SOW wording: the fraction of benign peers wrongly excluded.
+    #: Conventional name: the fraction of benign peers wrongly excluded.
     false_exclusion_rate = fpr
 
     @property

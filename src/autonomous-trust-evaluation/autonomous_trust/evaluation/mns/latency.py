@@ -13,12 +13,12 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Access-decision latency M&S — AT-local vs ZTA-PDP (SOW Task 2.4, "Latency -50%").
+"""Access-decision latency M&S — AT-local vs ZTA-PDP (target: "Latency -50%").
 
 Models the **steady-state per-request access decision** for an enrolled node under
 two architectures, over a modeled tactical link, and reports the AT-vs-ZTA latency
 reduction. (One-time enrollment / consensus admission is a separate, characterized
-cost — SOW Task 2.4 (2) — and is NOT modeled here.)
+cost — and is NOT modeled here.)
 
 The structural difference the model captures:
 
@@ -34,9 +34,9 @@ The structural difference the model captures:
   independently, so latency is flat in cohort size.
 
 Everything is MODELED (seeded Monte Carlo, stdlib only) and deterministic under a
-fixed seed. Per SOW measured-vs-modeled discipline: the **AT path is the one to be
-replaced with subscale *measurement* (Task 4)**; the **ZTA baseline is
-modeled/anchored to published DoD-PKI/OCSP/CRL figures (Task 2.2)**. All model
+fixed seed. By measured-vs-modeled discipline: the **AT path is the one to be
+replaced with subscale *measurement***; the **ZTA baseline is
+modeled/anchored to published DoD-PKI/OCSP/CRL figures**. All model
 parameters are exposed on :class:`LatencyConfig` for re-anchoring; nothing here is
 presented as a measured result.
 """
@@ -90,7 +90,7 @@ class LinkModel:
 @dataclass(frozen=True)
 class LatencyConfig:
     """Model parameters for one AT-vs-ZTA comparison. All MODELED/illustrative —
-    exposed for re-anchoring (SOW Task 2.2/2.3 measured inputs)."""
+    exposed for re-anchoring (measured inputs)."""
     link: LinkModel = field(default_factory=LinkModel)
 
     # ZTA-PDP path -------------------------------------------------------
@@ -154,13 +154,13 @@ class LatencyResult:
 
     def as_report(self) -> dict:
         return {
-            'target': 'SOW Task 2.4 — Latency -50% (AT-local vs ZTA-PDP)',
+            'target': 'Latency -50% (AT-local vs ZTA-PDP)',
             'modeled': True,
             'note': ('All figures MODELED (seeded Monte Carlo). AT path → to be '
-                     'measured on subscale HW (Task 4); ZTA baseline → anchor to '
-                     'published DoD-PKI/OCSP/CRL figures (Task 2.2). Steady-state '
+                     'measured on subscale HW; ZTA baseline → anchor to '
+                     'published DoD-PKI/OCSP/CRL figures. Steady-state '
                      'per-request decision; one-time enrollment characterized '
-                     'separately (Task 2.4(2)).'),
+                     'separately.'),
             'seed': self.config.seed,
             'cohort_size': self.config.cohort_size,
             'link_oneway_ms': self.config.link.oneway_ms,

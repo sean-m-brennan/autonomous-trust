@@ -513,7 +513,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
     # REASON is something every peer can see and judge for itself, and the
     # EMA plus the tier machinery is already graduated discipline.
     #
-    # What remains is the behaviour governor's path (SOW Task 3), which is
+    # What remains is the behaviour governor's path, which is
     # human-on-the-loop by its own default (`auto_slash=False`), and an
     # operator's explicit exclude/rehabilitate. Both are deliberate acts, so
     # the protocol they use is deliberate too: with SLASH_ENABLED off this
@@ -2411,7 +2411,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
           for a HUMAN, not something a co-signer can check, and running it
           through the Merkle branch refused it on a missing 'leaf' key --
           which quietly made every governor slash un-cosignable, i.e. the
-          SOW Task 3 path stopped at the proposer's own view. Accepting it
+          governor's path stopped at the proposer's own view. Accepting it
           opens no hole that is not already open: a slasher wanting to dodge
           the Merkle branch can simply send no evidence at all.
         - With a Merkle ``evidence_ref`` -> the offending tx's inclusion proof must

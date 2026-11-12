@@ -15,7 +15,7 @@
 #   limitations under the License.
 # ******************
 #
-# Run the behavioural-anomaly resilience/threat M&S red-team suite (SOW Task 3.4)
+# Run the behavioural-anomaly resilience/threat M&S red-team suite
 # and print two tables -- the headline "case for a governed sensor" (as in
 # last.md) and the full aggregate detector metrics -- each with a direction
 # column ("↑/↓ better" + acceptance target) and a PASS/FAIL column judging the
@@ -134,7 +134,7 @@ def table(headers, specs):
 HEADERS = ['Metric', 'Better / target', 'ML governed sensor',
            'Static baseline', 'Result']
 
-print('# Behavioural-anomaly red-team M&S (SOW Task 3.4)')
+print('# Behavioural-anomaly red-team M&S')
 print()
 print(f'Population: {result.population} peers · seed {seed} '
       '(deterministic — a fixed seed reproduces byte-identical metrics).')

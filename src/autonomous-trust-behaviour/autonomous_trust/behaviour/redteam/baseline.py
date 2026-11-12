@@ -13,8 +13,8 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""A static-policy baseline detector for the M&S comparison (SOW Task 3.4 asks
-for results *vs a static-policy baseline*).
+"""A static-policy baseline detector for the M&S comparison (results are
+reported *vs a static-policy baseline*).
 
 This is the kind of fixed, hand-tuned threshold rule a non-ML system would use:
 flag a peer when, over a sliding window, its refusal rate is too high or its mean

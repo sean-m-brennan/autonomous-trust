@@ -130,5 +130,4 @@ middleware; install `opensc` or set the env var), `failed to load PKCS#11 module
 works — check the reader and that `pcscd` is running). A software token instead
 reports `software token (dev)`, so a dev run never looks like live hardware.
 
-See `doc/NV059/work/PIV_MFA_OPERATOR_ACCESS_PLAN.md` for the full design and
-phasing (TUI core = P4, request/results = P5; software-token mock = §7.1).
+See `doc/architecture/operator-access.md` for the full design.

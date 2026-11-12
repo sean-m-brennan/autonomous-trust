@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Streaming anomaly detectors (SOW Task 3.2), built via River/PyOD.
+"""Streaming anomaly detectors, built via River/PyOD.
 
 * :class:`RiverHalfSpaceTrees` — multivariate isolation score (River).
 * :class:`PyODHBOS`            — per-feature explainable histogram score (PyOD,

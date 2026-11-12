@@ -483,9 +483,9 @@ Implementing AT with ZTA does not conflict with ZTA mandates. It extends them.
 
 > The full per-tenet / per-pillar **traceability matrix** (SP 800-207, DoD ZT RA
 > v2.0, SP 800-160 Vol. 2, CSF 2.0, CISA ZTMM, OMB M-22-09, DoD ZT Strategy →
-> AT mechanism, with I/IP/P/D status and gap→Option mapping) is the SOW Task 1.4
-> deliverable at `doc/NV059/work/NIST_DOD_ZT_TRACEABILITY.md`. The summary below
-> is the high-level alignment; that document is authoritative.
+> AT mechanism, with I/IP/P/D status and gap→Option mapping) is kept separately
+> and is available on request. The summary below is the high-level alignment;
+> the matrix is authoritative.
 
 | Standard/Framework | Requirement | AT Alignment |
 |---|---|---|

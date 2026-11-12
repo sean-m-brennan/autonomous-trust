@@ -13,15 +13,15 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Common interface for the streaming anomaly detectors (SOW Task 3.2).
+"""Common interface for the streaming anomaly detectors.
 
-The Phase-I prototype builds the detectors **via River/PyOD** (the mature,
-permissively-licensed reference runtimes named in the SOW and the AI/ML survey):
+The prototype builds the detectors **via River/PyOD** (the mature,
+permissively-licensed reference runtimes for streaming anomaly detection):
 the multivariate isolation score from ``river.anomaly.HalfSpaceTrees`` and the
 per-feature, natively-explainable histogram score from ``pyod.models.hbos.HBOS``.
 Both are unsupervised, online (HBOS via a sliding-window refit), and
 deterministic under a fixed seed, so their scores are reproducible enough to act
-as governed evidence. The deferred formally-verified C core (Task 3.5) is the
+as governed evidence. The deferred formally-verified C core is the
 "owned" reimplementation; this interface is what it will satisfy.
 """
 from __future__ import annotations

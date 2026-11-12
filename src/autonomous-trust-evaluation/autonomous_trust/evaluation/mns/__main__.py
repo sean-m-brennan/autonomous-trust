@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Latency-(-50%) M&S results artifact (SOW Task 2.4).
+"""Latency-(-50%) M&S results artifact.
 
     python -m autonomous_trust.evaluation.mns                 # markdown report
     python -m autonomous_trust.evaluation.mns --json out.json --seed 1234
@@ -42,15 +42,15 @@ def main(argv=None):
     result = run(cfg)
     r = result.as_report()
 
-    print('# Access-decision latency M&S — AT-local vs ZTA-PDP (SOW Task 2.4)')
+    print('# Access-decision latency M&S — AT-local vs ZTA-PDP')
     print()
     print(f'Seed {cfg.seed} (deterministic) · cohort {cfg.cohort_size} · modeled '
           f'tactical link {cfg.link.oneway_ms:.0f} ms one-way '
           f'({cfg.link.jitter_ms:.0f} ms jitter, {cfg.link.loss_prob:.0%} loss).')
     print()
-    print('_MODELED (seeded Monte Carlo). AT path → to be MEASURED on subscale HW '
-          '(Task 4); ZTA baseline → anchor to published DoD-PKI/OCSP/CRL figures '
-          '(Task 2.2). Steady-state per-request decision; enrollment characterized '
+    print('_MODELED (seeded Monte Carlo). AT path → to be MEASURED on subscale HW; '
+          'ZTA baseline → anchor to published DoD-PKI/OCSP/CRL figures. '
+          'Steady-state per-request decision; enrollment characterized '
           'separately._')
     print()
     print('| Path | mean | median | p95 | tag |')

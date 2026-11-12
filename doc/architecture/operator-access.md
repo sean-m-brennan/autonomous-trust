@@ -11,8 +11,7 @@ whether a *peer* may join also decides whether a *person* may operate, with a
 challenge-response and a second factor layered on top. What the operator path
 adds to what a peer must show is possession, knowledge, and liveness.
 
-The implementation plan is `doc/NV059/work/PIV_MFA_OPERATOR_ACCESS_PLAN.md`
-(phases P0-P6). This document describes the shipped design.
+This document describes the shipped design.
 
 ---
 
@@ -366,7 +365,6 @@ conformance `zta-x509-reject-revoked-credential`. See [ZTA Integration
 
 ## References
 
-- `doc/NV059/work/PIV_MFA_OPERATOR_ACCESS_PLAN.md`: implementation plan (P0-P6).
 - [ZTA integration](zta-integration.md): peer admission, verifier interface,
  policy, the admission gate.
 - [ZTA Python parity](zta-python-parity.md): the Python↔C parity discipline the

@@ -15,13 +15,13 @@
 #   limitations under the License.
 # ******************
 #
-# Run the access-decision latency M&S (SOW Task 2.4, "Latency -50%") and print
+# Run the access-decision latency M&S (target: "Latency -50%") and print
 # the AT-local vs ZTA-PDP comparison, the -50% target verdict, and a robustness
 # sweep over modeled link profiles (benign-LAN -> contested-tactical -> DDIL).
 #
 # All figures are MODELED (seeded Monte Carlo). The AT path is the one to be
-# MEASURED on subscale hardware (Task 4); the ZTA baseline is modeled/anchored to
-# published DoD-PKI/OCSP/CRL figures (Task 2.2).
+# MEASURED on subscale hardware; the ZTA baseline is modeled/anchored to
+# published DoD-PKI/OCSP/CRL figures.
 #
 # Usage:
 #   scripts/latency-report.sh                 # report (default seed 1234, cohort 25)

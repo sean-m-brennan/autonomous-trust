@@ -13,25 +13,24 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Unauthorized-access reduction M&S — with vs without AT (SOW Task 2.4, "-90%").
+"""Unauthorized-access reduction M&S — with vs without AT (target: "-90%").
 
 Counts successful unauthorized-access events over a **fixed attempt population**
 drawn from an ATT&CK-mapped taxonomy, under two postures:
 
-* **without AT** = the ZTA-only baseline (cert PDP + static authz) — SOW Task 2.2;
+* **without AT** = the ZTA-only baseline (cert PDP + static authz);
 * **with AT** = the AT overlay added (consensus admission, ZTA verifier, credential
   uniqueness, tier-gating, reputation/behavioural slashing, encrypted transport).
 
 The delta is what AT adds *over* a cert-only ZTA baseline — chiefly catching the
 **valid-credentialed abuse** a cert PDP cannot see. Per-attack block rates are
-mechanism-grounded (mechanism IDs M1..M8 are the `NIST_DOD_ZT_TRACEABILITY.md`
-inventory); the **behavioural rows are anchored to the red-team's MEASURED
+mechanism-grounded; the **behavioural rows are anchored to the red-team's MEASURED
 detection** (`autonomous_trust.behaviour.redteam`: compromised-credential 1.00,
 Byzantine 0.60), the rest are MODELED gates.
 
 Honesty discipline (as in `latency.py`): all rates are **modeled estimates**
-except where tagged measured; the taxonomy mix is **TPOC-pre-registration
-dependent** (SOW Task 2.2) and exposed on :class:`AttackType` for re-anchoring.
+except where tagged measured; the taxonomy mix is **to be
+pre-registered** and is exposed on :class:`AttackType` for re-anchoring.
 The harness reports the reduction the rates *imply* — it does not hardcode 90%.
 """
 from __future__ import annotations
@@ -52,7 +51,7 @@ class AttackType:
         weight:       share of the attempt population (the pre-registered mix).
         p_baseline:   P(success) against the ZTA-only baseline.
         p_at:         P(success) against full AT.
-        mechanism:    AT mechanism that reduces it (M-code, traceability matrix).
+        mechanism:    AT mechanism that reduces it.
         source:       'measured' (anchored to red-team) or 'modeled'.
     """
     key: str
@@ -66,32 +65,32 @@ class AttackType:
     source: str
 
 
-#: Default ATT&CK-mapped taxonomy + mix (TPOC pre-registration dependent).
+#: Default ATT&CK-mapped taxonomy + mix (to be pre-registered).
 #: Behavioural rows (valid_cred_abuse, byzantine_commit) anchor p_at to the
 #: behaviour red-team's MEASURED detection; the rest are modeled gates with their
 #: residual tied to tracked gaps where applicable.
 TAXONOMY: Tuple[AttackType, ...] = (
     AttackType('valid_cred_abuse', 'Compromised-but-credentialed asset',
-               'T1078', 'Valid Accounts', 0.30, 0.95, 0.00, 'M8→M6',
+               'T1078', 'Valid Accounts', 0.30, 0.95, 0.00, 'behaviour layer → slashing',
                'measured: red-team compromised-credential detection = 1.00'),
     AttackType('cred_replay', 'Harvested-credential replay under new identity',
-               'T1550.001', 'Defense Evasion', 0.15, 0.90, 0.20, 'M2b',
+               'T1550.001', 'Defense Evasion', 0.15, 0.90, 0.20, 'credential binding',
                'modeled; residual = credential binding, '
                'doc/architecture/zta-integration.md (TOFU race + C-parity pending)'),
     AttackType('sybil_admission', 'Sybil / fabricated identity at admission',
-               'T1136', 'Persistence', 0.12, 0.60, 0.15, 'M1',
+               'T1136', 'Persistence', 0.12, 0.60, 0.15, 'consensus admission',
                'modeled; residual = Sybil admission-bounding, '
                'doc/architecture/adversarial-testing.md (unproven)'),
     AttackType('open_channel', 'Unauthorized interception over open channel',
-               'T1040', 'Collection', 0.12, 0.40, 0.02, 'M7', 'modeled gate'),
+               'T1040', 'Collection', 0.12, 0.40, 0.02, 'encrypted transport', 'modeled gate'),
     AttackType('tier_escalation', 'Privilege / tier escalation',
-               'T1068', 'Privilege Escalation', 0.11, 0.50, 0.10, 'M5',
+               'T1068', 'Privilege Escalation', 0.11, 0.50, 0.10, 'tier gating',
                'modeled gate'),
     AttackType('byzantine_commit', 'Byzantine manipulation of consensus',
-               'T1565.001', 'Impact', 0.10, 0.70, 0.15, 'M3',
+               'T1565.001', 'Impact', 0.10, 0.70, 0.15, 'quorum consensus',
                'modeled; quorum prevention (red-team Byzantine detection = 0.60)'),
     AttackType('revoked_cred', 'Expired / revoked credential use',
-               'T1588.004', 'Resource Development', 0.10, 0.30, 0.05, 'M2',
+               'T1588.004', 'Resource Development', 0.10, 0.30, 0.05, 'ZTA verifier',
                'modeled; ZTA baseline also revocation-checks → small delta'),
 )
 
@@ -147,12 +146,12 @@ class UnauthorizedResult:
 
     def as_report(self) -> dict:
         return {
-            'target': 'SOW Task 2.4 — Unauthorized access -90% (with vs without AT)',
+            'target': 'Unauthorized access -90% (with vs without AT)',
             'modeled': True,
             'baseline': 'ZTA-only (cert PDP + static authz)',
             'note': ('Per-attack block rates mechanism-grounded; behavioural rows '
                      'anchored to red-team MEASURED detection, rest MODELED. Mix is '
-                     'TPOC-pre-registration dependent (Task 2.2). Reduction is '
+                     'to be pre-registered. Reduction is '
                      'implied by the rates, not hardcoded.'),
             'seed': self.config.seed,
             'total_attempts': self.total_attempts,
@@ -219,13 +218,13 @@ def main(argv=None):
     result = run(UnauthorizedConfig(seed=args.seed))
     r = result.as_report()
 
-    print('# Unauthorized-access reduction M&S — with vs without AT (SOW Task 2.4)')
+    print('# Unauthorized-access reduction M&S — with vs without AT')
     print()
     print(f'Seed {result.config.seed} (deterministic) · '
           f'{result.total_attempts} attempts · baseline = ZTA-only (cert PDP).')
     print()
     print('_MODELED. Behavioural rows anchored to red-team MEASURED detection; '
-          'rest modeled gates. Mix is TPOC-pre-registration dependent (Task 2.2); '
+          'rest modeled gates. Mix is to be pre-registered; '
           'reduction is implied by the rates, not hardcoded._')
     print()
     print('| Attack (ATT&CK) | mechanism | succeed w/o AT | succeed w/ AT | reduction | rate source |')
