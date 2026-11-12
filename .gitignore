@@ -208,5 +208,5 @@ deploy
 /src/c/extensions/zta/test/zta_test_ca/output/
 /src/autonomous-trust-dtn/autonomous_trust/dtn/_python/aap2_pb2.py
 /doc/tekfive/
-/src/c/extensions/gateway/
+/src/c/extensions/border-gateway/
 /embedded
