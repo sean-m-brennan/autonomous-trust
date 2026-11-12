@@ -58,6 +58,15 @@ int capability_table_append(const char *name, capability_function_t fn,
     return 0;
 }
 
+int capability_table_set_replay(const char *name, const capability_replay_t *replay)
+{
+    capability_t *row = find_capability(name);
+    if (row == NULL)
+        return -1;
+    row->replay = replay;
+    return 0;
+}
+
 /* TODO (divergence.md C14 follow-up): Python emits `peer.set/caps_*`
  * counter probes around capability-query traffic
  * (idprocess.py:884-977). The C side already covers

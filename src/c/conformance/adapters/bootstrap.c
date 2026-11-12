@@ -22,6 +22,12 @@
  *  list, then asserts the per-host observable (doc/architecture/trust-tiers.md
  *  §6.5). The contract is the RNG-agnostic coverage set — all three at.*
  *  caps fired — so the C and Python selection sequences need not match.
+ *
+ *  The join burst (RD_14.4 Phase 5) reads fixtures.bootstrap.join_burst and
+ *  probe_counts as the Python adapter does: each probe_counts row is
+ *  reputation's report before that (1-based) tick, a peer the row omits having
+ *  left the ceiling, so it is delivered as PEER_PROBE_COUNT would be, one
+ *  bootstrap_worker_note_probe_count per changed peer.
  */
 
 #include "bootstrap.h"
@@ -279,9 +285,61 @@ void at_bootstrap_run(const at_case_t *c, at_case_result_t *out) {
      * bootstrap_worker_tick_all window-only. */
     w.continuous_enabled = continuous;
     w.probe_interval_sec = probe_interval_sec;
-    for (long t = 0; t < ticks; t++)
+
+    /* The join burst. Each peer gets a uuid string by its position among the
+     * participants; the observables are aggregate, so which is not shared
+     * with Python, only that each is one. */
+    json_t *burst = json_is_object(bs) ? json_object_get(bs, "join_burst") : NULL;
+    json_t *rows = json_is_object(bs) ? json_object_get(bs, "probe_counts") : NULL;
+    if (json_is_object(burst)) {
+        json_t *en = json_object_get(burst, "enabled");
+        bootstrap_worker_set_burst(&w, en == NULL || json_is_true(en),
+                                   (int)_int_field(burst, "k", 3),
+                                   _num_field(burst, "interval_sec", 0.0),
+                                   (int)_int_field(burst, "budget_factor", 4));
+    }
+    enum { MAX_BS_PEERS = 16 };
+    char uuids[MAX_BS_PEERS][AT_BURST_UUID_LEN];
+    const char *uuid_of[MAX_BS_PEERS];
+    const char *peer_ids[MAX_BS_PEERS];
+    bool listed[MAX_BS_PEERS] = {false};
+    size_t n_ids = 0;
+    for (size_t i = 0; i < nparts && n_ids < MAX_BS_PEERS; i++) {
+        const char *id = json_string_value(
+            json_object_get(json_array_get(parts, i), "id"));
+        if (id == NULL || (host_id != NULL && strcmp(id, host_id) == 0))
+            continue;
+        snprintf(uuids[n_ids], sizeof(uuids[n_ids]),
+                 "00000000-0000-4000-8000-%012zx", n_ids + 1);
+        uuid_of[n_ids] = uuids[n_ids];
+        peer_ids[n_ids++] = id;
+    }
+
+    for (long t = 0; t < ticks; t++) {
+        size_t r;
+        json_t *row;
+        json_array_foreach(rows, r, row) {
+            if (_int_field(row, "tick", 0) != t + 1)
+                continue;
+            json_t *counts = json_object_get(row, "counts");
+            for (size_t j = 0; j < n_ids; j++) {
+                json_t *n = json_object_get(counts, peer_ids[j]);
+                if (json_is_integer(n)) {
+                    bootstrap_worker_note_probe_count(
+                        &w, uuid_of[j], true, (int)json_integer_value(n));
+                    listed[j] = true;
+                } else if (listed[j]) {
+                    bootstrap_worker_note_probe_count(&w, uuid_of[j], false, 0);
+                    listed[j] = false;
+                }
+            }
+        }
+        w.peer_uuids = uuid_of;
         bootstrap_worker_tick_all(&w, peer_count, 0.0, _always_emit,
-                                  continuous ? _always_probe : NULL, NULL);
+                                  (continuous || json_is_object(burst))
+                                      ? _always_probe : NULL, NULL);
+        w.peer_uuids = NULL;
+    }
 
     int caps_fired = 0;
     for (int i = 0; i < BOOTSTRAP_CAPABILITY_COUNT; i++)
@@ -343,6 +401,39 @@ void at_bootstrap_run(const at_case_t *c, at_case_result_t *out) {
                 at_case_result_set_fail(out, 0, "AssertionError", detail);
                 return;
             }
+        }
+        /* --- The join burst (RD_14.4 Phase 5) ------------------------------ */
+        want = json_object_get(host_exp, "burst_probes_issued");
+        if (json_is_integer(want) && w.burst_spent != (int)json_integer_value(want)) {
+            char detail[200];
+            snprintf(detail, sizeof(detail),
+                     "%s: burst_probes_issued=%d, expected %d",
+                     host_id ? host_id : "?", w.burst_spent,
+                     (int)json_integer_value(want));
+            at_case_result_set_fail(out, 0, "AssertionError", detail);
+            return;
+        }
+        want = json_object_get(host_exp, "burst_peers_probed");
+        if (json_is_integer(want)
+            && bootstrap_worker_burst_peers_probed(&w) != (int)json_integer_value(want)) {
+            char detail[200];
+            snprintf(detail, sizeof(detail),
+                     "%s: burst_peers_probed=%d, expected %d",
+                     host_id ? host_id : "?", bootstrap_worker_burst_peers_probed(&w),
+                     (int)json_integer_value(want));
+            at_case_result_set_fail(out, 0, "AssertionError", detail);
+            return;
+        }
+        want = json_object_get(host_exp, "burst_done");
+        if (json_is_boolean(want)
+            && (w.burst_state == BOOTSTRAP_BURST_DONE) != json_is_true(want)) {
+            char detail[200];
+            snprintf(detail, sizeof(detail), "%s: burst_done=%s, expected %s",
+                     host_id ? host_id : "?",
+                     w.burst_state == BOOTSTRAP_BURST_DONE ? "true" : "false",
+                     json_is_true(want) ? "true" : "false");
+            at_case_result_set_fail(out, 0, "AssertionError", detail);
+            return;
         }
         want = json_object_get(host_exp, "probe_caps_fired");
         if (json_is_integer(want)) {

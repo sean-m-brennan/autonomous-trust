@@ -43,10 +43,10 @@ DEFINE_TEST(test_tx_history_json_roundtrip)
      * era_to_json now correctly filters that out. To keep the
      * "2 entries on the wire" assertion meaningful, finish task2
      * bilaterally too. */
-    ck_assert_ret_ok(tx_history_update(&hist, task1, peer1, 0.8, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, task1, peer2, 0.6, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, task2, peer1, 0.9, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, task2, peer2, 0.5, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task1, peer1, 800, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task1, peer2, 600, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task2, peer1, 900, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task2, peer2, 500, NULL));
 
     /* Serialize to JSON */
     json_t *json_out = NULL;
@@ -65,7 +65,7 @@ DEFINE_TEST(test_tx_history_json_roundtrip)
     transaction_t out;
     ck_assert_ret_ok(tx_history_by_task(&hist2, task1, &out));
     ck_assert(out.p1_set);
-    ck_assert_double_eq_tol(out.p1_score, 0.8, 0.001);
+    ck_assert_int_eq(out.p1_score_milli, 800);
 
     json_decref(json_out);
     tx_history_free(&hist);
@@ -86,20 +86,20 @@ DEFINE_TEST(test_tx_two_peer_transaction)
     /* First update: fills p1 slot — tx is pending, not yet
      * committed (mirrors Python `_chain.append` gated on
      * `len(tx) > 1`). */
-    ck_assert_ret_ok(tx_history_update(&hist, task, peer1, 0.7, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer1, 700, NULL));
     ck_assert_int_eq(tx_history_len(&hist), 0);
 
     /* Second update same task: fills p2 slot — bilateral commit
      * promotes the tx and bumps len to 1. */
-    ck_assert_ret_ok(tx_history_update(&hist, task, peer2, 0.3, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer2, 300, NULL));
     ck_assert_int_eq(tx_history_len(&hist), 1);
 
     transaction_t out;
     ck_assert_ret_ok(tx_history_by_task(&hist, task, &out));
     ck_assert(out.p1_set);
     ck_assert(out.p2_set);
-    ck_assert_double_eq_tol(out.p1_score, 0.7, 0.001);
-    ck_assert_double_eq_tol(out.p2_score, 0.3, 0.001);
+    ck_assert_int_eq(out.p1_score_milli, 700);
+    ck_assert_int_eq(out.p2_score_milli, 300);
 
     tx_history_free(&hist);
 }
@@ -122,15 +122,15 @@ DEFINE_TEST(test_reputation_contrite_tft)
     ck_assert_double_eq_tol(score, 0.2, 0.001);
 
     /* Add a cooperative transaction (both peers, high scores) */
-    ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 0.9, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.8, NULL));
+    /* Each update records the score its scorer GAVE the other side. */
+    ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 800, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 900, NULL));
 
     score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
-    /* One cooperative direct interaction: peer_standing = 0.8,
-     * my_standing = 0.9, peer_last = 0.8 (not < 0.5). Falls into the
-     * cooperate/cooperate branch which returns max(0.51, peer_standing).
-     * Mirrors Python repprocess.py:384-385. */
-    ck_assert_double_eq_tol(score, 0.8, 0.001);
+    /* One cooperative direct interaction: what we gave it (0.8) shrunk
+     * toward the neutral prior, (0.8 + 3 * 0.2) / 4 = 0.35. Mirrors Python
+     * _contrite_tit_for_tat. */
+    ck_assert_double_eq_tol(score, 0.35, 0.001);
 
     tx_history_free(&hist);
     reputations_free(&reps);
@@ -157,21 +157,22 @@ DEFINE_TEST(test_reputation_contrite_tft_cooperative_self_p2)
     uuid_generate(peer_id);
     uuid_generate(task);
 
-    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.8, NULL));  /* peer → p1 */
-    ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 0.9, NULL));  /* self → p2 */
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 900, NULL));  /* peer → p1 */
+    ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 800, NULL));  /* self → p2 */
 
     double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
-    ck_assert_double_eq_tol(score, 0.8, 0.001);
+    ck_assert_double_eq_tol(score, 0.35, 0.001);
 
     tx_history_free(&hist);
     reputations_free(&reps);
 }
 END_TEST_DEFINITION()
 
-DEFINE_TEST(test_reputation_contrite_tft_retaliation)
+DEFINE_TEST(test_reputation_contrite_tft_our_low_score_is_its_record)
 {
-    /* Peer defected on last tx (peer_last < 0.5) and self's standing
-     * is good → retaliation branch → min(0.49, peer_standing). */
+    /* We scored the peer 0.2 on the last tx and it rated us well both times:
+     * a defection is the peer's score of us, so there is none, and its
+     * standing is our scores shrunk toward neutral. */
     tx_history_t hist;
     reputations_t reps;
     ck_assert_ret_ok(tx_history_init(&hist));
@@ -184,26 +185,25 @@ DEFINE_TEST(test_reputation_contrite_tft_retaliation)
     uuid_generate(t2);
 
     /* tx1: cooperate/cooperate. */
-    ck_assert_ret_ok(tx_history_update(&hist, t1, self_id, 0.9, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, t1, peer_id, 0.8, NULL));
-    /* tx2: self cooperates, peer defects. peer_last = 0.2. */
-    ck_assert_ret_ok(tx_history_update(&hist, t2, self_id, 0.9, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, t2, peer_id, 0.2, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t1, self_id, 800, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t1, peer_id, 900, NULL));
+    /* tx2: we judge the peer to have defected (0.2); it rates us 0.9. */
+    ck_assert_ret_ok(tx_history_update(&hist, t2, self_id, 200, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t2, peer_id, 900, NULL));
 
     double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
-    /* peer_standing = (0.8 + 0.2)/2 = 0.5; my_standing = 0.9.
-     * peer_last < 0.5, my_standing >= 0.5 → min(0.49, 0.5) = 0.49. */
-    ck_assert_double_eq_tol(score, 0.49, 0.001);
+    /* (0.8 + 0.2 + 3 * 0.2) / 5 = 0.32. */
+    ck_assert_double_eq_tol(score, 0.32, 0.001);
 
     tx_history_free(&hist);
     reputations_free(&reps);
 }
 END_TEST_DEFINITION()
 
-DEFINE_TEST(test_reputation_contrite_tft_contrition)
+DEFINE_TEST(test_reputation_contrite_tft_repeat_defection_has_no_floor)
 {
-    /* Peer defected on last tx but my own standing is also poor →
-     * contrition branch → max(0.51, peer_standing). */
+    /* The peer scored us low twice running: a repeat defection, held at
+     * min(0.49, standing). There is no 0.51 floor any more. */
     tx_history_t hist;
     reputations_t reps;
     ck_assert_ret_ok(tx_history_init(&hist));
@@ -216,15 +216,14 @@ DEFINE_TEST(test_reputation_contrite_tft_contrition)
     uuid_generate(t2);
 
     /* Both defect, both times. */
-    ck_assert_ret_ok(tx_history_update(&hist, t1, self_id, 0.2, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, t1, peer_id, 0.3, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, t2, self_id, 0.2, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, t2, peer_id, 0.4, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t1, self_id, 300, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t1, peer_id, 200, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t2, self_id, 400, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t2, peer_id, 200, NULL));
 
     double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
-    /* peer_standing = (0.3 + 0.4)/2 = 0.35; my_standing = 0.2.
-     * peer_last < 0.5, my_standing < 0.5 → max(0.51, 0.35) = 0.51. */
-    ck_assert_double_eq_tol(score, 0.51, 0.001);
+    /* (0.3 + 0.4 + 3 * 0.2) / 5 = 0.26, below the 0.49 cap. */
+    ck_assert_double_eq_tol(score, 0.26, 0.001);
 
     tx_history_free(&hist);
     reputations_free(&reps);
@@ -250,8 +249,8 @@ DEFINE_TEST(test_reputation_contrite_tft_third_party_informs_prior)
     uuid_generate(task);
 
     /* peer ↔ other tx, no self involvement; other scores the peer 0.1. */
-    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.1, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, task, other,   0.1, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 100, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task, other,   100, NULL));
 
     double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
     /* observed=0.1, cp_rep(other)=PREREP_NEUTRAL (0.2) default, n=1,
@@ -276,8 +275,8 @@ DEFINE_TEST(test_reputation_pure_with_counterparty)
     uuid_generate(task);
 
     /* Set up a complete transaction between peer1 and peer2 */
-    ck_assert_ret_ok(tx_history_update(&hist, task, peer1, 0.9, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, task, peer2, 0.7, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer1, 900, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer2, 700, NULL));
 
     /* Set reputations */
     ck_assert_ret_ok(reputations_update(&reps, peer1, 0.8));
@@ -301,10 +300,10 @@ DEFINE_TEST(test_reputation_pure_with_counterparty)
         uuid_t p, a, b, t1, t2;
         uuid_generate(p); uuid_generate(a); uuid_generate(b);
         uuid_generate(t1); uuid_generate(t2);
-        ck_assert_ret_ok(tx_history_update(&h2, t1, p, 0.5, NULL));
-        ck_assert_ret_ok(tx_history_update(&h2, t1, a, 0.9, NULL));
-        ck_assert_ret_ok(tx_history_update(&h2, t2, p, 0.5, NULL));
-        ck_assert_ret_ok(tx_history_update(&h2, t2, b, 0.3, NULL));
+        ck_assert_ret_ok(tx_history_update(&h2, t1, p, 500, NULL));
+        ck_assert_ret_ok(tx_history_update(&h2, t1, a, 900, NULL));
+        ck_assert_ret_ok(tx_history_update(&h2, t2, p, 500, NULL));
+        ck_assert_ret_ok(tx_history_update(&h2, t2, b, 300, NULL));
         ck_assert_ret_ok(reputations_update(&r2, a, 0.8));
         ck_assert_ret_ok(reputations_update(&r2, b, 0.2));
         ck_assert_double_eq_tol(reputation_pure(&h2, &r2, p, NULL), 0.78, 0.001);
@@ -319,8 +318,8 @@ DEFINE_TEST(test_reputation_pure_with_counterparty)
         {
             uuid_t t;
             uuid_generate(t);
-            ck_assert_ret_ok(tx_history_update(&h2, t, a, 0.9, NULL));
-            ck_assert_ret_ok(tx_history_update(&h2, t, b, 0.9, NULL));
+            ck_assert_ret_ok(tx_history_update(&h2, t, a, 900, NULL));
+            ck_assert_ret_ok(tx_history_update(&h2, t, b, 900, NULL));
         }
         double sa = 0.7, sb = 0.7;
         for (int it = 0; it < 20; it++)
@@ -368,8 +367,8 @@ DEFINE_TEST(test_reputation_pure_unknown_counterparty_default_0_5)
     uuid_generate(peer_id);
     uuid_generate(task);
 
-    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.9, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 0.6, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 900, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 600, NULL));
     /* No reputations set — counterparty fallback is PREREP_NEUTRAL (0.2). */
 
     double score = reputation_pure(&hist, &reps, peer_id, NULL);
@@ -404,10 +403,10 @@ DEFINE_TEST(test_reputation_pure_weighted_by_task)
     /* Two transactions involving `peer` and `counterparty`. Both score
      * the counterparty at 0.9; counterparty's reputation is 1.0 so
      * cp_score * cp_rep = 0.9 for each tx. */
-    ck_assert_ret_ok(tx_history_update(&hist, task_w1, peer, 0.0, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, task_w1, counterparty, 0.9, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, task_w4, peer, 0.0, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, task_w4, counterparty, 0.9, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task_w1, peer, 0, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task_w1, counterparty, 900, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task_w4, peer, 0, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task_w4, counterparty, 900, NULL));
     ck_assert_ret_ok(reputations_update(&reps, counterparty, 1.0));
 
     char k1[UUID_STRING_LEN + 1], k4[UUID_STRING_LEN + 1];
@@ -435,10 +434,10 @@ DEFINE_TEST(test_reputation_pure_weighted_by_task)
      * total / total_weight = 4.0 / 5 = 0.8. */
     tx_history_free(&hist);
     tx_history_init(&hist);
-    ck_assert_ret_ok(tx_history_update(&hist, task_w1, peer, 0.0, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, task_w1, counterparty, 0.4, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, task_w4, peer, 0.0, NULL));
-    ck_assert_ret_ok(tx_history_update(&hist, task_w4, counterparty, 0.9, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task_w1, peer, 0, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task_w1, counterparty, 400, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task_w4, peer, 0, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task_w4, counterparty, 900, NULL));
     double weighted_asym = reputation_pure(&hist, &reps, peer, &weights);
     ck_assert_double_eq_tol(weighted_asym, 0.8, 0.001);
 
@@ -686,14 +685,14 @@ DEFINE_TEST(test_committed_channel_is_part_of_the_entry_hash)
     tx_history_t plain, tagged;
     tx_history_init(&plain);
     tx_history_init(&tagged);
-    ck_assert_ret_ok(tx_history_update(&plain, task, p1, 0.9, NULL));
-    ck_assert_ret_ok(tx_history_update(&plain, task, p2, 0.2, NULL));
+    ck_assert_ret_ok(tx_history_update(&plain, task, p1, 900, NULL));
+    ck_assert_ret_ok(tx_history_update(&plain, task, p2, 200, NULL));
     /* An explicit default is the SAME CLAIM as absence, so it must be the
      * same bytes: two nodes cannot be allowed to disagree about an entry's
      * hash because one of them received the default spelled out. */
-    ck_assert_ret_ok(tx_history_update(&tagged, task, p1, 0.9,
+    ck_assert_ret_ok(tx_history_update(&tagged, task, p1, 900,
                                        TX_CHANNEL_TASK_OUTCOME));
-    ck_assert_ret_ok(tx_history_update(&tagged, task, p2, 0.2, NULL));
+    ck_assert_ret_ok(tx_history_update(&tagged, task, p2, 200, NULL));
 
     char plain_canon[512], tagged_canon[512];
     ck_assert(transaction_canonical_bytes(&plain.chain[0], plain_canon,
@@ -708,8 +707,8 @@ DEFINE_TEST(test_committed_channel_is_part_of_the_entry_hash)
      * refutation off an entry break the chain link and the window root. */
     tx_history_t refuted;
     tx_history_init(&refuted);
-    ck_assert_ret_ok(tx_history_update(&refuted, task, p1, 0.9, NULL));
-    ck_assert_ret_ok(tx_history_update(&refuted, task, p2, 0.2,
+    ck_assert_ret_ok(tx_history_update(&refuted, task, p1, 900, NULL));
+    ck_assert_ret_ok(tx_history_update(&refuted, task, p2, 200,
                                        TX_CHANNEL_PHYSICAL));
     char refuted_canon[512];
     ck_assert(transaction_canonical_bytes(&refuted.chain[0], refuted_canon,
@@ -725,7 +724,7 @@ DEFINE_TEST(test_committed_channel_is_part_of_the_entry_hash)
      * fork this node's entry hash away from the group's. */
     uuid_t task2;
     uuid_generate(task2);
-    ck_assert_ret_nonzero(tx_history_update(&refuted, task2, p1, 0.9,
+    ck_assert_ret_nonzero(tx_history_update(&refuted, task2, p1, 900,
                                             "a_channel_from_the_future"));
 
     tx_history_free(&plain);
@@ -748,8 +747,8 @@ DEFINE_TEST(test_committed_channel_survives_the_catchup_wire)
 
     tx_history_t src;
     tx_history_init(&src);
-    ck_assert_ret_ok(tx_history_update(&src, task, p1, 0.9, NULL));
-    ck_assert_ret_ok(tx_history_update(&src, task, p2, 0.2,
+    ck_assert_ret_ok(tx_history_update(&src, task, p1, 900, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, task, p2, 200,
                                        TX_CHANNEL_SELF_CONSISTENCY));
     json_t *arr = NULL;
     ck_assert_ret_ok(tx_history_era_to_json(&src, 0, tx_history_len(&src),
@@ -787,8 +786,8 @@ DEFINE_TEST(test_tx_catchup_skips_entries_already_held)
     uuid_generate(task2);
     uuid_generate(peer1);
     uuid_generate(peer2);
-    ck_assert_ret_ok(tx_history_update(&src, task1, peer1, 0.8, NULL));
-    ck_assert_ret_ok(tx_history_update(&src, task1, peer2, 0.6, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, task1, peer1, 800, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, task1, peer2, 600, NULL));
 
     /* dst holds the first entry already, the way a node one commit behind
      * does. */
@@ -800,8 +799,8 @@ DEFINE_TEST(test_tx_catchup_skips_entries_already_held)
     ck_assert_int_eq(tx_history_len(&dst), 1);
     json_decref(first);
 
-    ck_assert_ret_ok(tx_history_update(&src, task2, peer1, 0.9, NULL));
-    ck_assert_ret_ok(tx_history_update(&src, task2, peer2, 0.5, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, task2, peer1, 900, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, task2, peer2, 500, NULL));
     json_t *full = NULL;
     ck_assert_ret_ok(tx_history_era_to_json(&src, 0, tx_history_len(&src), &full));
     ck_assert_int_eq((int)json_array_size(full), 2);
@@ -834,10 +833,10 @@ DEFINE_TEST(test_tx_out_of_order_commits_still_link)
     uuid_generate(b);
     uuid_generate(p1);
     uuid_generate(p2);
-    ck_assert_ret_ok(tx_history_update(&src, a, p1, 0.8, NULL));
-    ck_assert_ret_ok(tx_history_update(&src, b, p1, 0.7, NULL));
-    ck_assert_ret_ok(tx_history_update(&src, b, p2, 0.6, NULL));   /* B commits first */
-    ck_assert_ret_ok(tx_history_update(&src, a, p2, 0.5, NULL));   /* then A */
+    ck_assert_ret_ok(tx_history_update(&src, a, p1, 800, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, b, p1, 700, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, b, p2, 600, NULL));   /* B commits first */
+    ck_assert_ret_ok(tx_history_update(&src, a, p2, 500, NULL));   /* then A */
     ck_assert_int_eq(tx_history_len(&src), 2);
     ck_assert(tx_history_verify_links(&src));
 
@@ -845,7 +844,7 @@ DEFINE_TEST(test_tx_out_of_order_commits_still_link)
     transaction_t out;
     ck_assert_ret_ok(tx_history_by_task(&src, a, &out));
     ck_assert_int_eq(out.index, 1);
-    ck_assert_double_eq_tol(out.p2_score, 0.5, 0.001);
+    ck_assert_int_eq(out.p2_score_milli, 500);
     ck_assert_ret_ok(tx_history_by_task(&src, b, &out));
     ck_assert_int_eq(out.index, 0);
     transaction_t by_peer[4];
@@ -878,10 +877,10 @@ DEFINE_TEST(test_tx_catchup_accepts_a_segment_in_arrival_order)
     uuid_generate(b);
     uuid_generate(p1);
     uuid_generate(p2);
-    ck_assert_ret_ok(tx_history_update(&src, a, p1, 0.8, NULL));
-    ck_assert_ret_ok(tx_history_update(&src, a, p2, 0.6, NULL));
-    ck_assert_ret_ok(tx_history_update(&src, b, p1, 0.9, NULL));
-    ck_assert_ret_ok(tx_history_update(&src, b, p2, 0.5, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, a, p1, 800, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, a, p2, 600, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, b, p1, 900, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, b, p2, 500, NULL));
     json_t *wire = NULL;
     ck_assert_ret_ok(tx_history_era_to_json(&src, 0, 2, &wire));
     json_t *reversed = json_array();
@@ -915,14 +914,14 @@ DEFINE_TEST(test_tx_catchup_completes_a_pending_task_in_place)
 
     tx_history_t src;
     ck_assert_ret_ok(tx_history_init(&src));
-    ck_assert_ret_ok(tx_history_update(&src, x, p1, 0.8, NULL));
-    ck_assert_ret_ok(tx_history_update(&src, x, p2, 0.6, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, x, p1, 800, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, x, p2, 600, NULL));
     json_t *wire = NULL;
     ck_assert_ret_ok(tx_history_era_to_json(&src, 0, tx_history_len(&src), &wire));
 
     tx_history_t dst;
     ck_assert_ret_ok(tx_history_init(&dst));
-    ck_assert_ret_ok(tx_history_update(&dst, x, p2, 0.6, NULL));   /* our half, pending */
+    ck_assert_ret_ok(tx_history_update(&dst, x, p2, 600, NULL));   /* our half, pending */
     ck_assert_int_eq(tx_history_len(&dst), 0);
 
     ck_assert_ret_ok(tx_history_era_from_json(&dst, wire));
@@ -937,7 +936,7 @@ DEFINE_TEST(test_tx_catchup_completes_a_pending_task_in_place)
     ck_assert_int_eq(n, 1);
 
     /* Our other half committing late changes nothing. */
-    ck_assert_ret_ok(tx_history_update(&dst, x, p1, 0.8, NULL));
+    ck_assert_ret_ok(tx_history_update(&dst, x, p1, 800, NULL));
     ck_assert_int_eq(tx_history_len(&dst), 1);
     ck_assert_int_eq(dst.chain_len, 1);
 
@@ -958,8 +957,8 @@ RUN_TESTS(Reputation3, test_tx_history_json_roundtrip,
           test_tx_catchup_skips_entries_already_held, test_tx_two_peer_transaction,
           test_reputation_contrite_tft,
           test_reputation_contrite_tft_cooperative_self_p2,
-          test_reputation_contrite_tft_retaliation,
-          test_reputation_contrite_tft_contrition,
+          test_reputation_contrite_tft_our_low_score_is_its_record,
+          test_reputation_contrite_tft_repeat_defection_has_no_floor,
           test_reputation_contrite_tft_third_party_informs_prior,
           test_reputation_pure_with_counterparty,
           test_reputation_pure_unknown_counterparty_default_0_5,

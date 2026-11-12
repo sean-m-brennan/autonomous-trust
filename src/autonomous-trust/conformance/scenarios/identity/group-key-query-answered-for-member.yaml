@@ -1,0 +1,56 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-key-query-answered-for-member
+byte_pinning: false
+description: |
+    A member behind on the group key asks for it and gets the group.
+
+    asker holds group G at key epoch 0; member holds G at epoch 2. Both list
+    each other, and member holds asker as a peer. asker sends group_key_query
+    naming G. member answers with an ordinary group_key_update carrying its
+    group, sealed to the key it holds for asker, and asker takes it through
+    the usual gate: the update is signed by a peer it holds, so the epoch-2
+    key is adopted. A query can make a member resend the group; it can never
+    make anyone accept a key the gate would refuse.
+
+participants:
+  - id: asker
+    role: group_member
+  - id: member
+    role: group_member
+
+fixtures:
+  groups:
+    asker:
+      uuid: "0a000000-0000-4000-8000-000000000ab3"
+      size: 1
+      key_epoch: 0
+      members: [member]
+    member:
+      uuid: "0a000000-0000-4000-8000-000000000ab3"
+      size: 1
+      key_epoch: 2
+      members: [asker]
+  holds:
+    asker: [member]
+    member: [asker]
+
+steps:
+  - id: 1
+    from: asker
+    to: member
+    function: group_key_query
+    payload: {}
+    description: asker asks member for the current group of G.
+
+  - id: 2
+    from: member
+    to: asker
+    function: group_key_update
+    in_response_to: 1
+    description: member answers with its group, which asker adopts.
+
+expected_state:
+  asker:
+    group_key_epoch: 2

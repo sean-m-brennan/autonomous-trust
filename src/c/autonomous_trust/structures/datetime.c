@@ -172,16 +172,24 @@ int str_to_offset(const char *str, float *offset)
 /* Frama-C: skipped — [solver-timeout] snprintf stub assigns cascade */
 int offset_to_str(float offset, char *str)
 {
-    const char *sign = "";
-    if (offset >= 0)
-        sign = "+";
-    float hour;
-    float frac = fabsf(modff(offset, &hour));
-    int minutes = (int)(60 * frac);
-    int seconds = (int)(3600 * (frac - (60.0 / minutes)));
+    /* Python's isoformat: "+HH:MM", or "+HH:MM:SS" when the offset has
+     * seconds. The sign is taken from the whole offset, so -0:30 keeps it. */
+    long total = lroundf(offset * 3600.0f);
+    char sign = (total < 0) ? '-' : '+';
+    total = labs(total);
+    /* Python rejects a UTC offset of 24h or more, and bounding it is what
+     * keeps the hours to two digits (and the string inside the buffer). */
+    if (total >= 24L * 3600L)
+    {
+        str[0] = '\0';
+        return -1;
+    }
+    int hours = (int)(total / 3600);
+    int minutes = (int)((total % 3600) / 60);
+    int seconds = (int)(total % 60);
     if (seconds > 0)
-        return snprintf(str, MAX_TZ_OFFSET_STR + 1, "%s%d:%d:%d", sign, (int)hour, minutes, seconds);
-    return snprintf(str, MAX_TZ_OFFSET_STR + 1, "%s%d:%d", sign, (int)hour, minutes);
+        return snprintf(str, MAX_TZ_OFFSET_STR + 1, "%c%02d:%02d:%02d", sign, hours, minutes, seconds);
+    return snprintf(str, MAX_TZ_OFFSET_STR + 1, "%c%02d:%02d", sign, hours, minutes);
 }
 
 const char *conversions[] = {"%f", "%z", "%Z"};
@@ -380,6 +388,19 @@ int datetime_strptime(const char *s, const char *format, datetime_t *dt)
     }
 
     return 0;
+}
+
+/* Frama-C: skipped — calls mktime, which normalizes its argument; it is
+ * given copies, so neither input changes. */
+int datetime_compare(const datetime_t *a, const datetime_t *b)
+{
+    struct tm ta = *(const struct tm *)a;
+    struct tm tb = *(const struct tm *)b;
+    time_t sa = mktime(&ta);
+    time_t sb = mktime(&tb);
+    if (sa != sb)
+        return sa < sb ? -1 : 1;
+    return (a->tm_nsec > b->tm_nsec) - (a->tm_nsec < b->tm_nsec);
 }
 
 inline int datetime_from_isostring(const char *s, datetime_t *dt)

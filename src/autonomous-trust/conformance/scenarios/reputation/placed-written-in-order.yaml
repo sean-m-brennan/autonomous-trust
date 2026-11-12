@@ -42,4 +42,4 @@ steps:
 expected_state:
   bob:
     chain_tasks: [t-2, t-1]
-    window_root: "bc67ac407075845fa6d0b6d41759421814a05d1bc4b9695899ef11a120f31aee"
+    window_root: "9b0faad9eac0f7e93e397747dae083c89475bbc16d553eefe041f6c7a282dc32"

@@ -850,12 +850,16 @@ class TestIdentityResync:
         return Message(CfgIds.identity, IdentityProtocol.id_query,
                        payload, encrypt=False)
 
-    def _id_response(self, member_identity):
+    def _id_response(self, member_identity, signer=...):
+        """A response publishing `member_identity`, signed by `signer` (its
+        subject by default; None for unsigned), as it arrives verified."""
         from autonomous_trust.core.config import to_json_string
         payload = to_json_string({'from_identity': member_identity.publish(),
                                   'from_address': member_identity.address})
+        if signer is ...:
+            signer = member_identity
         return Message(CfgIds.identity, IdentityProtocol.id_response,
-                       payload, encrypt=False)
+                       payload, from_whom=signer, encrypt=False)
 
     def test_query_emitted_when_identities_sparse(self):
         # group has 3 members (by address) but self.peers is empty -> we lack
@@ -929,6 +933,66 @@ class TestIdentityResync:
 
         assert proc.peers.find_by_uuid(member.uuid) is not None
         proc._record_peers.assert_called()  # propagates to main proc
+
+    def test_unsigned_response_refused(self):
+        """RD_2.6 plan §2.5: an identity response must be signed."""
+        me = _new_identity('coord', '10.0.0.3')
+        member = _new_identity('captain', '10.0.0.10')
+        proc = _build_process(me, _group_of_size(me, [member]), Peers())
+        proc._record_peers = MagicMock()
+        proc.handle_identity_response(_build_queues(),
+                                      self._id_response(member, signer=None))
+        assert proc.peers.find_by_uuid(member.uuid) is None
+
+    def test_response_signed_by_another_refused(self):
+        """A member cannot vouch for an identity that is not its own."""
+        me = _new_identity('coord', '10.0.0.3')
+        member = _new_identity('captain', '10.0.0.10')
+        other = _new_identity('intel', '10.0.0.12')
+        proc = _build_process(me, _group_of_size(me, [member, other]), Peers())
+        proc._record_peers = MagicMock()
+        proc.handle_identity_response(_build_queues(),
+                                      self._id_response(member, signer=other))
+        assert proc.peers.find_by_uuid(member.uuid) is None
+
+    def test_response_backfills_member_without_rewriting_its_map_entry(self):
+        """The group map holds 'captain' for this member, which advertises
+        10.0.0.10. The member is known by UUID, so its signed identity is
+        backfilled, but the map entry stays: it is this cohort's record of how
+        to reach the member, and a dual-homed gateway advertises an address
+        that only one of its cohorts can reach."""
+        me = _new_identity('coord', '10.0.0.3')
+        member = _new_identity('captain', '10.0.0.10')
+        grp = Group.initialize({str(me.uuid): me.address,
+                                str(member.uuid): 'captain'}, 'coord-grp')
+        proc = _build_process(me, grp, Peers())
+        proc._record_peers = MagicMock()
+        proc._record_group = MagicMock()
+
+        proc.handle_identity_response(_build_queues(), self._id_response(member))
+
+        assert proc.peers.find_by_uuid(member.uuid) is not None
+        assert 'captain' in list(proc.group.addresses)      # map entry untouched
+        assert '10.0.0.10' not in list(proc.group.addresses)
+        proc._record_group.assert_not_called()
+
+    def test_response_rejects_unknown_uuid_at_unknown_address(self):
+        """UUID membership does not open the door to strangers: an identity
+        whose UUID is not a member and whose address is not in the group is
+        still refused."""
+        me = _new_identity('coord', '10.0.0.3')
+        member = _new_identity('captain', '10.0.0.10')
+        grp = Group.initialize({str(me.uuid): me.address,
+                                str(member.uuid): 'captain'}, 'coord-grp')
+        stranger = _new_identity('stranger', '10.0.0.99')
+        proc = _build_process(me, grp, Peers())
+        proc._record_peers = MagicMock()
+
+        proc.handle_identity_response(_build_queues(),
+                                      self._id_response(stranger))
+
+        assert proc.peers.find_by_uuid(stranger.uuid) is None
+        proc._record_peers.assert_not_called()
 
     def test_response_rejects_non_group_address(self):
         me = _new_identity('coord', '10.0.0.3')

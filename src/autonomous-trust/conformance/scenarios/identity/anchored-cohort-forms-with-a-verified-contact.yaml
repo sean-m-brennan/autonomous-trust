@@ -1,0 +1,78 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: anchored-cohort-forms-with-a-verified-contact
+byte_pinning: false
+description: |
+    Under the join policy, a node that counts one of its cohort's members as
+    an anchor forms an anchored cohort with it, and invites only it
+    (RD_14.4_HOSTILE_JOIN_PLAN.md Phase 6, D8 (b)).
+
+    Why this matters: the cohort a joiner enters may be hostile, and its
+    members see, co-sign and can withhold every reputation entry the joiner
+    writes. Two honest nodes that know each other out of band form a second
+    group of their own beside the cohort, and the evidence between them moves
+    there, where the rest of the cohort neither receives nor co-signs it.
+
+    Shape: three members of one cohort. alice and zed are verified first
+    contact contacts, so each counts the other as an anchor; horde is
+    nobody's. The lowest uuid among a node and its anchors mints the group
+    (alice sorts below zed under both runtimes' participant uuids), so the
+    trigger on alice forms {alice, zed} and invites zed, and horde hears
+    nothing. The invitation is asserted, not delivered: C holds one identity
+    state per scenario, so each anchored-cohort scenario asserts one node's
+    view.
+
+    With the policy off nothing forms, so this fails against a runtime
+    without Phase 6.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: zed
+    role: border_guard
+  - id: horde
+    role: border_guard
+
+fixtures:
+  first_contact:
+    enabled: true
+  contacts:
+    alice:
+      verified: true
+    zed:
+      verified: true
+  # Every participant holds every other as a peer and cohort member (the
+  # Python adapter's default; C needs it said).
+  mutual_peers: true
+  join_policy:
+    version: 1
+    enabled: true
+    anchors: [verified_contact]
+
+steps:
+  - id: 1
+    from: alice
+    to: alice
+    function: trigger_anchored_cohort
+    description: The forming pass runs on alice.
+
+  - id: 2
+    in_response_to: 1
+    from: alice
+    to: zed
+    function: anchored_cohort_invite
+    no_propagate: true
+    description: zed, alice's anchor, is invited.
+
+  - id: 3
+    in_response_to: 1
+    from: alice
+    to: horde
+    function: anchored_cohort_invite
+    expect_none: true
+    description: horde, nobody's anchor, is not.
+
+expected_state:
+  alice:
+    anchored_cohort_members: [alice, zed]

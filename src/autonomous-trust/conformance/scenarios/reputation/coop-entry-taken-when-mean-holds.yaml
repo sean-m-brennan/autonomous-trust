@@ -1,0 +1,85 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: coop-entry-taken-when-mean-holds
+byte_pinning: false
+description: |
+    Entering the cooperation regime: own evidence wins.
+
+    bob holds two bilateral entries with subject, each scored 0.9 both ways,
+    and alice and carol have each scored subject 0.9. bob's stored score
+    of subject is 0.8, above COOP_ENTER (0.55), and subject is out of
+    cooperation, so this rescore may enter it.
+
+    Contrite tit-for-tat over bob's own entries: (1.8 + 3 * 0.2) / 5 = 0.48.
+    The cooperation mean weights each score by its reporter's reputation: bob
+    holds none of itself (the 0.2 neutral), alice and carol 0.5:
+    (2 * 0.9 * 0.2 + 2 * 0.9 * 0.5) / (0.4 + 1.0) = 0.9.
+
+    A peer now enters cooperation only if that mean is itself at or above
+    COOP_EXIT (0.45). 0.9 is, so subject enters cooperation and reads 0.9.
+
+    Before the rule, the hostile-join runs without the policy, 2026-11-04,
+    flipped every rescore: tit-for-tat over a joiner's own transactions scored
+    its contact 0.84, the slandered mean 0.34, and each sent the next rescore
+    to the other.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: oracle
+  - id: subject
+    role: subject
+  - id: carol
+    role: provider
+
+fixtures:
+  tx_history:
+    bob:
+      - task_id: t-b1
+        p1: subject
+        p1_score: 0.9
+        p2: bob
+        p2_score: 0.9
+      - task_id: t-b2
+        p1: bob
+        p1_score: 0.9
+        p2: subject
+        p2_score: 0.9
+      - task_id: t-a1
+        p1: alice
+        p1_score: 0.9
+        p2: subject
+        p2_score: 0.9
+      - task_id: t-c1
+        p1: carol
+        p1_score: 0.9
+        p2: subject
+        p2_score: 0.9
+
+  reputations:
+    bob:
+      subject: 0.8
+      alice: 0.5
+      carol: 0.5
+
+  coop_mode:
+    bob:
+      subject: false
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: request reputation
+    payload:
+      target: subject
+      proc: negotiation
+    description: |
+        alice asks bob for subject's reputation; bob rescores it.
+
+expected_state:
+  bob:
+    reputation_of:
+      subject: 0.9

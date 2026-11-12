@@ -75,6 +75,12 @@ size_t message_size(message_type_t type)
         return sizeof(peer_removed_msg_t);
     case PEER_PRESENCE:
         return sizeof(peer_presence_msg_t);
+    case PEER_ANCHOR:
+        return sizeof(peer_anchor_msg_t);
+    case PEER_PROBE_COUNT:
+        return sizeof(peer_probe_count_msg_t);
+    case ANCHORED_COHORT:
+        return sizeof(anchored_cohort_msg_t);
     case MSG_TYPE_RETIRED_10:   /* fleet's old slots: never sent (Phase 8) */
     case MSG_TYPE_RETIRED_11:
     case MSG_TYPE_RETIRED_12:
@@ -131,6 +137,12 @@ char *message_type_to_string(message_type_t type)
         return (char*)"PEER_REMOVED";
     case PEER_PRESENCE:
         return (char*)"PEER_PRESENCE";
+    case PEER_ANCHOR:
+        return (char*)"PEER_ANCHOR";
+    case PEER_PROBE_COUNT:
+        return (char*)"PEER_PROBE_COUNT";
+    case ANCHORED_COHORT:
+        return (char*)"ANCHORED_COHORT";
     case MSG_TYPE_RETIRED_10:   /* fleet's old slots: never sent (Phase 8) */
     case MSG_TYPE_RETIRED_11:
     case MSG_TYPE_RETIRED_12:
@@ -193,6 +205,12 @@ message_type_t message_type_core_by_name(const char *str)
         return PEER_REMOVED;
     if (strcmp(str, "PEER_PRESENCE") == 0)
         return PEER_PRESENCE;
+    if (strcmp(str, "PEER_ANCHOR") == 0)
+        return PEER_ANCHOR;
+    if (strcmp(str, "PEER_PROBE_COUNT") == 0)
+        return PEER_PROBE_COUNT;
+    if (strcmp(str, "ANCHORED_COHORT") == 0)
+        return ANCHORED_COHORT;
     return -1;  // No matching message type found (all valid types are > 0)
 }
 
@@ -305,6 +323,16 @@ int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr
      * older peer of this serializer stays compatible. */
     json_object_set_new(root, "verified", json_boolean(msg->verified));
     json_object_set_new(root, "has_signature", json_boolean(msg->has_signature));
+    /* The signature itself, so identity can check it again once it holds the
+     * sender (see net_msg_t.signature). */
+    if (msg->has_signature) {
+        char sig_hex[crypto_sign_BYTES * 2 + 1];
+        sodium_bin2hex(sig_hex, sizeof(sig_hex), msg->signature, crypto_sign_BYTES);
+        json_object_set_new(root, "signature", json_string(sig_hex));
+    }
+    /* Which child cohort the sender belongs to (gateways only); absent = none. */
+    if (msg->child_group[0] != '\0')
+        json_object_set_new(root, "child_group", json_string(msg->child_group));
 
     char uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(msg->from_whom.uuid, uuid_str);
@@ -505,6 +533,30 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         memcpy(subdata, &msg->info.peer_presence, subdata_len);
         break;
     }
+    case PEER_ANCHOR:
+    {
+        subdata_len = sizeof(peer_anchor_msg_t);
+        subdata = malloc(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.peer_anchor, subdata_len);
+        break;
+    }
+    case PEER_PROBE_COUNT:
+    {
+        subdata_len = sizeof(peer_probe_count_msg_t);
+        subdata = malloc(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.peer_probe_count, subdata_len);
+        break;
+    }
+    case ANCHORED_COHORT:
+    {
+        subdata_len = sizeof(anchored_cohort_msg_t);
+        subdata = malloc(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.anchored_cohort, subdata_len);
+        break;
+    }
     case MSG_TYPE_RETIRED_10:   /* fleet's old slots: never sent (Phase 8) */
     case MSG_TYPE_RETIRED_11:
     case MSG_TYPE_RETIRED_12:
@@ -627,6 +679,14 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
     net_msg->verified = json_boolean_value(json_object_get(root, "verified"));
     net_msg->has_signature =
         json_boolean_value(json_object_get(root, "has_signature"));
+    const char *sig_hex = json_string_value(json_object_get(root, "signature"));
+    if (sig_hex == NULL
+        || sodium_hex2bin(net_msg->signature, crypto_sign_BYTES, sig_hex,
+                          strlen(sig_hex), NULL, NULL, NULL) != 0)
+        memset(net_msg->signature, 0, crypto_sign_BYTES);
+    const char *cg = json_string_value(json_object_get(root, "child_group"));
+    if (cg != NULL)
+        snprintf(net_msg->child_group, sizeof(net_msg->child_group), "%s", cg);
 
     const char *ret = json_string_value(json_object_get(root, "return_to"));
     if (ret)
@@ -803,6 +863,15 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
         break;
     case PEER_PRESENCE:
         COPY_FIXED_PAYLOAD(peer_presence, peer_presence_msg_t);
+        break;
+    case PEER_ANCHOR:
+        COPY_FIXED_PAYLOAD(peer_anchor, peer_anchor_msg_t);
+        break;
+    case PEER_PROBE_COUNT:
+        COPY_FIXED_PAYLOAD(peer_probe_count, peer_probe_count_msg_t);
+        break;
+    case ANCHORED_COHORT:
+        COPY_FIXED_PAYLOAD(anchored_cohort, anchored_cohort_msg_t);
         break;
     case MSG_TYPE_RETIRED_10:   /* fleet's old slots: never sent (Phase 8) */
     case MSG_TYPE_RETIRED_11:

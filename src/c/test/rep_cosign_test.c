@@ -214,12 +214,13 @@ static void _round(cohort_t *c, uuid_t task, char *task_str)
     uuid_generate(task);
     uuid_unparse_lower(task, task_str);
     uuid_t subject;
-    uuid_clear(subject);
+    /* Our half names whom it scores (R+D.md §14.2). */
+    uuid_copy(subject, c->alice->uuid);
     _forward_transaction(c->proc, task, c->me->uuid, 0.9, "agora-post",
                          NULL, subject, 0.0);
     identity_t *voters[2] = { c->alice, c->bob };
     uint8_t desig[512];
-    size_t dlen = commit_designation(c->me->uuid, task, 0.9, NULL, desig,
+    size_t dlen = commit_designation(c->me->uuid, task, 900, NULL, desig,
                                      sizeof(desig));
     ck_assert(dlen > 0);
     for (int i = 0; i < 2; i++) {
@@ -301,7 +302,7 @@ static void _chain(identity_t *a, identity_t *b, int from, int n,
         snprintf(name, sizeof(name), "%s-%d", salt, i);
         uuid_t task;
         uuid_generate_sha1(task, a->uuid, name, strlen(name));
-        reputation_install_tx_pair(task, a->uuid, 0.8, b->uuid, 0.7);
+        reputation_install_tx_pair(task, a->uuid, 800, b->uuid, 700);
     }
 }
 

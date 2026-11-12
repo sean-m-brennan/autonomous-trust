@@ -1,0 +1,71 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-key-stale-signal-queries-sender
+byte_pinning: false
+description: |
+    A group frame that will not open makes identity ask its sender for the key.
+
+    The network process tells identity, with the local signal
+    group_key_stale, that a group frame from a member it holds would not
+    open: that member holds a key this node lacks. Identity asks it with
+    group_key_query. The signal is the network process's alone, so one that
+    names a sender (as a peer's frame would) is refused.
+
+    asker and member both hold group G and each other.
+
+participants:
+  - id: asker
+    role: group_member
+  - id: member
+    role: group_member
+
+fixtures:
+  groups:
+    asker:
+      uuid: "0a000000-0000-4000-8000-000000000ab6"
+      size: 1
+      key_epoch: 0
+      members: [member]
+    member:
+      uuid: "0a000000-0000-4000-8000-000000000ab6"
+      size: 1
+      key_epoch: 2
+      members: [asker]
+  holds:
+    asker: [member]
+    member: [asker]
+
+steps:
+  - id: 1
+    from: member
+    to: asker
+    function: group_key_stale
+    payload:
+      address_of: member
+      from_wire: true
+    description: The signal arrives as if from a peer; asker refuses it.
+
+  - id: 2
+    from: asker
+    to: member
+    function: group_key_query
+    in_response_to: 1
+    expect_none: true
+    description: No query.
+
+  - id: 3
+    from: member
+    to: asker
+    function: group_key_stale
+    payload:
+      address_of: member
+    description: The network process's own signal names member's address.
+
+  - id: 4
+    from: asker
+    to: member
+    function: group_key_query
+    in_response_to: 3
+    no_propagate: true
+    description: asker asks member for the current group.

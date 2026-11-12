@@ -30,9 +30,15 @@ class NegotiationProtocol(Protocol):
     start = 'spawn task'
     announce = 'invitation'
     response = 'haggle'
-    task = 'task info'
     acceptance = 'ack'
     refusal = 'nack'
     status_req = 'status request'
     status_resp = 'status response'
     result = 'report results'
+    # Live replication (RD_12.6_LIVE_REPLICATION_PLAN.md §3.7): a requestor
+    # asks an executor of a replayable capability for one chain digest, or
+    # for the reveal at the divergent step; the executor answers both with
+    # `replay response`.
+    replay_challenge = 'replay challenge'
+    replay_reveal = 'replay reveal'
+    replay_response = 'replay response'

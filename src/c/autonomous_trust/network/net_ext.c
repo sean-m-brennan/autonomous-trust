@@ -178,3 +178,39 @@ void net_exclusions_reset(void)
     excl.n_keys = 0;
     pthread_mutex_unlock(&excl.lock);
 }
+
+bool net_ext_wire_verb_declared(const char *function)
+{
+    if (function == NULL)
+        return false;
+    for (size_t i = 0; i < n_exts; i++)
+        for (const char *const *v = exts[i]->wire_verbs; v != NULL && *v != NULL; v++)
+            if (strcmp(*v, function) == 0)
+                return true;
+    return false;
+}
+
+int net_ext_check_config(logger_t *logger)
+{
+    int rc = 0;
+    for (size_t i = 0; i < n_exts; i++)
+        if (exts[i]->check_config != NULL && exts[i]->check_config(logger) != 0)
+            rc = -1;
+    return rc;
+}
+
+void net_ext_also_unicast(const uuid_t peer, const char *process,
+                          const char *function, const uint8_t *buf, size_t len)
+{
+    for (size_t i = 0; i < n_exts; i++)
+        if (exts[i]->also_unicast != NULL)
+            exts[i]->also_unicast(peer, process, function, buf, len);
+}
+
+void net_ext_fanout(net_channel_t ch, const char *process, const char *function,
+                    const group_t *grp, const uint8_t *buf, size_t len)
+{
+    for (size_t i = 0; i < n_exts; i++)
+        if (exts[i]->fanout != NULL)
+            exts[i]->fanout(ch, process, function, grp, buf, len);
+}

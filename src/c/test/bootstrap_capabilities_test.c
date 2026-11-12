@@ -388,7 +388,35 @@ DEFINE_TEST(test_probe_capabilities_are_in_the_capability_table)
 }
 END_TEST_DEFINITION()
 
+/* $AT_REDTEAM_DEFECT_AT makes a node answer probes wrongly, but only in a
+ * build configured with -DAT_REDTEAM=ON. A release build must ignore it, so
+ * that no deployed node can be told to lie through its environment. */
+DEFINE_TEST(test_redteam_defect_switch)
+{
+    setenv("AT_REDTEAM_DEFECT_AT", "1", 1);   /* long past */
+    char *echoed = at_echo_challenge("echo:deadbeef");
+    ck_assert_ptr_nonnull(echoed);
+#ifdef AT_REDTEAM
+    ck_assert_score(verify_handshake(at_handshake(7), 7), 0.1);
+    ck_assert_score(verify_echo(echoed, "echo:deadbeef"), 0.1);
+#else
+    ck_assert_score(verify_handshake(at_handshake(7), 7), 0.9);
+    ck_assert_score(verify_echo(echoed, "echo:deadbeef"), 0.9);
+#endif
+    free(echoed);
+
+    /* Before the set time, every build answers honestly */
+    setenv("AT_REDTEAM_DEFECT_AT", "99999999999", 1);
+    ck_assert_score(verify_handshake(at_handshake(7), 7), 0.9);
+    echoed = at_echo_challenge("echo:deadbeef");
+    ck_assert_score(verify_echo(echoed, "echo:deadbeef"), 0.9);
+    free(echoed);
+    unsetenv("AT_REDTEAM_DEFECT_AT");
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(BootstrapCapabilities,
+          test_redteam_defect_switch,
           test_handshake_increment,
           test_verify_handshake_scores,
           test_verify_time_attest_bands,

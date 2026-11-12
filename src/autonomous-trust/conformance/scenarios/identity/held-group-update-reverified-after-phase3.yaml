@@ -1,0 +1,66 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: held-group-update-reverified-after-phase3
+byte_pinning: false
+description: |
+    A rotation held through phase 2 is checked again once the sender is a peer
+    this node holds, and adopted.
+
+    Hostile-join run, 2026-11-03: two joiners still in phase 2 held the
+    cohort's rotations to epochs 10 and 11. They did not yet hold the senders,
+    so no signature had been checked, and after phase 3 the gate refused every
+    one ("Rejecting unverified group key rotation"). The cohort never resent,
+    and the joiners kept a forked key for the whole run.
+
+    joiner holds group G at key epoch 0 and is in phase 2. member, at epoch 2,
+    sends its group, signed, before joiner holds it: the update is held with
+    its signature unchecked. joiner then reaches phase 3 holding member as a
+    peer; the held update is replayed, its signature checks against the key
+    joiner holds for member, and the rotation is adopted. Only a verified
+    update raises the epoch, as before.
+
+participants:
+  - id: joiner
+    role: group_member
+  - id: member
+    role: group_member
+
+fixtures:
+  groups:
+    joiner:
+      uuid: "0a000000-0000-4000-8000-000000000ab1"
+      size: 1
+      key_epoch: 0
+      members: [member]
+    member:
+      uuid: "0a000000-0000-4000-8000-000000000ab1"
+      size: 1
+      key_epoch: 2
+      members: [joiner]
+  phases:
+    joiner: 2
+
+steps:
+  - id: 1
+    from: member
+    to: joiner
+    function: group_key_update
+    payload:
+      held_unverified: true
+    description: |
+        member's epoch-2 group, signed by member, reaches joiner in phase 2
+        before joiner holds member. joiner holds it.
+
+  - id: 2
+    from: joiner
+    to: joiner
+    function: trigger_phase3
+    payload:
+      admit: [member]
+    description: |
+        joiner reaches phase 3 holding member, and the held update is replayed.
+
+expected_state:
+  joiner:
+    group_key_epoch: 2

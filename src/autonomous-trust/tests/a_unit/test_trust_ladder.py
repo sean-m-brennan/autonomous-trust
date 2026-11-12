@@ -54,6 +54,20 @@ def test_defaults_when_absent(monkeypatch):
     assert ladder.bootstrap == BootstrapParams()
     assert ladder.bootstrap.duration_sec == 30
     assert ladder.tier_demotion_epsilon == pytest.approx(0.02)
+    assert ladder.tier_floors == pytest.approx((0.50, 0.65, 0.80, 0.90))
+
+
+@pytest.mark.parametrize('floors', [
+    '[0.5, 0.65, 0.8]',            # not four
+    '[0.5, 0.8, 0.65, 0.9]',       # not increasing
+    '[0.5, 0.5, 0.8, 0.9]',        # not strictly increasing
+    '[0.11, 0.65, 0.8, 0.9]',      # the probe hold would reach the cut-off
+    '[0.5, 0.65, 0.8, 1.01]',      # above any score
+    '"high"',
+])
+def test_malformed_tier_floors_raise(tmp_path, floors):
+    with pytest.raises(ValueError):
+        load_trust_ladder(_write(tmp_path, f'tier_floors: {floors}\n'))
 
 
 def test_load_parses_schema(tmp_path):
@@ -194,6 +208,7 @@ def test_the_shared_json_example_parses_here_too():
     assert ladder.bootstrap.duration_sec == 45
     assert ladder.bootstrap.pairs == 12
     assert ladder.tier_demotion_epsilon == pytest.approx(0.05)
+    assert ladder.tier_floors == pytest.approx((0.45, 0.60, 0.75, 0.85))
 
 
 @pytest.mark.skipif(not _SHARED_EXAMPLE.exists(),

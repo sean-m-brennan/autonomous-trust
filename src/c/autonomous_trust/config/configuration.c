@@ -21,7 +21,12 @@
 #include <errno.h>
 #include <stdio.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <dirent.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include <stdbool.h>
 
 #include <jansson.h>
@@ -202,10 +207,16 @@ int all_config_files(char dir[], array_t *paths)
             if (dot && (!strcmp(dot, ".cfg.jsn") || !strcmp(dot, ".cfg.json")
                         || !strcmp(dot, ".cfg.pb")))
             {
+                /* d_name can outrun CFG_PATH_LEN (MinGW's is MAX_PATH, 260).
+                 * A truncated name would name some other file, and strncpy
+                 * would leave it unterminated, so skip it instead. */
+                size_t len = strlen(de->d_name);
+                if (len > CFG_PATH_LEN)
+                    continue;
                 char *path = malloc(CFG_PATH_LEN + 1);
                 if (path == NULL)
                     return SYS_EXCEPTION();
-                strncpy(path, de->d_name, CFG_PATH_LEN);
+                memcpy(path, de->d_name, len + 1);   /* includes NUL */
                 data_t *str_dat = string_data(path, strlen(path));
                 int err = array_append(paths, str_dat);
                 if (err != 0)
@@ -365,6 +376,34 @@ int read_config_file(const char *filename, void *data_struct)
     return err;
 }
 
+/* Open a config file for writing, readable and writable by its owner only.
+ * Configs hold the node's identity seeds, so the mode is set here rather
+ * than left to the umask, and fchmod narrows a file an older build created
+ * with wider permissions. */
+static FILE *_open_config_for_write(const char *filename)
+{
+#ifdef _WIN32
+    return fopen(filename, "wb");
+#else
+    int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    if (fd < 0)
+        return NULL;
+    if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return NULL;
+    }
+    FILE *f = fdopen(fd, "wb");
+    if (f == NULL) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+    }
+    return f;
+#endif
+}
+
 /*@
   requires \valid(cfg_obj);
   requires data_struct != \null && \valid_read(data_struct);
@@ -400,7 +439,7 @@ int write_config_file(const config_t *cfg_obj, const void *data_struct, const ch
         size_t len = 0;
         int err = cfg_obj->to_proto(data_struct, &buf, &len);
         if (err != 0) return err;
-        FILE *f = fopen(filename, "wb");
+        FILE *f = _open_config_for_write(filename);
         if (f == NULL) { free(buf); return SYS_EXCEPTION(); }
         size_t wrote = fwrite(buf, 1, len, f);
         fclose(f);
@@ -414,8 +453,15 @@ int write_config_file(const config_t *cfg_obj, const void *data_struct, const ch
     if (err != 0)
         return err;
 
-    err = json_dump_file(root, filename, 0);
+    FILE *f = _open_config_for_write(filename);
+    if (f == NULL) {
+        json_decref(root);
+        return SYS_EXCEPTION();
+    }
+    err = json_dumpf(root, f, 0);
     json_decref(root); // frees created tree
+    if (fclose(f) != 0 && err == 0)
+        err = -1;
     if (err != 0)
         return EXCEPTION(EJSN_DUMP); // ECFG_BADFMT);
     return 0;
@@ -570,6 +616,25 @@ int load_config(char *filepath, config_t **config_ptr, char *cfg_name, logger_t 
         log_warn(logger, "No registered config section for %s; "
                          "leaving the file to whoever owns it\n", cfg_name);
         return EXCEPTION(ECFG_NOIMPL);
+    }
+    /* A registered name can still hold a file the registry does not own. A
+     * section's file is one JSON object; a top-level array is Python's
+     * ConfigJSONEncoder form, which a subsystem writes and reads for itself.
+     * group.cfg.json is the case: once a node joins a group, the identity
+     * process keeps it as [group, {"step_dag", "blacklist"}] and reads it with
+     * group_file_read. Parsing that here as the "group" section failed, and
+     * every node that had joined a group refused to start again. */
+    if (!_filename_is_proto(abspath))
+    {
+        json_t *peek = json_load_file(abspath, 0, NULL);
+        bool is_array = peek != NULL && json_is_array(peek);
+        json_decref(peek);
+        if (is_array)
+        {
+            log_info(logger, "%s is kept by its own subsystem; "
+                             "leaving the file to it\n", cfg_name);
+            return EXCEPTION(ECFG_NOIMPL);
+        }
     }
     config->data_struct = smrt_create(config->data_len);
     if (config->data_struct == NULL)

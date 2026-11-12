@@ -467,11 +467,20 @@ class NetworkAdapter:
         if case.name == 'wire-verb-policy':
             self._run_wire_verb_policy(case)
             return
+        if case.name == 'ext-wire-verbs':
+            self._run_ext_wire_verbs(case)
+            return
+        if case.name == 'transport-liveness':
+            self._run_transport_liveness(case)
+            return
         if case.name == 'unencrypted-verbs':
             self._run_unencrypted_verbs(case)
             return
         if case.name == 'plaintext-verbs-file':
             self._run_plaintext_verbs_file(case)
+            return
+        if case.name == 'deployment-manifest':
+            self._run_deployment_manifest(case)
             return
         if case.name == 'transport-binds-the-recipient':
             self._run_transport_binds_the_recipient(case)
@@ -750,6 +759,52 @@ class NetworkAdapter:
         _assert_expected_flags(case, 'node', {
             'all_cases_match': bool(cases) and not mismatched})
 
+    def _run_ext_wire_verbs(self, case: Case) -> None:
+        """Extension-declared network verbs (scenario `ext-wire-verbs`):
+        declare them through a test extension, then ask
+        netprocess.wire_verb_admitted. Mirrors C run_ext_wire_verbs."""
+        from autonomous_trust.core._python import extensions as _ext
+        from autonomous_trust.core._python.network.netprocess import \
+            wire_verb_admitted
+        fx = case.data.get('fixtures') or {}
+        test_ext = _ext.Extension(
+            name='conformance_wire_verbs', enabled=lambda: True,
+            register_handlers=lambda proc, name: None,
+            network_wire_verbs=tuple(fx.get('declared') or ()))
+        saved = (_ext._builtin, _ext._installed, _ext._source_tree)
+        _ext._builtin, _ext._installed, _ext._source_tree = \
+            (lambda: [test_ext]), (lambda: []), (lambda: [])
+        _ext.reset_extensions()
+        try:
+            cases = fx.get('cases') or []
+            mismatched = [c for c in cases
+                          if wire_verb_admitted(c['process'], c['function'],
+                                                c['path'])[0] != bool(c['admitted'])]
+        finally:
+            _ext._builtin, _ext._installed, _ext._source_tree = saved
+            _ext.reset_extensions()
+        if mismatched:
+            print('ext-wire-verbs mismatches:', mismatched)
+        _assert_expected_flags(case, 'node', {
+            'all_cases_match': bool(cases) and not mismatched})
+
+    def _run_transport_liveness(self, case: Case) -> None:
+        """Transport liveness (C net_liveness, Python TransportLiveness):
+        replay the events, ask every check. Mirrors C run_transport_liveness."""
+        from autonomous_trust.core._python.network.liveness import TransportLiveness
+        fx = case.data.get('fixtures') or {}
+        peers = fx.get('peers') or {}
+        lv = TransportLiveness(float(fx['start']))
+        for ev in fx.get('events') or []:
+            lv.heard(peers[ev['heard']], float(ev['at']))
+        checks = fx.get('checks') or []
+        bad = [c for c in checks
+               if abs(lv.quiet_for(peers[c['peer']], float(c['at']))
+                      - float(c['quiet_for'])) > 1e-9]
+        if bad:
+            print('transport-liveness mismatches:', bad)
+        _assert_expected_flags(case, 'node', {'all_checks_match': bool(checks) and not bad})
+
     def _run_unencrypted_verbs(self, case: Case) -> None:
         """The plaintext allowlist: which verbs a receiver accepts unencrypted
         from a known peer, and how that set relates to the bootstrap set.
@@ -839,6 +894,74 @@ class NetworkAdapter:
             'all_rows_match': all_match,
             'a_refusal_grants_nothing': refusal_grants_nothing,
             'group_key_update_never_plaintext': gku_never,
+        })
+
+    def _run_deployment_manifest(self, case: Case) -> None:
+        """The rules of the deployment manifest (RD_13.4 §3.3): each row is
+        applied over the baseline through the production loader. An accepted
+        row's gateway-pair counts must match; a refused row must leave the
+        baseline in force. Mirrors C run_deployment_manifest."""
+        import json
+        import os
+        import tempfile
+        from autonomous_trust.core import deployment_manifest as dm
+
+        fx = case.data.get('fixtures') or {}
+        rows = fx.get('rows') or []
+        if not rows:
+            raise AssertionError('scenario: fixtures.rows missing or empty')
+        base_node = fx['baseline_node']
+        env = dm.DEPLOYMENT_MANIFEST_ENV
+        saved_env = os.environ.pop(env, None)
+        all_match = keeps_previous = True
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                base_path = os.path.join(tmp, 'baseline.json')
+                with open(base_path, 'w') as fh:
+                    json.dump(fx['baseline'], fh)
+                for row in rows:
+                    dm.reset()
+                    dm.configure(base_path)
+                    source = row.get('source')
+                    path = None
+                    if source == 'unset':
+                        os.environ.pop(env, None)
+                    elif source == 'missing':
+                        os.environ[env] = os.path.join(tmp, 'absent.json')
+                    else:
+                        path = os.path.join(tmp, 'row.json')
+                        with open(path, 'w') as fh:
+                            if 'text' in row:
+                                fh.write(row['text'])
+                            else:
+                                json.dump(row['manifest'], fh)
+                    try:
+                        dm.configure(path)
+                        refused = False
+                    except dm.ManifestError:
+                        refused = True
+                    finally:
+                        os.environ.pop(env, None)
+                    active = dm.active()
+                    if refused and active.gateway_pairs(base_node) != 1:
+                        keeps_previous = False
+                    pairs_ok = all(
+                        active.gateway_pairs(node) == int(want)
+                        for node, want in (row.get('expect_pairs') or {}).items())
+                    if refused != bool(row['expect_refused']) or \
+                            (not refused and not pairs_ok):
+                        all_match = False
+                        raise AssertionError(
+                            '%s: refused=%s pairs_ok=%s, want refused=%s'
+                            % (row.get('id', '?'), refused, pairs_ok,
+                               row['expect_refused']))
+        finally:
+            dm.reset()
+            if saved_env is not None:
+                os.environ[env] = saved_env
+        _assert_expected_flags(case, 'node', {
+            'all_rows_match': all_match,
+            'a_refusal_keeps_the_previous_manifest': keeps_previous,
         })
 
     def _run_transport_binds_the_recipient(self, case: Case) -> None:

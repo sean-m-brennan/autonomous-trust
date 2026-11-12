@@ -1,0 +1,58 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-update-stranger-rotation-refused
+byte_pinning: false
+description: |
+    A stranger's rotation of our group, signed with its own key, is refused.
+
+    The broadcast channel cannot attribute a frame to a peer we hold, so the
+    signature is checked against the key the envelope names for itself, and
+    any keypair signs its own frame validly. mallory knows member's group uuid
+    and sends that group at epoch 2 with a key of its own choosing. The update
+    arrives verified against mallory's own key (`self_attested`), but mallory
+    is neither a member of the group nor a peer member holds, so member keeps
+    epoch 0.
+
+participants:
+  - id: member
+    role: group_member
+  - id: other
+    role: group_member
+  - id: mallory
+    role: group_member
+
+fixtures:
+  groups:
+    member:
+      uuid: "0a000000-0000-4000-8000-000000000ac1"
+      size: 1
+      key_epoch: 0
+      members: [other]
+    mallory:
+      uuid: "0a000000-0000-4000-8000-000000000ac1"
+      size: 1
+      key_epoch: 2
+
+steps:
+  - id: 1
+    from: member
+    to: member
+    function: trigger_phase3
+    payload:
+      admit: [other]
+    description: member is in phase 3 and holds other, a member of its group.
+
+  - id: 2
+    from: mallory
+    to: member
+    function: group_key_update
+    payload:
+      self_attested: true
+    description: |
+        mallory's epoch-2 copy of member's group, verified only against the
+        key mallory's envelope names, reaches member. It is refused.
+
+expected_state:
+  member:
+    group_key_epoch: 0

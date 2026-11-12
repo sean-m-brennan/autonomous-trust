@@ -45,6 +45,33 @@
     --demo-radius: 8px;
 }
 
+/* Light theme (--theme light): the demo builds .demo-root.theme-light,
+   and these tokens override :root for everything inside it. Status and
+   accent colors are darker shades of the dark-theme hues so they hold
+   3:1 contrast on the light background. */
+.demo-root.theme-light {
+    --demo-bg:           #f8fafc;
+    --demo-surface:      #ffffff;
+    --demo-surface-2:    #f1f5f9;
+    --demo-border:       #cbd5e1;
+    --demo-border-muted: #94a3b8;
+
+    --demo-text:         #0f172a;
+    --demo-text-muted:   #475569;
+    --demo-text-dim:     #64748b;
+
+    --demo-ok:     #16a34a;
+    --demo-warn:   #b45309;
+    --demo-alert:  #b91c1c;
+    --demo-info:   #2563eb;
+}
+.demo-root.theme-light .demo-topbar {
+    background: linear-gradient(180deg, #ffffff 0%, #f1f5f9 100%);
+}
+.demo-root.theme-light .demo-event {
+    background: rgba(226, 232, 240, 0.6);
+}
+
 /* ---- Base --------------------------------------------------------- */
 body.demo-mode,
 .demo-root {

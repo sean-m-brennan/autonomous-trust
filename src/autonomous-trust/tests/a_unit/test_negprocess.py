@@ -416,10 +416,31 @@ class TestHandleRefuseDeeper:
         np.my_tasks[task.uuid].results[peer.uuid] = None
         msg = Message(CfgIds.negotiation, NegotiationProtocol.refusal,
                       task, from_whom=peer)
+        msg.verified = True     # as the network layer marks a signed nack
         main_q = queue.Queue()
         result = np.handle_refuse({CfgIds.main: main_q}, msg)
         assert result is True
         assert peer.uuid not in np.my_tasks[task.uuid].results
+
+    def test_unverified_refuse_is_ignored(self):
+        """Only a signed nack counts, or anyone could cancel a participant by
+        naming the task (RD_2.6 plan §2.8)."""
+        np = _make_neg_process()
+        peer = _make_mock_peer()
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
+        task = Task(tp, peer, size=2)
+        np.my_tasks[task.uuid] = TaskTracker(task)
+        np.my_tasks[task.uuid].results[peer.uuid] = None
+        msg = Message(CfgIds.negotiation, NegotiationProtocol.refusal,
+                      task, from_whom=peer)
+        msg.verified = False
+        result = np.handle_refuse({CfgIds.main: queue.Queue()}, msg)
+        assert result is True
+        assert peer.uuid in np.my_tasks[task.uuid].results
+
+    def test_refuse_is_registered(self):
+        np = _make_neg_process()
+        assert NegotiationProtocol.refusal in np.protocol.handlers
 
 
 class TestHandleStatReqDeeper:
@@ -439,17 +460,50 @@ class TestHandleStatReqDeeper:
         assert result is True
         np.forward_status.assert_called_once()
 
-    def test_stat_req_not_in_stack(self):
+    def _status_of(self, np, task, peer, queues):
+        """What negotiation answers a status request about `task` with."""
+        np.forward_status = MagicMock(return_value=True)
+        msg = Message(CfgIds.negotiation, NegotiationProtocol.status_req,
+                      task, from_whom=peer)
+        assert np.handle_stat_req(queues, msg) is True
+        np.forward_status.assert_called_once()
+        return np.forward_status.call_args.args[1].status
+
+    def test_stat_req_not_held_is_unknown(self):
+        """A task this node does not hold is answered unknown by negotiation
+        itself; nothing goes to main."""
         np = _make_neg_process()
         peer = _make_mock_peer()
         tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
+        main_q = queue.Queue()
+        assert self._status_of(np, task, peer, {CfgIds.main: main_q}) \
+            == Status.unknown
+        assert main_q.empty()
+
+    def test_a_task_handed_to_execution_answers_running(self):
+        """Hostile-join run, 2026-11-04: a colluder's main queue held 162
+        tasks, and a status request about a joiner's probe went to main behind
+        them, where main answered unknown. The joiner gave the probe up and
+        never scored it. A task this node has handed to execution answers
+        running, from negotiation, until its result has gone out."""
+        np = _make_neg_process()
+        peer = _make_mock_peer()
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
+        task = Task(tp, peer)
+        np._add_task(task)
+        main_q = queue.Queue()
+        queues = {CfgIds.main: main_q, CfgIds.network: queue.Queue()}
+        np._dispatch_jobs(queues)
+        assert main_q.get_nowait() is task       # sent for execution
+        assert self._status_of(np, task, peer, queues) == Status.running
+        assert main_q.empty()
+        np.forward_result(queues, TaskResult(task, 'done'))
+        np.forward_status = MagicMock(return_value=True)
         msg = Message(CfgIds.negotiation, NegotiationProtocol.status_req,
                       task, from_whom=peer)
-        main_q = queue.Queue()
-        result = np.handle_stat_req({CfgIds.main: main_q}, msg)
-        assert result is True
-        assert not main_q.empty()
+        np.handle_stat_req(queues, msg)
+        assert np.forward_status.call_args.args[1].status == Status.unknown
 
 
 class TestHandleInviteNotAcceptable:
@@ -574,6 +628,7 @@ class TestHandleRefuseDeeper2:
         np.my_tasks[task.uuid].results[peer.uuid] = None
         msg = Message(CfgIds.negotiation, NegotiationProtocol.refusal,
                       task, from_whom=peer)
+        msg.verified = True
         main_q = queue.Queue()
         result = np.handle_refuse({CfgIds.main: main_q}, msg)
         assert result is True
@@ -848,6 +903,7 @@ class TestHandleRefuseFullException:
         np.my_tasks[task.uuid].results[peer.uuid] = None
         msg = Message(CfgIds.negotiation, NegotiationProtocol.refusal,
                       task, from_whom=peer)
+        msg.verified = True
         full_q = MagicMock()
         full_q.put = MagicMock(side_effect=queue.Full)
         result = np.handle_refuse({CfgIds.main: full_q}, msg)
@@ -858,7 +914,8 @@ class TestHandleStatReqFullException:
     """Cover Full exception in handle_stat_req (lines 207-208)."""
 
     def test_stat_req_not_in_stack_full_queue(self):
-        """Full exception when forwarding status_req to main queue."""
+        """A full network queue when answering a status request: the answer
+        is dropped, and the handler still reports the message handled."""
         np = _make_neg_process()
         peer = _make_mock_peer()
         tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
@@ -867,8 +924,9 @@ class TestHandleStatReqFullException:
                       task, from_whom=peer)
         full_q = MagicMock()
         full_q.put = MagicMock(side_effect=queue.Full)
-        result = np.handle_stat_req({CfgIds.main: full_q}, msg)
+        result = np.handle_stat_req({CfgIds.network: full_q}, msg)
         assert result is True
+        full_q.put.assert_called_once()
 
 
 class TestForwardStatusFullException:
@@ -1528,6 +1586,67 @@ class TestStatusSweep:
         assert task.uuid not in np.confirmed
         assert np.status_pending == []
         assert queues[CfgIds.main].empty()               # no result, no score
+
+    # A result that arrives after the task was given up. Hostile-join run,
+    # 2026-11-04: a colluder's backlog held a joiner's probes past their
+    # deadline, the joiner gave them up, and the answers that came minutes
+    # later were dropped, so the colluder was never scored. The tracker is
+    # kept LATE_RESULT_SEC: it holds the challenge the answer is checked
+    # against.
+
+    def _given_up(self):
+        np, task, peer, queues = self._requestor()
+        np.my_tasks[task.uuid].results[peer.uuid] = None     # invited
+        for t in (10, 12, 14):
+            np.status_sweep(queues, self.at(t))
+        assert np.status_sweep(queues, self.at(16)) == 1
+        self._asked(queues)
+        return np, task, peer, queues
+
+    @staticmethod
+    def _result(np, task, peer, queues, answer='late'):
+        msg = Message(CfgIds.negotiation, NegotiationProtocol.result,
+                      TaskResult(task, answer), from_whom=peer)
+        assert np.handle_results(queues, msg) is True
+        out = []
+        while not queues[CfgIds.main].empty():
+            out.append(queues[CfgIds.main].get_nowait())
+        return out
+
+    def test_a_late_result_after_give_up_is_scored(self):
+        np, task, peer, queues = self._given_up()
+        (late,) = self._result(np, task, peer, queues)
+        assert late.score_only            # scored; the app had its give-up
+        assert late.executor_uuid == str(peer.uuid)
+        assert late.requested_at is not None     # stamped with our challenge
+        assert task.uuid not in np.my_tasks
+
+    def test_a_late_result_is_scored_once(self):
+        np, task, peer, queues = self._given_up()
+        assert len(self._result(np, task, peer, queues)) == 1
+        assert self._result(np, task, peer, queues) == []
+
+    def test_a_late_result_from_a_peer_not_invited_is_not_scored(self):
+        np, task, _peer, queues = self._given_up()
+        stranger = _make_mock_peer(nickname='stranger', address='10.0.0.9')
+        assert self._result(np, task, stranger, queues) == []
+
+    def test_a_late_result_past_retention_is_dropped(self):
+        np, task, peer, queues = self._given_up()
+        np.status_sweep(queues, self.at(16 + np.LATE_RESULT_SEC + 1))
+        assert self._result(np, task, peer, queues) == []
+
+    def test_retention_is_bounded(self):
+        np = _make_neg_process()
+        queues = {CfgIds.network: queue.Queue(), CfgIds.main: queue.Queue()}
+        for _ in range(np.LATE_RESULT_MAX + 5):
+            tp = TaskParameters('noop', when=self.T0,
+                                duration=timedelta(seconds=1),
+                                timeout=timedelta(seconds=1))
+            task = Task(tp, 'req')
+            np.my_tasks[task.uuid] = TaskTracker(task)
+            np.status_sweep(queues, self.at(3))       # nobody to ask
+        assert len(np._given_up) == np.LATE_RESULT_MAX
 
     def test_a_live_answer_extends_and_resets_the_count(self):
         np, task, peer, queues = self._requestor()

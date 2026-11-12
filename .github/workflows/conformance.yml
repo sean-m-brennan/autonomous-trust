@@ -35,11 +35,8 @@ name: Conformance Corpus
 # can call this workflow via `workflow_run` or duplicate the
 # `diff_results` invocation against the artifacts uploaded here.
 
+# Automatic triggers are disabled for now; run by hand (Actions > Run workflow).
 on:
-  push:
-    branches: [master, main, 'feature/**']
-  pull_request:
-    branches: [master, main]
   workflow_dispatch:
 
 jobs:

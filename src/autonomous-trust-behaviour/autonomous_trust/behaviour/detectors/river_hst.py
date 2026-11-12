@@ -13,8 +13,8 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Multivariate isolation score via ``river.anomaly.HalfSpaceTrees`` (SOW Task
-3.2; the AI/ML survey's primary streaming-anomaly reference runtime).
+"""Multivariate isolation score via ``river.anomaly.HalfSpaceTrees``
+(the primary streaming-anomaly reference runtime).
 
 River's Half-Space Trees is online, unsupervised, bounded-memory and
 deterministic given a seed (the tree structure is fixed at construction; only

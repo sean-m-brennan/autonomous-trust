@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "note": "Selective assignment (R+D.md §12.7; doc/architecture/selection.md). Named by $AT_SELECTION; absent, every task fans out to every capable peer and the prober keeps its deterministic choice. k is the MEAN number of peers a task goes to (Bernoulli inclusion for k > 1); null fans out. floor is the least probability any eligible peer is drawn with, after the required_tier gate.",
+  "default": {"k": null, "floor": 0.05},
+  "probe": {
+    "floor": 0.05,
+    "note": "present: a directed probe's target is drawn over every capable peer, weighted by UCB1 bonuses, instead of the prober's argmax"
+  },
+  "capabilities": {
+    "demo.query": {
+      "k": 1,
+      "floor": 0.1,
+      "note": "a routine read: one peer per task is enough, and exploration is cheap"
+    },
+    "demo.command-issue": {
+      "k": null,
+      "note": "never selected; full fan-out, so every capable peer still sees command-class work"
+    },
+    "demo.thermal-forecast": {
+      "k": 2,
+      "floor": 0.0,
+      "note": "two forecasts per task on average; a floor of 0 means a peer the weights leave out is never explored"
+    }
+  },
+  "log_records": 4096
+}

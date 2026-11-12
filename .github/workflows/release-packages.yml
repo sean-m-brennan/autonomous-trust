@@ -1,0 +1,107 @@
+name: Release Packages
+
+# Builds autonomous-trust-devel (the C library, headers, pkg-config file) and
+# one autonomous-trust-<extension>-devel per extension (its library and
+# at_<extension>.h; requires the core package at the same version) as .debs
+# and .rpms, and attaches them to the GitHub release. DTN is built with the
+# uD3TN AAP 2.0 backend.
+#
+# One set per family, built in the family's oldest supported distro: the
+# libraries' dependencies (libsodium, jansson, protobuf-c, libuuid, OpenSSL 3)
+# keep one soname across distros and glibc runs forward, so they install on
+# newer ones.
+#   deb  autonomous-trust[-<ext>]-devel_<ver>-1_amd64.deb   built on Ubuntu 22.04: Ubuntu 22.04+, Debian 12+
+#   rpm  autonomous-trust[-<ext>]-devel-<ver>-1.x86_64.rpm  built on Rocky 9: EL9+ (with EPEL), Fedora
+# scripts/package-devel.sh knows apt and dnf.
+#
+# Local equivalent, for any architecture (arm64 under QEMU):
+#   scripts/package-devel-docker.sh [--arch arm64] v0.3.0
+#
+# Triggers: publishing a release, or by hand for an existing release tag
+# (Actions -> Release Packages -> Run workflow), which re-uploads over any
+# packages already attached. A release created by another workflow using
+# GITHUB_TOKEN does not trigger `release` events; use the manual run then.
+
+# Automatic triggers are disabled for now; run by hand (Actions > Run workflow).
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and attach packages to (e.g. v0.3.0)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  package:
+    name: ${{ matrix.format }} ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      # Let the other package finish; publish still waits for both.
+      fail-fast: false
+      matrix:
+        include:
+          - { format: deb, image: 'ubuntu:22.04' }
+          - { format: rpm, image: 'rockylinux:9' }
+    steps:
+      # Without git in the container, actions/checkout falls back to a REST
+      # download with no .git, and the submodule below cannot be fetched.
+      - name: Install git
+        run: |
+          if command -v apt-get >/dev/null; then
+            apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+          else
+            dnf install -y git
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      # ryu for the core; ud3tn for the DTN extension's aap2.proto (on GitLab,
+      # which may refuse a shallow fetch of the pinned commit). ION-DTN is not
+      # needed.
+      - name: Fetch submodules
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git submodule update --init --depth 1 src/c/third_party/ryu
+          git submodule update --init --depth 1 src/c/third_party/ud3tn \
+            || git submodule update --init src/c/third_party/ud3tn
+
+      - name: Build package
+        run: scripts/package-devel.sh --deps "$TAG" dist
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: devel-${{ matrix.format }}-${{ strategy.job-index }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: devel-*
+          merge-multiple: true
+          path: dist
+
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"

@@ -19,6 +19,7 @@
  * audit and the prequential layer settle through. Until FEATURE_SPLIT_PLAN
  * Phase 3 this lived in neg_proc.c. */
 
+#include <stdlib.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
@@ -38,7 +39,7 @@
  * the single-claim checks. `loaded` is separate from "the model is empty": an
  * unconfigured $AT_PHYSICS is a legitimate empty model, and re-reading the
  * file on every result to rediscover that would be a syscall per task. */
-static at_physics_checker_t checker;
+static at_physics_checker_t *checker = NULL;
 static bool loaded = false;
 
 static at_physics_checker_t *physics_checker(void)
@@ -58,10 +59,23 @@ static at_physics_checker_t *physics_checker(void)
                       err);
             at_physics_model_parse(NULL, &model, NULL, 0);
         }
-        at_physics_checker_init(&checker, &model);
+        /* The checker is over a megabyte, nearly all of it the observation
+         * store, so it is allocated only for a model that declares something.
+         * An unconfigured node, the common case, carries none of it, and NULL
+         * reads as the layer being off (at_physics_checker_enabled). */
+        free(checker);
+        checker = NULL;
+        if (model.n_quantities > 0)
+        {
+            checker = calloc(1, sizeof(*checker));
+            if (checker == NULL)
+                log_error(NULL, "physics: no memory for the checker, layer stays OFF\n");
+            else
+                at_physics_checker_init(checker, &model);
+        }
         loaded = true;
     }
-    return &checker;
+    return checker;
 }
 
 /* After the known-answer probe and before every other arm: a probe holds the
@@ -101,6 +115,8 @@ static bool physics_score(const neg_score_input_t *in, double *score, const char
 static const char *physics_quantity(const char *capability)
 {
     const at_physics_checker_t *physics = physics_checker();
+    if (physics == NULL)
+        return NULL;
     for (int i = 0; i < physics->model.n_quantities; i++)
         if (strcmp(physics->model.quantities[i].capability, capability) == 0)
             return physics->model.quantities[i].name;

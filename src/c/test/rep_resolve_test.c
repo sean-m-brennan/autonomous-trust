@@ -55,8 +55,8 @@ static void _fill_pair(tx_history_t *hist, const uuid_t p1, const uuid_t p2,
     {
         uuid_t task;
         uuid_generate(task);
-        tx_history_update(hist, task, p1, score, NULL);
-        tx_history_update(hist, task, p2, score, NULL);
+        tx_history_update(hist, task, p1, tx_score_to_milli(score), NULL);
+        tx_history_update(hist, task, p2, tx_score_to_milli(score), NULL);
     }
 }
 
@@ -163,7 +163,7 @@ DEFINE_TEST(edited_score_is_detectable)
 
     json_t *doc = _answer_doc(&hist, peer_str);
     json_t *entry = json_array_get(json_object_get(doc, "chain"), 0);
-    json_object_set_new(entry, "p2_score", json_real(0.01));
+    json_object_set_new(entry, "p2_score_milli", json_integer(10));
     ck_assert(!_root_reproduces(doc));
     json_decref(doc);
     tx_history_free(&hist);
@@ -245,6 +245,30 @@ DEFINE_TEST(originating_a_query_tracks_it_even_with_nowhere_to_send)
 }
 END_TEST_DEFINITION()
 
+DEFINE_TEST(resolve_floor_reads_the_same_variable_as_python)
+{
+    /* RD_13.4 D5(a): C used to hard-code 1, so an operator who raised
+     * AT_REP_RESOLVE_MIN_SIGNERS got a stricter Python and an unchanged C.
+     * The parse rules are Python's int(_env_float(...)) under
+     * verify_resolved's max(1, ...): truncate, and anything below 1 is 1. */
+    unsetenv("AT_REP_RESOLVE_MIN_SIGNERS");
+    ck_assert_uint_eq(reputation_resolve_min_signers(), 1);
+    setenv("AT_REP_RESOLVE_MIN_SIGNERS", "2", 1);
+    ck_assert_uint_eq(reputation_resolve_min_signers(), 2);
+    setenv("AT_REP_RESOLVE_MIN_SIGNERS", "2.7", 1);
+    ck_assert_uint_eq(reputation_resolve_min_signers(), 2);
+    setenv("AT_REP_RESOLVE_MIN_SIGNERS", "0", 1);
+    ck_assert_uint_eq(reputation_resolve_min_signers(), 1);
+    setenv("AT_REP_RESOLVE_MIN_SIGNERS", "-3", 1);
+    ck_assert_uint_eq(reputation_resolve_min_signers(), 1);
+    setenv("AT_REP_RESOLVE_MIN_SIGNERS", "junk", 1);
+    ck_assert_uint_eq(reputation_resolve_min_signers(), 1);
+    setenv("AT_REP_RESOLVE_MIN_SIGNERS", "", 1);
+    ck_assert_uint_eq(reputation_resolve_min_signers(), 1);
+    unsetenv("AT_REP_RESOLVE_MIN_SIGNERS");
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS("rep_resolve",
           honest_answer_reproduces_its_root,
           withheld_entry_is_detectable,
@@ -252,4 +276,5 @@ RUN_TESTS("rep_resolve",
           score_over_the_attested_window_matches_the_chain,
           a_leaf_has_nowhere_to_forward,
           unanswered_peer_has_no_recorded_outcome,
-          originating_a_query_tracks_it_even_with_nowhere_to_send)
+          originating_a_query_tracks_it_even_with_nowhere_to_send,
+          resolve_floor_reads_the_same_variable_as_python)

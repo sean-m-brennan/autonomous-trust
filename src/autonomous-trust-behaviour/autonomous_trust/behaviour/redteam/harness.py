@@ -13,15 +13,15 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Deterministic resilience/threat M&S harness for the behavioural-anomaly layer
-(SOW Task 3.4). Drives the *pure* library (`BehaviorMonitor`) and a static-policy
+"""Deterministic resilience/threat M&S harness for the behavioural-anomaly layer.
+Drives the *pure* library (`BehaviorMonitor`) and a static-policy
 baseline over a synthetic peer population spanning the threat archetypes, then
 reports detection latency, exclusion correctness, and the false-exclusion rate
 projected to a realistic base rate (Axelsson) -- ML layer vs static baseline.
 
 This is library-level M&S: no node, no network, no docker (the docker-based
 `evaluation/redteam` is the separate live-mesh integration). Everything is seeded,
-so a fixed config reproduces byte-identical metrics -- the determinism the SOW
+so a fixed config reproduces byte-identical metrics -- the determinism the
 exit criteria require, and the same property that makes a score admissible
 evidence. The population is sampled with enough adversaries/benigns for
 statistical power; the *operational* rarity of attackers enters only through the
@@ -63,7 +63,7 @@ class RedTeamConfig:
     applied analytically via ``ppv_at_base_rate``)."""
     n_benign: int = 30
     n_ddil: int = 8            # benign-but-disrupted -- the false-exclusion trap
-    n_compromised: int = 8     # the M5 exit target
+    n_compromised: int = 8     # the exit target
     n_byzantine: int = 5
     n_sybil: int = 5
     n_events: int = 420
@@ -82,7 +82,7 @@ class RedTeamResult:
 
     def as_report(self) -> dict:
         return {
-            'suite': 'behaviour-anomaly resilience/threat M&S (SOW Task 3.4)',
+            'suite': 'behaviour-anomaly resilience/threat M&S',
             'population': self.population,
             'seed': self.config.seed,
             'note': ('class-conditional rates measured on a powered sample; '
@@ -99,7 +99,7 @@ class RedTeamResult:
         def row(name, ml_v, bl_v):
             return f'| {name} | {ml_v} | {bl_v} |'
         lines = [
-            '# Behavioural-Anomaly Resilience / Threat M&S (SOW Task 3.4)',
+            '# Behavioural-Anomaly Resilience / Threat M&S',
             '',
             f'Population: {self.population} peers · seed {self.config.seed} '
             '(deterministic).',

@@ -1,0 +1,48 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: commit-cert-declared-n-min-bar-met-pooled
+byte_pinning: false
+description: |
+    The positive control for commit-cert-declared-n-min-raises-the-bar: three
+    signatures besides alice's own meet the bar N_min 4 sets over five members,
+    and bob pools the entry.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: proposer
+  - id: dave
+    role: member
+  - id: erin
+    role: member
+
+fixtures:
+  roster: {}
+  local_chain:
+    bob:
+      - {roster: genesis, members: [alice, bob, carol, dave, erin]}
+      - {roster: restate, n_min: 4}
+  tx_history:
+    bob:
+      - task_id: t-1
+        p1: carol
+        p1_score: 0.9
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: tx committed
+    payload:
+      task_id: t-1
+      score: 0.8
+      cosigners: [carol, dave, erin]
+
+expected_state:
+  bob:
+    halves_held: 2
+    certified_halves: 1

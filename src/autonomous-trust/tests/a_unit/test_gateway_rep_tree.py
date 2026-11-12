@@ -168,7 +168,7 @@ class TestSubtreeRoster:
         # A placed bilateral tx for `child` in the CHILD chain.
         task = uuid4()
         rp._chain_for_group(cg_uuid).apply_placed(0, [placement_entry(
-            Transaction(task, child, 0.9, cohort_peer, 0.9))])
+            Transaction(task, child, 900, cohort_peer, 900))])
         roster = rp._subtree_roster(gw)
         child_rep = next(r for r in roster if str(r.peer_id) == str(child))
         # EMA over a single 0.9 counterparty score == 0.9, well above the
@@ -229,10 +229,14 @@ def _tuple_json(tpl):
 def _commit_from(rp, tpl):
     """A `committed` as its proposer sends it: signed, from the peer whose
     half it writes (ISSUES.md §2.16, shape 2), and certified. tpl = (task,
-    peer, score[, group]). The certificate is a stand-in `rp` accepts: routing
-    is the subject here, certificates are test_commit_certificates'."""
-    tpl = tuple(tpl) + (None,) * (5 - len(tpl)) + ({'signer': 'ab'},)
+    peer, score[, group]). The certificate and the scorer's signature over a
+    half naming a stand-in counterparty are stand-ins `rp` accepts: routing is
+    the subject here, certificates are test_commit_certificates' and signed
+    halves test_bilateral_halves'."""
+    tpl = tuple(tpl) + (None,) * (5 - len(tpl)) + (
+        {'signer': 'ab'}, str(uuid4()), 'cd')
     rp._commit_cert_ok = lambda *a, **k: True
+    rp._half_sig_ok = lambda *a, **k: True
     msg = Message(CfgIds.reputation, ReputationProtocol.committed,
                   _tuple_json(tpl), None, from_whom=rp.identity)
     msg.verified = True
@@ -245,7 +249,7 @@ class TestCommittedWireCompat:
         rp = _make_rep_process()
         peer = uuid4()
         task = uuid4()
-        rp.handle_committed(None, _commit_from(rp, (task, peer, 0.8)))
+        rp.handle_committed(None, _commit_from(rp, (task, peer, 800)))
         assert rp.history.pooled(task) is not None  # until it is placed
         assert rp.child_histories == {}
 
@@ -256,7 +260,7 @@ class TestCommittedWireCompat:
         rp.protocol.child_groups = {cg_uuid: cg}
         peer = uuid4()
         task = uuid4()
-        rp.handle_committed(None, _commit_from(rp, (task, peer, 0.8, cg_uuid)))
+        rp.handle_committed(None, _commit_from(rp, (task, peer, 800, cg_uuid)))
         # Routed to the child chain, NOT the primary one.
         assert cg_uuid in rp.child_histories
         assert rp.child_histories[cg_uuid].pooled(task) is not None
@@ -266,6 +270,6 @@ class TestCommittedWireCompat:
         rp = _make_rep_process()
         peer = uuid4()
         task = uuid4()
-        rp.handle_committed(None, _commit_from(rp, (task, peer, 0.8, str(uuid4()))))
+        rp.handle_committed(None, _commit_from(rp, (task, peer, 800, str(uuid4()))))
         assert rp.history.pooled(task) is not None
         assert rp.child_histories == {}

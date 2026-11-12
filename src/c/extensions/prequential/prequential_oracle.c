@@ -19,6 +19,7 @@
  * score (negotiation/neg_oracle.h). Until FEATURE_SPLIT_PLAN Phase 3 this lived
  * in neg_proc.c. */
 
+#include <stdlib.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
@@ -34,7 +35,7 @@
 /* The multiplier IS the accumulated record of resolved forecasts, so an
  * estimator built per result would weight every peer at exactly 1.0 forever
  * -- indistinguishable from the layer being switched off. */
-static at_prequential_estimator_t est;
+static at_prequential_estimator_t *est = NULL;
 static bool loaded = false;
 
 /* Same load policy as the other layers (mirrors Python
@@ -53,10 +54,22 @@ static at_prequential_estimator_t *prequential_estimator(void)
                             "OFF: %s\n", err);
             at_prequential_model_parse(NULL, &model, NULL, 0);
         }
-        at_prequential_estimator_init(&est, &model);
+        /* Allocated only for a model that declares something, so an
+         * unconfigured node carries none of the estimator's tables; NULL reads
+         * as the layer being off. */
+        free(est);
+        est = NULL;
+        if (model.n_capabilities > 0)
+        {
+            est = calloc(1, sizeof(*est));
+            if (est == NULL)
+                log_error(NULL, "prequential: no memory for the estimator, layer stays OFF\n");
+            else
+                at_prequential_estimator_init(est, &model);
+        }
         loaded = true;
     }
-    return &est;
+    return est;
 }
 
 /* Both halves, as an OBSERVE arm: this layer renders no verdict, so its record

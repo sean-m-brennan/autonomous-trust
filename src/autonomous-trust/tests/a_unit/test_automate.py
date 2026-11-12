@@ -174,6 +174,20 @@ class TestAutonomousAbility:
         ])
 
 
+    def test_not_testing_still_advertises_bootstrap_caps(self, setup_teardown):
+        # The other processes answer peers' caps queries from what main sends
+        # them. A plain node that never sent its bootstrap probes advertised
+        # an empty list, and no peer could ever probe it.
+        at = AutonomousTrust(multiproc=False, testing=False, silent=True,
+                             logfile=Configuration.log_stdout)
+        q1 = queue.Queue()
+        q2 = queue.Queue()
+        at.autonomous_ability({'proc1': q1, at.proc_name: q2})
+        sent = q1.get_nowait()
+        assert 'at.handshake' in sent.to_list()
+        assert q2.empty()
+
+
 class TestFailedTaskCb:
     def test_callback(self, setup_teardown):
         at = AutonomousTrust(multiproc=False, silent=True, logfile=Configuration.log_stdout)

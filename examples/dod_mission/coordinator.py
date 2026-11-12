@@ -44,7 +44,7 @@ from autonomous_trust.core import (
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
 from autonomous_trust.core.reputation.reputation import (
-    TransactionScore, SlashAttestation)
+    TransactionScore, SlashAttestation, pair_task_id)
 from autonomous_trust.services.data import Reading
 from autonomous_trust.core.config.generate import (
     generate_identity, generate_worker_config,
@@ -55,23 +55,15 @@ from autonomous_trust.inspector.transitive_trust import (
 from autonomous_trust.evaluation.scenarios.recording import EventRecorder
 from autonomous_trust.core import LOG_FORMAT, LOG_DATEFMT
 
-def _roster_name_of(peer):
-    """Bare roster name for a peer == the local-part of its ONLINE nickname.
-
-    The online nickname (e.g. ``mq800@tekfive.com``) is the only globally-
-    consistent, wire-carried name; the local petname is deliberately arbitrary
-    (a random suffix is minted on receipt -- see
-    identity.derive_local_petname) and must NOT be used to match a peer to its
-    scenario roster role. We strip the ``@domain`` to recover the deployment-set
-    AT_PEER_NAME (``mq800``) the scenario keys on.
-
-    Accepts either a raw ``Identity`` (``.nickname``) or a peer wrapper that
-    exposes ``.identity`` (the inspector's ``PeerDataAcq``), and tolerates a
-    nickname with no ``@`` (returned as-is)."""
-    ident = getattr(peer, "identity", None) or peer
-    nn = (getattr(ident, "nickname", None)
-          or getattr(peer, "nickname", None) or "")
-    return str(nn).split('@', 1)[0].strip()
+# Imported as examples.dod_mission.coordinator (tests) or run as a script, where
+# the sibling module resolves by bare name.
+try:
+    from .subscribe_policy import (
+        pending_roster_subscriptions, resub_due, roster_name_of as _roster_name_of)
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from subscribe_policy import (  # noqa: E402
+        pending_roster_subscriptions, resub_due, roster_name_of as _roster_name_of)
 
 
 def _peer_permits_neighbor(name: str, agency: str,
@@ -198,6 +190,12 @@ try:
                 os.environ.get("AT_DATA_RESUBSCRIBE_TICKS", "6")))
             self._resub_tick = 0
             self._resub_logged: set = set()
+            # Per-peer backoff for those retries: the gap doubles from
+            # _resub_period up to this cap, so a producer that never answers
+            # stops costing a request every few ticks for the whole run.
+            self._resub_cap = max(self._resub_period, int(
+                os.environ.get("AT_DATA_RESUBSCRIBE_MAX_TICKS", "96")))
+            self._resub_schedule: dict = {}
             super().__init__(configurations, subsystems, log_queue,
                              dependencies, **kwargs)
 
@@ -281,19 +279,24 @@ try:
                 # (_received_data_uuids, set in handle_data), not on whether we
                 # once sent a request — until the stream is live.
                 #
-                # Fire on the FIRST pass (tick 0 % period == 0) and then every
-                # _resub_period passes — incrementing AFTER the check. The
-                # increment used to run first, so the first attempt waited a
-                # whole period (~10s): mq800, whose advert is lost and which
-                # thus depends entirely on this path, appeared ~10s late while
-                # cap-advertised producers (rq86) showed immediately. Firing
-                # immediately closes that mq800-specific lag.
-                if (self.data_producers
-                        and self._resub_tick % self._resub_period == 0):
+                # Each peer's first attempt fires on the pass where it first
+                # turns up pending, so mq800 (whose advert is lost and which
+                # depends entirely on this path) is not held back. Later retries
+                # back off per peer (_resub_due), doubling from _resub_period to
+                # _resub_cap: an unreachable producer used to be re-requested
+                # every _resub_period passes for the whole run, which at 100
+                # peers came to ~1.4M undecryptable requests.
+                if self.data_producers:
                     for p in self._pending_roster_subscriptions(
                             self.protocol.peers.all,
                             self._received_data_uuids,
                             self.data_producers):
+                        if not self._resub_due(
+                                self._resub_schedule,
+                                str(getattr(p, "uuid", "")),
+                                self._resub_tick, self._resub_period,
+                                self._resub_cap):
+                            continue
                         msg = _DQ_Message(
                             _DQ_DataProcess.name,
                             _DQ_DataProtocol.request,
@@ -328,35 +331,10 @@ try:
                             "Unhandled message of type %s",
                             type(message).__name__)
 
-        @staticmethod
-        def _pending_roster_subscriptions(peers_all, already, data_producers):
-            """Roster peers that produce data but aren't satisfied yet.
-
-            Pure decision half of the late-joiner fallback (see
-            _patched_process): given the admitted roster, the set of peers
-            already satisfied, and the set of data-producer roster names,
-            return the peers to (re)subscribe to now. ``already`` may hold
-            Identity objects (the cap path's servicers) OR bare uuid strings
-            (the retry path's _received_data_uuids) — both reduce to a uuid
-            string. Dedups by uuid string so a peer already serviced / already
-            delivering data is skipped, and the same peer isn't returned twice
-            within one pass.
-            """
-            subscribed = {str(getattr(s, "uuid", s)) for s in already}
-            pending = []
-            for p in peers_all:
-                # Match on the ONLINE nickname's local-part, NOT the petname:
-                # the petname is local-only and arbitrary on the receiver side
-                # (random suffix), so it never equals a roster name like
-                # "mq800". See _roster_name_of / identity.derive_local_petname.
-                if _roster_name_of(p) not in data_producers:
-                    continue
-                uid = str(getattr(p, "uuid", ""))
-                if not uid or uid in subscribed:
-                    continue
-                subscribed.add(uid)
-                pending.append(p)
-            return pending
+        # Shared with GatewayRelay (subscribe_policy); kept as attributes so
+        # existing callers and tests reach them through the receiver.
+        _pending_roster_subscriptions = staticmethod(pending_roster_subscriptions)
+        _resub_due = staticmethod(resub_due)
 
         def _resolve_identity(self, ref):
             """Accept Identity, UUID, or uuid-string; return Identity
@@ -417,7 +395,7 @@ except ImportError as _exc:
 # regardless of how the script was invoked.
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
-from scenario import DoDMissionScenario  # noqa: E402
+from scenario import DoDMissionScenario, scenario_from_env  # noqa: E402
 from dashboard.dod_app import build_dashboard  # noqa: E402
 from dashboard import live_server  # noqa: E402
 from dashboard.narration_script import DOD_NARRATION  # noqa: E402
@@ -639,6 +617,11 @@ class DoDMissionCoordinator(TransitiveTrustMixin, AutonomousTrust):
 
         # Panel components — built once, fed incrementally below and
         # rendered each tick by the Dash live server.
+        # Dashboard colors come from AT_THEME (run-demo.sh --theme, forwarded
+        # by the compose/k8s generators); unset or invalid means dark.
+        from autonomous_trust.inspector.dashboard import theme
+        theme.set_theme(theme.resolve_theme(None,
+                                            os.environ.get(theme.THEME_ENV)))
         self._panels = build_dashboard(scenario)
 
         # silent=False so logger output goes to stdout (and thus docker
@@ -901,7 +884,8 @@ class DoDMissionCoordinator(TransitiveTrustMixin, AutonomousTrust):
                         peer_name, entry)
                     continue
                 try:
-                    self.submit_reading_for_validation(reading, queues)
+                    self.submit_reading_for_validation(reading, queues,
+                                                       sender_uuid=uuid_str)
                 except Exception:
                     logger.exception(
                         "Validator/chart dispatch failed for %s",
@@ -1512,7 +1496,8 @@ class DoDMissionCoordinator(TransitiveTrustMixin, AutonomousTrust):
         except queue.Full:
             pass
 
-    def submit_reading_for_validation(self, reading, queues=None) -> None:
+    def submit_reading_for_validation(self, reading, queues=None,
+                                      sender_uuid=None) -> None:
         """Push a reading through validators + charts, and accumulate
         per-batch anomaly state so we can submit a TransactionScore
         for the batch as a whole once it has settled (see
@@ -1579,9 +1564,11 @@ class DoDMissionCoordinator(TransitiveTrustMixin, AutonomousTrust):
         if batch_id is not None:
             state = self._batch_state.get(batch_id)
             if state is None:
+                # The sender's uuid is whom our half names (R+D.md §14.2).
                 state = {"submitted": False, "anomalous": False,
                          "first_tick": self._tick_count,
-                         "peer_name": reading.peer_name}
+                         "peer_name": reading.peer_name,
+                         "sender_uuid": sender_uuid}
                 self._batch_state[batch_id] = state
                 if not DoDMissionCoordinator._logged_first_batch_seen:
                     logger.info(
@@ -1722,8 +1709,19 @@ class DoDMissionCoordinator(TransitiveTrustMixin, AutonomousTrust):
             # configured transaction_weight (4×) — see
             # examples/dod_mission/trust_ladder.yaml and
             # dod-demo-implementation-plan.md §Phase 6 / scope #3.
-            ts = TransactionScore(task_id=batch_id, score=score,
-                                  capability_name="dod.sensor-report")
+            # One pair per consumer: our half names the sender, under the
+            # batch's pair id with us, which is the id the sender's half for
+            # us carries (R+D.md §14.2). A batch whose sender we never saw
+            # has nobody to name, so it is not scored.
+            sender = state.get("sender_uuid")
+            me = getattr(getattr(self, 'identity', None), 'uuid', None)
+            if sender is None or me is None:
+                state["submitted"] = True
+                continue
+            ts = TransactionScore(task_id=pair_task_id(batch_id, me),
+                                  score=score,
+                                  capability_name="dod.sensor-report",
+                                  subject_uuid=sender)
             try:
                 queues[CfgIds.reputation].put(
                     ts, block=True, timeout=queue_cadence)
@@ -1815,15 +1813,7 @@ def main():
 
     # Build the scenario from env-var knobs so the same coordinator
     # image works for a 16-peer demo and a 100-peer scale test.
-    scenario = DoDMissionScenario(
-        squad_size=int(os.environ.get("AT_SQUAD_SIZE", "4")),
-        swarm_size=int(os.environ.get("AT_SWARM_SIZE", "4")),
-        sensor_count=int(os.environ.get("AT_SENSOR_COUNT", "3")),
-        hacked_sensors=int(os.environ.get("AT_HACKED_SENSORS", "2")),
-        include_mq800=os.environ.get("AT_INCLUDE_MQ800", "1") != "0",
-        include_jet=os.environ.get("AT_INCLUDE_JET", "1") != "0",
-        include_command=os.environ.get("AT_INCLUDE_COMMAND", "1") != "0",
-    )
+    scenario = scenario_from_env()
 
     if setup_mode:
         # Signature: generate_worker_config(cfg_dir, proc_name, cfg_class, defaults).

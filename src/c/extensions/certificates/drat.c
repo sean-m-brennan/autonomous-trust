@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "certificates/drat.h"
+#include "utilities/compiler.h"   /* AT_PRINTF_FORMAT */
 
 /* One clause: a heap array of non-zero literals. `lits` is NULL for the empty
  * clause, which is legitimate and is what a refutation ends on. */
@@ -46,7 +47,7 @@ typedef struct
 } assign_t;
 
 static void _fail(char *buf, size_t len, const char *fmt, ...)
-    __attribute__((format(printf, 3, 4)));
+    __attribute__((format(AT_PRINTF_FORMAT, 3, 4)));
 
 static void _fail(char *buf, size_t len, const char *fmt, ...)
 {

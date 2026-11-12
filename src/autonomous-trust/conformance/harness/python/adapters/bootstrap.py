@@ -52,6 +52,18 @@ twins (argmax over counts, no PRNG), so these are aggregate rather than
 sequence assertions only because the two runtimes index peers differently —
 Python by uuid ordering, C by position.
 
+The join burst (RD_14.4 Phase 5) has its own fixture keys under
+``fixtures.bootstrap``: ``join_burst`` (``enabled``, ``k``, ``interval_sec``,
+``budget_factor``; built straight into the policy, so an interval of 0 lifts
+the rate limit as ``probe_interval_sec: 0`` does) and ``probe_counts``, a list
+of ``{tick, counts}`` rows standing in for reputation: each ``counts`` maps
+participant ids to the probe verdicts held, and is put on the worker's own
+queue before that (1-based) tick, as reputation's ProbeCounts is. Observed by:
+
+- ``burst_probes_issued``: probes the burst issued.
+- ``burst_peers_probed``: distinct peers the burst probed.
+- ``burst_done``: whether the burst has ended.
+
 Result scoring (R+D.md §12.7 / §12.8) is the other half of a probe and has its
 own fixture: ``fixtures.scored_results`` is a list of ``{capability, kwargs,
 result}`` rows, each fed through this runtime's requestor-side scorer, with
@@ -82,6 +94,8 @@ from autonomous_trust.core.bootstrap_capabilities import (
 from autonomous_trust.core.bootstrap_worker import BootstrapWorker
 from autonomous_trust.core.automate import score_task_result
 from autonomous_trust.core.capabilities import Capabilities
+from autonomous_trust.core._python.identity.join_policy import (
+    JoinPolicy, ProbeCounts)
 from autonomous_trust.core.negotiation import TaskResult
 from autonomous_trust.core.identity import Identity
 from autonomous_trust.core.identity.encrypt import Encryptor
@@ -138,8 +152,24 @@ class BootstrapAdapter:
 
         worker = self._build_worker(seed, pairs_target, duration_sec,
                                     peer_count, continuous, probe_interval_sec)
-        queues = {CfgIds.negotiation: queue.Queue()}
-        for _ in range(ticks):
+        burst = bs.get('join_burst')
+        if burst is not None:
+            worker.join_policy = JoinPolicy(
+                enabled=bool(burst.get('enabled', True)),
+                burst_k=int(burst.get('k', 3)),
+                burst_interval_sec=float(burst.get('interval_sec', 0.0)),
+                burst_budget_factor=int(burst.get('budget_factor', 4)))
+        # Participant id -> the uuid of the peer built for it, in order.
+        others = [p['id'] for p in participants if p is not host]
+        uuid_of = {pid: str(peer.uuid)
+                   for pid, peer in zip(others, worker.peers.all)}
+        rows = {int(r['tick']): r.get('counts') or {}
+                for r in bs.get('probe_counts') or []}
+        queues = {CfgIds.negotiation: queue.Queue(), worker.name: queue.Queue()}
+        for tick in range(1, ticks + 1):
+            if tick in rows:
+                queues[worker.name].put(ProbeCounts(
+                    {uuid_of[pid]: n for pid, n in rows[tick].items()}))
             worker._tick(queues)
 
         expected = (spec.get('expected_state') or {}).get(host['id'], {})
@@ -171,6 +201,26 @@ class BootstrapAdapter:
             assert got == want, (
                 f"{host['id']}: distinct_peers_probed={got}, expected {want} "
                 f"(counts={worker._probes_by_peer})"
+            )
+        if 'burst_probes_issued' in expected:
+            want = int(expected['burst_probes_issued'])
+            assert worker._burst_spent == want, (
+                f"{host['id']}: burst_probes_issued={worker._burst_spent}, "
+                f"expected {want} (issued={worker._burst_issued})"
+            )
+        if 'burst_peers_probed' in expected:
+            want = int(expected['burst_peers_probed'])
+            got = sum(1 for n in worker._burst_issued.values() if n >= 1)
+            assert got == want, (
+                f"{host['id']}: burst_peers_probed={got}, expected {want} "
+                f"(issued={worker._burst_issued})"
+            )
+        if 'burst_done' in expected:
+            want = bool(expected['burst_done'])
+            got = worker._burst_state == 'done'
+            assert got == want, (
+                f"{host['id']}: burst_done={got}, expected {want} "
+                f"(state={worker._burst_state})"
             )
         if 'probe_caps_fired' in expected:
             want = int(expected['probe_caps_fired'])

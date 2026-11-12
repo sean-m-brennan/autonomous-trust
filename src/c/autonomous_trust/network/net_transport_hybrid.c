@@ -36,6 +36,7 @@
 #include "network/net_transport_hybrid.h"
 #include "network/network.h"
 #include "utilities/exception.h"
+#include "utilities/socket_helpers.h"  /* at_inet_pton */
 
 #define HYBRID_INBOUND_Q_CAP 64
 
@@ -69,8 +70,8 @@ static bool addr_in_cidr4(const char *ip_str, const char *cidr)
     if (prefix < 0 || prefix > 32) return false;
 
     struct in_addr net_a, ip_a;
-    if (inet_pton(AF_INET, buf,    &net_a) != 1) return false;
-    if (inet_pton(AF_INET, ip_str, &ip_a)  != 1) return false;
+    if (at_inet_pton(AF_INET, buf,    &net_a) != 1) return false;
+    if (at_inet_pton(AF_INET, ip_str, &ip_a)  != 1) return false;
 
     uint32_t mask = (prefix == 0) ? 0 : htonl(0xffffffffu << (32 - prefix));
     return (net_a.s_addr & mask) == (ip_a.s_addr & mask);
@@ -97,8 +98,8 @@ static bool addr_in_cidr6(const char *ip_str, const char *cidr)
     if (prefix < 0 || prefix > 128) return false;
 
     struct in6_addr net_a, ip_a;
-    if (inet_pton(AF_INET6, buf,    &net_a) != 1) return false;
-    if (inet_pton(AF_INET6, ip_str, &ip_a)  != 1) return false;
+    if (at_inet_pton(AF_INET6, buf,    &net_a) != 1) return false;
+    if (at_inet_pton(AF_INET6, ip_str, &ip_a)  != 1) return false;
 
     int full_bytes = prefix / 8;
     int rem_bits   = prefix % 8;
@@ -587,6 +588,48 @@ static int hybrid_send_broadcast_except_leg(net_transport_ctx_t *ctx_opaque,
     return any_ok;
 }
 
+int hybrid_leg_address(const hybrid_config_t *cfg, size_t leg_index,
+                       char *out, size_t out_len)
+{
+    if (cfg == NULL || out == NULL || out_len == 0 || leg_index >= cfg->n_inners)
+        return -1;
+    const char *cidr = cfg->inners[leg_index].net_cfg.ip4_cidr;
+    size_t n = strcspn(cidr, "/");
+    if (n == 0 || n >= out_len)
+        return -1;
+    memcpy(out, cidr, n);
+    out[n] = '\0';
+    return 0;
+}
+
+int hybrid_envelope_address(const hybrid_config_t *cfg, const char *target,
+                            char *out, size_t out_len)
+{
+    int idx = hybrid_route(cfg, target, NULL);
+    if (idx < 0)
+        return -1;
+    return hybrid_leg_address(cfg, (size_t)idx, out, out_len);
+}
+
+static size_t hybrid_leg_count(const net_transport_ctx_t *ctx_opaque)
+{
+    return ((const hybrid_ctx_t *)ctx_opaque)->n_inners;
+}
+
+static int hybrid_leg_address_op(const net_transport_ctx_t *ctx_opaque,
+                                 size_t leg_index, char *out, size_t out_len)
+{
+    return hybrid_leg_address(((const hybrid_ctx_t *)ctx_opaque)->cfg, leg_index,
+                              out, out_len);
+}
+
+static int hybrid_address_for_target(const net_transport_ctx_t *ctx_opaque,
+                                     const char *target, char *out, size_t out_len)
+{
+    return hybrid_envelope_address(((const hybrid_ctx_t *)ctx_opaque)->cfg, target,
+                                   out, out_len);
+}
+
 const net_transport_t hybrid_net_transport = {
     .name                     = "hybrid_net",
     /* Hybrid wraps an inner socket leg (typically udp_net_4) plus a DTN
@@ -604,6 +647,9 @@ const net_transport_t hybrid_net_transport = {
     .send_on_leg              = hybrid_send_on_leg,
     .last_recv_leg            = hybrid_last_recv_leg,
     .send_broadcast_except_leg = hybrid_send_broadcast_except_leg,
+    .leg_count                = hybrid_leg_count,
+    .leg_address              = hybrid_leg_address_op,
+    .address_for_target       = hybrid_address_for_target,
 };
 
 /* ---------- JSON serialization ---------- */

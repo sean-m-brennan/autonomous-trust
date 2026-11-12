@@ -166,7 +166,10 @@ class IdentityHistory(StepDAG, VoterTracker):
         for i in range(1, len(steps)):
             if steps[i].timestamp is not None and steps[i - 1].timestamp is not None:
                 if steps[i - 1].timestamp >= steps[i].timestamp:
-                    self.logger.error('Backdating at step %s.', i)
+                    self.logger.error('Backdating at step %s of %s: %s at %s, then %s at %s.',
+                                      i, len(steps), str(steps[i - 1].uuid)[:8],
+                                      steps[i - 1].timestamp.isoformat(),
+                                      str(steps[i].uuid)[:8], steps[i].timestamp.isoformat())
                     return False
         return True
 

@@ -16,6 +16,10 @@
 
 #include "socket_helpers.h"
 
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <stdbool.h>
+
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -151,4 +155,44 @@ int at_socket_listener_opts(int sock)
 #else
     return setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 #endif
+}
+
+/* Strict dotted quad: four decimal octets, 0-255, no leading zeros. */
+static bool _ipv4_strict(const char *s, const char *end)
+{
+    int octets = 0;
+    while (s < end)
+    {
+        const char *start = s;
+        int v = 0;
+        while (s < end && isdigit((unsigned char)*s))
+            v = v * 10 + (*s++ - '0');
+        size_t len = (size_t)(s - start);
+        if (len == 0 || len > 3 || v > 255 || (len > 1 && *start == '0'))
+            return false;
+        if (++octets > 4)
+            return false;
+        if (s < end && *s++ != '.')
+            return false;
+        if (s == end && s[-1] == '.')
+            return false;
+    }
+    return octets == 4;
+}
+
+int at_inet_pton(int af, const char *src, void *dst)
+{
+    if (src == NULL)
+        return 0;
+    if (af == AF_INET && !_ipv4_strict(src, src + strlen(src)))
+        return 0;
+    if (af == AF_INET6)
+    {
+        /* An embedded IPv4 tail ("::ffff:10.0.0.1") follows the last colon */
+        const char *colon = strrchr(src, ':');
+        if (colon != NULL && strchr(colon, '.') != NULL &&
+            !_ipv4_strict(colon + 1, src + strlen(src)))
+            return 0;
+    }
+    return inet_pton(af, src, dst);
 }

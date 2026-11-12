@@ -15,7 +15,7 @@
 # ******************
 """Unit tests for the detector ensemble + sustained-anomaly state machine (B3).
 
-Demonstrates the core O3 behavior in microcosm: a compromised-but-credentialed
+Demonstrates the core behavior in microcosm: a compromised-but-credentialed
 peer that drifts from its learned behavioral envelope is eventually flagged,
 while a steady peer is not, and a single anomalous spike does NOT trip an
 exclusion (the base-rate guard). Determinism is pinned throughout.

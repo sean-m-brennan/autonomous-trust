@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Unit tests for the unauthorized-access reduction M&S (SOW Task 2.4, -90%)."""
+"""Unit tests for the unauthorized-access reduction M&S (target: -90%)."""
 from autonomous_trust.evaluation.mns.unauthorized import (
     GAPS_CLOSED_PAT, TAXONOMY, UnauthorizedConfig, run)
 
@@ -45,7 +45,7 @@ def test_closing_tracked_gaps_reaches_target():
 
 
 def test_compromised_credential_fully_blocked_by_at():
-    # The M5 exit / headline behavioural case: p_at = 0.00 (measured 1.00 TPR).
+    # The headline behavioural case: p_at = 0.00 (measured 1.00 TPR).
     r = run(UnauthorizedConfig(seed=7))
     vca = next(o for o in r.per_type if o.atype.key == 'valid_cred_abuse')
     assert vca.success_at == 0

@@ -1,0 +1,47 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: commit-cert-named-roster-signer-outside-refused
+byte_pinning: false
+description: |
+    A certificate is judged by the roster it names, signers included. alice's
+    commit names the first roster, alice, bob, carol and dave, but erin, who
+    joined later, signed in dave's place. Only carol's signature counts toward
+    that roster's two, so bob refuses the half.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+  - id: erin
+    role: member
+  - id: frank
+    role: member
+
+fixtures:
+  roster: {}
+  local_chain:
+    bob:
+      - {roster: genesis, members: [alice, bob, carol, dave]}
+      - {roster: add, member: erin}
+      - {roster: add, member: frank}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: tx committed
+    payload:
+      task_id: t-1
+      score: 0.8
+      cosigners: [carol, erin]
+      cert_roster: [alice, bob, carol, dave]
+
+expected_state:
+  bob:
+    pool_tasks: []

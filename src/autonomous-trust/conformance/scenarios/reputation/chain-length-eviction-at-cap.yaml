@@ -30,6 +30,8 @@ participants:
 - id: dave
   role: consumer
 fixtures:
+  # Real scorers, so each half carries its scorer's signature (R+D.md §14.2).
+  chain_parties: [alice, dave]
   num_updates:
     dave: 1
 steps:
@@ -1071,4 +1073,4 @@ steps:
 expected_state:
   dave:
     committed_tx_count: 200
-    window_root: 7aca925f5fa36400235008088144860dd1ad0ff5d654cfd123605c0c0dbf8afd
+    window_root: ee58e50ec3325d761923413d11e94ad9a37a2a995365ea1893b826d5a6d1f47e

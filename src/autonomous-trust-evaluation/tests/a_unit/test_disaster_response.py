@@ -309,6 +309,36 @@ class TestComposeAndK8sGeneration:
         # standalone `-m examples.multi_agency` inspector.
         assert "examples.multi_agency.coordinator" in ins
 
+    def test_every_node_shares_one_ts_decimation(self):
+        """A batch's reputation entry forms only when the sending peer and the
+        coordinator both keep it, so both read AT_TS_DECIMATION and must read
+        the same value. It is 5 rather than the code default of 30 because at
+        30 the coordinator's verdicts on the rogue sensor's batches are too
+        few to take its reputation below the exclusion line."""
+        import yaml as yaml_mod
+        from autonomous_trust.evaluation.scenarios.disaster_response_compose import (
+            ComposeOptions, generate_compose, generate_k8s_manifests,
+        )
+        doc = yaml_mod.safe_load(generate_compose(DisasterResponseScenario(),
+                                                  ComposeOptions()))
+        at_nodes = {name: svc for name, svc in doc['services'].items()
+                    if 'AT_PEER_NAME' in (svc.get('environment') or {})}
+        assert 'coordinator' in at_nodes and 'noaa-3' in at_nodes
+        for name, svc in at_nodes.items():
+            assert svc['environment'].get('AT_TS_DECIMATION') == '5', name
+
+        envs = []
+        for text in generate_k8s_manifests(DisasterResponseScenario()).values():
+            for d in yaml_mod.safe_load_all(text):
+                spec = ((d or {}).get('spec') or {}).get('template', {}).get('spec', {})
+                for c in spec.get('containers', []):
+                    env = {e['name']: e.get('value') for e in c.get('env', [])}
+                    if 'AT_PEER_NAME' in env:
+                        envs.append((env['AT_PEER_NAME'], env))
+        assert {n for n, _ in envs} >= {'coordinator', 'noaa-3', 'epa-1'}
+        for name, env in envs:
+            assert env.get('AT_TS_DECIMATION') == '5', name
+
     def test_compose_passes_inspector_security_env_through(self):
         """The dashboard port is published, so the operator needs a way to turn
         TLS and the bearer token on. Compose forwards only what it is told to,
@@ -388,6 +418,36 @@ class TestComposeAndK8sGeneration:
             assert payload["name"] == s.name
             assert len(payload["peers"]) == 10
             assert len(payload["phases"]) == 9
+
+    def test_compose_provisions_identities_and_a_manifest(self):
+        # RD_13.4 §3.3: each peer gets a deterministic AT_IDENTITY_UUID, and
+        # the manifest written beside scenario.json names exactly those uuids
+        # and passes the runtime's own validator.
+        import yaml as yaml_mod
+        from autonomous_trust.core import deployment_manifest as dm
+        from autonomous_trust.evaluation.scenarios.disaster_response_compose import (
+            ComposeOptions, generate_compose, peer_identity_uuid, write_all,
+        )
+        s = DisasterResponseScenario()
+        with tempfile.TemporaryDirectory() as d:
+            write_all(s, d)
+            m = dm.load_manifest(
+                os.path.join(d, "scenario", "deployment_manifest.json"))
+        members = set(next(iter(m.cohorts.values())).members)
+        assert members == {str(peer_identity_uuid(s, n)) for n in s.peers}
+        assert not m.gateways
+        doc = yaml_mod.safe_load(generate_compose(s, ComposeOptions()))
+        for name in s.peers:
+            env = doc["services"][name]["environment"]
+            assert env["AT_IDENTITY_UUID"] == str(peer_identity_uuid(s, name))
+            assert env["AT_DEPLOYMENT_MANIFEST"] == \
+                "/app/scenario/deployment_manifest.json"
+        # Regenerating gives the same uuids.
+        assert peer_identity_uuid(s, "noaa-1") == peer_identity_uuid(s, "noaa-1")
+        off = yaml_mod.safe_load(generate_compose(
+            s, ComposeOptions(provision_identities=False)))
+        assert all("AT_IDENTITY_UUID" not in svc.get("environment", {})
+                   for svc in off["services"].values())
 
 
 # ---------------------------------------------------------------------------

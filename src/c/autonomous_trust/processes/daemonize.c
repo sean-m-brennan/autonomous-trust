@@ -146,8 +146,11 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
 #endif
     close(io[1]);
 
+    /* Owner-only, not the textbook umask(0): the daemon writes its identity
+     * seeds and opens its subsystem sockets in the data directory, and every
+     * subsystem runs as the same user. */
     if (!(flags & NO_UMASK))
-        umask(0); // clear
+        umask(S_IRWXG | S_IRWXO);
 
     if (!(flags & NO_CHDIR))
     {

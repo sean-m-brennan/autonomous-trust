@@ -65,6 +65,24 @@ typedef int (*capability_result_function_t)(const char *kwargs_json,
                                             char *result_out,
                                             size_t result_len);
 
+/** @brief A capability's step contract, for one written to be replayed
+ *  (RD_12.6_LIVE_REPLICATION_PLAN.md, the user's D2).
+ *
+ *  @c init writes the first state for the task's arguments, @c step the
+ *  state after @p state at step @p i (returning 1), or returns 0 once the
+ *  computation is done; either returns < 0 on failure. A state is its own
+ *  canonical text. @c result writes the task's answer from the final state,
+ *  or may be NULL for the final state itself. The executor runs the steps,
+ *  commits to the hash chain of the states (negotiation/neg_replay.h) and
+ *  keeps them, so that a replica's disagreement can be settled by asking it
+ *  about one step. Mirrors Python's `Replayable`. */
+typedef struct
+{
+    int (*init)(const char *kwargs_json, char *state_out, size_t state_len);
+    int (*step)(const char *state, int i, char *next_out, size_t next_len);
+    int (*result)(const char *final_state, char *result_out, size_t result_len);
+} capability_replay_t;
+
 typedef struct
 {
     smrt_ptr_t;
@@ -86,6 +104,10 @@ typedef struct
      * See doc/architecture/trust-tiers.md §4. */
     int required_tier;
     int transaction_weight;
+    /** The step contract of a replayable capability, or NULL. Run instead of
+     *  @c result_function when set. Not exported over the wire, like the
+     *  function pointers. APPENDED: capability_t is opaque to the CFFI cdef. */
+    const capability_replay_t *replay;
 } capability_t;
 
 typedef map_t peer_capabilities_matrix_t;   // map of UUID string to array of capabilities
@@ -160,6 +182,13 @@ int capability_execute_result(const capability_t *cap, const char *kwargs_json,
  */
 int capability_table_append(const char *name, capability_function_t fn,
                             capability_result_function_t res_fn);
+
+/**
+ * @brief Give the capability @p name in the table a step contract (static
+ *        storage), making it replayable (RD_12.6_LIVE_REPLICATION_PLAN.md).
+ *        @return 0, or -1 when no such capability is in the table.
+ */
+int capability_table_set_replay(const char *name, const capability_replay_t *replay);
 
 /** Register a capability at load time (what @ref capability_table_append
  *  does for an extension). */

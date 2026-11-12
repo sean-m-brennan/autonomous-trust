@@ -267,10 +267,14 @@ dod-mission options:
                          (compose: ./recording/FILE beside the compose file;
                          k8s: on the node). Play back with
                          'python -m examples.dod_mission --playback FILE'.
+  --theme dark|light     Dashboard colors (default dark). Exported as
+                         AT_THEME, which the playback dashboards and the
+                         compose/k8s coordinators read.
 
 Environment overrides: VARIANT, NAMESPACE, INSPECTOR_PORT, DEPLOY_DIR,
                        REGISTRY, IMAGE_TAG, LOG_LEVEL, TILT_LOG,
                        AT_RECORD, AT_RECORD_HOST_DIR, AT_RECORD_NODE_PATH,
+                       AT_THEME,
                        AT_KEEP_SUPERSEDED (=1 keeps the image generation a
                        rebuild replaces, instead of reclaiming it)
 EOF
@@ -300,6 +304,8 @@ while [[ $# -gt 0 ]]; do
         --record)                BACKEND_MODE="record";   RECORD_FILE="$2";   shift 2;;
         --record-to=*)           RECORD_TO="${1#*=}";        shift;;
         --record-to)             RECORD_TO="$2";             shift 2;;
+        --theme=*)               THEME="${1#*=}";            shift;;
+        --theme)                 THEME="$2";                 shift 2;;
         --namespace=*)           NAMESPACE="${1#*=}";        shift;;
         --namespace)             NAMESPACE="$2";             shift 2;;
         --port=*)                INSPECTOR_PORT="${1#*=}"; PORT_EXPLICIT=1; shift;;
@@ -339,6 +345,13 @@ while [[ $# -gt 0 ]]; do
         *)  POSITIONAL_ARGS+=("$1"); shift;;
     esac
 done
+
+if [[ -n "${THEME:-}" ]]; then
+    case "$THEME" in
+        dark|light) export AT_THEME="$THEME";;
+        *) err "--theme must be dark or light (got: $THEME)"; exit 1;;
+    esac
+fi
 
 # python/c take an optional positional NUM_NODES.
 if (( ${#POSITIONAL_ARGS[@]} > 0 )); then
@@ -971,7 +984,13 @@ PY
                     [[ "${AT_PRESEED_FORCE:-0}" == "1" ]] && seed_force="--force"
                     # On --reseed, clear root-owned container state first (see
                     # reseed_wipe_state) so the fresh seed isn't shadowed by it.
-                    [[ -n "$seed_force" ]] && reseed_wipe_state "$here/.demo-state/dod-mission"
+                    # Otherwise take that state back, since the seeder rewrites
+                    # every peer's group.cfg.json (see reclaim-demo-state.sh).
+                    if [[ -n "$seed_force" ]]; then
+                        reseed_wipe_state "$here/.demo-state/dod-mission"
+                    else
+                        "$here/scripts/reclaim-demo-state.sh" "$here/.demo-state/dod-mission"
+                    fi
                     # Seed C-format identities for the C microdrones so the SPEC
                     # matches generate_compose.py exactly (a peer running the C
                     # node must be seeded C, and vice-versa). No spaces in SPEC.
@@ -1021,7 +1040,19 @@ PY
                     [[ "${AT_PRESEED_FORCE:-0}" == "1" ]] && seed_force="--force"
                     # On --reseed, clear root-owned container state first (see
                     # reseed_wipe_state) so the fresh seed isn't shadowed by it.
-                    [[ -n "$seed_force" ]] && reseed_wipe_state "$here/.demo-state/dod-mission"
+                    # Otherwise take that state back, since the seeder rewrites
+                    # every peer's group.cfg.json (see reclaim-demo-state.sh).
+                    if [[ -n "$seed_force" ]]; then
+                        reseed_wipe_state "$here/.demo-state/dod-mission"
+                    else
+                        "$here/scripts/reclaim-demo-state.sh" "$here/.demo-state/dod-mission"
+                    fi
+                    # generate_k8s.py has no hierarchical mode, and the seeder
+                    # reads AT_COHORT_SIZE: a hierarchical seed under flat pods
+                    # gives every gateway a transport it has no config for.
+                    if [[ -n "${AT_COHORT_SIZE:-}" && "${AT_COHORT_SIZE}" != "0" ]]; then
+                        err "AT_COHORT_SIZE (cohort hierarchy) is supported by the compose path only"; exit 1
+                    fi
                     # Seed C-format identities for the C microdrones so the SPEC
                     # matches generate_k8s.py exactly (C Pod <-> C identity).
                     seed_c_arg=""

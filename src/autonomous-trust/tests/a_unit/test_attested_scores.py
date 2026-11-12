@@ -201,7 +201,7 @@ class TestChain:
     def test_a_pairing_commit_cannot_fill_its_other_half(self, trio):
         v, s, _ = trio
         h, att = self._history_with_attested(v, s)
-        h.update(att.task_id, s.uuid, 1.0)
+        h.update(att.task_id, s.uuid, 1000)
         assert h[att.task_id].p2_id is None
 
     def test_catch_up_refuses_an_uncertified_attested_entry(self, trio):
@@ -237,7 +237,7 @@ class TestChain:
         new.attest_sigs = {str(v.uuid): _sig(v, other), str(o.uuid): _sig(o, other)}
         assert not rp._chain_certified([new], msg)     # new: today's quorum
         changed = copy.copy(same)
-        changed.p1_score = 0.8
+        changed.p1_score_milli = 800
         assert not rp._chain_certified([changed], msg)
 
     def test_a_fork_cannot_take_a_certified_entry_away(self, trio):
@@ -254,7 +254,7 @@ class TestChain:
         # A peer's certified chain that forks at index 0 and never saw it.
         peer = TransactionHistory()
         peer.apply_placed(0, [placement_entry(Transaction(
-            uuid4(), v.uuid, 0.9, s.uuid, 0.9)) for _ in range(2)])
+            uuid4(), v.uuid, 900, s.uuid, 900)) for _ in range(2)])
         res = rp.history.reconcile(list(peer), certified={0, 1})
         assert res.status == 'adopted'
         assert att.task_id not in rp.history._task_mapping
@@ -265,8 +265,8 @@ class TestChain:
         v, s, _ = trio
         h = TransactionHistory()
         t = uuid4()
-        h.update(t, v.uuid, 0.9)
-        h.update(t, s.uuid, 0.9)
+        h.update(t, v.uuid, 900)
+        h.update(t, s.uuid, 900)
         before_s = consensus_score_from_window(s.uuid, list(h), 20)
         before_v = consensus_score_from_window(v.uuid, list(h), 20)
         att = _att(v, s)
@@ -287,17 +287,17 @@ class TestChain:
         h = TransactionHistory()
         for bad in (
                 Transaction(attest_task_id(v.uuid, s.uuid, DIGEST), p1_id=v.uuid,
-                            p1_score=0.3, p1_channel='first_person',
+                            p1_score_milli=300, p1_channel='first_person',
                             attested=True, subject_id=s.uuid,
                             evidence_digest=DIGEST),
-                Transaction(uuid4(), p1_id=v.uuid, p1_score=0.3,
+                Transaction(uuid4(), p1_id=v.uuid, p1_score_milli=300,
                             p1_channel='probe', attested=True,
                             subject_id=s.uuid, evidence_digest=DIGEST),
                 Transaction(attest_task_id(v.uuid, v.uuid, DIGEST), p1_id=v.uuid,
-                            p1_score=0.3, p1_channel='probe', attested=True,
+                            p1_score_milli=300, p1_channel='probe', attested=True,
                             subject_id=v.uuid, evidence_digest=DIGEST),
                 Transaction(attest_task_id(v.uuid, s.uuid, 'zz'), p1_id=v.uuid,
-                            p1_score=0.3, p1_channel='probe', attested=True,
+                            p1_score_milli=300, p1_channel='probe', attested=True,
                             subject_id=s.uuid, evidence_digest='zz')):
             assert not h.append_attested(bad)
         assert len(h) == 0
@@ -401,8 +401,8 @@ class TestArchive:
         v, s, o = trio
         rp, _ = _node(o, [v, s])
         t = uuid4()
-        rp.history.update(t, v.uuid, 0.9)
-        rp.history.update(t, s.uuid, 0.9)
+        rp.history.update(t, v.uuid, 900)
+        rp.history.update(t, s.uuid, 900)
         att = _att(v, s)
         assert rp.history.append_attested(
             att.to_transaction(), {str(v.uuid): _sig(v, att), str(o.uuid): _sig(o, att)})
@@ -424,7 +424,7 @@ class TestArchive:
 
     def test_a_tampered_score_does_not_verify(self, trio, tmp_path, monkeypatch):
         rec, _, _, _ = self._archived(trio, tmp_path, monkeypatch)
-        rec['entry']['p1_score'] = 0.9
+        rec['entry']['p1_score_milli'] = 900
         ok, why = verify_attested_record(rec)
         assert not ok
         assert 'entry not in the checkpoint window' in why
@@ -453,7 +453,7 @@ class TestArchive:
         with open(path) as f:
             rec = json.load(f)
         assert verify_attested_record(rec) == (True, [])
-        rec['entry']['p1_score'] = 0.9
+        rec['entry']['p1_score_milli'] = 900
         assert not verify_attested_record(rec)[0]
 
     def test_nothing_is_written_while_our_window_is_off_the_signed_root(
@@ -525,8 +525,8 @@ class TestArchive:
         rp.history.max_chain_len = 2
         for _ in range(3):
             t = uuid4()
-            rp.history.update(t, uuid4(), 0.9)
-            rp.history.update(t, uuid4(), 0.9)
+            rp.history.update(t, uuid4(), 900)
+            rp.history.update(t, uuid4(), 900)
         assert att.task_id not in rp.history._task_mapping
         assert verify_attested_record(json.loads(path.read_text()))[0]
 
@@ -585,8 +585,8 @@ class TestAnchor:
         x = _ident('forger', 9)
         rp, _ = _node(x, [])
         t = uuid4()
-        rp.history.update(t, x.uuid, 0.9)
-        rp.history.update(t, subject.uuid, 0.9)
+        rp.history.update(t, x.uuid, 900)
+        rp.history.update(t, subject.uuid, 900)
         att = AttestedScore(verifier_uuid=str(x.uuid),
                             subject_uuid=str(subject.uuid), score=0.8,
                             evidence_digest=DIGEST)

@@ -29,6 +29,7 @@ placement decides where it goes in the chain.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import queue
 import tempfile
@@ -42,7 +43,7 @@ from autonomous_trust.core.config import Configuration, to_json_string
 from autonomous_trust.core.reputation.reputation import (
     RESOLVE_TTL_DEFAULT, PeerReputation, resolve_query_to_dict,
     resolved_to_dict, Transaction, attest_task_id, AttestedScore,
-    SignedAttestation, commit_designation)
+    SignedAttestation, commit_designation, half_designation)
 from autonomous_trust.core._python.identity.identity import (
     public_identity_to_canonical)
 from autonomous_trust.core.identity import Group, Identity, Peers
@@ -55,10 +56,12 @@ from autonomous_trust.core.reputation.protocol import ReputationProtocol
 from autonomous_trust.core.reputation.reputation import (
     TransactionScore, SlashAttestation, SignedSlash,
     Checkpoint, SignedCheckpoint, evidence_to_dict, place_designation,
-    place_value_digest, placement_entry)
+    place_value_digest, placement_entry, score_to_milli)
 from autonomous_trust.core.reputation.placement import entry_to_dict
 from autonomous_trust.core.reputation.reputation import TransactionHistory
 from autonomous_trust.core.system import CfgIds, PackageHash
+from autonomous_trust.core._python.identity.join_policy import (
+    INERT as INERT_JOIN_POLICY, parse_join_policy)
 from autonomous_trust.core._python.identity.peer_standing import (
     PeerStanding, STANDING_CAPPED)
 
@@ -72,6 +75,9 @@ from ..scenario_engine import (
 
 
 _NS = UUID('00000000-0000-0000-0000-000000000aaa')
+# The anchored cohort's uuid when a case stages one (RD_14.4 Phase 6), the
+# same in both adapters; a scenario names it as `cohort`.
+_COHORT_UUID = uuid5(_NS, 'group:anchored-cohort')
 
 
 class _CapturingQueue:
@@ -161,6 +167,35 @@ class _Participant:
                 if actual != want:
                     raise AssertionError(f'{self.id}: {key} differ '
                                          f'({len(actual)} held)')
+            elif key == 'catchup_told':
+                # [index, ...], order-free: the primary-chain entries marked
+                # told by catch-up under the join policy (RD_14.4 plan,
+                # D2 (b)). C mirrors via reputation_catchup_marks.
+                actual = sorted(self.process._catchup_marks.get('', set()))
+                if actual != sorted(int(i) for i in expected or []):
+                    raise AssertionError(f'{self.id}: catchup_told={actual}, '
+                                         f'expected {sorted(expected or [])}')
+            elif key == 'equivocations':
+                # {count, index, both: [pid, ...]}: how many equivocation
+                # records the primary chain holds, and the newest one's fork
+                # index and the members who signed both values (R+D.md §14.1).
+                # Mirrors the C adapter.
+                held = self.process._fork_records('')
+                newest = held[-1] if held else {}
+                uuid_of = {str(p.identity.uuid).lower(): pid
+                           for pid, p in participants.items()}
+                actual = {'count': len(held)}
+                if 'index' in expected:
+                    actual['index'] = newest.get('index')
+                if 'both' in expected:
+                    actual['both'] = sorted(uuid_of.get(u, u)
+                                            for u in newest.get('both', ()))
+                want = dict(expected)
+                if 'both' in want:
+                    want['both'] = sorted(want['both'])
+                if actual != want:
+                    raise AssertionError(f'{self.id}: equivocations={actual}, '
+                                         f'expected {want}')
             elif key == 'place_promised':
                 # {n, by: <pid>}, or null for no promise.
                 have = self.process._place_state('')['promised']
@@ -172,6 +207,13 @@ class _Participant:
                 if not ok:
                     raise AssertionError(f'{self.id}: place_promised={have!r}, '
                                          f'expected {expected!r}')
+            elif key == 'retained_count':
+                # Own entries held past the primary window.
+                actual = len(self.process.history.retained())
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: retained_count={actual}, '
+                        f'expected {expected}')
             elif key == 'committed_tx_count':
                 # Count of transactions resident in the hash-linked chain
                 # (== len(history) here). The C twin reads tx_history rather
@@ -184,12 +226,20 @@ class _Participant:
                         f'{self.id}: committed_tx_count={actual}, '
                         f'expected {expected}'
                     )
-            elif key in ('halves_held', 'certified_halves'):
+            elif key in ('halves_held', 'certified_halves', 'signed_halves',
+                         'cohort_halves_held'):
                 # Ordinary halves held (in the chain or waiting in the pool),
-                # and how many carry a commit certificate
-                # (doc/architecture/reputation.md, "Commit certificates").
-                held = certified = 0
+                # how many carry a commit certificate
+                # (doc/architecture/reputation.md, "Commit certificates"), and
+                # how many carry their scorer's own signature (R+D.md §14.2).
+                # cohort_halves_held counts the anchored cohort's chain
+                # instead (RD_14.4 Phase 6); 0 when none is held.
+                held = certified = signed = 0
                 hist = self.process.history
+                if key == 'cohort_halves_held':
+                    ck = self.process._cohort_key()
+                    hist = (self.process._chain_for_group(ck) if ck
+                            else TransactionHistory())
                 for tx in (list(hist._task_mapping.values())
                            + list(hist._pool.values())):
                     if tx.attested:
@@ -199,7 +249,10 @@ class _Participant:
                             continue
                         held += 1
                         certified += tx.certificate_of(scorer) is not None
-                actual = held if key == 'halves_held' else certified
+                        signed += tx.half_sig_of(scorer) is not None
+                actual = {'halves_held': held, 'certified_halves': certified,
+                          'signed_halves': signed,
+                          'cohort_halves_held': held}[key]
                 if actual != expected:
                     raise AssertionError(
                         f'{self.id}: {key}={actual}, expected {expected}')
@@ -256,10 +309,13 @@ class _Participant:
                         checkpoint=ckpt,
                         sigs=dict(getattr(self.process,
                                           '_checkpoint_sigs_final', {})))
-                doc = evidence_to_dict(self.process.history, signed)
+                doc = evidence_to_dict(self.process.history, signed,
+                                       forks=self.process._fork_records(''))
                 actual = {
                     'schema': doc['schema'],
                     'chain_len': len(doc['chain']),
+                    # Equivocation records the document carries (R+D.md §14.1).
+                    'forks': len(doc.get('forks') or ()),
                     'checkpoint_root': ((doc['checkpoint'] or {}).get('root')
                                         or ''),
                 }
@@ -426,6 +482,31 @@ class _Participant:
                             f'{self.id}.reputation_of[{other_pid}]={got:.4f}, '
                             f'expected {float(want):.4f}'
                         )
+            elif key in ('brought_of', 'bounded_of'):
+                # { "<other_pid>": float | null }: the brought score (null:
+                # none held) or what a decision reads (RD_14.4 Phase 4).
+                # Mirrors the C adapter.
+                for other_pid, want in expected.items():
+                    other = participants.get(other_pid)
+                    if other is None:
+                        raise AssertionError(
+                            f'{self.id}.{key}: unknown participant {other_pid!r}')
+                    other_uuid = other.identity.uuid
+                    if key == 'brought_of':
+                        got = self.process.reputations.brought.get(str(other_uuid))
+                    else:
+                        told = (self.process.reputations[other_uuid]
+                                if other_uuid in self.process.reputations else None)
+                        got = self.process._bounded(other_uuid, told)
+                    if want is None or got is None:
+                        if want is not got:
+                            raise AssertionError(
+                                f'{self.id}.{key}[{other_pid}]={got!r}, '
+                                f'expected {want!r}')
+                    elif abs(got - float(want)) > 1e-3:
+                        raise AssertionError(
+                            f'{self.id}.{key}[{other_pid}]={got:.4f}, '
+                            f'expected {float(want):.4f}')
             elif key == 'unrated':
                 # `expected` is [ "<pid>", ... ] -- participants this one
                 # holds NO stored score for (the negation reputation_of cannot
@@ -452,14 +533,47 @@ class _Participant:
                 raise AssertionError(f'{self.id}: unsupported expected_state key {key!r}')
 
 
-def _chain_half(entry: dict, half: int, task: str, uuid_of) -> UUID:
-    """The uuid of one half of a `local_chain` / `latest update` chain entry:
-    the participant named by its `p1_id` / `p2_id` when there is one (so a
-    scenario can make an entry this node's OWN half, Agora Phase 4 DDIL), else
-    the synthetic ``chainp1:<task>`` / ``chainp2:<task>`` derivation. Both
-    builders go through here so the chains hash-match up to the fork. Mirrors
-    the C adapter's _chain_half_uuid."""
+
+def _milli(score):
+    """A scenario's score (0.0..1.0, as an application gives one) as the
+    integer thousandths the wire and the chain carry. A value off the scale is
+    passed through still off it (thousandths when finite, else as it came;
+    the C adapter sends INT_MIN for the latter), so a scenario that sends 7.5
+    or NaN still reaches the gate that refuses it.
+    Mirrors the C adapter's _milli."""
+    try:
+        return score_to_milli(score)
+    except ValueError:
+        try:
+            value = float(score)
+        except (TypeError, ValueError):
+            return score
+        if not math.isfinite(value) or abs(value) > 1e6:
+            return value
+        # C's lround: half away from zero.
+        return int(math.copysign(math.floor(abs(value) * 1000 + 0.5), value))
+
+
+def _chain_half_pid(entry: dict, half: int, parties=None):
+    """The participant id of one half of a chain entry: its `p1_id` / `p2_id`,
+    else the scenario's `chain_parties` fixture ([p1, p2]), else None."""
     pid = entry.get('p1_id' if half == 1 else 'p2_id')
+    if pid is None and parties:
+        pid = parties[half - 1]
+    return pid
+
+
+def _chain_half(entry: dict, half: int, task: str, uuid_of,
+                parties=None) -> UUID:
+    """The uuid of one half of a `local_chain` / `latest update` chain entry:
+    the participant named by its `p1_id` / `p2_id`, or by the scenario's
+    `chain_parties` fixture, when there is one (so a scenario can make an
+    entry this node's OWN half, Agora Phase 4 DDIL, and so a half can be
+    signed by its scorer, R+D.md §14.2), else the synthetic ``chainp1:<task>``
+    / ``chainp2:<task>`` derivation, which nobody can sign. Both builders go
+    through here so the chains hash-match up to the fork. Mirrors the C
+    adapter's _chain_half_uuid."""
+    pid = _chain_half_pid(entry, half, parties)
     if pid is not None:
         u = uuid_of(pid)
         if u is not None:
@@ -471,8 +585,9 @@ def _write_roster(hist, entry, member, sign) -> None:
     """A roster entry of a chain spec, placed alone at the chain's next index
     (doc/architecture/reputation.md, "Who is in the group"): {roster: genesis,
     members: [ids]} or {roster: add, member: id}, its placement certificate
-    signed by `placed_by: [ids]`. `member(id)` returns [uuid, key]. Mirrors the
-    C adapter's _write_roster."""
+    signed by `placed_by: [ids]`. `n_min: N` declares an N_min (RD_13.2 plan
+    §0.4). `member(id)` returns [uuid, key]. Mirrors the C adapter's
+    _write_roster."""
     from autonomous_trust.core.reputation.reputation import (roster_digest,
                                                              roster_task_id)
     op, who = entry['roster'], None
@@ -486,9 +601,10 @@ def _write_roster(hist, entry, member, sign) -> None:
             m = member(entry['member'])
             members, who = members + [m], m[0]
     d = roster_digest(members)
-    tx = Transaction(roster_task_id(prev, op, who, d), roster_op=op,
+    n_min = entry.get('n_min') or None
+    tx = Transaction(roster_task_id(prev, op, who, d, n_min), roster_op=op,
                      roster_uuid=None if who is None else UUID(who),
-                     roster_digest=d, roster_members=members)
+                     roster_digest=d, roster_members=members, roster_n_min=n_min)
     k = hist.next_index
     by = entry.get('placed_by')
     sigs = (sign(by, place_designation(k, hist.head_hash,
@@ -497,7 +613,7 @@ def _write_roster(hist, entry, member, sign) -> None:
     hist.apply_placed(k, [tx], sigs)
 
 
-def _write_chain(hist, spec, uuid_of, sign, member=None) -> None:
+def _write_chain(hist, spec, uuid_of, sign, member=None, parties=None) -> None:
     """Write a `local_chain` / `latest update` chain spec into `hist` through
     the production writers. An entry without `batch` is written the legacy way
     (two update() halves). Consecutive entries sharing a `batch` are written as
@@ -505,7 +621,13 @@ def _write_chain(hist, spec, uuid_of, sign, member=None) -> None:
     last entry may name `placed_by: [ids]`, who sign its placement certificate
     (doc/architecture/reputation.md, "Agreeing on an order"). `certified_by:
     [ids]` certifies both halves of an entry. `sign(ids, designation)` returns
-    {uuid str: signature hex}. Mirrors the C adapter's _write_chain."""
+    {uuid str: signature hex}.
+
+    Each half of an entry between two participants is signed by its scorer
+    over `half_designation` (R+D.md §14.2) unless the entry says `unsigned:
+    true`; `half_forged_by: id` signs both halves with that participant's key
+    instead. `parties` is the `chain_parties` fixture. Mirrors the C adapter's
+    _write_chain."""
     i = 0
     while i < len(spec):
         entry = spec[i]
@@ -515,10 +637,10 @@ def _write_chain(hist, spec, uuid_of, sign, member=None) -> None:
             continue
         if entry.get('batch') is None:
             tk = uuid5(_NS, f"chain:{entry['task']}")
-            hist.update(tk, _chain_half(entry, 1, entry['task'], uuid_of),
-                        float(entry['p1']))
-            hist.update(tk, _chain_half(entry, 2, entry['task'], uuid_of),
-                        float(entry['p2']))
+            hist.update(tk, _chain_half(entry, 1, entry['task'], uuid_of, parties),
+                        _milli(entry['p1']))
+            hist.update(tk, _chain_half(entry, 2, entry['task'], uuid_of, parties),
+                        _milli(entry['p2']))
             i += 1
             continue
         group = []
@@ -527,8 +649,10 @@ def _write_chain(hist, spec, uuid_of, sign, member=None) -> None:
             i += 1
         entries = [placement_entry(Transaction(
             uuid5(_NS, f"chain:{e['task']}"),
-            p1_id=_chain_half(e, 1, e['task'], uuid_of), p1_score=float(e['p1']),
-            p2_id=_chain_half(e, 2, e['task'], uuid_of), p2_score=float(e['p2'])))
+            p1_id=_chain_half(e, 1, e['task'], uuid_of, parties),
+            p1_score_milli=_milli(e['p1']),
+            p2_id=_chain_half(e, 2, e['task'], uuid_of, parties),
+            p2_score_milli=_milli(e['p2'])))
             for e in group]
         k = hist.next_index
         by = group[-1].get('placed_by')
@@ -543,9 +667,28 @@ def _write_chain(hist, spec, uuid_of, sign, member=None) -> None:
         tx = hist._task_mapping.get(uuid5(_NS, f"chain:{entry['task']}"))
         if tx is None:
             continue
-        for scorer, score in ((tx.p1_id, tx.p1_score), (tx.p2_id, tx.p2_score)):
+        for scorer, score in ((tx.p1_id, tx.p1_score_milli),
+                              (tx.p2_id, tx.p2_score_milli)):
             tx.attach_certificate(scorer, sign(
                 by, commit_designation(scorer, tx.task_id, score)))
+    for entry in spec:
+        if 'task' not in entry or entry.get('unsigned'):
+            continue
+        tx = hist._task_mapping.get(uuid5(_NS, f"chain:{entry['task']}"))
+        pids = [_chain_half_pid(entry, h, parties) for h in (1, 2)]
+        if tx is None or None in pids:
+            continue
+        pid_of = {str(uuid_of(p)): p for p in pids if uuid_of(p) is not None}
+        for scorer, other, score in ((tx.p1_id, tx.p2_id, tx.p1_score_milli),
+                                     (tx.p2_id, tx.p1_id, tx.p2_score_milli)):
+            pid = pid_of.get(str(scorer))
+            if pid is None or other is None:
+                continue
+            signer = entry.get('half_forged_by') or pid
+            got = sign([signer], half_designation(tx.task_id, scorer, other,
+                                                  score))
+            if got:
+                tx.attach_half_sig(scorer, next(iter(got.values())))
 
 
 def _to_captured(msg: Any, emitter_id: str) -> CapturedMessage:
@@ -622,6 +765,10 @@ class ReputationAdapter:
     def _build_participants(self, case: Case) -> dict[str, ParticipantHandle]:
         spec_participants = case.data['participants']
         fixtures = case.data.get('fixtures', {}) or {}
+        # The two participants a chain entry is between when it names none
+        # ([p1, p2]), so its halves can be signed by their scorers (R+D.md
+        # §14.2). Absent keeps the synthetic, unsignable halves.
+        self._chain_parties = fixtures.get('chain_parties') or None
         # Preset state for handlers that gate on history length -- see
         # scenario YAML keys for documentation.
         preset_history_len: dict[str, int] = fixtures.get('history_len', {}) or {}
@@ -689,6 +836,15 @@ class ReputationAdapter:
         # Scenario-level rather than per-participant, because the C twin's
         # knob is an environment variable and the whole cohort shares it.
         preset_slash_enabled: bool = bool(fixtures.get('slash_enabled', False))
+        # n_min: {pid: N} -- the N_min a participant is configured for
+        # (AT_REP_N_MIN; RD_13.2 plan §0.4). Mirrors the C adapter, which sets
+        # the variable for the participant a step is delivered to.
+        preset_n_min: dict = fixtures.get('n_min', {}) or {}
+        # resolve_min_signers: {pid: N} -- the floor of verified, trusted
+        # co-signers a participant demands of a rep_resolved answer
+        # (AT_REP_RESOLVE_MIN_SIGNERS; RD_13.4 D5). Mirrors the C adapter,
+        # which sets the variable for the participant a step is delivered to.
+        preset_min_signers: dict = fixtures.get('resolve_min_signers', {}) or {}
         # attest_conflicts: [[pid, ...], ...] -- the teams whose members do not
         # witness for each other (ISSUES §2.54). Scenario-level: every node
         # holds the same set, as every node holding one verified team roster
@@ -797,6 +953,9 @@ class ReputationAdapter:
             # the environment at import: the corpus must not depend on how the
             # harness process was launched.
             participant.process.SLASH_ENABLED = preset_slash_enabled
+            participant.process.N_MIN = preset_n_min.get(pid)
+            participant.process.RESOLVE_MIN_SIGNERS = int(
+                preset_min_signers.get(pid, 1))
 
             if pid in preset_checkpoint:
                 spec_ck = preset_checkpoint[pid]
@@ -810,14 +969,25 @@ class ReputationAdapter:
 
             for entry in preset_proposals.get(pid, []):
                 idx = (int(entry['id1']), int(entry['id2']))
+                # Whom the proposer's half names (R+D.md §14.2): `names`,
+                # else the first other participant. Mirrors the C adapter.
+                names = entry.get('names') or next(
+                    (p['id'] for p in spec_participants if p['id'] != pid), None)
                 score = TransactionScore(
                     task_id=str(uuid5(_NS, f'tx:{entry.get("task_id", "default")}')),
                     score=float(entry.get('score', 1.0)),
                     # Absent -> TX_CHANNEL_TASK_OUTCOME (R+D.md §12.8).
                     channel=entry.get('channel'),
+                    subject_uuid=(identities[names].uuid if names in identities
+                                  else None),
                 )
                 participant.process.proposals[idx] = score
-                participant.process.round_group[idx] = str(group.uuid)
+                # `group: cohort` binds the round to the anchored cohort, as
+                # _start_paxos does for a half about a member (RD_14.4 Phase
+                # 6). Mirrors the C adapter.
+                participant.process.round_group[idx] = (
+                    str(_COHORT_UUID) if entry.get('group') == 'cohort'
+                    else str(group.uuid))
 
             # tx_history: each entry installs a bilateral Transaction via
             # two history.update calls (matching how handle_committed
@@ -826,7 +996,8 @@ class ReputationAdapter:
             def _ident_uuid(other):
                 return identities[other].uuid if other in identities else None
             local = preset_local_chain.get(pid, [])
-            if any('batch' in e or 'certified_by' in e for e in local):
+            if any('batch' in e or 'certified_by' in e or 'roster' in e
+                   for e in local):
                 # A placed (or certified) local chain: built apart, then
                 # loaded verbatim with its certificates, as catch-up loads one.
                 def _sign_ids(ids, desig):
@@ -834,7 +1005,13 @@ class ReputationAdapter:
                             ReputationProcess._detached_sig(identities[i], desig)
                             for i in ids if i in identities}
                 tmp = TransactionHistory(max_chain_len=len(local) + 1)
-                _write_chain(tmp, local, _ident_uuid, _sign_ids)
+                def _member(i):
+                    from nacl.encoding import HexEncoder
+                    return [str(identities[i].uuid).lower(),
+                            identities[i].signature.public.encode(
+                                encoder=HexEncoder).decode('ascii')]
+                _write_chain(tmp, local, _ident_uuid, _sign_ids, _member,
+                             self._chain_parties)
                 built = list(tmp)
                 participant.process.history.reconcile(
                     built, certified={t.index for t in built})
@@ -842,11 +1019,13 @@ class ReputationAdapter:
                 for entry in local:
                     tk = uuid5(_NS, f"chain:{entry['task']}")
                     participant.process.history.update(
-                        tk, _chain_half(entry, 1, entry['task'], _ident_uuid),
-                        float(entry['p1']))
+                        tk, _chain_half(entry, 1, entry['task'], _ident_uuid,
+                                        self._chain_parties),
+                        _milli(entry['p1']))
                     participant.process.history.update(
-                        tk, _chain_half(entry, 2, entry['task'], _ident_uuid),
-                        float(entry['p2']))
+                        tk, _chain_half(entry, 2, entry['task'], _ident_uuid,
+                                        self._chain_parties),
+                        _milli(entry['p2']))
 
             for entry in preset_tx_history.get(pid, []):
                 if entry.get('attested'):
@@ -858,7 +1037,7 @@ class ReputationAdapter:
                         dig = entry.get('evidence_digest')
                         participant.process.history.append_attested(Transaction(
                             attest_task_id(vu, su, dig), p1_id=vu,
-                            p1_score=float(entry.get('p1_score', 0.0)),
+                            p1_score_milli=_milli(entry.get('p1_score', 0.0)),
                             p1_channel=entry.get('p1_channel'), attested=True,
                             subject_id=su, evidence_digest=dig,
                             attest_scope=entry.get('attest_scope')))
@@ -875,20 +1054,25 @@ class ReputationAdapter:
                     # reputation_install_tx_single): lets a single step drive
                     # the arrival that completes the entry, since the C
                     # harness resets state between steps.
+                    # `names: id` is whom the half names (R+D.md §14.2);
+                    # absent, it pairs as a half held before names did.
+                    names = entry.get('names')
                     participant.process.history.record_half(
                         task_uuid, identities[p1_id].uuid,
-                        float(entry.get('p1_score', 0.0)),
-                        entry.get('p1_channel'))
+                        _milli(entry.get('p1_score', 0.0)),
+                        entry.get('p1_channel'),
+                        counterparty=(identities[names].uuid
+                                      if names in identities else None))
                     continue
                 participant.process.history.update(
                     task_uuid, identities[p1_id].uuid,
-                    float(entry.get('p1_score', 0.0)),
+                    _milli(entry.get('p1_score', 0.0)),
                     entry.get('p1_channel'))
                 if p2_id not in identities:
                     continue
                 participant.process.history.update(
                     task_uuid, identities[p2_id].uuid,
-                    float(entry.get('p2_score', 0.0)),
+                    _milli(entry.get('p2_score', 0.0)),
                     entry.get('p2_channel'))
 
             for other_pid, score in preset_reputations.get(pid, {}).items():
@@ -940,6 +1124,59 @@ class ReputationAdapter:
                         continue
                     proc._member_since[str(identities[other_pid].uuid)] = (
                         None, _time.time() - float(ago))
+            # join_policy: the declaration's own JSON (RD_14.4 plan, Phase 3),
+            # under which catch-up is marked. Always set, and the marks
+            # cleared, so nothing a case's config dir holds leaks in. Mirrors
+            # the C adapter's reputation_set_join_policy.
+            participant.process.join_policy = (
+                parse_join_policy(fixtures['join_policy'])
+                if fixtures.get('join_policy') is not None else INERT_JOIN_POLICY)
+            participant.process._catchup_marks = {}
+            # lone_verdicts: {pid: [{task_id, subject, score}, ...]}, the
+            # verdicts held from this participant's own probes without the
+            # probed peer's half (lone probe verdicts, 2026-11-06), oldest
+            # first. Always reset, so nothing a case's config dir holds leaks
+            # in. Mirrors the C adapter.
+            from autonomous_trust.core.reputation.reputation import (
+                LoneVerdict, LoneVerdicts)
+            proc = participant.process
+            proc.lone_verdicts = LoneVerdicts(proc.history.max_chain_len)
+            for i, lv in enumerate((fixtures.get('lone_verdicts') or {})
+                                   .get(pid, [])):
+                if lv.get('subject') not in identities:
+                    continue
+                proc.lone_verdicts.add(LoneVerdict(
+                    uuid5(_NS, f"tx:{lv['task_id']}"),
+                    identities[lv['subject']].uuid, float(lv['score']),
+                    float(i)))
+            # Phase 4 (RD_14.4): `catchup_told` {pid: [index, ...]} pre-marks
+            # primary-chain entries as told; `anchored` {pid: [other, ...]}
+            # is the AnchoredSet identity would have sent; `seeds`
+            # {pid: {other: seed}} offers each seed as an extension would,
+            # after the reputations above. Mirrors the C adapter.
+            # Staged scores are not a warm start; nothing a case's config dir
+            # held is either.
+            participant.process._warm_started = set()
+            told = (fixtures.get('catchup_told') or {}).get(pid)
+            if told:
+                participant.process._catchup_marks = {'': {int(i) for i in told}}
+            participant.process.protocol.anchored = frozenset(
+                str(identities[o].uuid)
+                for o in (fixtures.get('anchored') or {}).get(pid) or ()
+                if o in identities)
+            # Phase 6 (RD_14.4): `anchored_cohort` {pid: [member, ...]} is the
+            # cohort identity would have published (AnchoredCohort), members
+            # this participant included. Mirrors the C adapter.
+            members = (fixtures.get('anchored_cohort') or {}).get(pid)
+            participant.process.protocol.anchored_cohort = Group(
+                _COHORT_UUID, {str(identities[m].uuid): identities[m].address
+                               for m in members if m in identities},
+                'anchored', Encryptor.generate(), False) if members else None
+            for other_pid, seed in ((fixtures.get('seeds') or {}).get(pid)
+                                    or {}).items():
+                if other_pid in identities:
+                    participant.process._offer_seed(
+                        'fixture', identities[other_pid].uuid, seed, 'seed')
             if preset_peer_standing.get(pid):
                 # ACT on them, not merely record them: the C adapter's
                 # reputation_apply_peer_standing does the unwind at install time,
@@ -1142,6 +1379,38 @@ class ReputationAdapter:
             str(target), float('inf'))
         return doc
 
+    def _half_elements(self, participants, payload, to_id, scorer_id,
+                       task_id, score) -> tuple:
+        """Elements 7 and 8 of a `committed` (R+D.md §14.2): whom the half
+        names, and its scorer's signature over it. `names` defaults to the
+        scorer of the half the recipient already pools for this task, else
+        the recipient. Negative controls: `unsigned: true` omits the
+        signature, `unnamed: true` the name, `half_forged_by: id` signs with
+        that participant's key, `half_names: id` signs a half naming somebody
+        other than the one sent, `half_score` signs another score. Mirrors
+        the C adapter's _rp_half_elements."""
+        names = payload.get('names')
+        if names is None and to_id in participants:
+            held = participants[to_id].impl.process.history.pooled(task_id)
+            if held is not None and len(held) == 1:
+                uid = str(held.p1_id if held.p1_id is not None else held.p2_id)
+                names = next((pid for pid, h in participants.items()
+                              if str(h.impl.identity.uuid) == uid), None)
+            if names is None:
+                names = to_id
+        if names not in participants:
+            raise AssertionError(f'names {names!r} not a known participant')
+        scorer = participants[scorer_id].impl.identity
+        named = participants[names].impl.identity.uuid
+        signed_name = participants[payload.get('half_names', names)].impl.identity.uuid
+        signer = participants[payload.get('half_forged_by', scorer_id)].impl.identity
+        sig = None if payload.get('unsigned') else self._detached_sig(
+            signer, half_designation(task_id, scorer.uuid, signed_name,
+                                     _milli(payload['half_score'])
+                                     if 'half_score' in payload else score,
+                                     payload.get('channel')))
+        return (None if payload.get('unnamed') else str(named), sig)
+
     #: A member no participant knows (roster specs). Mirrors the C adapter.
     STRANGER = ['5e5e5e5e-0000-4000-8000-000000000005', '55' * 32]
 
@@ -1156,17 +1425,18 @@ class ReputationAdapter:
     def _roster_spec(self, participants, spec, base):
         """A roster entry from its spec (doc/architecture/reputation.md, "Who
         is in the group"): {roster: genesis, members: [pid...]}, {roster: add,
-        member: pid[, key: hex]} or {roster: restate}; an add or restate
-        builds on the recipient's `roster` fixture (`base`). Mirrors the C
-        adapter's _rp_roster_entry."""
+        member: pid[, key: hex]} or {roster: restate}, each optionally
+        declaring `n_min: N`; an add or restate builds on the recipient's
+        `roster` fixture (`base`). Mirrors the C adapter's _rp_roster_entry."""
         from autonomous_trust.core.reputation.reputation import (roster_digest,
                                                                  roster_task_id)
         op = spec['roster']
         who = None
+        n_min = spec.get('n_min') or None
         if op == 'genesis':
             members = [self._roster_member(participants, p) for p in spec['members']]
             d = roster_digest(members)
-            task = roster_task_id(None, 'genesis', None, d)
+            task = roster_task_id(None, 'genesis', None, d, n_min)
         else:
             members = [self._roster_member(participants, p) for p in base or []]
             prev = roster_task_id(None, 'genesis', None, roster_digest(members))
@@ -1177,15 +1447,17 @@ class ReputationAdapter:
                 members = members + [m]
                 who = m[0]
             d = roster_digest(members)
-            task = roster_task_id(prev, op, who, d)
+            task = roster_task_id(prev, op, who, d, n_min)
         return Transaction(task, roster_op=op,
                            roster_uuid=None if who is None else UUID(who),
-                           roster_digest=d, roster_members=members)
+                           roster_digest=d, roster_members=members,
+                           roster_n_min=n_min)
 
     def _place_value(self, participants, payload, base=None):
         """A placement value from its spec: {task_id, p1, p1_score, p2,
         p2_score} entries, each half certified by `cosigners` (default every
-        participant but the entry's two parties) unless `uncertified`, halves
+        participant but the entry's two parties) unless `uncertified`, under
+        the roster `cert_roster: [ids]` names when given, halves
         in canonical order unless `swap`, entries by task id unless the step
         says `unsorted`. Returns (entries, wire list). Mirrors the C adapter's
         _rp_place_value."""
@@ -1198,7 +1470,7 @@ class ReputationAdapter:
             ia = participants[a].impl.identity
             ib = participants[b].impl.identity
             task = uuid5(_NS, f'tx:{spec["task_id"]}')
-            sa, sb = float(spec['p1_score']), float(spec['p2_score'])
+            sa, sb = _milli(spec['p1_score']), _milli(spec['p2_score'])
             certs = None
             if not spec.get('uncertified'):
                 signers = spec.get('cosigners') or [
@@ -1210,12 +1482,31 @@ class ReputationAdapter:
                             self._detached_sig(participants[pid].impl.identity,
                                                commit_designation(who.uuid, task, score))
                         for pid in signers}
-            tx = placement_entry(Transaction(task, p1_id=ia.uuid, p1_score=sa,
-                                             p2_id=ib.uuid, p2_score=sb,
-                                             commit_sigs=certs))
+            # Each scorer signs its own half naming the other (R+D.md §14.2),
+            # unless the spec says `unsigned`.
+            halves = None if spec.get('unsigned') else {
+                str(ia.uuid): self._detached_sig(
+                    ia, half_designation(task, ia.uuid, ib.uuid, sa)),
+                str(ib.uuid): self._detached_sig(
+                    ib, half_designation(task, ib.uuid, ia.uuid, sb))}
+            # cert_roster: [ids] names the roster both certificates were
+            # collected under.
+            named = None
+            if certs and isinstance(spec.get('cert_roster'), list):
+                from autonomous_trust.core.reputation.reputation import \
+                    roster_digest
+                d = roster_digest([self._roster_member(participants, m)
+                                   for m in spec['cert_roster']])
+                named = {str(ia.uuid): d, str(ib.uuid): d}
+            tx = placement_entry(Transaction(task, p1_id=ia.uuid, p1_score_milli=sa,
+                                             p2_id=ib.uuid, p2_score_milli=sb,
+                                             commit_sigs=certs,
+                                             half_sigs=halves,
+                                             cert_rosters=named))
             if spec.get('swap'):
                 tx.p1_id, tx.p2_id = tx.p2_id, tx.p1_id
-                tx.p1_score, tx.p2_score = tx.p2_score, tx.p1_score
+                tx.p1_score_milli, tx.p2_score_milli = (tx.p2_score_milli,
+                                                        tx.p1_score_milli)
             out.append(tx)
         out.sort(key=lambda tx: str(tx.task_id).lower())
         if payload.get('unsorted'):
@@ -1289,27 +1580,29 @@ class ReputationAdapter:
             obj = to_json_string((int(payload.get('id1', 1)),
                                   int(payload.get('id2', 1)), proposer_uuid))
         elif function == ReputationProtocol.transaction:
-            id_tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
-            score = TransactionScore(
-                task_id=str(uuid5(_NS, f'tx:{payload.get("task_id", "default")}')),
-                score=float(payload.get('score', 1.0)),
-                # Lets a scenario drive the evidence channel across the wire and
-                # assert the C twin agrees on the closed set -- including that an
-                # unknown spelling is REFUSED by both (R+D.md §12.8). Absent
-                # keeps the pre-channel behavior.
-                channel=payload.get('channel'),
-            )
-            # A proposer asks for certification and names its group ('' is
-            # the primary). `certify: false` or `placing: false` builds the
-            # proposal a half-round build sent, which is dropped.
-            tup = (id_tup, score)
+            # The proposal's wire shape is a JSON object with named fields, the
+            # same body the C adapter builds, so one scenario puts identical
+            # bytes on the wire in both runtimes.
+            body = {'id1': int(payload['id1']), 'id2': int(payload['id2']),
+                    'peer_uuid': proposer_uuid,
+                    'score_milli': _milli(payload.get('score', 1.0))}
+            # The evidence channel goes through verbatim (R+D.md §12.8), so a
+            # scenario can send a bogus one and assert both twins refuse it.
+            # Absent means "task outcome", the pre-channel behavior.
+            if payload.get('channel') is not None:
+                body['channel'] = payload['channel']
+            # A proposer asks for certification and names its group ('' is the
+            # primary). `certify: false` or `placing: false` leaves one off, to
+            # stand for a half-round build's proposal, which is dropped.
             if payload.get('certify', True) is True:
-                tup = tup + (True,)
+                body['certify'] = True
             if payload.get('placing', True) is True:
-                if len(tup) < 3:
-                    tup = tup + (False,)
-                tup = tup + ('',)
-            obj = to_json_string(tup)
+                # `group: cohort` names the anchored cohort (RD_14.4 Phase 6).
+                body['group'] = (str(_COHORT_UUID)
+                                 if payload.get('group') == 'cohort' else '')
+            if payload.get('task_id') is not None:
+                body['task_uuid'] = str(uuid5(_NS, f'tx:{payload["task_id"]}'))
+            obj = to_json_string(body)
         elif function == ReputationProtocol.accepted:
             tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
             if payload.get('signed') is True:
@@ -1320,7 +1613,7 @@ class ReputationAdapter:
                 task_id = uuid5(_NS, f'tx:{payload.get("task_id", "default")}')
                 tup = tup + (self._detached_sig(
                     sender_identity, commit_designation(
-                        proposer_uuid, task_id, float(payload.get('score', 1.0)),
+                        proposer_uuid, task_id, _milli(payload.get('score', 1.0)),
                         payload.get('channel'))),)
             obj = to_json_string(tup)
         elif function == ReputationProtocol.committed:
@@ -1337,7 +1630,7 @@ class ReputationAdapter:
             # by `UUID` -- two entries for one task, so an arriving commit
             # could never complete a staged one.
             task_id = uuid5(_NS, f'tx:{payload.get("task_id", "default")}')
-            tup = (task_id, proposer_uuid, float(payload.get('score', 1.0)))
+            tup = (task_id, proposer_uuid, _milli(payload.get('score', 1.0)))
             if payload.get('channel') is not None:
                 tup = tup + (None, str(payload['channel']))
             if 'cosigners' in payload or 'forged_by' in payload:
@@ -1351,8 +1644,22 @@ class ReputationAdapter:
                 tup = tup + (self._cosignatures(
                     participants, payload, commit_designation(
                         proposer_uuid, task_id,
-                        float(payload.get('certified_score', tup[2])),
+                        _milli(payload['certified_score'])
+                        if 'certified_score' in payload else tup[2],
                         payload.get('channel'))),)
+                tup = tup + self._half_elements(participants, payload, to_id,
+                                                proposer_id, task_id, tup[2])
+                # cert_roster: the roster the certificate names, as element 9
+                # -- participant ids (their roster's digest) or a literal
+                # digest. Mirrors the C adapter.
+                named = payload.get('cert_roster')
+                if isinstance(named, list):
+                    from autonomous_trust.core.reputation.reputation import \
+                        roster_digest
+                    named = roster_digest([self._roster_member(participants, m)
+                                           for m in named])
+                if named is not None:
+                    tup = tup + (str(named),)
             obj = to_json_string(tup)
         elif function == ReputationProtocol.outdated:
             obj = str(payload.get('length', 0))
@@ -1382,10 +1689,13 @@ class ReputationAdapter:
                 _write_chain(tmp, spec, _part_uuid,
                              lambda ids, desig: self._cosignatures(
                                  participants, {'cosigners': ids}, desig),
-                             lambda pid: self._roster_member(participants, pid))
+                             lambda pid: self._roster_member(participants, pid),
+                             getattr(self, '_chain_parties', None))
                 built = list(tmp)
                 if payload.get('tamper') and len(built) >= 2:
-                    built[1].p2_score = -1.0
+                    # Any other valid score: the link, not the range
+                    # check, is what must catch it. Mirrors the C adapter.
+                    built[1].p2_score_milli = (built[1].p2_score_milli + 1) % 1001
                 # from: N sends the chain from its Nth entry on, as a peer whose
                 # window has moved past the start would.
                 built = built[int(payload.get('from') or 0):]
@@ -1456,13 +1766,13 @@ class ReputationAdapter:
             target_pid = payload.get('target', from_id)
             target_uuid = (str(participants[target_pid].impl.identity.uuid)
                            if target_pid in participants else target_pid)
-            floor = float(payload.get('floor_score', 0.0))
+            floor = _milli(payload.get('floor_score', 0.0))
             epoch = int(payload.get('epoch', 1))
             reason = payload.get('reason',
                                  SlashAttestation.REASON_PEER_EXCLUDE)
             att = SlashAttestation(
                 slasher_uuid=str(proposer_uuid), target_uuid=target_uuid,
-                reason=reason, floor_score=floor, epoch=epoch)
+                reason=reason, floor_milli=floor, epoch=epoch)
             if function == ReputationProtocol.slash_sign:
                 # Co-signatures are SIGNED HERE, at scenario time, by the
                 # sending participant's own key -- not pinned as blobs -- so
@@ -1509,7 +1819,7 @@ class ReputationAdapter:
             att = AttestedScore(
                 verifier_uuid=str(participants[verifier_pid].impl.identity.uuid),
                 subject_uuid=subject_uuid,
-                score=float(payload.get('score', 0.3)),
+                score_milli=_milli(payload.get('score', 0.3)),
                 channel=payload.get('channel', 'probe'),
                 evidence_digest=payload.get('evidence_digest', 'ab' * 32),
                 attest_scope=payload.get('scope'))

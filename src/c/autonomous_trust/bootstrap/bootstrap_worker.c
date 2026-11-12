@@ -21,6 +21,7 @@
 #include <time.h>
 
 #include "bootstrap/bootstrap_worker.h"
+#include "utilities/numfmt.h"
 
 /* splitmix64 — a small, fast, fully-deterministic PRNG. The conformance pin
  * only requires that a seeded run cover all three caps (not that the C and
@@ -48,7 +49,7 @@ static double _read_float_env(const char *name, double dflt)
     if (v == NULL || v[0] == '\0')
         return dflt;
     char *end = NULL;
-    double parsed = strtod(v, &end);
+    double parsed = at_strtod(v, &end);
     return (end != NULL && *end == '\0') ? parsed : dflt;
 }
 
@@ -201,7 +202,7 @@ double bootstrap_ucb_bonus(int count, int total)
 }
 
 size_t bootstrap_worker_select_target(const bootstrap_worker_t *w,
-                                     size_t peer_count)
+                                     size_t peer_count, double now_sec)
 {
     if (w == NULL || peer_count == 0)
         return 0;
@@ -218,6 +219,27 @@ size_t bootstrap_worker_select_target(const bootstrap_worker_t *w,
         }
         return peer_count;
     }
+    /* The staleness bound first: the stalest peer past one round and one
+     * interval, unless some peer has never been probed. */
+    double bound = ((double)peer_count + 1.0) * w->probe_interval_sec;
+    size_t stalest = peer_count;
+    double stalest_age = bound;
+    for (size_t i = 0; i < peer_count; i++) {
+        if (w->skip_peer != NULL && w->skip_peer[i])
+            continue;
+        if (w->probes_by_peer[i] <= 0) {
+            stalest = peer_count;
+            break;
+        }
+        double age = now_sec - w->last_probed_sec[i];
+        if (age > stalest_age) {         /* strict: ties keep the lowest index */
+            stalest_age = age;
+            stalest = i;
+        }
+    }
+    if (stalest < peer_count)
+        return stalest;
+
     size_t best = peer_count;
     double best_bonus = -1.0;
     for (size_t i = 0; i < peer_count; i++) {
@@ -262,8 +284,11 @@ const char *bootstrap_worker_select_capability(const bootstrap_worker_t *w)
     return best;
 }
 
-bool bootstrap_worker_try_issue_probe(bootstrap_worker_t *w, size_t peer_count,
-                                     bootstrap_probe_emit_fn emit, void *ctx)
+/* Issue one directed probe to @p target, or to UCB's choice when @p target
+ * is @p peer_count. */
+static bool _issue_probe_to(bootstrap_worker_t *w, size_t target,
+                            size_t peer_count, double now_sec,
+                            bootstrap_probe_emit_fn emit, void *ctx)
 {
     if (w == NULL || peer_count == 0)
         return false;
@@ -273,7 +298,8 @@ bool bootstrap_worker_try_issue_probe(bootstrap_worker_t *w, size_t peer_count,
     int idx = _cap_index(cap_name);
     if (idx < 0)
         return false;
-    size_t target = bootstrap_worker_select_target(w, peer_count);
+    if (target >= peer_count)
+        target = bootstrap_worker_select_target(w, peer_count, now_sec);
     if (target >= peer_count)
         return false;                     /* every peer is skipped */
 
@@ -294,12 +320,216 @@ bool bootstrap_worker_try_issue_probe(bootstrap_worker_t *w, size_t peer_count,
     if (emit != NULL && !emit(ctx, cap_name, target, nonce, payload_arg))
         return false;                     /* queue full → retry next tick */
 
-    if (target < AT_PROBE_MAX_TRACKED_PEERS)
+    if (target < AT_PROBE_MAX_TRACKED_PEERS) {
         w->probes_by_peer[target] += 1;
+        w->last_probed_sec[target] = now_sec;
+    }
     w->probes_by_cap[idx] += 1;
     w->probes_issued += 1;
     w->counts_by_cap[idx] += 1;
     return true;
+}
+
+bool bootstrap_worker_try_issue_probe(bootstrap_worker_t *w, size_t peer_count,
+                                     double now_sec,
+                                     bootstrap_probe_emit_fn emit, void *ctx)
+{
+    return _issue_probe_to(w, peer_count, peer_count, now_sec, emit, ctx);
+}
+
+/* ----------------------------------------------------------------------------
+ * The join burst (RD_14.4 Phase 5, D5 (b))
+ * -------------------------------------------------------------------------- */
+
+void bootstrap_worker_set_burst(bootstrap_worker_t *w, bool enabled, int k,
+                                double interval_sec, int budget_factor)
+{
+    if (w == NULL)
+        return;
+    w->burst_enabled = enabled;
+    w->burst_k = k > 0 ? k : 1;
+    w->burst_interval_sec = interval_sec > 0.0 ? interval_sec : 0.0;
+    w->burst_budget_factor = budget_factor > 0 ? budget_factor : 1;
+}
+
+void bootstrap_worker_note_probe_count(bootstrap_worker_t *w,
+                                       const char *peer_uuid, bool bounded,
+                                       int verdicts)
+{
+    if (w == NULL || peer_uuid == NULL || !w->burst_enabled)
+        return;
+    bootstrap_burst_peer_t *p = NULL;
+    for (size_t i = 0; i < w->n_burst_peers && p == NULL; i++)
+        if (strcmp(w->burst_peers[i].uuid, peer_uuid) == 0)
+            p = &w->burst_peers[i];
+    if (p == NULL) {
+        if (!bounded || w->n_burst_peers >= AT_BURST_MAX_PEERS)
+            return;
+        p = &w->burst_peers[w->n_burst_peers++];
+        memset(p, 0, sizeof(*p));
+        snprintf(p->uuid, sizeof(p->uuid), "%s", peer_uuid);
+    }
+    p->listed = bounded;
+    p->verdicts = verdicts;
+    if (!bounded || verdicts >= w->burst_k || p->target)
+        return;
+    p->target = true;
+    w->burst_budget += w->burst_budget_factor * w->burst_k;
+    /* A peer first listed short after the burst ended opens it again: a
+     * joiner that knew one peer when the burst began, whose window probes had
+     * already given that peer k verdicts, ended its burst within a second and
+     * never probed the 32 peers it learned of next (hostile-join n32,
+     * 2026-11-06). A target the burst already took does not reopen it. */
+    w->burst_state = BOOTSTRAP_BURST_ACTIVE;
+}
+
+/* A target still short of k verdicts. One reputation no longer lists has left
+ * the ceiling: done. */
+static bool _burst_short(const bootstrap_worker_t *w,
+                         const bootstrap_burst_peer_t *p)
+{
+    return p->target && p->listed && p->verdicts < w->burst_k;
+}
+
+/* Issue one burst probe if the burst runs and its interval allows: to the held
+ * target with the fewest burst probes (lowest uuid on a tie) among those still
+ * short. A probe whose verdict never arrives is retried while the budget
+ * lasts. Ends the burst when no target is short or the budget is spent, until
+ * a peer first listed short later opens it again. True when it used this tick.
+ * Mirrors Python _burst_tick. */
+static bool _burst_tick(bootstrap_worker_t *w, size_t peer_count,
+                        double now_sec, bootstrap_probe_emit_fn emit, void *ctx)
+{
+    if (w->burst_state != BOOTSTRAP_BURST_ACTIVE)
+        return false;
+    bool pending = false;
+    for (size_t i = 0; i < w->n_burst_peers && !pending; i++)
+        pending = _burst_short(w, &w->burst_peers[i]);
+    if (!pending || w->burst_spent >= w->burst_budget) {
+        w->burst_state = BOOTSTRAP_BURST_DONE;
+        return false;
+    }
+    if (w->burst_ever && (now_sec - w->last_burst_sec) < w->burst_interval_sec)
+        return false;
+    if (w->peer_uuids == NULL || emit == NULL)
+        return false;
+    bootstrap_burst_peer_t *best = NULL;
+    size_t best_index = peer_count;
+    for (size_t i = 0; i < w->n_burst_peers; i++) {
+        bootstrap_burst_peer_t *p = &w->burst_peers[i];
+        if (!_burst_short(w, p))
+            continue;
+        size_t at = peer_count;
+        for (size_t j = 0; j < peer_count && at == peer_count; j++)
+            if (w->peer_uuids[j] != NULL && strcmp(w->peer_uuids[j], p->uuid) == 0
+                && (w->skip_peer == NULL || !w->skip_peer[j]))
+                at = j;
+        if (at == peer_count)
+            continue;                     /* not held yet, or absent */
+        if (best == NULL || p->issued < best->issued
+            || (p->issued == best->issued && strcmp(p->uuid, best->uuid) < 0)) {
+            best = p;
+            best_index = at;
+        }
+    }
+    if (best == NULL)
+        return false;
+    /* Stamped before issuing, as the continuous rate limit is. */
+    w->burst_ever = true;
+    w->last_burst_sec = now_sec;
+    if (!_issue_probe_to(w, best_index, peer_count, now_sec, emit, ctx))
+        return true;
+    best->issued += 1;
+    w->burst_spent += 1;
+    return true;
+}
+
+/* ----------------------------------------------------------------------------
+ * Suspects
+ * -------------------------------------------------------------------------- */
+
+void bootstrap_worker_note_suspect(bootstrap_worker_t *w,
+                                   const char *peer_uuid, bool suspect)
+{
+    if (w == NULL || peer_uuid == NULL || !w->burst_enabled)
+        return;
+    size_t at = w->n_suspects;
+    for (size_t i = 0; i < w->n_suspects && at == w->n_suspects; i++)
+        if (strcmp(w->suspects[i].uuid, peer_uuid) == 0)
+            at = i;
+    if (!suspect) {
+        if (at < w->n_suspects) {
+            memmove(&w->suspects[at], &w->suspects[at + 1],
+                    sizeof(w->suspects[0]) * (w->n_suspects - at - 1));
+            w->n_suspects--;
+        }
+        return;
+    }
+    if (at < w->n_suspects || w->n_suspects >= AT_BURST_MAX_PEERS)
+        return;
+    bootstrap_suspect_t *s = &w->suspects[w->n_suspects++];
+    memset(s, 0, sizeof(*s));
+    snprintf(s->uuid, sizeof(s->uuid), "%s", peer_uuid);
+}
+
+/* Probe a suspect again, at most AT_SUSPECT_REPROBES times a suspicion, one
+ * per burst_interval_sec: the held suspect with the fewest re-probes (lowest
+ * uuid on a tie). Waiting its turn at one probe a minute among every peer, a
+ * gamer that turned on its known answers met two to five probes in eleven
+ * minutes and kept its tier (red-team batch, 2026-11-10). True when it used
+ * this tick. Mirrors Python _suspect_tick. */
+static bool _suspect_tick(bootstrap_worker_t *w, size_t peer_count,
+                          double now_sec, bootstrap_probe_emit_fn emit,
+                          void *ctx)
+{
+    if (!w->burst_enabled || w->n_suspects == 0)
+        return false;
+    bool pending = false;
+    for (size_t i = 0; i < w->n_suspects && !pending; i++)
+        pending = w->suspects[i].issued < AT_SUSPECT_REPROBES;
+    if (!pending)
+        return false;
+    if (w->suspect_ever
+        && (now_sec - w->last_suspect_sec) < w->burst_interval_sec)
+        return false;
+    if (w->peer_uuids == NULL || emit == NULL)
+        return false;
+    bootstrap_suspect_t *best = NULL;
+    size_t best_index = peer_count;
+    for (size_t i = 0; i < w->n_suspects; i++) {
+        bootstrap_suspect_t *s = &w->suspects[i];
+        if (s->issued >= AT_SUSPECT_REPROBES)
+            continue;
+        size_t at = peer_count;
+        for (size_t j = 0; j < peer_count && at == peer_count; j++)
+            if (w->peer_uuids[j] != NULL && strcmp(w->peer_uuids[j], s->uuid) == 0
+                && (w->skip_peer == NULL || !w->skip_peer[j]))
+                at = j;
+        if (at == peer_count)
+            continue;                     /* not held yet, or absent */
+        if (best == NULL || s->issued < best->issued
+            || (s->issued == best->issued && strcmp(s->uuid, best->uuid) < 0)) {
+            best = s;
+            best_index = at;
+        }
+    }
+    if (best == NULL)
+        return false;
+    w->suspect_ever = true;
+    w->last_suspect_sec = now_sec;
+    if (!_issue_probe_to(w, best_index, peer_count, now_sec, emit, ctx))
+        return true;
+    best->issued += 1;
+    return true;
+}
+
+int bootstrap_worker_burst_peers_probed(const bootstrap_worker_t *w)
+{
+    int n = 0;
+    for (size_t i = 0; w != NULL && i < w->n_burst_peers; i++)
+        if (w->burst_peers[i].issued > 0)
+            n++;
+    return n;
 }
 
 void bootstrap_worker_tick_all(bootstrap_worker_t *w, size_t peer_count,
@@ -307,6 +537,10 @@ void bootstrap_worker_tick_all(bootstrap_worker_t *w, size_t peer_count,
                                bootstrap_probe_emit_fn probe_emit, void *ctx)
 {
     if (w == NULL || w->disabled)
+        return;
+    if (_burst_tick(w, peer_count, now_sec, probe_emit, ctx))
+        return;
+    if (_suspect_tick(w, peer_count, now_sec, probe_emit, ctx))
         return;
     if (!w->window_open) {
         if (peer_count > 0) {
@@ -333,7 +567,7 @@ void bootstrap_worker_tick_all(bootstrap_worker_t *w, size_t peer_count,
         return;
     w->probed_ever = true;
     w->last_probe_sec = now_sec;
-    bootstrap_worker_try_issue_probe(w, peer_count, probe_emit, ctx);
+    bootstrap_worker_try_issue_probe(w, peer_count, now_sec, probe_emit, ctx);
 }
 
 int bootstrap_worker_count_for(const bootstrap_worker_t *w, const char *cap_name)

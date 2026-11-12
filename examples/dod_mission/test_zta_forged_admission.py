@@ -44,39 +44,28 @@ from tools.provision_zta_certs import (  # noqa: E402
 from autonomous_trust.core.identity.idprocess import IdentityProcess  # noqa: E402
 from autonomous_trust.zta import (  # noqa: E402
     ZtaPolicy, BINDING_MODE_OFF, BINDING_MODE_REQUIRE)
+from autonomous_trust.zta import admission as _zta_admission  # noqa: E402
 
 
 class _Gate:
-    """Minimal carrier of the real ZTA admission-gate methods.
+    """Minimal stand-in process for the real ZTA admission gate.
 
-    The method list has to track what `_zta_admit` actually calls; it had fallen
-    behind the operator-attended work (which added the operator classification and
-    guardian-key steps) and then the multi-credential work, so these tests were
-    erroring on a missing attribute rather than exercising the gate.
+    The gate is `autonomous_trust.zta.admission.zta_admit(proc, peer)`, a function
+    over the process since ZTA was split out of the core; it reaches its helpers
+    directly and keeps its state on the process under the names `init_state` sets
+    up. The one process method it still calls is `_mark_operator_bound`.
     """
-    _zta_policy = IdentityProcess._zta_policy
-    _zta_verifier = IdentityProcess._zta_verifier
-    _zta_operator_verifier = IdentityProcess._zta_operator_verifier
-    _zta_anchor_verifiers = IdentityProcess._zta_anchor_verifiers
-    _zta_credentials = IdentityProcess._zta_credentials
-    _zta_match_anchors = IdentityProcess._zta_match_anchors
-    _zta_credential_replayed = IdentityProcess._zta_credential_replayed
-    _is_operator_credential = IdentityProcess._is_operator_credential
     _mark_operator_bound = staticmethod(IdentityProcess._mark_operator_bound)
-    _verify_operator_key = IdentityProcess._verify_operator_key
-    _zta_admit = IdentityProcess._zta_admit
 
     def __init__(self, policy: ZtaPolicy):
+        _zta_admission.init_state(self)
         self.configs = {ZtaPolicy.CONFIG_KEY: policy}
-        self._zta_policy_cache = None
-        self._zta_verifier_cache = None
-        self._zta_operator_verifier_cache = None
-        self._zta_anchor_cache = None
-        self._zta_capped = set()
-        self._operator_verified = set()
         self.logger = logging.getLogger("test.dod.zta")
         self.peers = SimpleNamespace(all=[])
         self.identity = None
+
+    def _zta_admit(self, peer) -> str:
+        return _zta_admission.zta_admit(self, peer)
 
 
 def _peer(cred: bytes, nick: str):

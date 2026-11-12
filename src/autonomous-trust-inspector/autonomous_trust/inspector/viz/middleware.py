@@ -58,14 +58,21 @@ class SassASGIMiddleware:
                 css_path = os.path.join(css_dir, css_filename)
                 try:
                     self.logger.info('Compile %s', sass_path)
-                    result = sass.compile(
+                    # With source_map_filename set, libsass returns a
+                    # (css, source_map) pair rather than a string. Compile
+                    # before opening anything, so a failure cannot leave an
+                    # empty stylesheet behind.
+                    css, source_map = sass.compile(
                         filename=sass_path,
                         output_style='nested',
                         source_map_filename=css_path + '.map',
+                        output_filename_hint=css_path,
                     )
                     os.makedirs(os.path.dirname(css_path), exist_ok=True)
                     with open(css_path, 'w') as f:
-                        f.write(result)
+                        f.write(css)
+                    with open(css_path + '.map', 'w') as f:
+                        f.write(source_map)
                 except (IOError, OSError) as err:
                     self.logger.error(str(err))
                     break

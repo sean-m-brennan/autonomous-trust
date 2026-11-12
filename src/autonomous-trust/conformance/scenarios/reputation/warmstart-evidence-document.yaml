@@ -60,7 +60,7 @@ expected_state:
     evidence_doc:
       # Pinned so a shape change becomes a refusal to rebuild — which degrades
       # safely to clamped restoration — rather than a misparse.
-      schema: "1"
+      schema: "2"
       # Three, not four: the pending entry from step 1 has no index.
       chain_len: 3
       # No checkpoint round ran here, so the document carries a null checkpoint:

@@ -159,6 +159,10 @@ static int es6_from_ryu(buf_t *b, const char *ryu, size_t n_in)
         digits[dlen++] = c;
         if (saw_point) ++frac_digits;
     }
+    /* Ryu always writes at least one digit. Without one, `dlen - 1` below
+     * wraps and the leading-zero scan reads digits[] before anything was
+     * written to it. */
+    if (dlen == 0) return -1;
 
     /* Parse the exponent WITHIN n_in.  `ryu` is a counted buffer, not a C
      * string: d2s_buffered_n writes the digits and returns the length but does

@@ -1,0 +1,47 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: gateway-primary-refuses-child-member
+byte_pinning: false
+description: |
+    A gateway's primary group never lists a member of a cohort it bridges, even
+    when one of its own members sends a group that does.
+
+    gw's primary group is itself and boss, and it bridges a cohort that lists
+    anchor. boss, a primary member, sends a group of four that lists anchor.
+    The size rule would have gw adopt it, and the command cohort would then span
+    the gateway. Every change to the primary passes one guard, which refuses a
+    group listing an address a child group holds, so gw keeps its two members.
+
+participants:
+  - id: gw
+    role: border_guard
+  - id: boss
+    role: group_member
+  - id: anchor
+    role: group_member
+
+fixtures:
+  groups:
+    boss:
+      uuid: "0c000000-0000-4000-8000-0000000000e3"
+      size: 3
+      members: [anchor]
+  cohort_tree:
+    nodes:
+      gw:
+        members: [boss]
+        child_group: [anchor]
+
+steps:
+  - id: 1
+    from: boss
+    to: gw
+    function: group_key_update
+    payload: {}
+    description: boss, a primary member, sends gw a larger group that lists anchor.
+
+expected_state:
+  gw:
+    group_size: 2
+    child_group_count: 1

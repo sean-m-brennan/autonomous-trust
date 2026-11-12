@@ -1,0 +1,60 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: anchored-cohort-invite-from-a-stranger-is-refused
+byte_pinning: false
+description: |
+    A node refuses an invitation to an anchored cohort from a member it does
+    not count as an anchor, and says so (RD_14.4_HOSTILE_JOIN_PLAN.md Phase
+    6, D8 (b)).
+
+    Why this matters: an anchored cohort is worth holding only because every
+    member of it is someone this node trusts out of band. A cohort member
+    that invited this node into a group of its own choosing would otherwise
+    have it hold a key, write evidence to a chain and count toward a quorum
+    the member controls.
+
+    Shape: horde, a cohort member nobody counts as an anchor, invites zed to
+    {horde, zed}. zed holds nothing, and replies with a refusal so a real
+    coordinator would drop it.
+
+participants:
+  - id: horde
+    role: border_guard
+  - id: zed
+    role: border_guard
+
+fixtures:
+  first_contact:
+    enabled: true
+  contacts:
+    zed:
+      verified: true
+  # Every participant holds every other as a peer and cohort member (the
+  # Python adapter's default; C needs it said).
+  mutual_peers: true
+  join_policy:
+    version: 1
+    enabled: true
+    anchors: [verified_contact]
+
+steps:
+  - id: 1
+    from: horde
+    to: zed
+    function: anchored_cohort_invite
+    payload:
+      members: [horde, zed]
+      group_uuid: "c0000000-0000-4000-8000-0000000000a2"
+      key_epoch: 0
+
+  - id: 2
+    in_response_to: 1
+    from: zed
+    to: horde
+    function: anchored_cohort_reply
+    no_propagate: true
+
+expected_state:
+  zed:
+    anchored_cohort_members: []

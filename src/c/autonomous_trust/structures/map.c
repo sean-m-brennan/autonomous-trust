@@ -44,9 +44,9 @@ size_t increment_capacity(size_t prev)
       loop invariant next <= i;
       loop invariant i >= prev + GAP;
       loop assigns i, j, next;
-      loop variant UINT64_MAX - i;
+      loop variant SIZE_MAX - i;
     */
-    for (size_t i = next; i < UINT64_MAX; i++) // find next prime, brute-force but good enough
+    for (size_t i = next; i < SIZE_MAX; i++) // find next prime, brute-force but good enough
     {
         size_t j;
         /*@
@@ -78,13 +78,15 @@ typedef uint64_t hash_t; // size must be synced with crypto_shorthash_BYTES
 /* Frama-C: skipped — [string-loop] iterates over key bytes for hashing */
 hash_t nacl_hash(map_t *map, map_key_t key)
 {
-    union
-    {
-        uint8_t hash_bytes[crypto_shorthash_BYTES]; // i.e. 8 bytes
-        hash_t hash_int;
-    } hash;
-    crypto_shorthash(hash.hash_bytes, (const unsigned char *)key, strlen(key), map->hashkey);
-    return hash.hash_int;
+    uint8_t hash_bytes[crypto_shorthash_BYTES]; // i.e. 8 bytes
+    crypto_shorthash(hash_bytes, (const unsigned char *)key, strlen(key), map->hashkey);
+    /* Little-endian on every host, as x86 always read it: the hash is
+     * serialized with the map (map_to_json), so a big-endian node must
+     * compute the same value from the same key and hashkey. */
+    hash_t hash = 0;
+    for (int i = crypto_shorthash_BYTES - 1; i >= 0; i--)
+        hash = (hash << 8) | hash_bytes[i];
+    return hash;
 }
 
 /*@
@@ -118,7 +120,15 @@ size_t map_hash2index(map_t *map, hash_t hash)
 #ifdef __SIZEOF_INT128__
     return (uint64_t)(((__uint128_t)hash * (__uint128_t)(map->capacity - 1)) >> 64);
 #else
-    return hash % (map->capacity - 1);
+    /* High 64 bits of the 64x64 product from 32-bit halves, so a target
+     * without __int128 (32-bit SPARC) picks the same bucket, and so walks a
+     * map in the same order, as one with it. */
+    uint64_t m = (uint64_t)(map->capacity - 1);
+    uint64_t a_lo = hash & 0xffffffffu, a_hi = hash >> 32;
+    uint64_t b_lo = m & 0xffffffffu, b_hi = m >> 32;
+    uint64_t p0 = a_lo * b_lo, p1 = a_lo * b_hi, p2 = a_hi * b_lo, p3 = a_hi * b_hi;
+    uint64_t mid = (p0 >> 32) + (p1 & 0xffffffffu) + (p2 & 0xffffffffu);
+    return (size_t)(p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32));
 #endif
 }
 
@@ -648,7 +658,7 @@ int map_to_json(const void *data_struct, json_t **obj_ptr)
                 json_t *val;
                 data_to_json(map->items[i].value, &val);
                 json_object_set_new(elt, "value", val);
-                json_object_set_new(elt, "hash", json_integer(map->items[i].hash));
+                json_object_set_new(elt, "hash", json_integer((json_int_t)map->items[i].hash));
             }
         }
         json_array_append_new(j_arr, elt);
@@ -693,7 +703,7 @@ int map_from_json(const json_t *obj, void *data_struct)
         json_t *elt = json_array_get(j_arr, i);
         if (!json_is_null(elt))
         {
-            map->items[i].hash = json_integer_value(json_object_get(elt, "hash"));
+            map->items[i].hash = (uint64_t)json_integer_value(json_object_get(elt, "hash"));
             /* Guard against malformed input: a missing or non-string
              * "key" used to crash via strlen(NULL). Treat such an entry
              * as an empty slot and continue. */

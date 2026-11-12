@@ -100,7 +100,15 @@ class IdentityHooks:
     recorded as a contact (first contact). Duplicate detection lets such a peer,
     presenting the keys it is known by, be voted on like any newcomer, which is
     the one route by which a contact joins the cohort. None is a node with no
-    contacts."""
+    contacts.
+
+    ``anchor_classes(proc, ident)`` says which out-of-band anchor classes
+    (``identity.join_policy.ANCHOR_CLASSES``) the public identity ``ident``
+    holds here, as an iterable of class names: first contact for contacts and
+    siblings, ZTA for credentials and the operator key. It must match on keys,
+    not on the uuid alone, since a uuid is public. The core intersects the
+    answers with the join policy's declared classes (RD_14.4 plan, Phase 2);
+    None anchors nobody."""
     on_start: Optional[Callable[[Any, Any], None]] = None
     on_peer_confirmed: Optional[Callable[[Any, Any, Any], None]] = None
     periodic_resync: Optional[Callable[[Any, Any], None]] = None
@@ -112,6 +120,7 @@ class IdentityHooks:
     credential_anchored: Optional[Callable[[Any, dict], bool]] = None
     on_tick: Optional[Callable[[Any, Any, Any], None]] = None
     is_contact: Optional[Callable[[Any, str], bool]] = None
+    anchor_classes: Optional[Callable[[Any, Any], Any]] = None
 
 
 @dataclass(frozen=True)
@@ -132,13 +141,27 @@ class NetworkHooks:
     uuid_str, excluded)`` runs after the core recorded that reputation cut a
     peer off or readmitted it (:meth:`NetworkProcess.is_excluded`). Local
     verbs addressed to the network process register through
-    ``Extension.register_handlers`` as any other handler."""
+    ``Extension.register_handlers`` as any other handler.
+
+    ``also_unicast(proc, peer_uuid, frame, process, function)`` sees every
+    unicast the transport is about to send (none an extension carried through
+    ``unicast``), already sealed for the peer. ``fanout(proc, channel, frame,
+    process, function, group)`` sees every frame on the 'group' (sealed with
+    ``group``'s key) or 'broadcast' (plaintext) channel after the transport
+    was asked to send it, whether or not that succeeded. ``group`` is the
+    group whose key sealed the frame: the node's own, or the child cohort on
+    a gateway's send to a child (C always passes the node's own). A
+    broadcast whose send raises BrokenPipeError skips it. Neither can stop or
+    alter the transport send. Twins of C
+    ``net_ext_t.also_unicast`` / ``fanout``."""
     on_start: Optional[Callable[[Any, Any], None]] = None
     periodic: Optional[Callable[[Any, Any], None]] = None
     drain_inbound: Optional[Callable[[Any, Any, int], int]] = None
     reaches: Optional[Callable[[Any, Any], bool]] = None
     unicast: Optional[Callable[[Any, Any, bytes], None]] = None
     on_exclusion: Optional[Callable[[Any, str, bool], None]] = None
+    also_unicast: Optional[Callable[[Any, Any, bytes, str, str], None]] = None
+    fanout: Optional[Callable[[Any, str, bytes, str, str, Any], None]] = None
 
 
 @dataclass(frozen=True)
@@ -152,8 +175,35 @@ class NegotiationHooks:
     the capability's ``required_tier``. A cap may only LOWER the tier
     (:func:`capped_tier` ignores a higher answer), and decides its own gate:
     it is asked whenever the extension is PRESENT, enabled or not, as C's
-    constructor-registered cap is."""
+    constructor-registered cap is.
+
+    ``on_result(proc, queues, task, tracker)`` is asked about every result
+    the requestor accepts, before it goes to the main process (live
+    replication, RD_12.6 plan §3.7). It returns None to leave the result to
+    the core, ``'hold'`` to forward it to the application but hold its score
+    (the feature releases it later, :meth:`NegotiationProcess.release_result`),
+    or ``'consume'`` to take it entirely (neither forwarded nor scored).
+    ``periodic(proc, queues)`` runs once per pass of the negotiation loop.
+
+    Selective assignment (RD_12.7 plan §3.1) adds four.
+    ``select_participants(proc, task, peers, target)`` is asked by
+    ``start_task`` with every capable, present peer and the peer the task is
+    addressed to (None for a fan-out). It returns None to leave the task to
+    the core, or the peers to invite instead. It may set ``task.draw``, which
+    the invitation carries. ``on_decline(proc, task, peer_uuid, peers)``
+    is asked when a verified nack drops an invitee. It returns replacement
+    peers to invite, or None. ``on_invitation(proc, queues, task, sender)`` sees
+    every fresh invitation a worker admits, before it is accepted or
+    refused, and only observes. ``on_score(proc, echo)`` receives the
+    main process's :class:`ScoreEcho` for a result the feature asked to see
+    scored (``task.echo_score``)."""
     capped_tier: Optional[Callable[[Any, Any, int], int]] = None
+    on_result: Optional[Callable[[Any, Any, Any, Any], Optional[str]]] = None
+    periodic: Optional[Callable[[Any, Any], None]] = None
+    select_participants: Optional[Callable[[Any, Any, list, Any], Optional[list]]] = None
+    on_decline: Optional[Callable[[Any, Any, Any, list], Optional[list]]] = None
+    on_invitation: Optional[Callable[[Any, Any, Any, Any], None]] = None
+    on_score: Optional[Callable[[Any, Any], None]] = None
 
 
 @dataclass(frozen=True)
@@ -206,7 +256,16 @@ class Extension:
     ``process_aliases`` is ``((wire_name, local_process), ...)``: a process a
     C peer addresses that Python runs inside another one. ZTA's findings go to
     C's ``zta_verify`` process; Python's ZTA rides identity, so the network
-    process delivers them there (:func:`process_alias`)."""
+    process delivers them there (:func:`process_alias`).
+
+    ``network_wire_verbs`` are network-process functions this feature accepts
+    from the wire, admitted only on a member's paths (peer, group) and then
+    handled by a network-process handler it registers; the local outbound
+    form of the same verb reaches that handler first with no sender, and the
+    handler declines it so it is sent. Every inbound frame of a declared verb
+    (it carries a sender) must be consumed by that handler; one it declines
+    is treated as a local outbound message. Twin of C
+    ``net_ext_t.wire_verbs``."""
     name: str
     enabled: Callable[[], bool]
     register_handlers: Callable[[Any, str], None]
@@ -221,6 +280,7 @@ class Extension:
     plaintext_verbs: tuple = ()
     transports: tuple = ()
     process_aliases: tuple = ()
+    network_wire_verbs: tuple = ()
 
 
 def _builtin() -> list[Extension]:
@@ -367,6 +427,21 @@ def identity_hooks(proc) -> tuple:
 _network_hooks_cache: dict = {}
 
 
+_network_wire_verbs_cache: Optional[frozenset] = None
+
+
+def network_wire_verbs() -> frozenset:
+    """Network-process functions the enabled extensions accept from the wire
+    (``Extension.network_wire_verbs``). Cached until ``reset_extensions()``;
+    each extension's ``enabled()`` is sampled once, when the cache fills."""
+    global _network_wire_verbs_cache
+    if _network_wire_verbs_cache is None:
+        _network_wire_verbs_cache = frozenset(
+            v for ext in all_extensions() if ext.enabled()
+            for v in ext.network_wire_verbs)
+    return _network_wire_verbs_cache
+
+
 def network_hooks(proc) -> tuple:
     """The NetworkHooks of the extensions ``proc`` loaded, in load order.
     Cached by ``proc._extensions`` (names): the loop asks on every pass."""
@@ -413,6 +488,60 @@ def capped_tier(proc, peer_uuid, tier: int) -> int:
         if capped < tier:
             tier = capped
     return tier
+
+
+def negotiation_on_result(proc, queues, task, tracker) -> Optional[str]:
+    """The first answer any extension's ``on_result`` gives (None for none)."""
+    for hooks in negotiation_hooks():
+        if hooks.on_result is None:
+            continue
+        verdict = hooks.on_result(proc, queues, task, tracker)
+        if verdict is not None:
+            return verdict
+    return None
+
+
+def negotiation_periodic(proc, queues) -> None:
+    """Run every extension's negotiation ``periodic``."""
+    for hooks in negotiation_hooks():
+        if hooks.periodic is not None:
+            hooks.periodic(proc, queues)
+
+
+def negotiation_select(proc, task, peers: list, target) -> Optional[list]:
+    """The first answer any extension's ``select_participants`` gives."""
+    for hooks in negotiation_hooks():
+        if hooks.select_participants is None:
+            continue
+        chosen = hooks.select_participants(proc, task, peers, target)
+        if chosen is not None:
+            return chosen
+    return None
+
+
+def negotiation_on_decline(proc, task, peer_uuid, peers: list) -> Optional[list]:
+    """The first replacement any extension's ``on_decline`` offers."""
+    for hooks in negotiation_hooks():
+        if hooks.on_decline is None:
+            continue
+        chosen = hooks.on_decline(proc, task, peer_uuid, peers)
+        if chosen is not None:
+            return chosen
+    return None
+
+
+def negotiation_on_invitation(proc, queues, task, sender) -> None:
+    """Show every extension a fresh invitation."""
+    for hooks in negotiation_hooks():
+        if hooks.on_invitation is not None:
+            hooks.on_invitation(proc, queues, task, sender)
+
+
+def negotiation_on_score(proc, echo) -> None:
+    """Hand every extension the main process's score echo."""
+    for hooks in negotiation_hooks():
+        if hooks.on_score is not None:
+            hooks.on_score(proc, echo)
 
 
 #: The declarations a node's environment can make about a feature, and the
@@ -532,6 +661,8 @@ def configure_plaintext_verbs(cfg_dir=None, logger=None) -> frozenset:
 
 def reset_extensions() -> None:
     """Drop every extension's process-global state (conformance/tests)."""
+    global _network_wire_verbs_cache
+    _network_wire_verbs_cache = None
     _identity_hooks_cache.clear()
     _network_hooks_cache.clear()
     _present_hooks_cache.clear()

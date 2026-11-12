@@ -54,7 +54,8 @@ from .bootstrap_capabilities import (
 from .capabilities import Capabilities, Capability, PeerCapabilities
 from .system import CfgIds, PackageHash, queue_cadence, max_concurrency, now, preferred_proto_ver, QueueType
 from .protocol import Protocol
-from .negotiation import Task, TaskParameters, TaskStatus, Status, TaskResult, NegotiationProtocol
+from .negotiation import (Task, TaskParameters, TaskStatus, Status, TaskResult,
+                          NegotiationProtocol, ScoreEcho)
 from .network import Message, require_synced_clock
 from .reputation import (TransactionScore, ReputationProtocol, PeerReputation,
                          TX_CHANNEL_CERTIFICATE, TX_CHANNEL_TASK_OUTCOME,
@@ -62,6 +63,7 @@ from .reputation import (TransactionScore, ReputationProtocol, PeerReputation,
 from .reputation.reputation import Reputation, pair_task_id
 from . import oracles
 from .negotiation.certified import split_certified
+from .negotiation.replay import split_traced, trace_chain
 from .queue_pool import QueuePool
 from .app_verbs import AppRequest, AppEvent, app_verb_target
 from .._zkp import ZKP_AVAILABLE
@@ -172,8 +174,10 @@ def score_task_result(task, logger=None, name: str = '',
             sent_at=getattr(task, 'requested_at', None))
     if probe_score is not None:
         if logger is not None:
-            logger.info('%s: probe %s scored %.2f for task %s',
-                        name, cap_name, probe_score, task.uuid)
+            # The peer probed ends the line, after the fields readers parse.
+            logger.info('%s: probe %s scored %.2f for task %s of %s',
+                        name, cap_name, probe_score, task.uuid,
+                        getattr(task, 'executor_uuid', None))
         return probe_score, TX_CHANNEL_PROBE
 
     # The verification layers (R+D.md §12.2-12.5), as the arms they registered
@@ -322,6 +326,22 @@ class AutonomousTrust(Protocol):
         # on with no ZTA extension, or one ZTA cannot honour (FEATURE_SPLIT_PLAN
         # Phase 6). Both refuse the start rather than run with ZTA silently off.
         extensions_check_config(logger=self._logger)
+        # The join policy (RD_14.4 plan, D9): malformed, or naming an anchor
+        # class no installed extension answers, refuses the start. Installed,
+        # as C can see only what is linked: one installed but switched off
+        # anchors nobody.
+        from .identity.join_policy import check_join_policy
+        check_join_policy([ext.name for ext in all_extensions()],
+                          logger=self._logger)
+        # The deployment manifest (RD_13.4 §3.3): one that exists and breaks a
+        # rule refuses the start. The network worker applies it again, since
+        # module state does not survive the forkserver.
+        from .deployment_manifest import ManifestError, configure as dm_configure
+        try:
+            dm_configure()
+        except ManifestError as err:
+            self._logger.error('%s; refusing to start', err)
+            raise
         self._logger.info('Extensions: %s',
                           ', '.join(ext.name for ext in all_extensions()) or 'none')
         self.identity = None  # of type Identity (can't import)
@@ -423,15 +443,20 @@ class AutonomousTrust(Protocol):
         Override this to register real services (Capability).
         :param queues: Interprocess communication queues to each process
         :return: None
+
+        The other processes answer peers' caps queries from what this sends
+        them, so a node that sent nothing advertised no capabilities at all,
+        not even the bootstrap probes registered in __init__. An override
+        that registers more must send them the same way.
         """
         if self.testing:
             self.capabilities.register_ability('mult', mul)
             self.capabilities.register_ability('pow', pow)
             self.capabilities.register_ability('pi', pi)
 
-            for q_name in queues:
-                if q_name != self.proc_name:
-                    queues[q_name].put(self.capabilities, block=True, timeout=queue_cadence)
+        for q_name in queues:
+            if q_name != self.proc_name:
+                queues[q_name].put(self.capabilities, block=True, timeout=queue_cadence)
 
     def init_tasking(self, queues: dict[str, QueueType]):
         """
@@ -1143,8 +1168,18 @@ class AutonomousTrust(Protocol):
                     # its negotiation process, which is where its requestor-side
                     # record of the task lives, so the two runtimes cannot share
                     # a call site, only the rules.
-                    score, channel = score_task_result(
-                        task, logger=self.logger, name=self.name)
+                    # Live replication (RD_12.6 plan §3.7) may hold this
+                    # score until a replica settles it: the application still
+                    # gets the answer now, and the negotiation process
+                    # releases the result later, with the verdict's score or
+                    # for the arms below.
+                    held = getattr(task, 'score_hold', False)
+                    verdict = getattr(task, 'replication_score', None)
+                    if verdict is not None:
+                        score, channel = verdict
+                    elif not held:
+                        score, channel = score_task_result(
+                            task, logger=self.logger, name=self.name)
                     cap_name = getattr(task, 'requested_capability_name', None)
                     # subject_uuid: who the score is ABOUT, stamped on the
                     # requestor side by negprocess.handle_results from the
@@ -1163,13 +1198,20 @@ class AutonomousTrust(Protocol):
                     # (ISSUES §2.50); the executor's own half uses the same.
                     tx_id = (pair_task_id(task.uuid, executor)
                              if executor is not None else task.uuid)
-                    tx = TransactionScore(tx_id, score,
-                                          capability_name=cap_name,
-                                          channel=channel,
-                                          subject_uuid=executor,
-                                          competence=competence_weight(
-                                              cap_name, executor))
-                    queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
+                    if verdict is not None or not held:
+                        tx = TransactionScore(tx_id, score,
+                                              capability_name=cap_name,
+                                              channel=channel,
+                                              subject_uuid=executor,
+                                              competence=competence_weight(
+                                                  cap_name, executor))
+                        queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
+                        # A selection layer joins this score into its
+                        # decision log, which lives in negotiation (RD_12.7).
+                        if getattr(task, 'echo_score', False) and executor is not None:
+                            queues[CfgIds.negotiation].put(
+                                ScoreEcho(task.uuid, executor, score, channel),
+                                block=True, timeout=queue_cadence)
                     # The application sees one answer per task; the other
                     # executors' results are scored only (negprocess).
                     if self.external_feedback in queues \
@@ -1301,7 +1343,15 @@ class AutonomousTrust(Protocol):
                     # the requestor would have to know about to read the
                     # answer at all.
                     result, certificate = split_certified(result)
-                    tr = TaskResult(orig_task, result, certificate=certificate)
+                    # A replayable capability returns its answer with the
+                    # states it passed through (RD_12.6 plan, D2 and D9): the
+                    # reply commits to them, and they stay with this node.
+                    result, states = split_traced(result)
+                    trace = trace_chain(states) if states else None
+                    tr = TaskResult(orig_task, result, certificate=certificate,
+                                    trace_root=trace[-1] if trace else None,
+                                    trace_len=len(states) if states else None)
+                    tr.trace_states = states
                     tr.generate_proof()
                     queues[CfgIds.negotiation].put(tr, block=True, timeout=queue_cadence)
                     # Tag the TS with the capability that produced it so the
@@ -1309,17 +1359,22 @@ class AutonomousTrust(Protocol):
                     # capability's configured transaction_weight. The executor
                     # holds the original Task (active_tasks), so the name comes
                     # "for free" off the negotiation-driven path — this is the
-                    # principled producer the DoD coordinator stop-gap hand-tags
-                    # by hand (see doc/NV059/work/deferred.md §1.2). A None name
+                    # principled producer the DoD coordinator stop-gap tags
+                    # by hand. A None name
                     # falls back to weight 1, the prior behavior.
                     cap_name = getattr(
                         getattr(orig_task, 'capability', None), 'name', None)
                     # Under the pair task id (ISSUES §2.50): pairs only with
                     # the requestor's half about THIS executor.
                     me = getattr(self.identity, 'uuid', None)
+                    # It names the requestor, whose half names us back: two
+                    # halves pair only when each names the other (R+D.md
+                    # §14.2).
                     tx = TransactionScore(
                         pair_task_id(tr.uuid, me) if me is not None else tr.uuid,
-                        0.9, capability_name=cap_name)
+                        0.9, capability_name=cap_name,
+                        subject_uuid=getattr(getattr(orig_task, 'requestor',
+                                                     None), 'uuid', None))
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
                 except KeyboardInterrupt:
                     pass

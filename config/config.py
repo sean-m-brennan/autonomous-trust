@@ -18,7 +18,9 @@ import os
 import sys
 import platform
 
-REGISTRY_DISK = '~/Software/.docker.dir'
+# Where the local Docker registry keeps its images: $REGISTRY_DISK, as for
+# scripts/local-registry.sh, else ~/Software/.docker.dir.
+REGISTRY_DISK = os.path.expanduser(os.environ.get('REGISTRY_DISK') or '~/Software/.docker.dir')
 
 ARCH = platform.machine()
 OS = sys.platform

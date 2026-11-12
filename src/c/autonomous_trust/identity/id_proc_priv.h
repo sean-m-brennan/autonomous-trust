@@ -22,6 +22,7 @@
 
 #include "processes/processes.h"
 #include "identity/group.h"
+#include "identity/join_policy.h"
 #include "utilities/send_retry.h"
 #include "utilities/clock.h"    /* at_clock_sample_t (cohort clock skew) */
 
@@ -168,9 +169,42 @@ void identity_periodic_vote_collection(process_t *proc, directory_t *queues);
  *  cadence tick; exposed for unit tests. */
 void identity_retry_sibling_handoffs(process_t *proc);
 
+/** Write group.cfg.json (Python's schema, identity/group_file.h) if the group
+ *  changed since the last write. Called once per identity-loop pass with no
+ *  lock held (RD_14.4 plan, D10). */
+void identity_persist_group_if_dirty(process_t *proc);
+
+/** Take @p g (with its tagged step_dag @p steps, borrowed) as the group this
+ *  node persisted, as identity_run does from group.cfg.json at boot; NULL
+ *  forgets it. Preferred among the histories offered at join, and restored
+ *  before minting when none is usable. Also a test hook. */
+void identity_set_configured_group(const group_t *g, json_t *steps);
+
 /** How many group_key_update frames identity holds while it is not yet in
  *  phase 3 (ISSUES §2.18); past it the oldest is dropped. */
 #define ID_HELD_GROUP_UPDATES 16
+
+/** Catching up on the group key (doc/architecture/identity-protocol.md). A node
+ *  admitted while the cohort rotates can end behind on the key, and the
+ *  cohort, seeing it as a member, never resends (hostile-join run,
+ *  2026-11-03). It asks with group_key_query: a few members once phase 3
+ *  settles, and the sender of any group frame that will not open
+ *  (group_key_stale from the network process). A member answers a member it
+ *  holds with an ordinary group_key_update, taken through the same verified
+ *  gate as any other. Mirrors Python IdentityProcess._KEY_*. */
+#define ID_KEY_PULL_SETTLE_SEC     1.0   /* after phase 3, for the history's peers */
+#define ID_KEY_PULL_FANOUT         3     /* members asked on reaching phase 3 */
+#define ID_KEY_QUERY_COOLDOWN_SEC  10.0  /* per member asked */
+#define ID_KEY_ANSWER_COOLDOWN_SEC 5.0   /* per asker answered */
+#define ID_KEY_MARKS               32    /* cooldown entries kept per direction */
+
+/** Ask a few held members for the current group @p delay_sec from now
+ *  (identity_run calls it on reaching phase 3). */
+void identity_schedule_key_pull(double delay_sec);
+
+/** Once the scheduled pull is due and we are in phase 3, ask up to
+ *  ID_KEY_PULL_FANOUT held members, once; returns how many were asked. */
+size_t identity_maybe_pull_key(const process_t *proc);
 
 /** Replay, in arrival order, the group updates held because they arrived
  *  before phase 3, and forget them. identity_run calls it the moment it enters
@@ -275,6 +309,9 @@ int identity_partition_canonical_response(const char *group_uuid,
  *  one participant to do the refusing. Same compromise as
  *  @ref identity_get_peer_caps_count. */
 int64_t identity_freshness_refusals(const char *verb);
+/* The freshness high-water mark this node holds for (@p sender uuid, @p verb):
+ * 0 until a stamped message from it is accepted. */
+int64_t identity_freshness_mark(const char *sender, const char *verb);
 
 /** @name Identity services for a feature built beside the identity process
  *
@@ -414,6 +451,33 @@ void identity_set_border_guard_mode(process_t *proc, bool enabled);
  *  border-guards have confirmed the admission. Values < 1 clamp to 1. */
 void identity_set_admission_quorum(process_t *proc, int quorum);
 
+/** Load $AT_JOIN_POLICY into this node's identity state and refuse what it
+ *  cannot honour: a declaration that does not validate, or one naming an
+ *  anchor class no linked extension answers (RD_14.4 plan, D9). Logs an
+ *  ERROR per reason. @return 0, or -1 to refuse the start. */
+int identity_join_policy_check(logger_t *logger);
+
+/** Install @p policy (NULL: inert). Test hook as well as the loader's. */
+void identity_set_join_policy(const at_join_policy_t *policy);
+
+/** A copy of the join policy identity holds, into @p out. */
+void identity_get_join_policy(at_join_policy_t *out);
+
+/** The out-of-band anchor classes (AT_ANCHOR_* bits) @p ident holds here and
+ *  the join policy counts: the extensions' answers (id_ext.h anchor_classes)
+ *  intersected with the declared classes; 0 under an inert policy. Mirrors
+ *  Python IdentityProcess.anchor_classes. Takes and releases id_state.lock;
+ *  calls the hooks with no lock held. */
+uint32_t identity_anchor_classes(const process_t *proc, const public_identity_t *ident);
+
+/** Whether the join policy counts @p ident as an anchor. */
+bool identity_is_anchored(const process_t *proc, const public_identity_t *ident);
+
+/** Send reputation a PEER_ANCHOR for every peer whose anchoring changed since
+ *  the last call (RD_14.4 Phase 4); nothing while the join policy is off.
+ *  Mirrors Python IdentityProcess._publish_anchors. */
+void identity_publish_anchors(const process_t *proc);
+
 /** Wipe the entire identity singleton state (histories, peer_potentials,
  *  vote_collection, peer_caps_map, and conformance-only override maps),
  *  resetting choosing_group to false. Preserves synchronous_dispatch so
@@ -532,6 +596,36 @@ int identity_request_cohort_join(process_t *proc, directory_t *queues,
  *  surface for tests. */
 bool identity_join_pending(const char *group_uuid);
 
+/** Whether @p grp as our primary group would span the gateway: it is one of
+ *  our child groups, or lists an address one of them holds (our own entries
+ *  aside). Every primary adopt checks it, so invariant G holds on the result
+ *  whichever path got there. Always false on a leaf node. Mirrors Python
+ *  IdentityProcess._spans_gateway. */
+bool identity_group_spans_gateway(const process_t *proc, const group_t *grp);
+
+/** Whether a joiner still waiting to be admitted should re-broadcast
+ *  request_access at @p elapsed_us into its wait. When it should, records the
+ *  ask in @p last_us and, once @p init_us has passed, doubles @p interval_us up
+ *  to @p cap_us. A single broadcast was all a joiner used to send; on a loaded
+ *  host a large share of UDP sends is dropped at the sender while the kernel
+ *  reports success. Mirrors Python IdentityProcess.choose_group. */
+bool identity_rejoin_due(long elapsed_us, long *last_us, long *interval_us,
+                         long init_us, long cap_us);
+
+/** How long a joiner waits to be admitted before founding a group of its own:
+ *  @p init_us, or AT_JOIN_PATIENCE_SEC when that is longer. Mirrors Python
+ *  IdentityProcess._join_patience. */
+long identity_join_wait_us(long init_us);
+
+/** Send every scheduled welcome copy (access_granted, full_history) due at
+ *  @p now (monotonic seconds). A welcome is sent again 2 s and 6 s after the
+ *  first (ID_WELCOME_RESEND_AFTER_S): a joiner's request may be one of a
+ *  hundred that got through a loaded host, and if its one welcome is lost it
+ *  never hears back. A copy the joiner already has is refused as a replay by
+ *  its freshness stamp. Mirrors Python IdentityProcess._resend_welcomes. */
+void identity_resend_welcomes_at(const process_t *proc, directory_t *queues,
+                                 double now);
+
 /** Seed a child cohort this node gateways (C twin of Python child_groups
  *  seeding). @p gateway_uuid names the deeper gateway to recurse into for that
  *  child group (NULL for a 2-level gateway). Returns 0 on success. */
@@ -607,6 +701,29 @@ DECLARE_ERROR(EID_NOQ, "Required process queue missing");
 /** Stash one full_history payload as handle_receive_history does. The array
  *  takes ownership of @p history. Test hook. */
 void identity_stash_history(json_t *history);
+
+/** As identity_stash_history, naming who offered it (NULL: nobody known), as
+ *  handle_receive_history records the box-decrypted sender (RD_14.4 plan, D1).
+ *  Test hook. */
+void identity_stash_history_from(json_t *history, const public_identity_t *sender);
+
+/** The members marked provisional by an adoption under the join policy
+ *  (RD_14.4 plan, D1 (d)): a new JSON array of uuid strings the caller
+ *  decrefs. Mirrors Python IdentityProcess.provisional_members. */
+json_t *identity_provisional_members(void);
+
+/** Mark this node as having minted its own group when no history came, so a
+ *  history arriving now takes _merge_to_mesh rather than choose_group. Test
+ *  hook (the conformance self_bootstrapped fixture). */
+void identity_set_self_bootstrapped(bool on);
+
+/** Mark choose_group's wait as running, so a history arriving now is only
+ *  stashed for it. Test hook (the conformance choosing fixture). */
+void identity_set_choosing_group(bool on);
+
+/** Its file: <cfg>/provisional_members.cfg.json, a JSON array of uuids, shared
+ *  with Python (PROVISIONAL_FILE). */
+#define ID_PROVISIONAL_FILE "provisional_members"
 
 /** Run choose_group's history adoption over the stashed histories: adopt the
  *  mesh group and its key, and push it to the sibling processes as a GROUP

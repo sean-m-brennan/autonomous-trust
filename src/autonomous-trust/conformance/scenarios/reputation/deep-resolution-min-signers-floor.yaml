@@ -1,0 +1,55 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: deep-resolution-min-signers-floor
+byte_pinning: false
+description: |
+    Deep resolution, the signer floor: a requestor configured to demand two
+    verified, trusted co-signers refuses an answer that carries one
+    (AT_REP_RESOLVE_MIN_SIGNERS; RD_13.4 D5).
+
+    The answer is otherwise honest. The window is whole, the root reproduces,
+    and the one signature verifies against a signer the requestor trusts, so
+    the floor is the only check that fails. Python always read this variable;
+    C hard-coded 1, so the same environment once gave a refusal on one runtime
+    and an acceptance on the other. This pins that they now agree.
+
+    The floor is not a quorum test. A receiver across a boundary does not know
+    the answering group's size, so it cannot tell what a majority would be.
+    The floor is only the point below which an answer is not evidence.
+
+participants:
+  - id: requestor
+    role: proposer
+  - id: holder
+    role: acceptor
+  - id: subject
+    role: acceptor
+
+fixtures:
+  resolve_min_signers:
+    requestor: 2
+  tx_history:
+    holder:
+      - {task_id: d1, p1: holder, p1_score: 0.8, p2: subject, p2_score: 0.6}
+      - {task_id: d2, p1: holder, p1_score: 0.9, p2: subject, p2_score: 0.4}
+      - {task_id: d3, p1: holder, p1_score: 0.7, p2: subject, p2_score: 0.5}
+
+steps:
+  - id: 1
+    from: holder
+    to: requestor
+    function: resolved reputation
+    payload:
+      peer: subject
+      query_id: q1
+      cosigners: [holder]
+    description: |
+        One genuine co-signature against a floor of two.
+
+expected_state:
+  requestor:
+    resolved_reputation:
+      peer: subject
+      verified: false
+      score: null

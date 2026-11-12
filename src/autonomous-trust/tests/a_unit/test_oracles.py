@@ -164,6 +164,17 @@ class TestCheckEnv:
         assert len(caplog.records) == 2
         assert '$AT_CALIBRATION is set' in caplog.records[0].getMessage()
 
+    def test_a_declared_replication_layer_missing_is_refused(self, empty,
+                                                             monkeypatch):
+        """$AT_REPLICATION is a declaration like the other four, so a node
+        that sets it without the layer refuses to start (RD_12.6 plan,
+        Phase 1)."""
+        monkeypatch.setenv('AT_REPLICATION', '/nonexistent/replication.json')
+        with pytest.raises(oracles.OracleMissingError, match='replication'):
+            oracles.check_env()
+        oracles.declare('replication')
+        oracles.check_env()
+
     def test_empty_is_undeclared(self, empty, monkeypatch):
         monkeypatch.setenv('AT_PHYSICS', '')
         oracles.check_env()

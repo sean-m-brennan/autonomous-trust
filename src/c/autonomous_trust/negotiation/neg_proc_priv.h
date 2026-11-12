@@ -90,6 +90,13 @@ void negotiation_clear_test_state(const process_t *proc);
  *  polluted by prior scenarios run in alphabetical order. */
 void negotiation_reset_state(void);
 
+/** Keep the trace @p states (copied) for @p task, shown only to @p requestor,
+ *  as an executor of a replayable capability does (RD_12.6 plan 3.7).
+ *  Conformance/test hook. @return 0, or -1 on a bad argument or no memory. */
+int negotiation_retain_trace_for_test(const unsigned char *task,
+                                      const unsigned char *requestor,
+                                      const char *const *states, int n);
+
 /** Read the current size of the shared task_stack for
  *  `task_in_stack` expected_state assertions. Returns -1 if neg_state
  *  is uninitialized. Mirrors the Python adapter's check on
@@ -268,5 +275,13 @@ DECLARE_ERROR(ENEG_NOPEERS, "No capable peers available");
  *  which applies the host's timezone to what is a UTC struct. See
  *  test_task_start_epoch_ignores_the_host_timezone. */
 time_t negotiation_dt_epoch(const datetime_t *dt);
+
+/* How long a given-up task's tracker is kept, and how many at most, so a
+ * result that arrives after give-up is still scored against the challenge we
+ * issued (hostile-join run, 2026-11-04: a colluder's backlog held a joiner's
+ * probes past their deadline, and the answers that came minutes later were
+ * dropped). Mirrors Python NegotiationProcess.LATE_RESULT_SEC / _MAX. */
+#define NEG_LATE_RESULT_SEC 600.0
+#define NEG_LATE_RESULT_MAX 64
 
 #endif  /* NEG_PROC_PRIV_H */

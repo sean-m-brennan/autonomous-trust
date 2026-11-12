@@ -147,8 +147,8 @@ DEFINE_TEST(test_a_checkpoint_archives_its_attested_entries)
 
     /* The attestation's designation, as AttestedScore.designation spells it. */
     char desig[512];
-    int n = snprintf(desig + 10, sizeof(desig) - 10, "%s|%s|%s|%.17g|probe|%s",
-                     v_str, s_str, t_str, 0.3, DIGEST);
+    int n = snprintf(desig + 10, sizeof(desig) - 10, "%s|%s|%s|%d|probe|%s",
+                     v_str, s_str, t_str, 300, DIGEST);
     memcpy(desig, "AT-ATTEST", 10);
     size_t dlen = 10 + (size_t)n;
     char sig_v[crypto_sign_BYTES * 2 + 1], sig_o[crypto_sign_BYTES * 2 + 1];
@@ -158,7 +158,7 @@ DEFINE_TEST(test_a_checkpoint_archives_its_attested_entries)
     char *cert_txt = json_dumps(cert, JSON_COMPACT | JSON_SORT_KEYS);
     json_decref(cert);
     ck_assert_ret_ok(reputation_install_tx_attested_scoped(
-        ver->uuid, 0.3, "probe", subj->uuid, DIGEST, NULL, cert_txt));
+        ver->uuid, 300, "probe", subj->uuid, DIGEST, NULL, cert_txt));
     free(cert_txt);
 
     char root[TX_HASH_HEX_LEN + 1] = {0};
@@ -189,7 +189,7 @@ DEFINE_TEST(test_a_checkpoint_archives_its_attested_entries)
     json_error_t jerr;
     json_t *rec = json_load_file(path, 0, &jerr);
     ck_assert_ptr_nonnull(rec);
-    ck_assert_str_eq(json_string_value(json_object_get(rec, "schema")), "1");
+    ck_assert_str_eq(json_string_value(json_object_get(rec, "schema")), "2");
     json_t *entry = json_object_get(rec, "entry");
     ck_assert_str_eq(json_string_value(json_object_get(entry, "task_id")), t_str);
     ck_assert(json_is_object(json_object_get(entry, "attest_sigs")));
@@ -272,7 +272,7 @@ DEFINE_TEST(test_a_checkpoint_short_of_quorum_archives_nothing)
     tx_attest_task_uuid(ver->uuid, subj->uuid, DIGEST, task);
     uuid_unparse_lower(task, t_str);
     ck_assert_ret_ok(reputation_install_tx_attested_scoped(
-        ver->uuid, 0.3, "probe", subj->uuid, DIGEST, NULL, "{\"x\":\"y\"}"));
+        ver->uuid, 300, "probe", subj->uuid, DIGEST, NULL, "{\"x\":\"y\"}"));
     char root[TX_HASH_HEX_LEN + 1] = {0};
     reputation_get_window_root(root);
     json_t *sigs = json_pack("{s:s}", o_str, "00");   /* one of three */
@@ -315,7 +315,7 @@ DEFINE_TEST(test_a_checkpoint_off_our_window_archives_nothing)
     tx_attest_task_uuid(ver->uuid, subj->uuid, DIGEST, task);
     uuid_unparse_lower(task, t_str);
     ck_assert_ret_ok(reputation_install_tx_attested_scoped(
-        ver->uuid, 0.3, "probe", subj->uuid, DIGEST, NULL, "{\"x\":\"y\"}"));
+        ver->uuid, 300, "probe", subj->uuid, DIGEST, NULL, "{\"x\":\"y\"}"));
     char path[400];
     snprintf(path, sizeof(path), "%s/etc/at/attested/%s.json", root_dir, t_str);
 
@@ -440,8 +440,8 @@ DEFINE_TEST(test_the_group_size_is_the_one_the_certificate_was_made_in)
     tx_attest_task_uuid(ver->uuid, subj->uuid, DIGEST, task);
     uuid_unparse_lower(task, t_str);
     char desig[512];
-    int n = snprintf(desig + 10, sizeof(desig) - 10, "%s|%s|%s|%.17g|probe|%s",
-                     v_str, s_str, t_str, 0.3, DIGEST);
+    int n = snprintf(desig + 10, sizeof(desig) - 10, "%s|%s|%s|%d|probe|%s",
+                     v_str, s_str, t_str, 300, DIGEST);
     memcpy(desig, "AT-ATTEST", 10);
     size_t dlen = 10 + (size_t)n;
     char sig_v[crypto_sign_BYTES * 2 + 1], sig_o[crypto_sign_BYTES * 2 + 1];
@@ -451,7 +451,7 @@ DEFINE_TEST(test_the_group_size_is_the_one_the_certificate_was_made_in)
     char *cert_txt = json_dumps(cert, JSON_COMPACT | JSON_SORT_KEYS);
     json_decref(cert);
     ck_assert_ret_ok(reputation_install_tx_attested_scoped(
-        ver->uuid, 0.3, "probe", subj->uuid, DIGEST, NULL, cert_txt));
+        ver->uuid, 300, "probe", subj->uuid, DIGEST, NULL, cert_txt));
     free(cert_txt);
 
     char root[TX_HASH_HEX_LEN + 1] = {0};

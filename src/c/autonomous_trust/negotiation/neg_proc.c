@@ -36,13 +36,17 @@
 #include "utilities/util.h"       /* at_strlcpy */
 #include "bootstrap/bootstrap_capabilities.h"  /* known-answer probe verifiers */
 #include "bootstrap/bootstrap_worker.h"        /* probe allocation + window */
+#include "identity/join_policy.h"              /* the join burst's knobs */
 #include "negotiation/neg_oracle.h"            /* §12 verification layers */
 #include "negotiation/neg_ext.h"               /* extensions' tier caps */
 #include "negotiation/neg_certified.h"         /* §12.3 witness wire format */
+#include "negotiation/neg_replay.h"            /* §12.6 the executor's trace */
+#include "negotiation/neg_ext.h"               /* §12.6 the result hook */
 #include "config/configuration.h"             /* config_t, for our own identity */
 #include "reputation/tx_channel.h"             /* evidence channels */
 #include "reputation/reputation.h"              /* tx_pair_task_uuid */
 #include "utilities/send_retry.h"   /* at_send: keep a refused frame */
+#include "utilities/numfmt.h"
 
 /* Hand a sibling queue one of this process's frames, keeping it if the queue is
  * full (utilities/send_retry.h, ISSUES §2.14). Every negotiation frame is a
@@ -69,6 +73,9 @@ char NEG_PROTO_STAT_REQ[] = "status request";
 char NEG_PROTO_STAT_RSP[] = "status response";
 char NEG_PROTO_RESULT[]   = "report results";
 char NEG_PROTO_CANCEL[]   = "cancel";
+char NEG_PROTO_REPLAY_CHALLENGE[] = "replay challenge";
+char NEG_PROTO_REPLAY_REVEAL[]    = "replay reveal";
+char NEG_PROTO_REPLAY_RESPONSE[]  = "replay response";
 /* Local-IPC function name for the tier_lost message. Mirrors Python
  * IdentityProtocol.tier_lost verbatim; reputation publishes this
  * onto the negotiation queue when a peer's tier drops, and
@@ -97,6 +104,14 @@ static char ID_TIER_LOST[] = "tier_lost";
  * most max_concurrency are used at once; this is only the array's bound. */
 #define NEG_RUNNING_MAX 16
 
+/* A given-up task's tracker, kept until @c until so a late result is scored
+ * against it (negotiation_status_sweep, handle_results). */
+typedef struct {
+    char task[UUID_STRING_LEN + 1];   /* "" when free */
+    task_tracker_t *tracker;          /* owned */
+    double until;
+} neg_late_t;
+
 typedef struct {
     bool used;                    /* holds a job, running or not yet reported */
     bool done;                    /* its thread has finished */
@@ -105,7 +120,24 @@ typedef struct {
     const capability_t *cap;
     int rc;
     char result[CAP_RESULT_LEN + 1];
+    neg_trace_t trace;            /* a replayable capability's states */
 } neg_running_t;
+
+/* Traces kept to answer a verifier (RD_12.6 plan, section 3.2): an executor
+ * of a replayable capability commits to its trace and must be able to reveal
+ * any step of it while a replica's disagreement is settled. Kept for
+ * NEG_TRACE_RETAIN_SEC, twice the requestor's hold on its halves; the oldest
+ * goes first when the table is full. */
+#define NEG_TRACE_RETAIN_MAX 16
+#define NEG_TRACE_RETAIN_SEC 60
+
+typedef struct {
+    bool used;
+    uuid_t task;
+    uuid_t requestor;             /* the only peer it is shown to */
+    time_t expires;
+    neg_trace_t trace;
+} neg_retained_trace_t;
 
 static struct {
     job_queue_t task_stack;
@@ -160,7 +192,55 @@ static struct {
     bootstrap_worker_t bootstrap;
     /* Jobs running on worker threads, or finished and not yet reported. */
     neg_running_t running[NEG_RUNNING_MAX];
+    neg_retained_trace_t traces[NEG_TRACE_RETAIN_MAX];
+    neg_late_t late[NEG_LATE_RESULT_MAX];
 } neg_state;
+
+/* Free a retained given-up tracker's slot. Caller holds neg_state.lock. */
+static void _late_free_locked(neg_late_t *l)
+{
+    if (l->tracker != NULL)
+    {
+        task_tracker_free(l->tracker);
+        free(l->tracker);
+    }
+    memset(l, 0, sizeof(*l));
+}
+
+/* The retained tracker of given-up task @p task_uuid_str, or NULL. Caller
+ * holds neg_state.lock. */
+static neg_late_t *_late_find_locked(const char *task_uuid_str)
+{
+    for (int i = 0; i < NEG_LATE_RESULT_MAX; i++)
+        if (neg_state.late[i].task[0] != '\0'
+            && strcmp(neg_state.late[i].task, task_uuid_str) == 0)
+            return &neg_state.late[i];
+    return NULL;
+}
+
+/* Keep @p tracker (owned from here on) for given-up task @p task_uuid_str
+ * until @p until; the slot that would be let go soonest is taken when the
+ * table is full. Caller holds neg_state.lock. */
+static void _late_retain_locked(const char *task_uuid_str,
+                                task_tracker_t *tracker, double until)
+{
+    neg_late_t *slot = &neg_state.late[0];
+    for (int i = 0; i < NEG_LATE_RESULT_MAX; i++)
+    {
+        neg_late_t *l = &neg_state.late[i];
+        if (l->task[0] == '\0')
+        {
+            slot = l;
+            break;
+        }
+        if (l->until < slot->until)
+            slot = l;
+    }
+    _late_free_locked(slot);
+    at_strlcpy(slot->task, task_uuid_str, sizeof(slot->task));
+    slot->tracker = tracker;
+    slot->until = until;
+}
 
 static void _join_running(void);
 
@@ -183,6 +263,15 @@ static void _ensure_init(void)
          * three capabilities registered, which matches the static capability
          * table this runtime advertises them from. */
         bootstrap_worker_init(&neg_state.bootstrap);
+        /* The join burst (RD_14.4 Phase 5), under the join policy identity
+         * validated at start (identity_run refuses a bad one). */
+        at_join_policy_t policy;
+        char jerr[256];
+        if (at_join_policy_load_env(&policy, jerr, sizeof(jerr)))
+            bootstrap_worker_set_burst(&neg_state.bootstrap, policy.enabled,
+                                       policy.burst_k,
+                                       policy.burst_interval_sec,
+                                       policy.burst_budget_factor);
         freshness_init(&neg_state.freshness, "negotiation", NULL);
         neg_state.initialized = true;
     }
@@ -377,6 +466,13 @@ void negotiation_reset_state(void)
     map_init(&neg_state.peer_tiers);
     map_free(&neg_state.cap_required_tiers);
     map_init(&neg_state.cap_required_tiers);
+    for (int i = 0; i < NEG_TRACE_RETAIN_MAX; i++)
+    {
+        neg_trace_free(&neg_state.traces[i].trace);
+        memset(&neg_state.traces[i], 0, sizeof(neg_state.traces[i]));
+    }
+    for (int i = 0; i < NEG_LATE_RESULT_MAX; i++)
+        _late_free_locked(&neg_state.late[i]);
     /* Replay marks too. The harness derives participant uuids
      * deterministically from their slugs, so "alice" is the same sender in
      * every scenario; a mark left behind by one would refuse the next
@@ -663,6 +759,17 @@ static void _task_info_into_json(const process_t *proc, const task_t *task,
      * other verbs carry whatever the task already held and nothing reads it
      * there. */
     json_object_set_new(j, "seq", json_integer((json_int_t)task->seq));
+    /* A selection layer's draw (RD_12.7 plan section 0.1), only when one drew
+     * this invitee: a task nothing selected keeps its old shape. */
+    if (task->draw_json[0] != '\0')
+    {
+        json_error_t jerr;
+        json_t *draw = json_loads(task->draw_json, 0, &jerr);
+        if (json_is_object(draw))
+            json_object_set_new(j, "draw", draw);
+        else
+            json_decref(draw);
+    }
 }
 
 /****************************
@@ -753,7 +860,8 @@ static json_t *_task_status_to_json(const process_t *proc, const task_t *task,
 /* Frama-C: skipped — [serialization] jansson JSON serialization */
 static json_t *_task_result_to_json(const process_t *proc, const task_t *task,
                                     const char *answer, json_t *certificate,
-                                    json_t *prediction)
+                                    json_t *prediction, const char *trace_root,
+                                    int trace_len)
 {
     json_t *j = json_object();
     if (j == NULL)
@@ -792,6 +900,14 @@ static json_t *_task_result_to_json(const process_t *proc, const task_t *task,
      * so a Python peer's set survives a C hop intact. */
     json_object_set_new(j, "prediction",
                         prediction != NULL ? prediction : json_null());
+    /* The executor's commitment to a replayable capability's trace (RD_12.6
+     * plan, D9): the last chain digest and how many states. Always emitted,
+     * `null` for any other capability, because Python always serializes the
+     * pair and the corpus round-trips one pinned fixture through both. */
+    json_object_set_new(j, "trace_root", trace_root != NULL && trace_len > 0
+                        ? json_string(trace_root) : json_null());
+    json_object_set_new(j, "trace_len", trace_root != NULL && trace_len > 0
+                        ? json_integer(trace_len) : json_null());
     /* Fields Python's TaskResult always serializes and that this runtime never
      * fills: `proof` is the ZK-STARK attesting the bytes were not altered
      * (Python's `generate_proof`, which C has no counterpart for), and the
@@ -820,7 +936,10 @@ static bool _py_result_text(const json_t *j_result, char *out, size_t cap)
         return (size_t)snprintf(out, cap, "%lld",
                                 (long long)json_integer_value(j_result)) < cap;
     if (json_is_real(j_result))
-        return (size_t)snprintf(out, cap, "%.17g", json_real_value(j_result)) < cap;
+    {
+        char g17[AT_G17_LEN];
+        return at_strlcpy(out, at_fmt_g17(json_real_value(j_result), g17), cap) < cap;
+    }
     if (json_is_true(j_result) || json_is_false(j_result))
         return at_strlcpy(out, json_is_true(j_result) ? "True" : "False", cap) < cap;
     /* An object or array: hand it over as compact JSON rather than dropping
@@ -873,6 +992,20 @@ static int _task_from_json(const json_t *j, task_t *task)
     json_t *j_seq = json_object_get(j, "seq");
     if (json_is_integer(j_seq))
         task->seq = (int64_t)json_integer_value(j_seq);
+
+    /* The requestor's draw, kept whole or not at all, as kwargs is. */
+    task->draw_json[0] = '\0';
+    json_t *j_draw = json_object_get(j, "draw");
+    if (json_is_object(j_draw))
+    {
+        char *dumped = json_dumps(j_draw, JSON_COMPACT | JSON_SORT_KEYS);
+        if (dumped != NULL)
+        {
+            if (strlen(dumped) < sizeof(task->draw_json))
+                at_strlcpy(task->draw_json, dumped, sizeof(task->draw_json));
+            free(dumped);
+        }
+    }
 
     /* A TaskResult carries no `parameters` (it extends TaskInfo), so their
      * absence is normal for that verb and leaves the caller's memset zeros. */
@@ -981,6 +1114,16 @@ int negotiation_payload_roundtrip(const char *verb, const char *in_json,
     json_t *cert_copy = json_is_object(j_cert) ? json_deep_copy(j_cert) : NULL;
     json_t *j_pred = json_object_get(in, "prediction");
     json_t *pred_copy = json_is_object(j_pred) ? json_deep_copy(j_pred) : NULL;
+    char trace_root[NEG_REPLAY_HASH_HEX_LEN + 1] = {0};
+    const char *tr = json_string_value(json_object_get(in, "trace_root"));
+    json_t *tl = json_object_get(in, "trace_len");
+    int trace_len = 0;
+    if (tr != NULL && strlen(tr) == NEG_REPLAY_HASH_HEX_LEN && json_is_integer(tl)
+        && json_integer_value(tl) > 0 && json_integer_value(tl) <= NEG_REPLAY_MAX_STEPS)
+    {
+        at_strlcpy(trace_root, tr, sizeof(trace_root));
+        trace_len = (int)json_integer_value(tl);
+    }
     neg_status_t status = _py_status_value(_py_tagged_str(json_object_get(in, "status")));
     json_decref(in);
 
@@ -1000,7 +1143,8 @@ int negotiation_payload_roundtrip(const char *verb, const char *in_json,
         /* Takes ownership of both copies, including on its own failure. */
         out = _task_result_to_json(NULL, &task,
                                    have_result ? result_text : NULL, cert_copy,
-                                   pred_copy);
+                                   pred_copy, trace_len > 0 ? trace_root : NULL,
+                                   trace_len);
     }
     else
     {
@@ -1088,6 +1232,68 @@ static bool _peer_has_capability(const process_t *proc, const char *peer_uuid_st
  * a cadence for it to come back around. Caller holds neg_state.lock.
  *
  * @p target_uuid, when non-zero, narrows the fan-out to one peer. */
+/* The candidates a selection layer draws from: every capable, present peer
+ * in the core's peer order, with its tier and its index in the peer table.
+ * Caller holds neg_state.lock and the peers read lock. */
+typedef struct {
+    neg_candidates_t cands;
+    unsigned char (*uuid)[16];
+    int *tier;
+    size_t *at;
+    bool *flags;
+} sel_cands_t;
+
+static void _sel_cands_free(sel_cands_t *sc)
+{
+    free(sc->uuid);
+    free(sc->tier);
+    free(sc->at);
+    free(sc->flags);
+    memset(sc, 0, sizeof(*sc));
+}
+
+static int _sel_cands_build(const process_t *proc, const char *cap_name, sel_cands_t *sc)
+{
+    memset(sc, 0, sizeof(*sc));
+    size_t n_peers = proc->protocol.num_peers;
+    sc->uuid = calloc(n_peers ? n_peers : 1, sizeof(*sc->uuid));
+    sc->tier = calloc(n_peers ? n_peers : 1, sizeof(*sc->tier));
+    sc->at = calloc(n_peers ? n_peers : 1, sizeof(*sc->at));
+    sc->flags = calloc(n_peers ? n_peers : 1, sizeof(*sc->flags));
+    if (sc->uuid == NULL || sc->tier == NULL || sc->at == NULL || sc->flags == NULL)
+    {
+        _sel_cands_free(sc);
+        return -1;
+    }
+    size_t nc = 0;
+    for (size_t i = 0; i < n_peers; i++)
+    {
+        char peer_uuid_str[UUID_STRING_LEN + 1] = {0};
+        uuid_unparse_lower(proc->protocol.peers[i].uuid, peer_uuid_str);
+        if (!_peer_has_capability(proc, peer_uuid_str, cap_name)
+            || proc->protocol.peer_absent[i])
+            continue;
+        memcpy(sc->uuid[nc], proc->protocol.peers[i].uuid, 16);
+        int tier = _peer_tier_override_locked(proc, proc->protocol.peers[i].uuid);
+        sc->tier[nc] = tier >= 0 ? tier : identity_get_peer_tier(proc->protocol.peers[i].uuid);
+        sc->at[nc++] = i;
+    }
+    sc->cands.uuid = (const unsigned char (*)[16])sc->uuid;
+    sc->cands.tier = sc->tier;
+    sc->cands.n = nc;
+    return 0;
+}
+
+/* The chosen flags by peer-table index, or NULL when out of memory. */
+static bool *_sel_cands_chosen(const sel_cands_t *sc, size_t n_peers)
+{
+    bool *chosen = calloc(n_peers ? n_peers : 1, sizeof(*chosen));
+    if (chosen != NULL)
+        for (size_t c = 0; c < sc->cands.n; c++)
+            chosen[sc->at[c]] = sc->flags[c];
+    return chosen;
+}
+
 static int _announce_task_locked(const process_t *proc, task_t *task,
                                  const uuid_t target_uuid)
 {
@@ -1140,9 +1346,6 @@ static int _announce_task_locked(const process_t *proc, task_t *task,
         return 0;
     }
 
-    /* Build JSON payload for invitation */
-    json_t *invite_json = _task_to_json(proc, task);
-
     /* An addressed start narrows the fan-out to one peer. A probe has to be
      * able to say "this peer": fanned out, an invitation is answered by
      * whichever peer replies first, so a broadcast cannot express a directed
@@ -1156,27 +1359,66 @@ static int _announce_task_locked(const process_t *proc, task_t *task,
     bool addressed = (target_uuid != NULL
                       && uuid_compare(target_uuid, zero_uuid) != 0);
 
+    /* Selective assignment (RD_12.7 plan section 3.1): a selection layer may
+     * draw the invitees from the capable, present peers -- k of them for a
+     * capability it selects on, or the target of a directed probe -- and
+     * stamp the invitation with the draw. With no layer, or none that selects
+     * this task, nothing below changes. Mirrors Python start_task. */
+    peers_read_lock(proc);
+    bool *chosen = NULL;
+    size_t n_peers = proc->protocol.num_peers;
+    const neg_select_hook_t *sel = neg_ext_select_hook();
+    if (sel != NULL && sel->select != NULL && n_peers > 0)
+    {
+        sel_cands_t sc;
+        if (_sel_cands_build(proc, task->capability.name, &sc) == 0)
+        {
+            char task_uuid_s[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(task->uuid, task_uuid_s);
+            if (sc.cands.n > 0
+                && sel->select(proc, task_uuid_s, task->capability.name, &sc.cands,
+                               addressed ? target_uuid : NULL, sc.flags,
+                               task->draw_json, sizeof(task->draw_json)))
+            {
+                chosen = _sel_cands_chosen(&sc, n_peers);
+                if (tracker != NULL)
+                    tracker->drawn = true;
+            }
+        }
+        _sel_cands_free(&sc);
+    }
+
+    /* Build JSON payload for invitation, after the draw it may carry. */
+    json_t *invite_json = _task_to_json(proc, task);
+
     /* Send invitation to capable peers */
     int invited = 0;
     int sent = 0;   /* of those, the invitations the network queue took */
-    peers_read_lock(proc);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         char peer_uuid_str[UUID_STRING_LEN + 1] = {0};
         uuid_unparse_lower(proc->protocol.peers[i].uuid, peer_uuid_str);
 
-        if (addressed && uuid_compare(proc->protocol.peers[i].uuid, target_uuid) != 0)
-            continue;
+        if (chosen != NULL)
+        {
+            if (!chosen[i])
+                continue;
+        }
+        else
+        {
+            if (addressed && uuid_compare(proc->protocol.peers[i].uuid, target_uuid) != 0)
+                continue;
 
-        /* Filter by capability if peer_capabilities map is available */
-        if (!_peer_has_capability(proc, peer_uuid_str, task->capability.name))
-            continue;
+            /* Filter by capability if peer_capabilities map is available */
+            if (!_peer_has_capability(proc, peer_uuid_str, task->capability.name))
+                continue;
 
-        /* Not a peer the network process has heard from lately: asking it to
-         * work would only time out (doc/architecture/peer-presence.md). It
-         * stays a member; it is just not invited. */
-        if (proc->protocol.peer_absent[i])
-            continue;
+            /* Not a peer the network process has heard from lately: asking it
+             * to work would only time out (doc/architecture/peer-presence.md).
+             * It stays a member; it is just not invited. */
+            if (proc->protocol.peer_absent[i])
+                continue;
+        }
 
         generic_msg_t invite = {0};
         invite.type = NET_MESSAGE;
@@ -1198,6 +1440,7 @@ static int _announce_task_locked(const process_t *proc, task_t *task,
         invited++;
     }
     peers_read_unlock(proc);
+    free(chosen);
 
     if (invite_json)
         json_decref(invite_json);
@@ -1353,6 +1596,15 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
                                             NEG_PROTO_ANNOUNCE));
         pthread_mutex_unlock(&neg_state.lock);
         return true;
+    }
+
+    /* A selection layer checks the requestor's coin (RD_12.7 plan section
+     * 0.2): it logs and counts a bad draw, and changes nothing here. */
+    {
+        const neg_select_hook_t *sel = neg_ext_select_hook();
+        if (have_task && task.draw_json[0] != '\0' && sel != NULL
+            && sel->on_invitation != NULL)
+            sel->on_invitation(proc, nmsg->from_whom.uuid, task.draw_json);
     }
 
     /* Flood detection: count how many times we have seen this task */
@@ -1712,6 +1964,68 @@ static void _cancel_participant(const process_t *proc,
                  task_uuid_str ? task_uuid_str : "?", peer_str);
 }
 
+/* Invite a selection layer's replacement for a drawn invitee that declined
+ * (RD_12.7 plan section 3.5, D5(a)), from the task this node announced
+ * (proposed_tasks) with the new draw and a fresh stamp. Mirrors Python
+ * NegotiationProcess._replace_declined. Caller holds neg_state.lock. */
+static void _replace_declined_locked(const process_t *proc, task_tracker_t *tracker,
+                                     const char *task_uuid_str, const uuid_t peer)
+{
+    const neg_select_hook_t *sel = neg_ext_select_hook();
+    if (sel == NULL || sel->on_decline == NULL)
+        return;
+    data_t *task_dat = NULL;
+    task_t *announced = NULL;
+    if (map_get(&neg_state.proposed_tasks, (char *)task_uuid_str, &task_dat) != 0 || task_dat == NULL
+        || data_object_ptr(task_dat, (ptr_t *)&announced) != 0 || announced == NULL)
+        return;
+    task_t task;
+    memcpy(&task, announced, sizeof(task));
+
+    peers_read_lock(proc);
+    sel_cands_t sc;
+    bool *chosen = NULL;
+    if (_sel_cands_build(proc, task.capability.name, &sc) == 0)
+    {
+        if (sc.cands.n > 0
+            && sel->on_decline(proc, task_uuid_str, task.capability.name, peer,
+                               &sc.cands, sc.flags, task.draw_json,
+                               sizeof(task.draw_json)))
+            chosen = _sel_cands_chosen(&sc, proc->protocol.num_peers);
+    }
+    _sel_cands_free(&sc);
+    if (chosen == NULL)
+    {
+        peers_read_unlock(proc);
+        return;
+    }
+    task.seq = freshness_stamp(&neg_state.freshness, proc->logger);
+    json_t *invite_json = task.seq > 0 ? _task_to_json(proc, &task) : NULL;
+    for (size_t i = 0; invite_json != NULL && i < proc->protocol.num_peers; i++)
+    {
+        if (!chosen[i])
+            continue;
+        generic_msg_t invite = {0};
+        invite.type = NET_MESSAGE;
+        strncpy(invite.info.net_msg.process, "negotiation", PROC_NAME_LEN);
+        invite.info.net_msg.function = NEG_PROTO_ANNOUNCE;
+        invite.info.net_msg.encrypt = true;
+        memcpy(&invite.info.net_msg.to_whom, &proc->protocol.peers[i],
+               sizeof(public_identity_t));
+        strncpy(invite.info.net_msg.return_to, "negotiation", PROC_NAME_LEN);
+        net_msg_pack_json(&invite.info.net_msg, invite_json);
+        (void)_neg_send(proc, "network", &invite, "a re-drawn invitation");
+        net_msg_free_obj(&invite.info.net_msg);
+        task_tracker_add_invited(tracker, proc->protocol.peers[i].uuid);
+        tracker->expected++;
+        log_debug(proc->logger, "Negotiation: declined task %s re-drawn to %s\n",
+                  task_uuid_str, proc->protocol.peers[i].nickname);
+    }
+    peers_read_unlock(proc);
+    json_decref(invite_json);
+    free(chosen);
+}
+
 /****************************
  * Handler: handle_refuse (nack) — NEG_PROTO_REFUSE
  * Extract task UUID, decrement expected count in tracker; log failure if insufficient.
@@ -1727,6 +2041,15 @@ static bool handle_refuse(const process_t *proc, directory_t *queues, generic_ms
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* Only a signed nack counts, or anyone could cancel a participant by
+     * naming the task (RD_2.6 plan §2.8, the user's call 2026-10-21). Mirrors
+     * Python handle_refuse. */
+    if (!nmsg->verified)
+    {
+        log_warn(proc->logger, "Negotiation: ignoring unverified nack from %s\n",
+                 nmsg->from_whom.nickname);
+        return true;
+    }
     log_info(proc->logger, "Negotiation: refused by %s\n", nmsg->from_whom.nickname);
 
     pthread_mutex_lock(&neg_state.lock);
@@ -1758,8 +2081,13 @@ static bool handle_refuse(const process_t *proc, directory_t *queues, generic_ms
         {
             task_tracker_t *tracker = NULL;
             if (data_object_ptr(trk_dat, (ptr_t *)&tracker) == 0 && tracker)
+            {
                 _cancel_participant(proc, tracker, task_uuid_str,
                                     nmsg->from_whom.uuid);
+                if (tracker->drawn)
+                    _replace_declined_locked(proc, tracker, task_uuid_str,
+                                             nmsg->from_whom.uuid);
+            }
         }
     }
 
@@ -2280,7 +2608,7 @@ double negotiation_score_task_result_at(const char *cap_name,
         if (result_str != NULL && result_str[0] != '\0')
         {
             char *parse_end = NULL;
-            double parsed = strtod(result_str, &parse_end);
+            double parsed = at_strtod(result_str, &parse_end);
             /* Whole-string parse only: "42abc" is not 42. */
             if (parse_end != NULL && *parse_end == '\0')
                 result_num = parsed;
@@ -2466,6 +2794,12 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
             task_tracker_t *tracker = NULL;
             if (map_get(&neg_state.my_tasks, task_uuid_str, &trk_dat) == 0 && trk_dat)
                 data_object_ptr(trk_dat, (ptr_t *)&tracker);
+            /* A task we gave up is still scored if its result comes before
+             * we let its tracker go: scored, never forwarded to the main
+             * process, which already had the give-up. */
+            neg_late_t *late = NULL;
+            if (tracker == NULL && (late = _late_find_locked(task_uuid_str)) != NULL)
+                tracker = late->tracker;
 
             if (tracker && !task_tracker_was_invited(tracker, nmsg->from_whom.uuid))
             {
@@ -2503,27 +2837,60 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
                  * the authenticated sender, the same peer the physics layer
                  * files the observation under and the competence weight
                  * belongs to. */
+                /* Live replication may hold this result's score, or take a
+                 * replica's result entirely (RD_12.6 plan section 3.7). The
+                 * hook only decides here, under the lock; it acts from its
+                 * periodic pass. */
+                const char *trace_root = json_string_value(json_object_get(j, "trace_root"));
+                json_t *j_tl = json_object_get(j, "trace_len");
+                neg_result_info_t info = {
+                    .task = task_uuid, .executor = nmsg->from_whom.uuid,
+                    .capability = tracker->capability_name,
+                    .kwargs_json = tracker->kwargs_json,
+                    .issued_at = tracker->issued_at,
+                    .result = (const char *)result_data, .result_len = result_len,
+                    .certificate_json = certificate_json,
+                    .prediction_json = prediction_json,
+                    .trace_root = trace_root != NULL
+                        && strlen(trace_root) == NEG_REPLAY_HASH_HEX_LEN ? trace_root : NULL,
+                    .trace_len = json_is_integer(j_tl) && json_integer_value(j_tl) > 0
+                        && json_integer_value(j_tl) <= NEG_REPLAY_MAX_STEPS
+                        ? (int)json_integer_value(j_tl) : 0,
+                };
+                neg_result_verdict_t held = late != NULL ? NEG_RESULT_LEAVE
+                                                         : neg_ext_on_result(proc, &info);
+                if (late != NULL)
+                    log_info(proc->logger,
+                             "Negotiation: late result for given-up task %s from %s "
+                             "scored\n", task_uuid_str, nmsg->from_whom.nickname);
                 const char *channel = TX_CHANNEL_TASK_OUTCOME;
                 char subject[UUID_STRING_LEN + 1] = {0};
                 uuid_unparse_lower(nmsg->from_whom.uuid, subject);
-                double score = negotiation_score_task_result_at(
+                double score = held != NEG_RESULT_LEAVE ? 0.0 : negotiation_score_task_result_at(
                     tracker->capability_name, tracker->kwargs_json,
                     tracker->issued_at,
                     (const char *)result_data, result_len,
                     certificate_json, prediction_json, subject,
                     _now_sec(), at_cert_verifier_seed(), &channel);
-                log_info(proc->logger,
-                         "Negotiation: task %s scored %.2f for %s (cap %s, via %s)\n",
-                         task_uuid_str, score, nmsg->from_whom.nickname,
-                         tracker->capability_name[0] != '\0'
-                             ? tracker->capability_name : "-",
-                         channel);
-                uuid_t pair;
-                tx_pair_task_uuid(task_uuid, nmsg->from_whom.uuid, pair);
-                _submit_tx_score(proc, pair, score, tracker->capability_name,
-                                 channel, nmsg->from_whom.uuid,
-                                 negotiation_competence_weight(
-                                     tracker->capability_name, subject));
+                if (held == NEG_RESULT_LEAVE)
+                {
+                    log_info(proc->logger,
+                             "Negotiation: task %s scored %.2f for %s (cap %s, via %s)\n",
+                             task_uuid_str, score, nmsg->from_whom.nickname,
+                             tracker->capability_name[0] != '\0'
+                                 ? tracker->capability_name : "-",
+                             channel);
+                    uuid_t pair;
+                    tx_pair_task_uuid(task_uuid, nmsg->from_whom.uuid, pair);
+                    _submit_tx_score(proc, pair, score, tracker->capability_name,
+                                     channel, nmsg->from_whom.uuid,
+                                     negotiation_competence_weight(
+                                         tracker->capability_name, subject));
+                    /* A drawn task's outcome joins the selection log. */
+                    const neg_select_hook_t *sel = neg_ext_select_hook();
+                    if (tracker->drawn && sel != NULL && sel->on_score != NULL)
+                        sel->on_score(proc, task_uuid_str, nmsg->from_whom.uuid, score);
+                }
 
                 /* The first answer goes to the main process, so the app
                  * sees one answer per task and one slow or silent invitee
@@ -2531,7 +2898,7 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
                  * tracker lives until every invitee has answered (or the
                  * task is cancelled). Mirrors Python handle_results, which
                  * marks the later ones score_only. */
-                if (collected == 1)
+                if (late == NULL && collected == 1 && held != NEG_RESULT_CONSUME)
                 {
                     log_info(proc->logger,
                              "Negotiation: task %s first result — forwarding\n",
@@ -2549,7 +2916,9 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
 
                     _neg_send(proc, AT_MAIN_QUEUE, &result_msg, "a task result");
                 }
-                if (collected >= tracker->expected)
+                if (late != NULL && collected >= tracker->expected)
+                    _late_free_locked(late);
+                else if (collected >= tracker->expected)
                 {
                     log_info(proc->logger,
                              "Negotiation: task %s complete\n", task_uuid_str);
@@ -2608,7 +2977,7 @@ static bool _peer_by_uuid(const process_t *proc, const uuid_t peer_uuid,
 /* Report a finished job's answer to the peer that asked for it, as Python's
  * tagged TaskResult -- the one form both runtimes read (doc/architecture/negotiation.md). */
 static void _report_result(const process_t *proc, const task_t *task,
-                           const char *result)
+                           const char *result, const neg_trace_t *trace)
 {
     public_identity_t requestor;
     memset(&requestor, 0, sizeof(requestor));
@@ -2641,7 +3010,12 @@ static void _report_result(const process_t *proc, const task_t *task,
         }
     }
     /* No prediction: no C capability emits one yet (see the serializer). */
-    json_t *j = _task_result_to_json(proc, task, answer, j_cert, NULL);
+    char root[NEG_REPLAY_HASH_HEX_LEN + 1] = {0};
+    bool traced = trace != NULL && trace->n > 0
+        && neg_trace_digest(trace, trace->n - 1, root);
+    json_t *j = _task_result_to_json(proc, task, answer, j_cert, NULL,
+                                     traced ? root : NULL,
+                                     traced ? trace->n : 0);
     if (j == NULL)
     {
         log_error(proc->logger, "Negotiation: json_object OOM (report)\n");
@@ -2679,8 +3053,68 @@ static void _report_result(const process_t *proc, const task_t *task,
 
 /* Report one finished job: its answer (or none) to the requestor, and our own
  * half when it produced one. Called on the process loop. */
+/* Keep @p trace (taken: emptied on return) to answer a verifier about
+ * @p task. Caller does not hold neg_state.lock. */
+static void _retain_trace(const uuid_t task, const uuid_t requestor,
+                          neg_trace_t *trace)
+{
+    if (trace->n == 0)
+        return;
+    time_t now = time(NULL);
+    pthread_mutex_lock(&neg_state.lock);
+    int slot = 0;
+    for (int i = 0; i < NEG_TRACE_RETAIN_MAX; i++)
+    {
+        neg_retained_trace_t *r = &neg_state.traces[i];
+        if (!r->used || r->expires <= now)
+        {
+            slot = i;
+            break;
+        }
+        if (r->expires < neg_state.traces[slot].expires)
+            slot = i;
+    }
+    neg_retained_trace_t *r = &neg_state.traces[slot];
+    neg_trace_free(&r->trace);
+    r->used = true;
+    uuid_copy(r->task, task);
+    uuid_copy(r->requestor, requestor);
+    r->expires = now + NEG_TRACE_RETAIN_SEC;
+    r->trace = *trace;
+    pthread_mutex_unlock(&neg_state.lock);
+    trace->states = NULL;
+    trace->n = 0;
+}
+
+int negotiation_retain_trace_for_test(const unsigned char *task,
+                                      const unsigned char *requestor,
+                                      const char *const *states, int n)
+{
+    if (task == NULL || requestor == NULL || states == NULL || n <= 0
+        || n > NEG_REPLAY_MAX_STEPS)
+        return -1;
+    _ensure_init();
+    neg_trace_t t = {0};
+    t.states = calloc((size_t)n, sizeof(char *));
+    if (t.states == NULL)
+        return -1;
+    for (int i = 0; i < n; i++)
+    {
+        t.states[i] = strdup(states[i] != NULL ? states[i] : "");
+        if (t.states[i] == NULL)
+        {
+            neg_trace_free(&t);
+            return -1;
+        }
+        t.n = i + 1;
+    }
+    _retain_trace(task, requestor, &t);
+    return 0;
+}
+
 static void _complete_job(const process_t *proc, job_t *job,
-                          const capability_t *cap, int rc, const char *result)
+                          const capability_t *cap, int rc, const char *result,
+                          neg_trace_t *trace)
 {
     char task_uuid_str[UUID_STRING_LEN + 1] = {0};
     uuid_unparse_lower(job->task.uuid, task_uuid_str);
@@ -2704,13 +3138,15 @@ static void _complete_job(const process_t *proc, job_t *job,
         log_debug(proc->logger,
                   "Negotiation: job %s (%s) produced no result (rc=%d)\n",
                   task_uuid_str, job->task.capability.name, rc);
-        _report_result(proc, &job->task, NULL);
+        _report_result(proc, &job->task, NULL, NULL);
+        neg_trace_free(trace);
         return;
     }
 
     log_info(proc->logger, "Negotiation: job %s (%s) done\n",
              task_uuid_str, job->task.capability.name);
-    _report_result(proc, &job->task, result);
+    _report_result(proc, &job->task, result, trace);
+    _retain_trace(job->task.uuid, job->task.requestor_uuid, trace);
     /* Executor side, scoring our own completion: no subject, and none
      * needed -- task_outcome is not slash-eligible. */
     /* No subject, so no learned weight: competence is a fact about a
@@ -2728,8 +3164,10 @@ static void _complete_job(const process_t *proc, job_t *job,
     }
     uuid_t pair;
     tx_pair_task_uuid(job->task.uuid, me->uuid, pair);
+    /* It names the requestor, whose half names us back: two halves pair
+     * only when each names the other (R+D.md §14.2). */
     _submit_tx_score(proc, pair, 0.9, job->task.capability.name,
-                     TX_CHANNEL_TASK_OUTCOME, NULL,
+                     TX_CHANNEL_TASK_OUTCOME, job->task.requestor_uuid,
                      NEG_NEUTRAL_COMPETENCE);
 }
 
@@ -2739,10 +3177,15 @@ static void *_run_job(void *arg)
 {
     neg_running_t *slot = arg;
     char result[CAP_RESULT_LEN + 1] = {0};
-    int rc = capability_execute_result(slot->cap, slot->job.task.kwargs_json,
-                                       result, sizeof(result));
+    neg_trace_t trace = {0};
+    int rc = slot->cap != NULL && slot->cap->replay != NULL
+        ? neg_replay_run(slot->cap->replay, slot->job.task.kwargs_json, &trace,
+                         result, sizeof(result))
+        : capability_execute_result(slot->cap, slot->job.task.kwargs_json,
+                                    result, sizeof(result));
     pthread_mutex_lock(&neg_state.lock);
     memcpy(slot->result, result, sizeof(slot->result));
+    slot->trace = trace;
     slot->rc = rc;
     slot->done = true;
     pthread_mutex_unlock(&neg_state.lock);
@@ -2777,7 +3220,7 @@ static void _finish_jobs(const process_t *proc)
     pthread_mutex_unlock(&neg_state.lock);
     for (size_t i = 0; i < n_done; i++)
         _complete_job(proc, &done[i].job, done[i].cap, done[i].rc,
-                      done[i].result);
+                      done[i].result, &done[i].trace);
 }
 
 /* Wait for every running job's thread (shutdown, and a test's reset). Their
@@ -2789,6 +3232,7 @@ static void _join_running(void)
         neg_running_t *slot = &neg_state.running[i];
         if (slot->used)
             pthread_join(slot->thread, NULL);
+        neg_trace_free(&slot->trace);
         memset(slot, 0, sizeof(*slot));
     }
 }
@@ -2852,7 +3296,7 @@ static void _drain_task_stack(const process_t *proc)
                      "Negotiation: accepted job %s names unknown capability "
                      "'%s'; reporting no result\n",
                      task_uuid_str, job.task.capability.name);
-            _report_result(proc, &job.task, NULL);
+            _report_result(proc, &job.task, NULL, NULL);
             continue;
         }
 
@@ -2872,9 +3316,13 @@ static void _drain_task_stack(const process_t *proc)
         log_warn(proc->logger, "Negotiation: no thread for job %s; running it "
                  "inline\n", task_uuid_str);
         char result[CAP_RESULT_LEN + 1] = {0};
-        int rc = capability_execute_result(cap, job.task.kwargs_json,
-                                           result, sizeof(result));
-        _complete_job(proc, &job, cap, rc, result);
+        neg_trace_t trace = {0};
+        int rc = cap->replay != NULL
+            ? neg_replay_run(cap->replay, job.task.kwargs_json, &trace, result,
+                             sizeof(result))
+            : capability_execute_result(cap, job.task.kwargs_json,
+                                        result, sizeof(result));
+        _complete_job(proc, &job, cap, rc, result, &trace);
     }
 }
 
@@ -3026,12 +3474,19 @@ static void _bootstrap_tick(const process_t *proc)
 
     /* Who not to probe this pass: the peers reported absent. Snapshotted, so
      * the worker reads a stable view; indices match peers[] for this tick
-     * (_emit_bootstrap_task re-checks the index under the lock). */
+     * (_emit_bootstrap_task re-checks the index under the lock). The join
+     * burst names its targets by uuid, so it gets theirs too. */
     bool absent[DEFAULT_MAX_PEERS] = {false};
+    char uuids[DEFAULT_MAX_PEERS][AT_BURST_UUID_LEN];
+    const char *uuid_of[DEFAULT_MAX_PEERS];
     peers_read_lock(proc);
     size_t snap = proc->protocol.num_peers < DEFAULT_MAX_PEERS
                   ? proc->protocol.num_peers : DEFAULT_MAX_PEERS;
     memcpy(absent, proc->protocol.peer_absent, snap * sizeof(absent[0]));
+    for (size_t i = 0; i < snap; i++) {
+        uuid_unparse_lower(proc->protocol.peers[i].uuid, uuids[i]);
+        uuid_of[i] = uuids[i];
+    }
     peers_read_unlock(proc);
     if (peer_count > snap)
         peer_count = snap;
@@ -3039,9 +3494,11 @@ static void _bootstrap_tick(const process_t *proc)
     probe_ctx_t ctx = { .proc = proc, .peer_count = peer_count };
     double now_sec = _now_sec();
     neg_state.bootstrap.skip_peer = absent;
+    neg_state.bootstrap.peer_uuids = uuid_of;
     bootstrap_worker_tick_all(&neg_state.bootstrap, peer_count, now_sec,
                               _pair_emit, _probe_emit, &ctx);
     neg_state.bootstrap.skip_peer = NULL;
+    neg_state.bootstrap.peer_uuids = NULL;
 }
 
 /****************************
@@ -3402,6 +3859,9 @@ size_t negotiation_status_sweep(const process_t *proc, double present)
     size_t given_up = 0;
     pthread_mutex_lock(&neg_state.lock);
     _compact_status_pending_locked();
+    for (int i = 0; i < NEG_LATE_RESULT_MAX; i++)
+        if (neg_state.late[i].task[0] != '\0' && neg_state.late[i].until <= present)
+            _late_free_locked(&neg_state.late[i]);
     array_t *keys = map_keys(&neg_state.my_tasks);
     size_t n = array_size(keys);
     for (size_t i = 0; i < n; i++)
@@ -3438,6 +3898,11 @@ size_t negotiation_status_sweep(const process_t *proc, double present)
                      "Negotiation: task %s past its deadline with no live answer "
                      "after %d status request round(s); giving it up\n",
                      task_uuid_str, tracker->status_asks);
+            /* Kept a while: a late result is still scored against it. Taken
+             * out of my_tasks first, so forgetting the task leaves it be. */
+            map_remove(&neg_state.my_tasks, (map_key_t)task_uuid_str);
+            _late_retain_locked(task_uuid_str, tracker,
+                                present + NEG_LATE_RESULT_SEC);
             _forget_task_locked(task_uuid_str);
             given_up++;
             continue;
@@ -3512,6 +3977,241 @@ int negotiation_get_task_flood_count(const uuid_t uuid)
     return count;
 }
 
+/****************************
+ * Live replication (RD_12.6_LIVE_REPLICATION_PLAN.md section 3.7)
+ ****************************/
+
+/* Send @p payload_json under @p verb to @p peer. 0 when the network took it. */
+static int _send_json_to(const process_t *proc, const char *verb,
+                         const uuid_t peer, const char *payload_json)
+{
+    public_identity_t to;
+    memset(&to, 0, sizeof(to));
+    if (!_peer_by_uuid(proc, peer, &to))
+        return -1;
+    json_error_t jerr;
+    json_t *j = json_loads(payload_json, 0, &jerr);
+    if (j == NULL)
+        return -1;
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    strncpy(out.info.net_msg.process, "negotiation", PROC_NAME_LEN);
+    out.info.net_msg.function = (char *)verb;
+    out.info.net_msg.encrypt = true;
+    memcpy(&out.info.net_msg.to_whom, &to, sizeof(public_identity_t));
+    strncpy(out.info.net_msg.return_to, "negotiation", PROC_NAME_LEN);
+    net_msg_pack_json(&out.info.net_msg, j);
+    json_decref(j);
+    int rc = _neg_send(proc, "network", &out, "a replay message");
+    net_msg_free_obj(&out.info.net_msg);
+    return rc;
+}
+
+int negotiation_send_replay(const process_t *proc, const char *verb,
+                            const unsigned char *peer, const char *payload_json)
+{
+    if (proc == NULL || verb == NULL || peer == NULL || payload_json == NULL)
+        return -1;
+    return _send_json_to(proc, verb, peer, payload_json);
+}
+
+/* Answer a verifier about a trace we committed to: a chain digest
+ * (`replay challenge`) or the reveal at the divergent step (`replay
+ * reveal`). Only the task's requestor is answered, and only while the trace
+ * is kept. Mirrors Python NegotiationProcess.handle_replay_request. */
+static bool handle_replay_request(const process_t *proc, directory_t *queues,
+                                  generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (!nmsg->verified)
+        return true;
+    json_t *j = NULL;
+    if (nmsg->obj == NULL || nmsg->len == 0 || net_msg_unpack_json(nmsg, &j) != 0
+        || !json_is_object(j))
+    {
+        json_decref(j);
+        return true;
+    }
+    const char *task = json_string_value(json_object_get(j, "task"));
+    json_t *jr = json_object_get(j, "round");
+    json_t *ji = json_object_get(j, "index");
+    uuid_t task_uuid;
+    if (task == NULL || uuid_parse(task, task_uuid) != 0 || !json_is_integer(jr)
+        || !json_is_integer(ji))
+    {
+        json_decref(j);
+        return true;
+    }
+    int index = (int)json_integer_value(ji);
+    bool reveal = strcmp(nmsg->function, NEG_PROTO_REPLAY_REVEAL) == 0;
+    json_t *answer = json_pack("{s:s, s:O, s:i}", "task", task, "round", jr,
+                               "index", index);
+    bool ok = false;
+    time_t now = time(NULL);
+    pthread_mutex_lock(&neg_state.lock);
+    for (int i = 0; answer != NULL && i < NEG_TRACE_RETAIN_MAX; i++)
+    {
+        neg_retained_trace_t *r = &neg_state.traces[i];
+        if (!r->used || r->expires <= now || uuid_compare(r->task, task_uuid) != 0)
+            continue;
+        if (uuid_compare(r->requestor, nmsg->from_whom.uuid) != 0)
+            break;                 /* only the requestor is answered */
+        const neg_trace_t *t = &r->trace;
+        char h[NEG_REPLAY_HASH_HEX_LEN + 1];
+        if (!reveal)
+        {
+            ok = index >= 0 && index < t->n && neg_trace_digest(t, index, h);
+            if (ok)
+                json_object_set_new(answer, "digest", json_string(h));
+        }
+        else if (index >= 0 && index <= t->n)
+        {
+            json_t *rv = json_object();
+            json_object_set_new(rv, "prev", index >= 2 && neg_trace_digest(t, index - 2, h)
+                                ? json_string(h) : json_null());
+            json_object_set_new(rv, "pre", index >= 1
+                                ? json_string(t->states[index - 1]) : json_null());
+            json_object_set_new(rv, "state", index < t->n
+                                ? json_string(t->states[index]) : json_null());
+            json_object_set_new(answer, "reveal", rv);
+            ok = true;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&neg_state.lock);
+    json_decref(j);
+    if (ok)
+    {
+        char *text = json_dumps(answer, JSON_COMPACT);
+        if (text != NULL)
+            _send_json_to(proc, NEG_PROTO_REPLAY_RESPONSE, nmsg->from_whom.uuid, text);
+        free(text);
+    }
+    else
+        log_debug(proc->logger, "Negotiation: replay request for %s from %s not "
+                  "answered\n", task, nmsg->from_whom.nickname);
+    json_decref(answer);
+    return true;
+}
+
+void negotiation_release_held(const process_t *proc, const neg_result_info_t *info,
+                              bool have_score, double score, const char *channel)
+{
+    if (proc == NULL || info == NULL)
+        return;
+    char subject[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(info->executor, subject);
+    const char *ch = channel;
+    if (!have_score)
+    {
+        ch = TX_CHANNEL_TASK_OUTCOME;
+        score = negotiation_score_task_result_at(
+            info->capability, info->kwargs_json, info->issued_at, info->result,
+            info->result_len, info->certificate_json, info->prediction_json,
+            subject, _now_sec(), at_cert_verifier_seed(), &ch);
+    }
+    uuid_t pair;
+    tx_pair_task_uuid(info->task, info->executor, pair);
+    log_info(proc->logger, "Negotiation: held result for %s released, %.2f via %s\n",
+             subject, score, ch);
+    _submit_tx_score(proc, pair, score, info->capability, ch, info->executor,
+                     negotiation_competence_weight(info->capability, subject));
+}
+
+void negotiation_propose_attestation(const process_t *proc,
+                                     const unsigned char *subject, double score,
+                                     const char *channel, const char *capability,
+                                     const char *evidence_digest, const char *scope)
+{
+    if (proc == NULL || subject == NULL || evidence_digest == NULL)
+        return;
+    generic_msg_t msg = {0};
+    msg.type = TRANSACTION_SCORE;
+    msg.size = sizeof(tx_score_msg_t);
+    uuid_copy(msg.info.tx_score.peer_uuid, subject);
+    msg.info.tx_score.score = score;
+    msg.info.tx_score.attested = true;
+    at_strlcpy(msg.info.tx_score.channel, channel != NULL ? channel : "",
+               sizeof(msg.info.tx_score.channel));
+    if (capability != NULL)
+        at_strlcpy(msg.info.tx_score.capability_name, capability,
+                   sizeof(msg.info.tx_score.capability_name));
+    at_strlcpy(msg.info.tx_score.evidence_digest, evidence_digest,
+               sizeof(msg.info.tx_score.evidence_digest));
+    if (scope != NULL)
+        at_strlcpy(msg.info.tx_score.attest_scope, scope,
+                   sizeof(msg.info.tx_score.attest_scope));
+    if (_neg_send(proc, "reputation", &msg, "an attestation") != 0)
+        log_warn(proc->logger, "Negotiation: could not propose the attestation\n");
+}
+
+static int _uuid_str_cmp(const void *a, const void *b)
+{
+    return strcmp((const char *)a, (const char *)b);
+}
+
+int negotiation_start_replica(const process_t *proc, const char *capability,
+                              const char *kwargs_json, const unsigned char *exclude,
+                              unsigned long long seed, unsigned char *task_out,
+                              unsigned char *peer_out)
+{
+    if (proc == NULL || capability == NULL || task_out == NULL || peer_out == NULL)
+        return -1;
+    const identity_t *self = identity_self_identity(proc);
+    char (*cands)[UUID_STRING_LEN + 1] = NULL;
+    size_t n = 0;
+    peers_read_lock(proc);
+    if (proc->protocol.num_peers > 0)
+        cands = calloc(proc->protocol.num_peers, sizeof(*cands));
+    for (size_t i = 0; cands != NULL && i < proc->protocol.num_peers; i++)
+    {
+        const unsigned char *u = proc->protocol.peers[i].uuid;
+        char us[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(u, us);
+        if ((exclude != NULL && uuid_compare(u, exclude) == 0)
+            || (self != NULL && uuid_compare(u, self->uuid) == 0)
+            || proc->protocol.peer_absent[i]
+            || !_peer_has_capability(proc, us, capability))
+            continue;
+        memcpy(cands[n++], us, sizeof(us));
+    }
+    peers_read_unlock(proc);
+    if (n == 0)
+    {
+        free(cands);
+        return -1;
+    }
+    qsort(cands, n, sizeof(*cands), _uuid_str_cmp);
+    uuid_t target;
+    uuid_parse(cands[seed % n], target);
+    free(cands);
+
+    task_t task;
+    memset(&task, 0, sizeof(task));
+    uuid_generate(task.uuid);
+    if (self != NULL)
+        uuid_copy(task.requestor_uuid, self->uuid);
+    at_strlcpy(task.capability.name, capability, sizeof(task.capability.name));
+    task.flexible = true;
+    time_t now_sec = time(NULL);
+    struct tm *tm_ptr = gmtime(&now_sec);
+    if (tm_ptr != NULL)
+        memcpy(&task.when, tm_ptr, sizeof(struct tm));
+    task.duration.seconds = 1;
+    task.timeout = 30;
+    if (kwargs_json != NULL)
+        at_strlcpy(task.kwargs_json, kwargs_json, sizeof(task.kwargs_json));
+    pthread_mutex_lock(&neg_state.lock);
+    int sent = _announce_task_locked(proc, &task, target);
+    pthread_mutex_unlock(&neg_state.lock);
+    if (sent <= 0)
+        return -1;
+    uuid_copy(task_out, task.uuid);
+    uuid_copy(peer_out, target);
+    return 0;
+}
+
 int negotiation_register_handlers(process_t *proc)
 {
     if (proc == NULL) return -1;
@@ -3523,6 +4223,11 @@ int negotiation_register_handlers(process_t *proc)
     process_register_handler(proc, NEG_PROTO_STAT_REQ, (handler_ptr_t)handle_stat_req);
     process_register_handler(proc, NEG_PROTO_STAT_RSP, (handler_ptr_t)handle_stat_resp);
     process_register_handler(proc, NEG_PROTO_RESULT,   (handler_ptr_t)handle_results);
+    /* The executor's half of live replication (RD_12.6 plan section 3.7). */
+    process_register_handler(proc, NEG_PROTO_REPLAY_CHALLENGE,
+                             (handler_ptr_t)handle_replay_request);
+    process_register_handler(proc, NEG_PROTO_REPLAY_REVEAL,
+                             (handler_ptr_t)handle_replay_request);
     /* Tier-down task cancellation (trust-tiers.md §7.2). Local IPC
      * from ReputationProcess on demotion; not a wire-facing
      * protocol message but registered the same way so the protocol
@@ -3569,6 +4274,22 @@ int negotiation_run(process_t *proc, directory_t *queues, queue_id_t signal, log
             int rerr = messaging_recv(&buf);
             if (rerr == -1 || rerr == ENOMSG)
                 break;
+            if (buf.type == PEER_PROBE_COUNT)
+            {
+                /* Reputation's count for the join burst (RD_14.4 Phase 5): a
+                 * local struct, like reputation's PEER_ANCHOR, not a net_msg
+                 * run_message_handlers could route. */
+                char pu[AT_BURST_UUID_LEN];
+                uuid_unparse_lower(buf.info.peer_probe_count.peer_uuid, pu);
+                bootstrap_worker_note_probe_count(
+                    &neg_state.bootstrap, pu,
+                    buf.info.peer_probe_count.bounded,
+                    (int)buf.info.peer_probe_count.verdicts);
+                bootstrap_worker_note_suspect(
+                    &neg_state.bootstrap, pu,
+                    buf.info.peer_probe_count.suspect);
+                continue;
+            }
             run_message_handlers(proc, queues, buf.type, &buf);
         }
         messaging_recv_release(&buf);
@@ -3576,6 +4297,7 @@ int negotiation_run(process_t *proc, directory_t *queues, queue_id_t signal, log
         _drain_task_stack(proc);
         _bootstrap_tick(proc);
         negotiation_status_sweep(proc, (double)time(NULL));
+        neg_ext_periodic(proc);
     }
     _join_running();
 

@@ -144,25 +144,26 @@ class TestDesignationBytes:
         assert att.designation == (
             b'AT-SLASH\x00'
             b'11111111-1111-1111-1111-111111111111|'
-            b'22222222-2222-2222-2222-222222222222|peer_exclude|0.100000|7')
+            b'22222222-2222-2222-2222-222222222222|peer_exclude|100|7')
 
     def test_checkpoint_designation_pinned(self):
         ck = Checkpoint(
             proposer_uuid='11111111-1111-1111-1111-111111111111',
-            root=b'044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556',
+            root=b'f9bf077e5bfd8ef4cdf5fb0519b70ec51fb7df536515bf16c594a477ce6d5168',
             epoch=7, first_index=0, count=3)
         assert ck.designation == (
             b'AT-CKPT\x00'
             b'11111111-1111-1111-1111-111111111111|'
-            b'044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556'
+            b'f9bf077e5bfd8ef4cdf5fb0519b70ec51fb7df536515bf16c594a477ce6d5168'
             b'|7|0|3')
 
-    def test_floor_is_fixed_precision(self):
-        """The one field where a float formatting difference would silently
-        break interop: C uses %.6f, so Python must too."""
+    def test_floor_is_integer_thousandths(self):
+        """The floor is signed as its integer thousandths, so no libc's float
+        formatting reaches the signed bytes (doc/architecture/reputation.md,
+        "Integer scores"). C writes the same %d."""
         att = SlashAttestation(slasher_uuid='a', target_uuid='b',
                               reason='r', floor_score=0.1, epoch=1)
-        assert b'|0.100000|' in att.designation
+        assert b'|100|' in att.designation
 
 
 # --- signature verification -------------------------------------------------
@@ -239,14 +240,18 @@ class TestVerifiedCosignerCounting:
 
     def test_quorum_sized_against_our_own_roster(self):
         """The finalizer does not get to choose the bar it must clear: quorum
-        comes from the receiver's own member count."""
+        comes from the receiver's own member count. Three peers and this node
+        are a group of four, and a slash needs a strict majority of it: three
+        (RD_13.2 plan §0.4; two of four used to finalize)."""
         a, b, c = (_identity('a'), _identity('b'), _identity('c'))
-        rp = _rep_process([a, b, c])            # quorum floor(3/2) = 1
+        rp = _rep_process([a, b, c])
         att = _att(a.uuid, uuid4())
         one = {str(a.uuid): _sig(a, att.designation)}
         two = dict(one, **{str(b.uuid): _sig(b, att.designation)})
+        three = dict(two, **{str(c.uuid): _sig(c, att.designation)})
         assert rp._quorum_met(att.designation, one) is False
-        assert rp._quorum_met(att.designation, two) is True
+        assert rp._quorum_met(att.designation, two) is False
+        assert rp._quorum_met(att.designation, three) is True
 
 
 # --- vote attribution -------------------------------------------------------
@@ -314,8 +319,8 @@ class TestVoteAttribution:
                           to_json_string(ack), rp.group, from_whom=voter)
             msg.verified = True
             rp.handle_slash_sign({CfgIds.network: net_q}, msg)
-        # A map keyed by voter, so four deliveries are one vote -- under the
-        # quorum of floor(3/2)=1, hence no finalizer went out.
+        # A map keyed by voter, so four deliveries are one vote -- short of
+        # the three a group of four needs, hence no finalizer went out.
         assert list(rp._slash_sigs[att.key()]) == [str(voter.uuid)]
         assert net_q.empty()
 
@@ -366,10 +371,10 @@ class TestSlashFinalQuorum:
         return rp, members
 
     def test_quorum_of_verified_signatures_applies_the_floor(self):
-        rp, members = self._setup()             # quorum floor(3/2) = 1
+        rp, members = self._setup()             # a group of four: three sign
         target = uuid4()
         att = _att(members[0].uuid, target, floor=0.1, epoch=1)
-        sigs = {str(m.uuid): _sig(m, att.designation) for m in members[:2]}
+        sigs = {str(m.uuid): _sig(m, att.designation) for m in members[:3]}
         msg = _final(rp, ReputationProtocol.slash_final,
                      SignedSlash(attestation=att, sigs=sigs), members[0])
         assert rp.handle_slash_final({CfgIds.network: queue.Queue()},
@@ -516,7 +521,7 @@ class TestFinalizerCarriesSignatures:
         voter = _identity('voter')
         rp = _rep_process([voter])
         net_q = queue.Queue()
-        rp.history.update(uuid4(), uuid4(), 0.7)
+        rp.history.update(uuid4(), uuid4(), 700)
         rp.forward_checkpoint({CfgIds.network: net_q}, Checkpoint(None, b''))
         net_q.get_nowait()
         ck = rp._checkpoint

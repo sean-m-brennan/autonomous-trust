@@ -130,6 +130,20 @@ class PeerDataAcq(object):
         # aggregate stand-in.
         self.reputation_by_other: dict[str, deque[float]] = {}
 
+    def __getstate__(self):
+        # Workers start under forkserver, which pickles their state, and a
+        # threading.Event cannot be pickled. Drop it and rebuild it from
+        # _active, so a populated roster can be handed to a worker.
+        state = self.__dict__.copy()
+        state.pop('_active_event', None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._active_event = threading.Event()
+        if self._active:
+            self._active_event.set()
+
     @property
     def active(self):
         return self._active

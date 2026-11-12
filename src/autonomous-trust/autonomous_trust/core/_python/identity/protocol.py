@@ -77,6 +77,15 @@ class IdentityProtocol(Protocol):
     vote = 'vote_on_peer'  # msg.obj <- (identityobj, proof, signature)
     confirm = 'peer_accepted'  # msg.obj <- identityobj
     update = 'group_key_update'  # msg.obj <- group
+    # A node behind on the group key asks a member for the current group,
+    # point to point and encrypted. A member answers a member it holds with
+    # an ordinary signed group_key_update, which the asker takes through the
+    # same verified gate as any other (doc/architecture/identity-protocol.md).
+    key_query = 'group_key_query'  # msg.obj <- json {'group_uuid': str, 'epoch': int}
+    # key_stale: local-only IPC. NetProcess emits it when a group frame from a
+    # peer we hold will not open, which means that peer holds a key we lack.
+    #   msg.obj <- str (from_addr of the frame)
+    key_stale = 'group_key_stale'
     # Recovery path for the announce-broadcast loss case: when a peer
     # admits another via confirm but never received its announce
     # (no_prior_potential), it sends caps_query directly. The target
@@ -127,6 +136,11 @@ class IdentityProtocol(Protocol):
     # its local mirror; capability-gated negotiation reads peer._tier.
     # See doc/architecture/trust-tiers.md for the rank-vs-tier split.
     tier_update = 'tier_update'  # msg.obj <- (peer_uuid_str, new_tier_int)
+    # The anchored cohort (RD_14.4 Phase 6, identity/anchored_cohort.py),
+    # point-to-point between members. A node without the join policy ignores
+    # both.
+    cohort_invite = 'anchored_cohort_invite'  # msg.obj <- canonical group (key included)
+    cohort_reply = 'anchored_cohort_reply'  # msg.obj <- [group_uuid_str, key_epoch, accepted]
     # Local-only IPC (no wire egress). ReputationProcess emits this to
     # CfgIds.negotiation when a peer's trust tier drops (demotion).
     # NegotiationProcess.handle_tier_lost cancels any in-flight tasks whose

@@ -293,7 +293,11 @@ reputation process applies it at boot and, guarded by the file's mtime, once per
 pass afterwards, so a contact verified while the node is running is picked up
 without a restart.
 
-We write it **only where the node has no reputation for that peer at all**. It
+We write it **only where the node has no reputation for that peer at all**,
+or, under the join policy, where the score it holds exists only because of
+told evidence: a cohort must not be able to pre-empt a contact's seed by
+slandering it before the joiner arrives (see
+[Joining a hostile cohort](hostile-join.md#seeds-beat-told-scores)). It
 can never overwrite an earned score, a warm-started one, or a slashed one, since
 a contact cannot be verified back into good standing, or safety-number
 confirmation would become an attack on reputation rather than a convenience. The

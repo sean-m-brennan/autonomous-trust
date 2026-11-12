@@ -13,6 +13,8 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
+import pytest
+
 from autonomous_trust.core.identity.protocol import IdentityProtocol
 
 
@@ -48,6 +50,9 @@ class TestIdentityProtocol:
           session round trip it needs
           (operator_state_req, operator_state_resp)
         - runtime hierarchy roots (hierarchy, hierarchy_req)
+        - the anchored cohort (cohort_invite, cohort_reply), RD_14.4 Phase 6
+        - catching up on the group key (key_query, and its local-only
+          trigger key_stale), 2026-11-04
         First contact's verbs left with it (FEATURE_SPLIT_PLAN Phase 7, C6):
         they are ``FirstContactProtocol``, pinned in that distribution's
         test_first_contact_plaintext.py.
@@ -62,8 +67,20 @@ class TestIdentityProtocol:
         to ``IdentityProtocol``.
         """
         values = list(IdentityProtocol)
-        assert len(values) == 26
+        assert len(values) == 30
         assert 'announce' in values
         assert 'hello' not in values
         assert 'report' not in values
         assert 'business_ad' not in values
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (None, True), ("1", True), ("yes", True),
+    ("0", False), ("false", False), ("no", False)])
+def test_border_guard_default_from_env(monkeypatch, raw, expected):
+    from autonomous_trust.core._python.identity.idprocess import _border_guard_default
+    if raw is None:
+        monkeypatch.delenv("AT_BORDER_GUARD", raising=False)
+    else:
+        monkeypatch.setenv("AT_BORDER_GUARD", raw)
+    assert _border_guard_default() is expected

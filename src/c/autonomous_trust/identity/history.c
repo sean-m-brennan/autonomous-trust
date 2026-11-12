@@ -157,7 +157,8 @@ void identity_obj_free(identity_obj_t *obj)
  *   prev->timestamp <= cur->timestamp
  * (the newer node has a non-strictly-greater timestamp). Mirrors
  * the Python `steps[i-1].timestamp >= steps[i].timestamp` test
- * over the root-first branch_list.
+ * over the root-first branch_list, and like it compares below the
+ * second (datetime_compare): a cohort admits many peers inside one.
  *
  * NB: Python's check skips entries with `timestamp is None`; the C
  * representation never carries a NULL timestamp (datetime_t is
@@ -193,9 +194,7 @@ static bool _identity_history_validate_branch(step_dag_t *dag,
             continue;
         const linked_step_t *prev = (const linked_step_t *)prev_p;
         const linked_step_t *cur  = (const linked_step_t *)cur_p;
-        time_t prev_t = mktime((struct tm *)&prev->timestamp);
-        time_t cur_t  = mktime((struct tm *)&cur->timestamp);
-        if (prev_t <= cur_t)
+        if (datetime_compare(&prev->timestamp, &cur->timestamp) <= 0)
         {
             if (h != NULL)
                 log_error(h->logger,

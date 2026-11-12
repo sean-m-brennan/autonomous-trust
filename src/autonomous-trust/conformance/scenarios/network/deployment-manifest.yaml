@@ -1,0 +1,277 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: deployment-manifest
+byte_pinning: false
+description: |
+    The rules of the deployment manifest, the file that bounds which nodes may
+    hold a gateway role (RD_13.4 §3.3; $AT_DEPLOYMENT_MANIFEST).
+
+    At runtime the manifest grants nothing. A gateway role still needs both
+    cohorts' quorum certificates (RD_13.4 §3.2); the manifest only says which
+    nodes may hold one, and for how many cohort pairs. That makes the
+    validator the part worth pinning, because a rule that holds on one runtime
+    and not the other lets the same file start a node in C and refuse it in
+    Python, or the reverse.
+
+    Each row starts from the baseline manifest below (one gateway, `bbbb...`),
+    then applies one file through the production loader and records whether
+    the start is refused. An accepted row replaces the baseline, and its
+    per-node gateway-pair counts must match. A refused row must leave the
+    baseline in force, which is what a node that refuses to start has to
+    guarantee about the state it was holding.
+
+      * no manifest, or one named by the environment that does not exist, is
+        the empty manifest: nothing refused and no node may be a gateway;
+      * a node in two cohorts must be listed as a gateway between exactly
+        those two, which is invariant G at design time;
+      * a gateway must be a member of both cohorts it bridges;
+      * version, keys, uuids (canonical form only), names
+        ([A-Za-z0-9._-], 1 to 64), n_min and duplicate keys are all checked.
+
+    Production-code analogue:
+      Python: deployment_manifest.configure, from automate at node start and
+              again in the network worker.
+      C:      deployment_manifest_configure, from network_run.
+
+participants:
+  - id: node
+    role: receiver
+
+fixtures:
+  baseline:
+    version: 1
+    cohorts:
+      p: {members: [bbbbbbbb-0000-4000-8000-000000000001,
+                    11111111-0000-4000-8000-000000000001]}
+      q: {members: [bbbbbbbb-0000-4000-8000-000000000001,
+                    22222222-0000-4000-8000-000000000001]}
+    gateways:
+      - {node: bbbbbbbb-0000-4000-8000-000000000001, between: [p, q]}
+  baseline_node: bbbbbbbb-0000-4000-8000-000000000001
+
+  rows:
+    - id: unset-is-empty
+      source: unset
+      expect_refused: false
+      expect_pairs: {bbbbbbbb-0000-4000-8000-000000000001: 0}
+
+    - id: env-named-missing-is-empty
+      source: missing
+      expect_refused: false
+      expect_pairs: {bbbbbbbb-0000-4000-8000-000000000001: 0}
+
+    - id: cohorts-without-gateways
+      manifest:
+        version: 1
+        cohorts:
+          a: {members: [11111111-0000-4000-8000-000000000001], n_min: 1}
+      expect_refused: false
+      expect_pairs: {11111111-0000-4000-8000-000000000001: 0}
+
+    - id: one-gateway
+      manifest:
+        version: 1
+        cohorts:
+          a: {members: [aaaaaaaa-0000-4000-8000-000000000001,
+                        11111111-0000-4000-8000-000000000001]}
+          b: {members: [aaaaaaaa-0000-4000-8000-000000000001,
+                        22222222-0000-4000-8000-000000000001]}
+        gateways:
+          - {node: aaaaaaaa-0000-4000-8000-000000000001, between: [a, b]}
+      expect_refused: false
+      expect_pairs:
+        aaaaaaaa-0000-4000-8000-000000000001: 1
+        11111111-0000-4000-8000-000000000001: 0
+        bbbbbbbb-0000-4000-8000-000000000001: 0
+
+    - id: two-gateways-one-pair
+      manifest:
+        version: 1
+        cohorts:
+          a: {members: [aaaaaaaa-0000-4000-8000-000000000001,
+                        aaaaaaaa-0000-4000-8000-000000000002,
+                        11111111-0000-4000-8000-000000000001], n_min: 4}
+          b: {members: [aaaaaaaa-0000-4000-8000-000000000001,
+                        aaaaaaaa-0000-4000-8000-000000000002,
+                        22222222-0000-4000-8000-000000000001], n_min: 4}
+        gateways:
+          - {node: aaaaaaaa-0000-4000-8000-000000000001, between: [a, b]}
+          - {node: aaaaaaaa-0000-4000-8000-000000000002, between: [b, a]}
+      expect_refused: false
+      expect_pairs:
+        aaaaaaaa-0000-4000-8000-000000000001: 1
+        aaaaaaaa-0000-4000-8000-000000000002: 1
+
+    - id: three-cohorts-one-hub
+      manifest:
+        version: 1
+        cohorts:
+          a: {members: [aaaaaaaa-0000-4000-8000-000000000001]}
+          b: {members: [aaaaaaaa-0000-4000-8000-000000000001]}
+          c: {members: [aaaaaaaa-0000-4000-8000-000000000001]}
+        gateways:
+          - {node: aaaaaaaa-0000-4000-8000-000000000001, between: [a, b]}
+          - {node: aaaaaaaa-0000-4000-8000-000000000001, between: [a, c]}
+          - {node: aaaaaaaa-0000-4000-8000-000000000001, between: [b, c]}
+      expect_refused: false
+      expect_pairs: {aaaaaaaa-0000-4000-8000-000000000001: 3}
+
+    - id: hub-missing-a-pair-refused
+      manifest:
+        version: 1
+        cohorts:
+          a: {members: [aaaaaaaa-0000-4000-8000-000000000001]}
+          b: {members: [aaaaaaaa-0000-4000-8000-000000000001]}
+          c: {members: [aaaaaaaa-0000-4000-8000-000000000001]}
+        gateways:
+          - {node: aaaaaaaa-0000-4000-8000-000000000001, between: [a, b]}
+          - {node: aaaaaaaa-0000-4000-8000-000000000001, between: [a, c]}
+      expect_refused: true
+
+    - id: member-of-two-not-a-gateway-refused
+      manifest:
+        version: 1
+        cohorts:
+          a: {members: [11111111-0000-4000-8000-000000000001]}
+          b: {members: [11111111-0000-4000-8000-000000000001]}
+      expect_refused: true
+
+    - id: gateway-not-a-member-refused
+      manifest:
+        version: 1
+        cohorts:
+          a: {members: [aaaaaaaa-0000-4000-8000-000000000001]}
+          b: {members: [22222222-0000-4000-8000-000000000001]}
+        gateways:
+          - {node: aaaaaaaa-0000-4000-8000-000000000001, between: [a, b]}
+      expect_refused: true
+
+    - id: unknown-cohort-refused
+      manifest:
+        version: 1
+        cohorts:
+          a: {members: [aaaaaaaa-0000-4000-8000-000000000001]}
+        gateways:
+          - {node: aaaaaaaa-0000-4000-8000-000000000001, between: [a, z]}
+      expect_refused: true
+
+    - id: same-cohort-twice-refused
+      manifest:
+        version: 1
+        cohorts:
+          a: {members: [aaaaaaaa-0000-4000-8000-000000000001]}
+        gateways:
+          - {node: aaaaaaaa-0000-4000-8000-000000000001, between: [a, a]}
+      expect_refused: true
+
+    - id: pair-listed-twice-refused
+      manifest:
+        version: 1
+        cohorts:
+          a: {members: [aaaaaaaa-0000-4000-8000-000000000001]}
+          b: {members: [aaaaaaaa-0000-4000-8000-000000000001]}
+        gateways:
+          - {node: aaaaaaaa-0000-4000-8000-000000000001, between: [a, b]}
+          - {node: aaaaaaaa-0000-4000-8000-000000000001, between: [b, a]}
+      expect_refused: true
+
+    - id: version-2-refused
+      manifest: {version: 2}
+      expect_refused: true
+
+    - id: version-as-string-refused
+      manifest: {version: "1"}
+      expect_refused: true
+
+    - id: unknown-key-refused
+      manifest: {version: 1, gateway: []}
+      expect_refused: true
+
+    - id: uppercase-uuid-refused
+      manifest:
+        version: 1
+        cohorts:
+          a: {members: [AAAAAAAA-0000-4000-8000-000000000001]}
+      expect_refused: true
+
+    - id: unhyphenated-uuid-refused
+      manifest:
+        version: 1
+        cohorts:
+          a: {members: [aaaaaaaa000040008000000000000001]}
+      expect_refused: true
+
+    - id: member-listed-twice-refused
+      manifest:
+        version: 1
+        cohorts:
+          a: {members: [11111111-0000-4000-8000-000000000001,
+                        11111111-0000-4000-8000-000000000001]}
+      expect_refused: true
+
+    - id: empty-members-refused
+      manifest:
+        version: 1
+        cohorts:
+          a: {members: []}
+      expect_refused: true
+
+    - id: n-min-zero-refused
+      manifest:
+        version: 1
+        cohorts:
+          a: {members: [11111111-0000-4000-8000-000000000001], n_min: 0}
+      expect_refused: true
+
+    - id: n-min-boolean-refused
+      manifest:
+        version: 1
+        cohorts:
+          a: {members: [11111111-0000-4000-8000-000000000001], n_min: true}
+      expect_refused: true
+
+    - id: cohort-name-with-space-refused
+      manifest:
+        version: 1
+        cohorts:
+          "a b": {members: [11111111-0000-4000-8000-000000000001]}
+      expect_refused: true
+
+    - id: gateway-extra-key-refused
+      manifest:
+        version: 1
+        cohorts:
+          a: {members: [aaaaaaaa-0000-4000-8000-000000000001]}
+          b: {members: [aaaaaaaa-0000-4000-8000-000000000001]}
+        gateways:
+          - {node: aaaaaaaa-0000-4000-8000-000000000001, between: [a, b],
+             k: 2}
+      expect_refused: true
+
+    - id: duplicate-key-refused
+      text: '{"version": 1, "version": 1}'
+      expect_refused: true
+
+    - id: not-json-refused
+      text: 'version: 1'
+      expect_refused: true
+
+    - id: top-level-list-refused
+      text: '[1]'
+      expect_refused: true
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: apply_deployment_manifests
+    description: |
+        The adapter applies every row over the baseline through the production
+        loader and records whether each matches.
+
+expected_state:
+  node:
+    all_rows_match: true
+    # A refused file leaves the manifest the node already held.
+    a_refusal_keeps_the_previous_manifest: true

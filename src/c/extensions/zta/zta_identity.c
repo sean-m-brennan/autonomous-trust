@@ -825,6 +825,102 @@ static bool _hook_credential_anchored(const process_t *proc,
     return result.status == ZTA_VERIFIED;
 }
 
+/* The join-policy anchor classes @p ident holds through ZTA (RD_14.4 plan,
+ * Phase 2). AT_ANCHOR_ZTA: a credential that chains to one of our anchors, is
+ * not revoked, and is BOUND to this identity, whatever the admission
+ * binding_mode, since a certificate is public and a cohort could hand us
+ * anyone's. AT_ANCHOR_OPERATOR: on such a credential, operator-class, an
+ * operator-key binding that verifies, naming THIS node's operator key (the
+ * user's call: the operator's other nodes). Nothing when the policy is off.
+ * Mirrors Python admission.anchor_classes. */
+static uint32_t _hook_anchor_classes(const process_t *proc, const public_identity_t *ident)
+{
+    const zta_policy_t *policy = _policy(proc);
+    if (ident == NULL || policy == NULL || !policy->enabled)
+        return 0;
+    zta_credential_t fallback;
+    const zta_credential_t *creds = ident->zta_credentials;
+    size_t n_creds = ident->num_zta_credentials;
+    if (n_creds == 0) {
+        if (ident->zta_credential == NULL || ident->zta_credential_len == 0)
+            return 0;
+        memset(&fallback, 0, sizeof(fallback));
+        fallback.der = ident->zta_credential;
+        fallback.der_len = ident->zta_credential_len;
+        creds = &fallback;
+        n_creds = 1;
+    }
+    /* The verifiers _zta_admit builds, by the same resolution. */
+    zta_anchor_t anchors[ZTA_POLICY_MAX_ANCHORS];
+    zta_verifier_t *verifiers[ZTA_POLICY_MAX_ANCHORS] = {0};
+    size_t n_anchors = 0;
+    if (strcmp(policy->verifier_type, "x509") == 0)
+        n_anchors = zta_policy_resolved_anchors(policy, anchors, ZTA_POLICY_MAX_ANCHORS);
+    if (n_anchors == 0) {
+        memset(&anchors[0], 0, sizeof(anchors[0]));
+        n_anchors = 1;
+        zta_policy_create_verifier(policy, &verifiers[0]);
+    } else {
+        for (size_t a = 0; a < n_anchors; a++)
+            zta_policy_create_anchor_verifier(policy, &anchors[a], &verifiers[a]);
+    }
+    const identity_t *self = identity_self_identity(proc);
+    bool own_key = self != NULL && !at_operator_pubkey_empty(self->operator_pubkey);
+    bool claims_own = own_key
+        && sodium_memcmp(ident->operator_pubkey, self->operator_pubkey,
+                         crypto_sign_PUBLICKEYBYTES) == 0
+        && ident->operator_key_binding != NULL && ident->operator_key_binding_len > 0;
+    uint32_t found = 0;
+    for (size_t i = 0; i < n_creds; i++) {
+        const uint8_t *cred = creds[i].der;
+        size_t cred_len = creds[i].der_len;
+        if (cred == NULL || cred_len == 0 || cred_len > ZTA_CRED_MAX)
+            continue;
+        bool matched = false, is_operator = false, revoked = false;
+        for (size_t a = 0; a < n_anchors; a++) {
+            if (verifiers[a] == NULL || verifiers[a]->verify_credential == NULL)
+                continue;
+            zta_result_t r;
+            memset(&r, 0, sizeof(r));
+            verifiers[a]->verify_credential(verifiers[a], cred, cred_len, &r);
+            if (r.status != ZTA_VERIFIED)
+                continue;
+            matched = true;
+            is_operator = is_operator || anchors[a].is_operator;
+            if (verifiers[a]->check_revocation != NULL) {
+                zta_result_t rev;
+                memset(&rev, 0, sizeof(rev));
+                verifiers[a]->check_revocation(verifiers[a], r.credential_hash, &rev);
+                revoked = revoked || rev.status == ZTA_REVOKED;
+            }
+        }
+        if (!matched || revoked)
+            continue;
+        if (!zta_identity_is_bound(ident, cred, cred_len,
+                                   creds[i].binding, creds[i].binding_len,
+                                   policy->san_uri_template, ident->operator_pubkey,
+                                   ident->operator_key_binding,
+                                   ident->operator_key_binding_len))
+            continue;
+        found |= AT_ANCHOR_ZTA;
+        if (!claims_own || (found & AT_ANCHOR_OPERATOR))
+            continue;
+        if (!is_operator && !_is_operator_credential(policy, cred, cred_len,
+                                                     ident->zta_credential_hash))
+            continue;
+        uint8_t preimage[OPERATOR_BINDING_PREIMAGE_LEN];
+        if (operator_binding_preimage(ident, ident->operator_pubkey, preimage) == 0
+            && x509_verify_data_signature(cred, cred_len, preimage, sizeof(preimage),
+                                          ident->operator_key_binding,
+                                          ident->operator_key_binding_len))
+            found |= AT_ANCHOR_OPERATOR;
+    }
+    for (size_t a = 0; a < n_anchors; a++)
+        if (verifiers[a] != NULL)
+            verifiers[a]->destroy(verifiers[a]);
+    return found;
+}
+
 static const identity_ext_t zta_identity_ext = {
     .name = "zta",
     .admission_gate = _hook_admission_gate,
@@ -832,6 +928,7 @@ static const identity_ext_t zta_identity_ext = {
     .gateway_refused = _hook_gateway_refused,
     .operator_credential = _hook_operator_credential,
     .credential_anchored = _hook_credential_anchored,
+    .anchor_classes = _hook_anchor_classes,
 };
 IDENTITY_EXT_REGISTER(zta, &zta_identity_ext)
 

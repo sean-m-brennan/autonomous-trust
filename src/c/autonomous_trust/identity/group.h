@@ -72,8 +72,8 @@ typedef struct
      * fact -- format detection is deliberately unimplemented
      * (doc/architecture/network-wire-format.md). A joiner
      * therefore ADOPTS this at admission; AT_NET_WIRE_MODE only stamps a group
-     * its node mints. NET_WIRE_JSON == 0, so group_init's zeroed struct, an
-     * absent proto field and a group config predating this all mean JSON.
+     * its node mints. group_init sets NET_WIRE_JSON, and NET_WIRE_JSON == 0, so a
+     * zeroed struct, an absent proto field and a group config predating this all mean JSON.
      *
      * Placed LAST on purpose: every other field keeps its offset, so a stale
      * consumer built against the older header misreads only this one rather

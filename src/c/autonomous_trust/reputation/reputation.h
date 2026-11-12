@@ -21,6 +21,7 @@
  *  @{
  */
 
+#include <math.h>                    /* lround */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>                  /* getenv, for SLASH_ENABLED */
@@ -156,13 +157,21 @@ extern char REP_PROTO_PLACED[];
  * transaction-memory prior shrinks a peer's observed third-party standing
  * toward PREREP_NEUTRAL by a pseudo-count of PREREP_SHRINKAGE_K, so a
  * genuinely-unknown peer (zero observations) reads exactly PREREP_NEUTRAL.
- * This is the STARTING point only -- the CTFT bilateral pivots
- * (min(0.49,.)/max(0.51,.) around the 0.5 cooperate threshold) are the earned
- * near-threshold outputs and are deliberately unchanged. Mirror of
+ * CTFT shrinks a peer's bilateral standing toward the same value by the same
+ * pseudo-count (reputation_ctft_score), so the prior and the earned score sit
+ * on one curve. Mirror of
  * repprocess.py PREREP_NEUTRAL / PREREP_SHRINKAGE_K / COMM_CUTOFF.
  * Disable the prior heuristic via AT_PREREP_HEURISTIC=0; re-adjust values via
  * AT_REP_NEUTRAL / AT_REP_COMM_CUTOFF. */
 double reputation_env_double(const char *name, double dflt);
+/* Fewest distinct verified, trusted co-signers a rep_resolved answer must
+ * carry before _accept_resolved takes it as evidence. It is a floor, not a
+ * quorum test: an opaque subtree does not disclose its membership, so the
+ * receiver cannot know what a majority would be. Read from
+ * AT_REP_RESOLVE_MIN_SIGNERS on every call, default 1. The value truncates
+ * toward zero and anything below 1 (or unparseable) means 1, which is
+ * Python's int(_env_float(...)) under verify_resolved's max(1, ...). */
+size_t reputation_resolve_min_signers(void);
 #define PREREP_NEUTRAL_DEFAULT 0.2
 #define COMM_CUTOFF_DEFAULT    0.1
 #define PREREP_NEUTRAL (reputation_env_double("AT_REP_NEUTRAL", PREREP_NEUTRAL_DEFAULT))
@@ -193,6 +202,49 @@ double reputation_env_double(const char *name, double dflt);
 static inline bool tx_score_in_range(double score)
 {
     return score >= TX_SCORE_MIN && score <= TX_SCORE_MAX;
+}
+
+/* Scores travel, are signed and are hashed as integer thousandths, 0..1000
+ * for 0.0..1.0 (doc/architecture/reputation.md, "Integer scores"). Text for a
+ * double depends on the libc that prints and parses it -- uClibc-ng, the libc
+ * of SPARC LEON3 Linux, misreads about a quarter of three-decimal values --
+ * and a node that converts differently signs and hashes different bytes. An
+ * integer has one spelling everywhere. Floats stop at the producer's
+ * tx_score_msg_t: the score is rounded once (tx_score_to_milli) and
+ * everything after holds the integer; the algebra divides by TX_SCORE_SCALE
+ * where it does arithmetic. Mirrors TX_SCORE_SCALE in Python's
+ * reputation.py. */
+#define TX_SCORE_SCALE 1000
+
+/** True iff @p milli is a score on the 0..TX_SCORE_SCALE integer scale. */
+static inline bool tx_milli_in_range(long long milli)
+{
+    return milli >= 0 && milli <= TX_SCORE_SCALE;
+}
+
+/** @p score (which must pass tx_score_in_range) as integer thousandths,
+ *  rounded half away from zero. One IEEE multiply and lround, which Python's
+ *  score_to_milli reproduces exactly. */
+static inline int tx_score_to_milli(double score)
+{
+    return (int)lround(score * (double)TX_SCORE_SCALE);
+}
+
+/** Integer thousandths as the 0.0..1.0 double the algebra computes with. */
+static inline double tx_milli_to_score(int milli)
+{
+    return (double)milli / (double)TX_SCORE_SCALE;
+}
+
+/** Read a score off the wire: true and @p out set only for a JSON INTEGER in
+ *  0..TX_SCORE_SCALE. A real is refused even when integral, so a value from a
+ *  node that predates integer scores (0.8) is never read as thousandths. */
+static inline bool tx_milli_from_json(const json_t *v, int *out)
+{
+    if (!json_is_integer(v) || !tx_milli_in_range(json_integer_value(v)))
+        return false;
+    *out = (int)json_integer_value(v);
+    return true;
 }
 
 /* --- Slashing: OFF unless armed (R+D.md §12.8) ---
@@ -237,7 +289,9 @@ static inline bool tx_score_in_range(double score)
 typedef struct {
     smrt_ptr_t;
     uuid_t task_uuid;
-    double score;
+    /* Integer thousandths, 0..TX_SCORE_SCALE. Mirrors Python
+     * TransactionScore.score_milli. */
+    int score_milli;
     /* Optional: name of the Capability that produced this TS. Used by
      * _pure_reputation to look up transaction_weight (Slice 3). Empty
      * string == "unknown / legacy" — weight defaults to 1. Mirrors
@@ -262,6 +316,10 @@ typedef struct {
      * verbatim. Mirrors Python TransactionScore.competence. See
      * prequential/prequential.h. */
     double competence;
+    /* Whom this half names: the peer it scores (R+D.md §14.2). Staged so the
+     * commit can sign a half naming it; a half that names nobody is never
+     * proposed. Mirrors Python TransactionScore.subject_uuid. */
+    uuid_t subject_uuid;
 } tx_score_t;
 
 /****************************
@@ -292,10 +350,10 @@ typedef struct {
 typedef struct {
     uuid_t task_uuid;
     uuid_t p1_uuid;
-    double p1_score;
+    int    p1_score_milli;      /* thousandths, 0..TX_SCORE_SCALE */
     bool   p1_set;
     uuid_t p2_uuid;
-    double p2_score;
+    int    p2_score_milli;
     bool   p2_set;
     int    index;
     /* Phase 1 hash-linking (reputation-vs-blockchain-analysis.md §2.1):
@@ -354,6 +412,12 @@ typedef struct {
     char   roster_op[TX_ROSTER_OP_LEN];
     uuid_t roster_uuid;
     char   roster_digest[TX_HASH_HEX_LEN + 1];
+    /* A roster entry's declared N_min (RD_13.2 plan section 0.4), 0 for none:
+     * the cohort size the certificate rounds are Byzantine-sized for, F =
+     * (N_min - 1) / 3. Covered by transaction_canonical_bytes ONLY when set,
+     * so an undeclaring roster entry hashes as it always did. APPENDED, for
+     * the CFFI mirror. Mirrors Python Transaction.roster_n_min. */
+    int    roster_n_min;
 } transaction_t;
 
 /* Committed: bilateral, or attested and indexed. The one test every reader of
@@ -391,6 +455,16 @@ int roster_digest(const json_t *members, char out[TX_HASH_HEX_LEN + 1],
 void tx_roster_task_uuid(const uuid_t prev, const char *op, const uuid_t member,
                          const char *digest, uuid_t out);
 
+/* tx_roster_task_uuid for an entry declaring @p n_min: "|n_min" follows the
+ * digest when @p n_min > 0, and the name is unchanged otherwise. Mirrors
+ * Python roster_task_id's n_min. */
+void tx_roster_task_uuid_n(const uuid_t prev, const char *op, const uuid_t member,
+                           const char *digest, int n_min, uuid_t out);
+
+/* F, the faults a declared @p n_min tolerates: (n_min - 1) / 3, or 0 for no
+ * declaration. Mirrors Python byzantine_f. */
+int tx_byzantine_f(int n_min);
+
 /* uuid5(AT_ATTEST_NS, "verifier|subject|digest"): the task id an attested
  * entry must carry. Mirrors Python attest_task_id. */
 void tx_attest_task_uuid(const uuid_t verifier, const uuid_t subject,
@@ -425,6 +499,22 @@ bool tx_attest_digest_valid(const char *digest);
  * by_peer / era* therefore filter for tx->p1_set && tx->p2_set,
  * so unilateral txs are invisible to consumers until they commit. */
 #define MAX_CHAIN_LEN 200
+
+/* Own entries outlive the window: an evicted entry naming the history's
+ * keep_party (this node) as a party is kept aside, at most
+ * REP_RETAINED_PER_PEER per counterparty and REP_RETAINED_FACTOR times the
+ * cap in all, oldest out first. The hostile-join runs without the policy,
+ * 2026-11-04, lost a joiner's own transactions with its contact to ten
+ * nodes' traffic in minutes (35 fell to 2). Not on the chain, never on the
+ * wire; the scorers read them before the resident entries. Mirrors Python
+ * RETAINED_PER_PEER / RETAINED_FACTOR. */
+#define REP_RETAINED_PER_PEER 64
+#define REP_RETAINED_FACTOR   4
+#define REP_RETAINED_MAX      (REP_RETAINED_FACTOR * MAX_CHAIN_LEN)
+/* What one peer's entries can come to across the primary and anchored
+ * chains, retained ones included: a scorer's buffer. by_peer can list an
+ * entry under both of its sides. */
+#define REP_BY_PEER_MAX (2 * (2 * MAX_CHAIN_LEN + REP_RETAINED_PER_PEER))
 
 typedef struct {
     transaction_t chain[MAX_CHAIN_LEN];
@@ -479,6 +569,17 @@ typedef struct {
      * per round. Outside the entry hash, like attest_certs; dropped on
      * eviction. Mirrors Python Transaction.commit_sigs. */
     map_t         commit_certs;
+    /* Each ordinary half's SCORER signature (R+D.md §14.2): "<task>|<scorer>"
+     * -> signature hex over half_designation, which names the other side.
+     * Outside the entry hash like commit_certs; dropped on eviction. Mirrors
+     * Python Transaction.half_sigs. */
+    map_t         half_sigs;
+    /* The roster each placed half's certificate was collected under, as its
+     * commit named it: "<task>|<scorer>" -> roster digest hex. A receiver
+     * ahead of the proposer judges the certificate by that roster while it is
+     * recent (REP_CERT_ROSTER_WINDOW). Outside the entry hash, like
+     * commit_certs; dropped with them. Mirrors Python Transaction.cert_rosters. */
+    map_t         commit_cert_rosters;
     /* Ordered placement (doc/architecture/reputation.md, "Agreeing on an
      * order"). Committed halves and certified attestations wait in the POOL,
      * by task, until a decided placement writes their entry; nothing in it is
@@ -490,6 +591,14 @@ typedef struct {
      * JSON of a half, "<task>" -> quorum certificate JSON of an attestation.
      * Moved beside the entry when it is placed. */
     map_t         pool_certs;
+    /* Pooled halves' names and scorer signatures: "<task>|<scorer>" ->
+     * "<counterparty uuid>|<signature hex>", either part possibly empty. The
+     * signature moves to half_sigs when the entry is placed; the name is the
+     * other side by then. Mirrors Python Transaction.names / half_sigs. */
+    map_t         pool_halves;
+    /* The roster each pooled half's certificate names: "<task>|<scorer>" ->
+     * roster digest hex. Moves to commit_cert_rosters when the entry is placed. */
+    map_t         pool_cert_rosters;
     /* Bumped on every change to the pool, so the process persists it
      * (reputation-pool.cfg.json) only when there is something new. Mirrors
      * Python TransactionHistory.pool_rev. */
@@ -518,11 +627,30 @@ typedef struct {
      * conformance fixture stands for a roster logged before the scenario
      * starts. Mirrors Python TransactionHistory.roster_anchor. */
     char          roster_anchor[TX_HASH_HEX_LEN + 1];
+    /* Own entries evicted from the window (REP_RETAINED_PER_PEER), oldest
+     * first: heap, allocated on first use and freed by tx_history_free, since
+     * a tx_history_t sits on the stack in places. keep_party is empty until
+     * the owning process sets it (tx_history_set_keep_party). */
+    char           keep_party[UUID_STRING_LEN + 1];
+    transaction_t *retained;
+    int            retained_len;
+    int            retained_per_peer;
+    int            retained_max;
+    unsigned       retained_rev;
+    unsigned       retained_saved;  /* retained_rev last persisted */
 } tx_history_t;
 
 /* Upper bound on the entries one placement decides. Mirrors Python
  * PLACE_BATCH_MAX. */
 #define PLACE_BATCH_MAX 32
+/* Upper bound on a value's encoded size, in bytes of its JSON: the entries a
+ * proposer puts in one value stop short of it, though a value always holds at
+ * least one. A `place` frame carries the value base64-encoded, about 1.34
+ * times its size, and must fit one UDP datagram (65,507 bytes). At 18 members
+ * an entry is about 6 KB, so PLACE_BATCH_MAX alone made frames of 257 KB that
+ * no send could carry, and the 16-colluder hostile-join runs of 2026-11-05 sat
+ * on one instance to the end. Mirrors Python PLACE_VALUE_BYTES_MAX. */
+#define PLACE_VALUE_BYTES_MAX 40000
 /* Room for place_value_bytes at its longest. */
 #define PLACE_VALUE_MAX (16 + PLACE_BATCH_MAX * (TX_CANON_MAX + 1))
 /* Room for place_designation: tag, index, two hex digests, separators. */
@@ -534,7 +662,8 @@ typedef enum {
     TX_HALF_READY,         /* both: its entry can be placed */
     TX_HALF_DUP,           /* this scorer's half (or a whole entry) is held */
     TX_HALF_PLACED,        /* the task is in the chain */
-    TX_HALF_TOMBSTONED     /* it was, and has been evicted */
+    TX_HALF_TOMBSTONED,    /* it was, and has been evicted */
+    TX_HALF_MISMATCH       /* the held half and this one do not name each other */
 } tx_half_status_t;
 
 /* tx_history_apply_placed's outcomes. Mirrors the Python strings. */
@@ -609,8 +738,28 @@ const char *tx_history_attest_cert(const tx_history_t *hist, const uuid_t task_u
  * history or an unknown channel. Nothing here touches the chain. Mirrors
  * Python TransactionHistory.record_half. */
 int  tx_history_record_half(tx_history_t *hist, const uuid_t task_uuid,
-                            const uuid_t peer_uuid, double score,
+                            const uuid_t peer_uuid, int score_milli,
                             const char *channel, const char *cert_json);
+/* tx_history_record_half for a half that names @p counterparty (NULL: names
+ * nobody, as a half held before names did) and carries its scorer's signature
+ * @p half_sig (hex, may be NULL); the caller has verified both (R+D.md §14.2).
+ * Two halves pair only when each names the other. When they do not, the held
+ * half gives way only if this one proves it can never pair -- this scorer is
+ * the one it names, and this half names somebody else -- and otherwise this
+ * one is refused with TX_HALF_MISMATCH. Mirrors Python record_half. */
+int  tx_history_record_signed_half(tx_history_t *hist, const uuid_t task_uuid,
+                                   const uuid_t peer_uuid, int score_milli,
+                                   const char *channel, const char *cert_json,
+                                   const uuid_t counterparty,
+                                   const char *half_sig);
+/* Whom @p scorer's pooled half of @p task_uuid names: true and @p out set when
+ * known (the other side of a paired entry, or the name the half carried). */
+bool tx_history_pool_names(const tx_history_t *hist, const uuid_t task_uuid,
+                           const uuid_t scorer, uuid_t out);
+/* @p scorer's own signature over its pooled half of @p task_uuid (hex), or
+ * NULL. Borrowed. */
+const char *tx_history_pool_half_sig(const tx_history_t *hist,
+                                     const uuid_t task_uuid, const uuid_t scorer);
 /* Put a certified attested entry in the pool, ready to be placed. Returns 0,
  * or EINVAL and changes nothing when it is malformed or its task was ever
  * held. Mirrors Python TransactionHistory.pool_attested. */
@@ -624,6 +773,17 @@ const transaction_t *tx_history_pooled(const tx_history_t *hist,
  * or NULL. Borrowed. */
 const char *tx_history_pool_cert(const tx_history_t *hist,
                                  const uuid_t task_uuid, const uuid_t scorer);
+/* Name @p digest (hex; NULL or "" for none) as the roster @p scorer's pooled
+ * half of @p task_uuid was certified under. Returns 0, or -1 when that half
+ * is not pooled. Bumps pool_rev on a change. Mirrors Python record_half's
+ * cert_roster. */
+int  tx_history_pool_set_cert_roster(tx_history_t *hist, const uuid_t task_uuid,
+                                     const uuid_t scorer, const char *digest);
+/* The roster digest named for @p scorer's pooled half of @p task_uuid, or
+ * NULL. Borrowed. */
+const char *tx_history_pool_cert_roster(const tx_history_t *hist,
+                                        const uuid_t task_uuid,
+                                        const uuid_t scorer);
 /* Take @p task_uuid out of the pool with its certificates. Returns 0, or -1
  * when it is not pooled. */
 int  tx_history_pool_drop(tx_history_t *hist, const uuid_t task_uuid);
@@ -674,10 +834,18 @@ int  tx_history_roster_at(const tx_history_t *hist, int k, transaction_t *out);
 /* The canonical member list (JSON text) kept for @p digest, or NULL. */
 const char *tx_history_roster_members(const tx_history_t *hist,
                                       const char *digest);
+/* The roster entry @p digest names while it may still judge a commit
+ * certificate: the roster in force, or one superseded at an instance no more
+ * than @p window below the next, copied to @p out. A digest covers the
+ * members only and a restatement keeps it, so this is the newest such entry.
+ * The anchor stands below every resident entry. Returns 0, or -1 when there
+ * is none. Mirrors Python TransactionHistory.roster_named. */
+int  tx_history_roster_named(const tx_history_t *hist, const char *digest,
+                             int window, transaction_t *out);
 
 /**
  * @brief The bytes an acceptor signs to certify ONE half of an ordinary
- *        commit: "AT-COMMIT\0" scorer "|" task "|" %.17g score "|" channel.
+ *        commit: "AT-COMMIT\0" scorer "|" task "|" score_milli "|" channel.
  *
  * Lowercase uuids, and the channel normalized (NULL / "" == task_outcome), so
  * an absent channel and an explicit default are one claim with one signature.
@@ -685,7 +853,7 @@ const char *tx_history_roster_members(const tx_history_t *hist,
  *
  * @return the designation's length, or 0 if @p cap is too small.
  */
-size_t commit_designation(const uuid_t scorer, const uuid_t task, double score,
+size_t commit_designation(const uuid_t scorer, const uuid_t task, int score_milli,
                           const char *channel, uint8_t *out, size_t cap);
 /**
  * @brief Keep @p cert_json ({voter: sig hex}) as the commit certificate of
@@ -702,9 +870,44 @@ int tx_history_attach_commit_cert(tx_history_t *hist, const uuid_t task,
  *         text, or NULL. Borrowed: valid until the history next changes. */
 const char *tx_history_commit_cert(const tx_history_t *hist, const uuid_t task,
                                    const uuid_t scorer);
+/** @brief Name @p digest as the roster @p scorer's held certificate of @p task
+ *         was collected under. Kept only beside a held certificate.
+ *  @return 0 when kept, -1 otherwise. */
+int tx_history_attach_cert_roster(tx_history_t *hist, const uuid_t task,
+                                  const uuid_t scorer, const char *digest);
+/** @brief The roster digest named for @p scorer's held certificate of @p task,
+ *         or NULL. Borrowed. */
+const char *tx_history_commit_cert_roster(const tx_history_t *hist,
+                                          const uuid_t task, const uuid_t scorer);
+
+/* Room for half_designation: tag, task, two uuids, a score, a channel. */
+#define HALF_DESIG_MAX (16 + 3 * UUID_STRING_LEN + 32 + TX_CHANNEL_NAMELEN)
+/**
+ * @brief The bytes a SCORER signs over its own half (R+D.md §14.2):
+ *        "AT-HALF\0" task "|" scorer "|" counterparty "|" score_milli "|"
+ *        channel.
+ *
+ * Lowercase uuids, the channel normalized (NULL / "" == task_outcome), as
+ * commit_designation. Index and link are not covered. Mirrors Python
+ * half_designation.
+ *
+ * @return the designation's length, or 0 if @p cap is too small.
+ */
+size_t half_designation(const uuid_t task, const uuid_t scorer,
+                        const uuid_t counterparty, int score_milli,
+                        const char *channel, uint8_t *out, size_t cap);
+/** @brief Keep @p sig_hex as @p scorer's own signature over its half of
+ *         @p task. The caller has verified it. Nothing is kept unless the
+ *         history holds that half of an ordinary entry. @return 0 or -1. */
+int tx_history_attach_half_sig(tx_history_t *hist, const uuid_t task,
+                               const uuid_t scorer, const char *sig_hex);
+/** @brief @p scorer's own signature over its half of @p task (hex), or NULL.
+ *         Borrowed: valid until the history next changes. */
+const char *tx_history_half_sig(const tx_history_t *hist, const uuid_t task,
+                                const uuid_t scorer);
 
 int  tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
-                       const uuid_t peer_uuid, double score,
+                       const uuid_t peer_uuid, int score_milli,
                        const char *channel);
 
 /*@
@@ -792,6 +995,36 @@ bool tx_merkle_verify(const char leaf_hex[TX_HASH_HEX_LEN + 1],
 */
 int  tx_history_by_peer(const tx_history_t *hist, const uuid_t peer_uuid,
                         transaction_t *out, int *out_count, int max_out);
+
+/** This node's own entries about @p peer_uuid that left the window, oldest
+ *  first (REP_RETAINED_PER_PEER). Mirrors Python retained_by_peer. */
+int  tx_history_retained_by_peer(const tx_history_t *hist,
+                                 const uuid_t peer_uuid, transaction_t *out,
+                                 int *out_count, int max_out);
+
+/** The retained entries, then the resident ones, about @p peer_uuid: what the
+ *  scorers read from one chain. */
+int  tx_history_by_peer_kept(const tx_history_t *hist, const uuid_t peer_uuid,
+                             transaction_t *out, int *out_count, int max_out);
+
+/** Keep this node's (@p self_uuid) own entries aside when they leave
+ *  @p hist's window. */
+void tx_history_set_keep_party(tx_history_t *hist, const uuid_t self_uuid);
+
+/** Take @p n entries (oldest first) as retained, as a restart or a chain
+ *  reset does: only those naming keep_party, not resident and not already
+ *  retained count, and the bounds hold. Mirrors Python adopt_retained. */
+void tx_history_adopt_retained(tx_history_t *hist, const transaction_t *src,
+                               int n);
+
+/** The retained entries as an evidence-shaped document (schema
+ *  REP_EVIDENCE_SCHEMA, no checkpoint), the form Python's
+ *  evidence_to_dict(retained) writes. */
+int  reputation_retained_to_json(const tx_history_t *hist, json_t **out);
+
+/** Adopt the entries of a document reputation_retained_to_json (or Python)
+ *  wrote into @p hist (tx_history_adopt_retained). -1 on a malformed one. */
+int  reputation_retained_from_json(const json_t *doc, tx_history_t *hist);
 
 /*@
   requires \valid(hist);
@@ -919,6 +1152,16 @@ typedef struct {
 int  tx_history_place_batches(const tx_history_t *hist, const json_t *arr,
                               tx_place_batch_t **out, int *n_out);
 
+/** The committed entry at absolute @p index, or NULL when it is not resident. */
+const transaction_t *tx_history_committed_at(const tx_history_t *hist, int index);
+
+/** Our own placement holding index @p f, completed from resident entries,
+ *  with its certificate: *@p sigs_out is a new reference (decref it), also
+ *  borrowed by out->sigs. Returns -1 when the placement is not resident in
+ *  full. Mirrors the batch Python _own_fork_cert picks. */
+int  tx_history_own_place_batch(const tx_history_t *hist, int f,
+                                tx_place_batch_t *out, json_t **sigs_out);
+
 /** Merkle root over our committed entries at indices [first, first + count),
  *  the value a checkpoint over that window attests. Returns -1 unless every
  *  index in the range is resident, in order. Mirrors Python's
@@ -1019,6 +1262,21 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
                        const uuid_t peer_uuid,
                        const map_t *task_weights);
 
+/** reputation_pure over @p hist and then @p extra (NULL: none): the anchored
+ *  cohort's chain beside the primary one (RD_14.4 Phase 6). */
+double reputation_pure_with(const tx_history_t *hist, const tx_history_t *extra,
+                            const reputations_t *reps, const uuid_t peer_uuid,
+                            const map_t *task_weights);
+
+/** For a transaction between @p self_uuid and @p peer_uuid: the score this
+ *  node gave the peer and the score the peer gave this node, each read
+ *  through transaction_score_about. False for any other transaction. Mirrors
+ *  repprocess.py bilateral_scores. */
+bool reputation_bilateral_scores(const transaction_t *tx,
+                                 const uuid_t self_uuid,
+                                 const uuid_t peer_uuid,
+                                 double *ours_of_peer, double *peers_of_us);
+
 /*@
   requires \valid(hist);
   requires \valid(reps);
@@ -1027,6 +1285,86 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
 */
 double reputation_contrite_tft(const tx_history_t *hist, const reputations_t *reps,
                                const uuid_t self_uuid, const uuid_t peer_uuid);
+
+/** reputation_contrite_tft, with the cold-start prior skipping the chain
+ *  indices in @p told (the entries catch-up marked under the join policy,
+ *  RD_14.4 D4 (b)); NULL/0 skips none. */
+double reputation_contrite_tft_told(const tx_history_t *hist,
+                                    const reputations_t *reps,
+                                    const uuid_t self_uuid,
+                                    const uuid_t peer_uuid,
+                                    const int64_t *told, size_t n_told);
+
+/** reputation_contrite_tft_told over @p hist and then @p extra (NULL: none):
+ *  the anchored cohort's chain beside the primary one (RD_14.4 Phase 6). The
+ *  @p told indices are @p hist's; @p extra's entries are never told. */
+double reputation_contrite_tft_told_with(const tx_history_t *hist,
+                                         const tx_history_t *extra,
+                                         const reputations_t *reps,
+                                         const uuid_t self_uuid,
+                                         const uuid_t peer_uuid,
+                                         const int64_t *told, size_t n_told);
+
+/** reputation_contrite_tft_told_with, with @p n_lone more scores this node
+ *  gave the peer (@p lone): its lone probe verdicts, already less those whose
+ *  bilateral entry is on @p hist or @p extra. No score of us stands behind
+ *  one, so none is a defection; with any, the peer is scored from them rather
+ *  than from the prior (the user's call, 2026-11-06). */
+double reputation_contrite_tft_told_lone(const tx_history_t *hist,
+                                         const tx_history_t *extra,
+                                         const reputations_t *reps,
+                                         const uuid_t self_uuid,
+                                         const uuid_t peer_uuid,
+                                         const int64_t *told, size_t n_told,
+                                         const double *lone, size_t n_lone);
+
+/** Contrite tit-for-tat over this node's bilateral record with a peer:
+ *  @p given_sum the sum of the @p n scores it gave the peer, @p got_last and
+ *  @p got_prev the last two scores the peer gave it (@p got_prev negative when
+ *  there is only one). The standing is given_sum shrunk toward PREREP_NEUTRAL
+ *  by a pseudo-count of PREREP_SHRINKAGE_K. A defection is a score the peer
+ *  gave below 0.5; the first is forgiven, and two in a row hold the standing
+ *  at min(standing, 0.49). No floor. Shared by the told and brought scores
+ *  (RD_14.4 Phase 4). Mirrors repprocess.py contrite_tft_of. */
+double reputation_ctft_score(double given_sum, int n, double got_last,
+                             double got_prev);
+
+/** Where two failed probes in a row hold a peer's brought score, just below
+ *  tier 1, at the default floors. The hold in force follows the trust ladder's
+ *  tier-1 floor (reputation_tier_one_hold); contrite tit-for-tat's 0.49
+ *  belongs to the 0.5 cooperation boundary and does not move. */
+#define REP_PROBE_HOLD 0.49
+
+/** The probe score that is neither a pass nor a failure: an out-of-tolerance
+ *  time attestation. Left out of the latest two that reputation_probe_hold
+ *  reads. Mirrors repprocess.py PROBE_NEUTRAL. */
+#define REP_PROBE_NEUTRAL 0.5
+
+/** Whether the latest two of our probe verdicts about a peer, @p last and
+ *  @p prev (negative: none), both failed: scored below 0.5. A known-answer
+ *  probe is a defection the prober stands behind alone, but a lone verdict
+ *  carries no score of us, so contrite tit-for-tat never counts one; a gamer
+ *  that answered rightly for eight minutes and wrongly after kept tier 2..3
+ *  for twelve minutes on every honest node (red-team batch, 2026-11-10). An
+ *  out-of-tolerance time attestation scores 0.5, so clock drift is not a
+ *  failure. Mirrors repprocess.py probe_hold_of. */
+bool reputation_probe_hold(double last, double prev);
+
+/** Which regime scores a peer: true for cooperation. A peer is scored in
+ *  cooperation while the cooperation score @p pure is itself at or above
+ *  COOP_EXIT: in it, once @p previous > COOP_EXIT; out of it, once
+ *  @p previous > COOP_ENTER. Otherwise it is scored by tit-for-tat. @p pure is
+ *  read only when reputation_coop_needs_pure says so, so a caller may pass
+ *  anything otherwise. Without the test, the hostile-join runs without the
+ *  policy, 2026-11-04, flipped every rescore: tit-for-tat over own
+ *  transactions scored the contact 0.84, the mean over everyone's entries,
+ *  slander included, 0.34. Testing it only on entry still scored the contact
+ *  once on that mean on the way out, and the runs of 2026-11-05 lost its tier
+ *  for a minute. Own evidence wins. Mirrors repprocess.py coop_regime_of. */
+bool reputation_coop_regime(bool in_coop, double previous, double pure);
+
+/** Whether reputation_coop_regime would read the cooperation score. */
+bool reputation_coop_needs_pure(bool in_coop, double previous);
 
 /*@
   requires \valid(hist);
@@ -1098,7 +1436,7 @@ int reputation_consensus_by_tier(const tx_history_t *hist, const uuid_t peer_uui
  *
  * The schema is pinned so a future shape change is a refusal to rebuild --
  * which degrades safely to clamped restoration -- rather than a misparse. */
-#define REP_EVIDENCE_SCHEMA "1"
+#define REP_EVIDENCE_SCHEMA "2"   /* 2: scores are integer thousandths */
 #define REP_EVIDENCE_FILE   "reputation-history"
 
 /* Per-(target, slasher) slash high-water marks. A separate file from the chain
@@ -1106,6 +1444,19 @@ int reputation_consensus_by_tier(const tx_history_t *hist, const uuid_t peer_uui
  * can lose harmlessly, while these marks are the memory a replayed slash has to
  * clear, so the two must not share a failure. */
 #define REP_SLASH_MARKS_FILE "reputation-slash-marks"
+/* Own entries evicted from a chain's window (tx_history_t.retained), in the
+ * evidence document's shape with no checkpoint; one file per chain, like the
+ * evidence. This node's own record, so nothing in it is verified on load
+ * beyond naming this node as a party. Mirrors Python RETAINED_FILE. */
+#define REP_RETAINED_FILE "reputation-retained"
+/* This node's lone probe verdicts (rep_proc.c rep_lone_verdict_t): one file
+ * per node, written beside the primary chain's retained entries. Mirrors
+ * Python LONE_VERDICTS_FILE. */
+#define REP_LONE_VERDICTS_FILE "reputation-verdicts"
+/** Chain entries held only by catch-up under the join policy (RD_14.4 plan,
+ *  D2 (b)): chain key ("" primary) -> sorted absolute indices. Shared with
+ *  Python's CATCHUP_MARKS_FILE. */
+#define REP_CATCHUP_MARKS_FILE "reputation-catchup-marks"
 
 /* Hex length of a detached Ed25519 signature (crypto_sign_BYTES * 2). Defined
  * here rather than only in rep_proc.c because the evidence document carries

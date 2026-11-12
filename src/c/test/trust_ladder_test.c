@@ -57,6 +57,32 @@ DEFINE_TEST(test_defaults_are_the_documented_ones)
     ck_assert_int_eq(ladder.bootstrap.duration_sec, 30);
     ck_assert_int_eq(ladder.bootstrap.pairs, 20);
     ck_assert_double_eq_tol(ladder.tier_demotion_epsilon, 0.02, 1e-9);
+    static const double floors[] = {0.50, 0.65, 0.80, 0.90};
+    for (int i = 0; i < TRUST_LADDER_NUM_TIERS; i++)
+        ck_assert_double_eq_tol(ladder.tier_floors[i], floors[i], 1e-9);
+}
+
+/* Four scores, strictly increasing, tier 1's above TRUST_LADDER_MIN_TIER_ONE_FLOOR
+ * and tier 4's at most 1.0; anything else is a broken ladder and leaves the
+ * defaults. Mirrors Python test_malformed_tier_floors_raise. */
+DEFINE_TEST(test_malformed_tier_floors_are_rejected)
+{
+    static const char *const bad[] = {
+        "{\"tier_floors\": [0.5, 0.65, 0.8]}",         /* not four */
+        "{\"tier_floors\": [0.5, 0.8, 0.65, 0.9]}",    /* not increasing */
+        "{\"tier_floors\": [0.5, 0.5, 0.8, 0.9]}",     /* not strictly */
+        "{\"tier_floors\": [0.11, 0.65, 0.8, 0.9]}",   /* probe hold at the cut-off */
+        "{\"tier_floors\": [0.5, 0.65, 0.8, 1.01]}",   /* above any score */
+        "{\"tier_floors\": \"high\"}",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        char *path = _ladder_file(bad[i]);
+        trust_ladder_t ladder;
+        ck_assert_ret_nonzero(trust_ladder_load(path, &ladder));
+        ck_assert_double_eq_tol(ladder.tier_floors[0], 0.50, 1e-9);
+        remove(path);
+        free(path);
+    }
 }
 
 DEFINE_TEST(test_a_full_ladder_parses)
@@ -254,6 +280,9 @@ DEFINE_TEST(test_the_shared_example_parses)
     ck_assert_int_eq(ladder.bootstrap.pairs, 12);
     ck_assert(ladder.bootstrap.enabled == true);
     ck_assert_double_eq_tol(ladder.tier_demotion_epsilon, 0.05, 1e-9);
+    static const double floors[] = {0.45, 0.60, 0.75, 0.85};
+    for (int i = 0; i < TRUST_LADDER_NUM_TIERS; i++)
+        ck_assert_double_eq_tol(ladder.tier_floors[i], floors[i], 1e-9);
     ck_assert_int_eq(trust_ladder_find(&ladder, "demo.sensor-report")->required_tier, 2);
     ck_assert_int_eq(trust_ladder_find(&ladder, "demo.sensor-report")->transaction_weight, 4);
     /* Partial entry: tier from the file, weight from the documented default. */
@@ -265,6 +294,7 @@ DEFINE_TEST(test_the_shared_example_parses)
 }
 
 RUN_TESTS(TrustLadder, test_defaults_are_the_documented_ones,
+          test_malformed_tier_floors_are_rejected,
           test_a_full_ladder_parses,
           test_absent_fields_take_the_documented_defaults,
           test_an_empty_object_is_the_default_ladder,

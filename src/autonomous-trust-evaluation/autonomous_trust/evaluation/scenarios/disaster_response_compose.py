@@ -35,14 +35,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Optional
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 
 # Default subnet for the demo (isolated from other compose networks).
 _DEMO_SUBNET = "10.27.4.0/24"
 _DEMO_ROUTER = "10.27.4.1"
 _DEMO_FIRST_IP = 10   # first peer gets .10, peers assigned in order
+# One sensor batch in this many becomes a reputation entry. The sending peer
+# and the coordinator each keep a batch by the same filter on its id, and the
+# entry forms only when both halves exist, so every node gets the same value.
+# The code default of 30 left the coordinator's verdicts on the rogue sensor
+# too few to take its reputation below the exclusion line.
+_TS_DECIMATION = "5"
 
 
 @dataclass
@@ -84,6 +92,58 @@ class ComposeOptions:
     probes: bool = field(default_factory=lambda: bool(os.environ.get('AT_PROBES')))
     probes_host_dir: str = field(default_factory=lambda: os.environ.get('AT_PROBES_HOST_DIR', './at-probes'))
     probes_container_dir: str = '/var/at-probes'
+    # Give each peer a deterministic identity uuid (AT_IDENTITY_UUID) and
+    # write a deployment manifest naming them (RD_13.4 §3.3), mounted beside
+    # scenario.json and named by AT_DEPLOYMENT_MANIFEST.
+    provision_identities: bool = True
+
+
+_MANIFEST_FILENAME = "deployment_manifest.json"
+_IDENTITY_NS = uuid5(NAMESPACE_URL,
+                     "https://autonomous-trust/evaluation/disaster-response")
+
+
+def peer_identity_uuid(scenario, peer_name: str) -> UUID:
+    """The identity uuid a provisioned peer adopts: uuid5 of the scenario
+    and peer names, so regenerating a deployment gives the same uuids and the
+    manifest written beside it keeps matching."""
+    return uuid5(_IDENTITY_NS, f"{scenario.name}/{peer_name}")
+
+
+def _cohort_name(scenario) -> str:
+    # The manifest allows [A-Za-z0-9._-]{1,64} only.
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", scenario.name).strip("-")
+    return (name or "cohort")[:64]
+
+
+def generate_deployment_manifest(scenario) -> dict:
+    """The deployment manifest (RD_13.4 §3.3) for a scenario: every peer in
+    one cohort, and no gateways, because these deployments have none. It
+    changes nothing at runtime today. It exists so the offline robustness
+    checker can read the deployment, and so a deployment that does add a
+    gateway has the file to add it to."""
+    return {
+        "version": 1,
+        "cohorts": {
+            _cohort_name(scenario): {
+                "members": [str(peer_identity_uuid(scenario, name))
+                            for name in scenario.peers],
+            },
+        },
+        "gateways": [],
+    }
+
+
+def _provisioning_env(scenario, peer_name: str,
+                      opts: "ComposeOptions") -> dict[str, str]:
+    if not opts.provision_identities:
+        return {}
+    env = {"AT_IDENTITY_UUID": str(peer_identity_uuid(scenario, peer_name))}
+    # The manifest rides the scenario mount; with no mount there is no file.
+    if opts.scenario_mount:
+        env["AT_DEPLOYMENT_MANIFEST"] = (
+            f"{opts.scenario_mount}/{_MANIFEST_FILENAME}")
+    return env
 
 
 # ----------------------------------------------------------------------
@@ -91,7 +151,7 @@ class ComposeOptions:
 # ----------------------------------------------------------------------
 
 def _peer_entry(peer_name: str, role, ip: str, delay_sec: int,
-                opts: ComposeOptions) -> list[str]:
+                opts: ComposeOptions, scenario=None) -> list[str]:
     """Build the YAML lines for a single compose service."""
     image = f"{opts.registry}{opts.image}{opts.image_tag}"
     caps = ",".join(role.capabilities) if role.capabilities else ""
@@ -119,7 +179,10 @@ def _peer_entry(peer_name: str, role, ip: str, delay_sec: int,
         "AT_POSITION_LON": f"{role.position.lon:.6f}",
         "LOG_LEVEL": opts.log_level,
         "STARTUP_DELAY": str(delay_sec),
+        "AT_TS_DECIMATION": _TS_DECIMATION,
     }
+    if scenario is not None:
+        env.update(_provisioning_env(scenario, peer_name, opts))
     if opts.probes:
         env["AT_PROBES"] = "1"
         env["AT_PROBES_DIR"] = opts.probes_container_dir
@@ -209,6 +272,7 @@ def _inspector_entry(opts: ComposeOptions) -> list[str]:
         # Writable AT config/identity root (explicit command bypasses the
         # native entrypoint's default rooting). /tmp is always writable.
         f'      AUTONOMOUS_TRUST_ROOT: "/tmp/multi-agency-coordinator"',
+        f'      AT_TS_DECIMATION: "{_TS_DECIMATION}"',
     ]
     if opts.probes:
         env_lines.append(f'      AT_PROBES: "1"')
@@ -219,8 +283,9 @@ def _inspector_entry(opts: ComposeOptions) -> list[str]:
     # the style. Only emitted when set on the host running the
     # compose generator.
     # AT_REP_DUMP_SEC rides along so the coordinator (also a mesh node)
-    # emits its own-view dumps for the log-harvest lens too.
-    for var in ("MAPBOX", "MAPBOX_STYLE", "AT_REP_DUMP_SEC"):
+    # emits its own-view dumps for the log-harvest lens too. AT_THEME
+    # carries the dashboard colors (run-demo.sh --theme).
+    for var in ("MAPBOX", "MAPBOX_STYLE", "AT_REP_DUMP_SEC", "AT_THEME"):
         val = os.environ.get(var)
         if val:
             safe = val.replace('"', '\\"')
@@ -295,7 +360,7 @@ def generate_compose(scenario, opts: Optional[ComposeOptions] = None) -> str:
             delay = int(scenario.phases[role.join_phase].start.total_seconds())
         else:
             delay = (i // stagger_group) * stagger_sec
-        lines.extend(_peer_entry(name, role, ip, delay, opts))
+        lines.extend(_peer_entry(name, role, ip, delay, opts, scenario))
 
     if opts.include_inspector:
         lines.extend(_inspector_entry(opts))
@@ -434,12 +499,14 @@ def _inspector_k8s_yaml(opts: ComposeOptions, namespace: str) -> str:
         # native entrypoint's default rooting).
         "AUTONOMOUS_TRUST_ROOT": "/tmp/multi-agency-coordinator",
         "LOG_LEVEL": opts.log_level,
+        "AT_TS_DECIMATION": _TS_DECIMATION,
     }
     # Forward Mapbox env (host → cluster) when present, identical to the
     # compose path. Skipped silently when unset.
     # AT_REP_DUMP_SEC rides along (host → cluster) so the log-harvest lens
     # can tail `kubectl logs` of the coordinator + peers. Off when unset.
-    for var in ("MAPBOX", "MAPBOX_STYLE", "AT_REP_DUMP_SEC"):
+    # AT_THEME carries the dashboard colors (run-demo.sh --theme).
+    for var in ("MAPBOX", "MAPBOX_STYLE", "AT_REP_DUMP_SEC", "AT_THEME"):
         val = os.environ.get(var)
         if val:
             env[var] = val
@@ -585,7 +652,9 @@ def generate_k8s_manifests(scenario, namespace: str = "disaster-demo",
                 "AT_POSITION_LAT": f"{role.position.lat:.6f}",
                 "AT_POSITION_LON": f"{role.position.lon:.6f}",
                 "LOG_LEVEL": opts.log_level,
+                "AT_TS_DECIMATION": _TS_DECIMATION,
             }
+            env.update(_provisioning_env(scenario, name, opts))
             if role.join_phase > 0 and role.join_phase < len(scenario.phases):
                 delay = int(scenario.phases[role.join_phase].start.total_seconds())
                 env["STARTUP_DELAY"] = str(delay)
@@ -635,6 +704,13 @@ def generate_k8s_manifests(scenario, namespace: str = "disaster-demo",
         f"  scenario.json: |\n"
         f"{indented}\n"
     )
+    if opts.provision_identities:
+        manifest_json = json.dumps(generate_deployment_manifest(scenario),
+                                   indent=2)
+        files["scenario-config.yaml"] += (
+            f"  {_MANIFEST_FILENAME}: |\n"
+            + "\n".join("    " + line for line in manifest_json.splitlines())
+            + "\n")
 
     # Namespace manifest (convenience for one-command apply).
     files["namespace.yaml"] = (
@@ -662,6 +738,8 @@ def write_all(scenario, out_dir: str, namespace: str = "disaster-demo",
     Layout:
         out_dir/docker-compose.yaml
         out_dir/scenario/scenario.json   (for volume-mount from compose)
+        out_dir/scenario/deployment_manifest.json  (RD_13.4 §3.3; when
+                                         provision_identities=True)
         out_dir/kubernetes/namespace.yaml
         out_dir/kubernetes/scenario-config.yaml
         out_dir/kubernetes/<agency>.yaml
@@ -685,6 +763,14 @@ def write_all(scenario, out_dir: str, namespace: str = "disaster-demo",
     with open(scenario_path, "w") as f:
         f.write(scenario_json + "\n")
     written[scenario_path] = scenario_json
+
+    if (opts or ComposeOptions()).provision_identities:
+        manifest_path = os.path.join(out_dir, "scenario", _MANIFEST_FILENAME)
+        manifest_json = json.dumps(generate_deployment_manifest(scenario),
+                                   indent=2)
+        with open(manifest_path, "w") as f:
+            f.write(manifest_json + "\n")
+        written[manifest_path] = manifest_json
 
     k8s = generate_k8s_manifests(scenario, namespace, opts)
     for fname, body in k8s.items():

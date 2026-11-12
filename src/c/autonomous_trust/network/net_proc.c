@@ -38,6 +38,7 @@
 #include "processes/processes.h"
 #include "processes/extension.h"
 #include "processes/plaintext_verbs.h"
+#include "config/deployment_manifest.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
@@ -49,6 +50,7 @@
 #include "network/net_proc_priv.h"
 #include "network/net_filter.h"
 #include "network/net_ext.h"
+#include "network/net_liveness.h"
 #include "network/net_presence.h"
 #include "utilities/send_retry.h"
 #include "identity/identity.h"
@@ -74,64 +76,71 @@ _Static_assert(ADDR_LEN + 1 >= IPV6_ADDR_LEN,
  *   dispatch silently. */
 static char NET_ID_PARTITION_SIGNAL[] = "partition_signal";
 
-/* Per-from-addr last-signal-timestamp (CLOCK_MONOTONIC microseconds,
- * truncated to seconds for `integer_data` compatibility). 5s cooldown
- * per address keeps the identity queue clear under a chatty foreign
- * group. The map is initialized lazily on first use. */
-static struct {
+/* Local key-stale signal to IdentityProcess: a group frame from a peer we
+ * hold would not open, so that member holds a key we lack, and identity asks
+ * it for the current group (group_key_query). MUST match id_proc.c's
+ * ID_KEY_STALE[] (Python IdentityProtocol.key_stale). */
+static char NET_ID_KEY_STALE[] = "group_key_stale";
+
+/* What an unverified group_key_update comes to: identity checks a signed one
+ * again against the peer it holds for the sender (id_proc.c _reverify_held), and
+ * raises no epoch from it otherwise. */
+#define NET_UNVERIFIED_UPDATE_NOTE \
+    "identity takes a rotation from it only if its signature checks against " \
+    "a peer it holds"
+
+/* Per-from-addr last-signal-timestamp (CLOCK_MONOTONIC seconds, for
+ * `integer_data` compatibility), one table per signal. A 5 s cooldown per
+ * address keeps the identity queue clear while decrypts keep failing. Each
+ * map is initialized lazily on first use. */
+typedef struct {
     map_t cooldown;
     bool inited;
     pthread_mutex_t lock;
-} _net_partition_signal_state = {
-    .inited = false,
-};
+} net_signal_cooldown_t;
 
-static void _net_partition_signal_init_once(void)
+static net_signal_cooldown_t _net_partition_signal_state = { .inited = false };
+static net_signal_cooldown_t _net_key_stale_signal_state = { .inited = false };
+
+/* Whether @p from_addr may be signalled now; records it when so. */
+static bool _net_signal_due(net_signal_cooldown_t *st, const char *from_addr)
 {
-    if (!_net_partition_signal_state.inited) {
-        map_init(&_net_partition_signal_state.cooldown);
-        pthread_mutex_init(&_net_partition_signal_state.lock, NULL);
-        _net_partition_signal_state.inited = true;
+    if (!st->inited) {
+        map_init(&st->cooldown);
+        pthread_mutex_init(&st->lock, NULL);
+        st->inited = true;
     }
-}
-
-/* Forward a partition-recovery signal to IdentityProcess. Rate-limited
- * at one signal per `from_addr` per 5 seconds. Called from the group-
- * channel drop site (group_decrypt failure) — same role as Python's
- * NetProcess._signal_partition. */
-static void _net_signal_partition(net_thread_ctx_t *ctx, const char *from_addr)
-{
-    if (ctx == NULL || from_addr == NULL || from_addr[0] == '\0') return;
-    _net_partition_signal_init_once();
-
-    /* 5s cooldown lookup. */
     struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return false;
     int64_t now_s = (int64_t)ts.tv_sec;
 
-    pthread_mutex_lock(&_net_partition_signal_state.lock);
+    pthread_mutex_lock(&st->lock);
     data_t *prev = NULL;
-    if (map_get(&_net_partition_signal_state.cooldown,
-                (map_key_t)from_addr, &prev) == 0 && prev != NULL) {
+    if (map_get(&st->cooldown, (map_key_t)from_addr, &prev) == 0 && prev != NULL) {
         int prev_s = 0;
         if (data_integer(prev, &prev_s) == 0 && now_s - prev_s < 5) {
-            pthread_mutex_unlock(&_net_partition_signal_state.lock);
-            return;
+            pthread_mutex_unlock(&st->lock);
+            return false;
         }
     }
     char key_buf[64];
     snprintf(key_buf, sizeof(key_buf), "%s", from_addr);
     data_t *now_dat = integer_data((int)now_s);
     if (now_dat != NULL)
-        map_set(&_net_partition_signal_state.cooldown, key_buf, now_dat);
-    pthread_mutex_unlock(&_net_partition_signal_state.lock);
+        map_set(&st->cooldown, key_buf, now_dat);
+    pthread_mutex_unlock(&st->lock);
+    return true;
+}
 
-    /* Build a Message-like envelope with the from_addr as a JSON
-     * string payload. */
+/* Send IdentityProcess a local signal @p function carrying @p from_addr as a
+ * JSON string. It names no sender: identity refuses one that does. */
+static void _net_send_identity_signal(net_thread_ctx_t *ctx, char *function,
+                                      const char *from_addr)
+{
     generic_msg_t sig = {0};
     sig.type = NET_MESSAGE;
     strncpy(sig.info.net_msg.process, "identity", PROC_NAME_LEN);
-    sig.info.net_msg.function = NET_ID_PARTITION_SIGNAL;
+    sig.info.net_msg.function = function;
     sig.info.net_msg.encrypt = false;
     json_t *body = json_string(from_addr);
     if (body != NULL) {
@@ -143,10 +152,31 @@ static void _net_signal_partition(net_thread_ctx_t *ctx, const char *from_addr)
         net_msg_free_obj(&sig.info.net_msg);
         if (rc != 0) {
             log_debug(ctx->logger,
-                      "Network: partition_signal: messaging_send failed (%d)\n",
-                      rc);
+                      "Network: %s: messaging_send failed (%d)\n",
+                      function, rc);
         }
     }
+}
+
+/* Forward a partition-recovery signal to IdentityProcess. Rate-limited
+ * at one signal per `from_addr` per 5 seconds. Called from the group-
+ * channel drop site (group_decrypt failure) — same role as Python's
+ * NetProcess._signal_partition. */
+static void _net_signal_partition(net_thread_ctx_t *ctx, const char *from_addr)
+{
+    if (ctx == NULL || from_addr == NULL || from_addr[0] == '\0') return;
+    if (_net_signal_due(&_net_partition_signal_state, from_addr))
+        _net_send_identity_signal(ctx, NET_ID_PARTITION_SIGNAL, from_addr);
+}
+
+/* Tell IdentityProcess that a group frame from @p from_addr, a peer we hold,
+ * would not open: it holds a key we lack. Same cooldown as the partition
+ * signal. Twin of Python NetProcess._signal_key_stale. */
+static void _net_signal_key_stale(net_thread_ctx_t *ctx, const char *from_addr)
+{
+    if (ctx == NULL || from_addr == NULL || from_addr[0] == '\0') return;
+    if (_net_signal_due(&_net_key_stale_signal_state, from_addr))
+        _net_send_identity_signal(ctx, NET_ID_KEY_STALE, from_addr);
 }
 #include "identity/group.h"
 #include "structures/data.h"
@@ -474,14 +504,24 @@ static char rejected_addresses[MAX_REJECTED][ADDR_LEN + 1];
 static size_t rejected_count = 0;
 static pthread_mutex_t rejected_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Canonicalize an address to the peer-listing key form (strip any
- * '/suffix', e.g. a CIDR mask), so an exclusion keyed on a peer's stored
- * address matches the raw from_addr seen at recv. Mirrors Python
- * NetworkProcess._norm_addr. @p out must hold ADDR_LEN + 1 bytes. */
-static void _norm_addr(const char *address, char *out, size_t outlen)
+/* @p address without a CIDR suffix ("10.0.0.1/24" -> "10.0.0.1"): the key the
+ * blacklist and the admission tables use, so an exclusion keyed on a peer's
+ * stored address matches the raw from_addr seen at recv. A DTN endpoint ID
+ * (dtn:/ipn:) is kept whole: its slashes are part of the address, and cutting
+ * at the first one would turn every EID into "dtn:", so excluding or holding
+ * for one DTN peer would hit every DTN peer. Mirrors Python strip_cidr (and
+ * NetworkProcess._norm_addr) and C peers_find_by_address. @p out must hold
+ * ADDR_LEN + 1 bytes. */
+static void _strip_cidr(const char *address, char *out, size_t outlen)
 {
-    if (address == NULL || out == NULL || outlen == 0) {
-        if (out != NULL && outlen > 0) out[0] = '\0';
+    if (out == NULL || outlen == 0)
+        return;
+    if (address == NULL) {
+        out[0] = '\0';
+        return;
+    }
+    if (strncmp(address, "dtn:", 4) == 0 || strncmp(address, "ipn:", 4) == 0) {
+        snprintf(out, outlen, "%s", address);
         return;
     }
     size_t i = 0;
@@ -493,7 +533,7 @@ static void _norm_addr(const char *address, char *out, size_t outlen)
 static bool reject_message(const char *address)
 {
     char norm[ADDR_LEN + 1];
-    _norm_addr(address, norm, sizeof(norm));
+    _strip_cidr(address, norm, sizeof(norm));
     bool found = false;
     pthread_mutex_lock(&rejected_lock);
     for (size_t i = 0; i < rejected_count; i++) {
@@ -509,7 +549,7 @@ static bool reject_message(const char *address)
 static void blacklist_address(const char *address)
 {
     char norm[ADDR_LEN + 1];
-    _norm_addr(address, norm, sizeof(norm));
+    _strip_cidr(address, norm, sizeof(norm));
     pthread_mutex_lock(&rejected_lock);
     for (size_t i = 0; i < rejected_count; i++) {
         if (strcmp(rejected_addresses[i], norm) == 0) {
@@ -531,7 +571,7 @@ static void blacklist_address(const char *address)
 static void remove_rejected_address(const char *address)
 {
     char norm[ADDR_LEN + 1];
-    _norm_addr(address, norm, sizeof(norm));
+    _strip_cidr(address, norm, sizeof(norm));
     pthread_mutex_lock(&rejected_lock);
     for (size_t i = 0; i < rejected_count; i++) {
         if (strcmp(rejected_addresses[i], norm) == 0) {
@@ -633,6 +673,16 @@ bool net_proc_test_is_rejected(const char *address)
     return reject_message(address);
 }
 
+void net_proc_test_blacklist(const char *address)
+{
+    blacklist_address(address);
+}
+
+void net_proc_test_readmit(const char *address)
+{
+    remove_rejected_address(address);
+}
+
 /****************************
  * Deferred encrypted message queue (mystery handler)
  ****************************/
@@ -662,6 +712,11 @@ typedef struct {
     uuid_t src_uuid;        /* Original sender's UUID (envelope mode). */
     bool   has_src_uuid;    /* True iff src_uuid is meaningful. */
     int64_t deferred_at_s;  /* CLOCK_MONOTONIC seconds when deferred (age-out). */
+    /* Decrypted from a KNOWN peer we could not place in any group we hold, and
+     * refused for its wire format: it waits for the peer's group, not for the
+     * peer (net_replay_placed_deferred), where every other entry waits for a
+     * PEER admission to supply the key. */
+    bool    awaits_group;
     uint8_t data[];         /* Flexible: allocated with `len` bytes. */
 } deferred_msg_t;
 
@@ -731,7 +786,8 @@ static void _deferred_sweep_stale_locked(int64_t now_s)
  * preconditions.
  */
 static void defer_message(const uint8_t *data, size_t len,
-                          const char *from_addr, const uuid_t src_uuid)
+                          const char *from_addr, const uuid_t src_uuid,
+                          bool awaits_group)
 {
     if (len > DEFERRED_MSG_MAX)
         len = DEFERRED_MSG_MAX;
@@ -751,6 +807,7 @@ static void defer_message(const uint8_t *data, size_t len,
         memset(dm->src_uuid, 0, 16);
         dm->has_src_uuid = false;
     }
+    dm->awaits_group = awaits_group;
     int64_t now_s = _deferred_now_s();
     dm->deferred_at_s = now_s;
     pthread_mutex_lock(&deferred_lock);
@@ -822,7 +879,7 @@ bool net_proc_test_deferred_matches_peer(size_t idx,
  * live socket. Wraps the static defer_message. */
 void net_proc_test_defer(const uint8_t *data, size_t len, const char *from_addr)
 {
-    defer_message(data, len, from_addr, NULL);
+    defer_message(data, len, from_addr, NULL, false);
 }
 
 /* Backdate every queued entry by @p secs so a test can simulate the passage of
@@ -1026,7 +1083,9 @@ bool net_wire_verb_admitted(const char *process, const char *function,
     else if (strncmp(function, "app_", 4) == 0)
         reason = "app verbs are the local app's and never travel";
     else if (strcmp(process, "network") == 0
-             && strcmp(function, NET_FN_STATS_REQ) != 0)
+             && strcmp(function, NET_FN_STATS_REQ) != 0
+             && !((path == NET_PATH_PEER || path == NET_PATH_GROUP)
+                  && net_ext_wire_verb_declared(function)))
         reason = "the network process takes only stats_req from the wire";
     else if ((path == NET_PATH_STRANGER || path == NET_PATH_RELAY_STRANGER)
              && !identity_verb_is_unencrypted(function))
@@ -1042,11 +1101,136 @@ bool net_wire_verb_admitted(const char *process, const char *function,
  * legitimate verb shows in the first cohort log and a flood cannot fill it. */
 static unsigned long _route_refusals;
 
+/* True while this thread routes a frame an extension delivered (a relay, a
+ * radio): such a frame is evidence the peer is alive, but not that the
+ * transport path to it works, so it does not stamp net_liveness. */
+static __thread bool _net_ext_inbound;
+
+void net_proc_test_set_ext_inbound(bool on)
+{
+    _net_ext_inbound = on;
+}
+
+/****************************
+ * Admissions in progress, as the joiner
+ ****************************/
+/* The moment of admission into a proto-format cohort. The admitter counts us a
+ * member, and so expects its cohort's format from us, the instant it admits
+ * us; we learn that format only when our group arrives a beat later. Sent in
+ * that gap, our point-to-point traffic goes as JSON (we cannot place the
+ * admitter yet) and the admitter refuses it. So an access_granted from a sender
+ * we cannot place records admitter address -> deadline here (note_admission),
+ * and per-recipient frames to that address are held (hold_for_admission) until
+ * the admission settles: the admitter can be placed in a group we hold, or the
+ * deadline (the out-of-order queue's age bound) passes, after which a frame
+ * goes as the lookup says. Mirrors Python NetworkProcess._admission_pending.
+ *
+ * Written by whichever receiver thread routes the access_granted and read by
+ * the main loop's send path, hence admission_lock. */
+typedef struct {
+    char    address[ADDR_LEN + 1];
+    int64_t deadline_s;     /* CLOCK_MONOTONIC */
+} admission_pending_t;
+static admission_pending_t admission_pending[NET_ADMISSIONS_PENDING];
+static size_t admission_pending_count = 0;
+static pthread_mutex_t admission_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static const group_t *group_for_sender(const process_t *proc,
+                                       const char *address);
+
+/* An access_granted from a sender we cannot place: we are being admitted. Not
+ * on the broadcast or group channel (bootstrap is never group-addressed, and
+ * the gateway boundary refused it there already). A second grant from the same
+ * admitter moves its deadline; past NET_ADMISSIONS_PENDING admitters at once
+ * the one nearest its deadline gives way. Mirrors Python
+ * NetworkProcess._note_admission. */
+static void note_admission(const process_t *proc, const net_wire_msg_t *wmsg,
+                           net_route_path_t path)
+{
+    if (path == NET_PATH_BROADCAST || path == NET_PATH_GROUP)
+        return;
+    if (wmsg->function == NULL || strcmp(wmsg->process, "identity") != 0
+        || strcmp(wmsg->function, "access_granted") != 0)
+        return;
+    char addr[ADDR_LEN + 1];
+    _strip_cidr(wmsg->from_whom.address, addr, sizeof(addr));
+    if (addr[0] == '\0' || group_for_sender(proc, addr) != NULL)
+        return;
+    int64_t deadline = _deferred_now_s() + _deferred_max_age_s();
+    pthread_mutex_lock(&admission_lock);
+    size_t slot = admission_pending_count;
+    for (size_t i = 0; i < admission_pending_count; i++)
+        if (strcmp(admission_pending[i].address, addr) == 0)
+            slot = i;
+    if (slot == NET_ADMISSIONS_PENDING) {
+        slot = 0;
+        for (size_t i = 1; i < admission_pending_count; i++)
+            if (admission_pending[i].deadline_s < admission_pending[slot].deadline_s)
+                slot = i;
+    } else if (slot == admission_pending_count) {
+        admission_pending_count++;
+    }
+    snprintf(admission_pending[slot].address,
+             sizeof(admission_pending[slot].address), "%s", addr);
+    admission_pending[slot].deadline_s = deadline;
+    pthread_mutex_unlock(&admission_lock);
+}
+
+/* True once a pending admission from @p addr (normalized) is over: the
+ * admitter can be placed in a group we hold, or the wait has run out. Either
+ * way the entry is forgotten. True, too, when there was none. Mirrors Python
+ * NetworkProcess._admission_settled. */
+static bool admission_settled(const process_t *proc, const char *addr)
+{
+    bool settled = true;
+    pthread_mutex_lock(&admission_lock);
+    for (size_t i = 0; i < admission_pending_count; i++) {
+        if (strcmp(admission_pending[i].address, addr) != 0)
+            continue;
+        if (group_for_sender(proc, addr) != NULL
+            || _deferred_now_s() >= admission_pending[i].deadline_s) {
+            admission_pending[i] = admission_pending[--admission_pending_count];
+        } else {
+            settled = false;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&admission_lock);
+    return settled;
+}
+
+bool net_proc_test_admission_pending(const char *address)
+{
+    char addr[ADDR_LEN + 1];
+    _strip_cidr(address, addr, sizeof(addr));
+    bool found = false;
+    pthread_mutex_lock(&admission_lock);
+    for (size_t i = 0; i < admission_pending_count; i++)
+        if (strcmp(admission_pending[i].address, addr) == 0)
+            found = true;
+    pthread_mutex_unlock(&admission_lock);
+    return found;
+}
+
+void net_proc_test_backdate_admissions(int64_t secs)
+{
+    pthread_mutex_lock(&admission_lock);
+    for (size_t i = 0; i < admission_pending_count; i++)
+        admission_pending[i].deadline_s -= secs;
+    pthread_mutex_unlock(&admission_lock);
+}
+
+static bool address_crosses_gateway(const process_t *proc,
+                                    const identity_t *myself,
+                                    const char *address);
+static const group_t *group_for_sender(const process_t *proc,
+                                       const char *address);
+
 static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
                             directory_t *queues, logger_t *logger,
                             net_route_path_t path)
 {
-    (void)proc; (void)queues;
+    (void)queues;
     /* Test-hook capture: record the from_whom.address the downstream
      * handler will observe. See net_proc_test_get_last_routed_from_addr. */
     pthread_mutex_lock(&_test_last_routed_lock);
@@ -1057,8 +1241,14 @@ static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
     /* Every frame from the wire is routed here, so this is where a peer is
      * heard (doc/architecture/peer-presence.md). A uuid not on the roster is
      * ignored by the tracker. A presence frame has said everything it carries
-     * by arriving: consumed here, never routed. */
+     * by arriving: consumed here, never routed. Transport liveness is stamped
+     * only on the paths where the sender is a peer we hold: a stranger or the
+     * broadcast channel names any uuid it likes. */
     net_presence_heard(wmsg->from_whom.uuid, (double)time(NULL));
+    if (!_net_ext_inbound
+        && (path == NET_PATH_PEER || path == NET_PATH_GROUP
+            || path == NET_PATH_PLAIN_KNOWN))
+        net_liveness_heard(wmsg->from_whom.uuid, net_liveness_now());
     if (wmsg->function != NULL
         && strcmp(wmsg->process, NET_PRESENCE_PROCESS) == 0
         && strcmp(wmsg->function, NET_PRESENCE_FUNCTION) == 0) {
@@ -1077,6 +1267,7 @@ static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
                      wmsg->from_whom.address, _path_name(path), why, n);
         return NET_ROUTE_REFUSED;
     }
+    note_admission(proc, wmsg, path);
 
     /* Build a generic_msg_t with NET_MESSAGE type.  obj/data are POINTER
      * ASSIGNMENTS, not copies — no heap-overflow possible regardless of
@@ -1102,6 +1293,14 @@ static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
      * (network/message.py:243) and read by repprocess.handle_*. */
     gmsg.info.net_msg.verified = wmsg->verified;
     gmsg.info.net_msg.has_signature = wmsg->has_signature;
+    if (wmsg->has_signature)
+        memcpy(gmsg.info.net_msg.signature, wmsg->signature, crypto_sign_BYTES);
+    /* A frame from a cohort we gateway is news about that cohort. The
+     * from_whom here is the peer we attributed the frame to (the parser copies
+     * the known peer in), so this is the sender's placement, not its claim. */
+    (void)net_child_group_of(proc, wmsg->from_whom.address,
+                             gmsg.info.net_msg.child_group,
+                             sizeof(gmsg.info.net_msg.child_group));
 
     /* Every inbound frame from the wire passes here, on a receiver thread, and
      * the sibling's queue holds ten. A refused frame is KEPT (one try, so a
@@ -1291,20 +1490,33 @@ static int handle_outbound_stats_req(const net_msg_t *nmsg,
  * sealed for the peer either way. */
 static int _peer_unicast(const net_transport_t *transport,
                          net_transport_ctx_t *ctx, const uuid_t peer,
+                         const char *process, const char *function,
                          const uint8_t *buf, size_t len, const char *host,
                          int port)
 {
     int rc = net_ext_unicast(peer, buf, len);
     if (rc != 1)
         return rc;
+    net_ext_also_unicast(peer, process, function, buf, len);
     return transport->send_unicast(ctx, buf, len, host, port);
 }
 
-static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
-                                const net_wire_msg_t *msg,
-                                const net_transport_t *transport,
-                                net_transport_ctx_t *ctx,
-                                int port, net_wire_format_t fmt, logger_t *logger)
+/* A broadcast or group frame on one leg (@p leg >= 0), or on all of them. */
+static int _send_on(const net_transport_t *transport, net_transport_ctx_t *ctx,
+                    int leg, net_channel_t channel,
+                    const uint8_t *buf, size_t len, int port)
+{
+    if (leg >= 0)
+        return transport->send_on_leg(ctx, (size_t)leg, channel, buf, len, port);
+    return transport->send_broadcast(ctx, channel, buf, len, port);
+}
+
+static int _seal_and_send(const identity_t *myself, const group_t *grp,
+                          const net_wire_msg_t *msg,
+                          const net_transport_t *transport,
+                          net_transport_ctx_t *ctx,
+                          int port, net_wire_format_t fmt, logger_t *logger,
+                          int leg, bool fanout)
 {
     uint8_t *wire = NULL;
     size_t wire_len = 0;
@@ -1330,8 +1542,11 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
             free(wire);
             return SYS_EXCEPTION();
         }
-        int ret = transport->send_broadcast(ctx, NET_CHAN_BROADCAST,
+        int ret = _send_on(transport, ctx, leg, NET_CHAN_BROADCAST,
                                             send_buf, send_len, port);
+        if (fanout)
+            net_ext_fanout(NET_CHAN_BROADCAST, msg->process, msg->function, grp,
+                           send_buf, send_len);
         if (ret == 0) {
             track_send(msg->to_whom.target.peer.address, send_len);
         } else if (ret == -1) {
@@ -1412,8 +1627,11 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
             free(frame);
             return SYS_EXCEPTION();
         }
-        int ret = transport->send_broadcast(ctx, NET_CHAN_GROUP,
+        int ret = _send_on(transport, ctx, leg, NET_CHAN_GROUP,
                                             send_buf, send_len, port);
+        if (fanout)
+            net_ext_fanout(NET_CHAN_GROUP, msg->process, msg->function, grp,
+                           send_buf, send_len);
         if (ret == -1)
             log_debug(logger, "Network: transport lacks group multicast; skipping\n");
         if (send_buf != frame)
@@ -1467,6 +1685,7 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
         }
         const char *host = msg->to_whom.target.peer.address;
         int ret = _peer_unicast(transport, ctx, msg->to_whom.target.peer.uuid,
+                                msg->process, msg->function,
                                 send_buf, send_len, host, port);
         if (ret == 0) track_send(host, send_len);
         else          track_send_error(host);
@@ -1486,6 +1705,7 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
     }
     const char *host = msg->to_whom.target.peer.address;
     int ret = _peer_unicast(transport, ctx, msg->to_whom.target.peer.uuid,
+                            msg->process, msg->function,
                             send_buf, send_len, host, port);
     if (ret == 0) track_send(host, send_len);
     else          track_send_error(host);
@@ -1493,6 +1713,128 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
         free((void *)send_buf);
     free(wire);
     return ret;
+}
+
+/* Show the extensions a broadcast once, as built. A multi-leg send seals one
+ * copy per leg, each naming that leg's address; the extensions are not a leg,
+ * and Python's _send_broadcast_message hands them the one frame it built. */
+static void _fanout_broadcast(const identity_t *myself, const group_t *grp,
+                              const net_wire_msg_t *msg, net_wire_format_t fmt)
+{
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    if (net_message_to_wire_fmt(msg, myself, fmt, &wire, &wire_len) != 0)
+        return;
+    const uint8_t *send_buf = wire;
+    size_t send_len = wire_len;
+    if (filter_outbound(NET_CHAN_BROADCAST, myself, NULL,
+                        wire, wire_len, &send_buf, &send_len) == 0) {
+        net_ext_fanout(NET_CHAN_BROADCAST, msg->process, msg->function, grp,
+                       send_buf, send_len);
+        if (send_buf != wire)
+            free((void *)send_buf);
+    }
+    free(wire);
+}
+
+/* The leg a group frame leaves on: the one that reaches the group's first
+ * member other than this node. A group stops at the gateway, so all its
+ * members sit on one of our networks. -1 when no other member names a leg. */
+static int _group_leg(const identity_t *myself, const group_t *grp,
+                      const net_transport_t *transport,
+                      const net_transport_ctx_t *ctx, size_t n_legs)
+{
+    if (grp == NULL || transport->address_for_target == NULL)
+        return -1;
+    int found = -1;
+    map_key_t key;
+    data_t *val;
+    map_entries_for_each((map_t *)&grp->address_map, key, val)
+        string_t member = NULL;
+        if (found >= 0 || data_string_ptr(val, &member) != 0 || member == NULL
+            || (myself != NULL && strcmp(member, myself->address) == 0))
+            continue;
+        char mine[sizeof(myself->address)];
+        if (transport->address_for_target(ctx, member, mine, sizeof(mine)) != 0
+            || strcmp(member, mine) == 0)
+            continue;   /* our own entry on one of the legs */
+        for (size_t i = 0; i < n_legs && found < 0; i++) {
+            char leg_addr[sizeof(myself->address)];
+            if (transport->leg_address(ctx, i, leg_addr, sizeof(leg_addr)) == 0
+                && strcmp(leg_addr, mine) == 0)
+                found = (int)i;
+        }
+    map_end_for_each
+    return found;
+}
+
+/* The sender address a frame names is the address this node holds on the
+ * network the frame leaves on. A node on one network has one address and names
+ * it. A transport with several legs (the hybrid) gives each leg's: each side
+ * reaches a gateway only at the address it holds on that side, and a frame
+ * naming the identity address on every leg made the far side take the gateway
+ * for a member that had moved, and readdress it out of reach. The envelope's
+ * signature covers process, function and payload, so a restamped copy keeps
+ * it. Mirrors Python NetworkProcess._as_sent_from / Hybrid._send_any_message. */
+static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
+                                const net_wire_msg_t *msg,
+                                const net_transport_t *transport,
+                                net_transport_ctx_t *ctx,
+                                int port, net_wire_format_t fmt, logger_t *logger)
+{
+    bool named = msg->from_whom.address[0] != '\0';
+    if (named && (msg->to_whom.type == RECIPIENT_BROADCAST
+                  || msg->to_whom.type == RECIPIENT_GROUP)
+        && transport->leg_count != NULL && transport->leg_address != NULL
+        && transport->send_on_leg != NULL && transport->leg_count(ctx) > 1) {
+        size_t n = transport->leg_count(ctx);
+        bool is_group = msg->to_whom.type == RECIPIENT_GROUP;
+        int only = is_group ? _group_leg(myself, grp, transport, ctx, n) : -1;
+        int ret = -1;
+        for (size_t i = 0; i < n; i++) {
+            if (only >= 0 && (int)i != only)
+                continue;
+            net_wire_msg_t stamped = *msg;
+            char addr[sizeof(stamped.from_whom.address)];
+            if (transport->leg_address(ctx, i, addr, sizeof(addr)) == 0)
+                at_strlcpy(stamped.from_whom.address, addr,
+                           sizeof(stamped.from_whom.address));
+            /* A group frame is sealed per leg, so the extensions see the
+             * first copy; a broadcast is shown to them once, as built. */
+            bool fanout = is_group && (only >= 0 || i == 0);
+            int rc = _seal_and_send(myself, grp, &stamped, transport, ctx, port,
+                                    fmt, logger, (int)i, fanout);
+            if (rc == 0 || ret != 0)
+                ret = rc;
+        }
+        if (!is_group)
+            _fanout_broadcast(myself, grp, msg, fmt);
+        return ret;
+    }
+    if (named && msg->to_whom.type == RECIPIENT_PEER
+        && transport->address_for_target != NULL) {
+        char addr[sizeof(msg->from_whom.address)];
+        if (transport->address_for_target(ctx, msg->to_whom.target.peer.address,
+                                          addr, sizeof(addr)) == 0
+            && strcmp(addr, msg->from_whom.address) != 0) {
+            net_wire_msg_t stamped = *msg;
+            at_strlcpy(stamped.from_whom.address, addr,
+                       sizeof(stamped.from_whom.address));
+            return _seal_and_send(myself, grp, &stamped, transport, ctx, port,
+                                  fmt, logger, -1, true);
+        }
+    }
+    return _seal_and_send(myself, grp, msg, transport, ctx, port, fmt, logger, -1,
+                          true);
+}
+
+int net_proc_test_encrypt_and_send(const identity_t *myself, const group_t *grp,
+                                   const net_wire_msg_t *msg,
+                                   const net_transport_t *transport,
+                                   net_transport_ctx_t *ctx, int port,
+                                   net_wire_format_t fmt, logger_t *logger)
+{
+    return net_encrypt_and_send(myself, grp, msg, transport, ctx, port, fmt, logger);
 }
 
 /****************************
@@ -1664,6 +2006,48 @@ static bool address_crosses_gateway(const process_t *proc,
     return in_child;
 }
 
+/* The group we hold (primary first, then each child cohort we gateway) that
+ * lists `address`, or NULL when we cannot place it. Mirrors Python
+ * NetworkProcess._group_for_sender. Placement is a question about every held
+ * group, where the format lookup (wire_format_for_address) consults the
+ * primary alone; the two agree on a leaf node, which holds no child groups. */
+static const group_t *group_for_sender(const process_t *proc,
+                                       const char *address)
+{
+    if (proc == NULL || address == NULL || address[0] == '\0')
+        return NULL;
+    if (group_lists_address(&proc->protocol.group, address))
+        return &proc->protocol.group;
+    const group_t *found = NULL;
+    if (proc->protocol.child_groups != NULL) {
+        map_key_t key;
+        data_t *value;
+        map_entries_for_each(proc->protocol.child_groups, key, value)
+            void *gp = NULL;
+            if (found == NULL && data_object_ptr(value, &gp) == 0 && gp != NULL &&
+                group_lists_address((const group_t *)gp, address))
+                found = (const group_t *)gp;
+        map_end_for_each
+    }
+    return found;
+}
+
+bool net_child_group_of(const process_t *proc, const char *address,
+                        char *out, size_t out_len)
+{
+    if (out == NULL || out_len == 0)
+        return false;
+    out[0] = '\0';
+    if (address == NULL || address[0] == '\0'
+        || !address_crosses_gateway(proc, NULL, address))
+        return false;
+    const group_t *grp = group_for_sender(proc, address);
+    if (grp == NULL || out_len < UUID_STRING_LEN + 1)
+        return false;
+    uuid_unparse_lower(grp->uuid, out);
+    return true;
+}
+
 /* Count + rate-limited log for a boundary refusal. Always returns true so call
  * sites read `if (boundary_refuse(...)) return;`.
  *
@@ -1699,29 +2083,32 @@ static bool boundary_refuse(logger_t *logger, const char *kind,
  * decrypt is NOT accepted -- corrupt ciphertext, a stale group key or a forged
  * frame all fall through to the caller's existing log + annoy path.
  *
- * Parses with a NULL peer, i.e. without signature verification, mirroring
- * Python's validate=False on the same path. Only the ADDRESS is stamped onto
- * from_whom, exactly as the unknown-sender branch below does: public_identity_t
- * carries heap members (operator_key_binding, zta_credential) that
- * net_wire_msg_free does not release, so copying a whole peer struct over
- * from_whom would leak them and alias the peer's own pointers.
+ * Parses with the known @p peer, so the transport wins and the signature is
+ * checked against the key we hold for that peer, as Python's
+ * _accept_unencrypted does. It used to parse with NULL, which read the key off
+ * the envelope: a plaintext frame from a known address verified under any key
+ * the frame named (RD_2.6 plan §2.7, the user's call 2026-10-21). The parser
+ * copies the peer into from_whom exactly as the encrypted known-peer branch
+ * does.
  *
  * Frama-C: skipped — [serialization] net_message_from_wire + at_logging.
  */
 static bool try_unencrypted_from_known_peer(net_thread_ctx_t *ctx,
                                            const uint8_t *buf, size_t len,
                                            const char *from_addr,
+                                           const public_identity_t *peer,
                                            net_wire_format_t fmt)
 {
     net_wire_msg_t wmsg;
-    if (net_message_from_wire_fmt(buf, len, NULL, fmt, &wmsg) != 0)
+    if (net_message_from_wire_fmt(buf, len, peer, fmt, &wmsg) != 0)
         return false;
     if (!wmsg.verified && wmsg.function != NULL
         && strcmp(wmsg.function, "group_key_update") == 0)
         log_warn(ctx->logger,
                  "Network: group_key_update arrived UNVERIFIED via %s "
-                 "(has_signature=%d) — the rotation will be ignored\n",
-                 "plaintext-from-known-peer", (int)wmsg.has_signature);
+                 "(has_signature=%d) — %s\n",
+                 "plaintext-from-known-peer", (int)wmsg.has_signature,
+                 NET_UNVERIFIED_UPDATE_NOTE);
     if (wmsg.encrypt || !identity_verb_is_unencrypted(wmsg.function)) {
         if (!wmsg.encrypt && wmsg.function != NULL)
             log_warn(ctx->logger, "Refusing plaintext %s from known peer %s: "
@@ -1729,10 +2116,120 @@ static bool try_unencrypted_from_known_peer(net_thread_ctx_t *ctx,
         net_wire_msg_free(&wmsg);
         return false;
     }
-    snprintf(wmsg.from_whom.address, sizeof(wmsg.from_whom.address),
-             "%s", from_addr);
     route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger,
                      NET_PATH_PLAIN_KNOWN);
+    net_wire_msg_free(&wmsg);
+    return true;
+}
+
+/* Route a point-to-point frame that DECRYPTED from the known @p peer. Returns
+ * false, having routed nothing, when the caller should defer it. Mirrors Python
+ * NetworkProcess._route_decrypted.
+ *
+ * A peer we can place in a group we hold speaks that group's format, and a
+ * refusal there is a foreign-format drop like any other. A peer we cannot place
+ * yet is read as JSON, and the one legitimate sender of anything else is our
+ * admitter: the moment it admits us it is talking its cohort's format, while we
+ * learn that format only when our group arrives a beat later. So on that path a
+ * refusal (ENET_WIRE_FORMAT) defers the frame, to be read in the group's format
+ * once the sender can be placed (net_replay_placed_deferred), or reclaimed by
+ * the out-of-order queue's age bound if it never can. The foreign parser is
+ * still never run over the bytes: the replay re-reads them only after a group
+ * says which format they are in.
+ *
+ * Takes no deferred_lock, so the replay passes call it while holding that lock.
+ */
+static bool route_decrypted(net_thread_ctx_t *ctx,
+                            const uint8_t *plain, size_t plain_len,
+                            const public_identity_t *peer,
+                            const char *from_addr)
+{
+    net_wire_msg_t wmsg;
+    /* Keyed on the PEER's own address, not from_addr: under a forwarded
+     * envelope from_addr is the gateway, and the format belongs to the
+     * originator's group. */
+    net_wire_format_t fmt =
+        wire_format_for_address(&ctx->proc->protocol.group, peer->address);
+    if (net_message_from_wire_fmt(plain, plain_len, peer, fmt, &wmsg) == 0) {
+        /* A frame that DECRYPTED (so the peer's encryption key is the
+         * one we hold) but whose signature does not check out against
+         * the SAME peer entry's signing key. Those two keys arrive
+         * together in a PEER message, so a mismatch here means one of
+         * them is stale — and every handler gated on `verified`
+         * silently does nothing, which is how 107 group-key rotations
+         * were minted across 25 cohort runs and not one was ever
+         * adopted. Warned once per frame, naming the verb, because the
+         * damage is per-verb and invisible at the transport. */
+        if (!wmsg.verified) {
+            /* Name WHICH of the two failures this is. They need
+             * different fixes and are indistinguishable from outside:
+             * an unsigned frame means the sender never signed it, a
+             * failed check means our peer entry's signing key is not
+             * the key it signed with, and an all-zero key means the
+             * entry never carried one at all. */
+            char sigkey[17] = {0};
+            sodium_bin2hex(sigkey, sizeof(sigkey),
+                           peer->signature.public, 8);
+            bool no_key = sodium_is_zero(peer->signature.public,
+                                         crypto_sign_PUBLICKEYBYTES);
+            log_warn(ctx->logger,
+                     "Network: frame '%s' from %s DECRYPTED but is "
+                     "UNVERIFIED (%s; peer signing key %s) — every "
+                     "verified-gated handler will silently ignore it\n",
+                     wmsg.function != NULL ? wmsg.function : "(none)",
+                     peer->address,
+                     !wmsg.has_signature ? "carries no signature"
+                                         : "signature did not check out",
+                     no_key ? "ABSENT (all zero)" : sigkey);
+        }
+        /* Gateway boundary, invariant B. False on a leaf node and for
+         * a peer in our own group, so this is a gateway-only gate. */
+        if (identity_verb_is_bootstrap(wmsg.function) &&
+            address_crosses_gateway(ctx->proc, ctx->myself,
+                                    peer->address)) {
+            boundary_refuse(ctx->logger, "bootstrap_across_gateway",
+                            peer->address,
+                            "admitting across the boundary would make a "
+                            "group span it");
+        } else {
+            route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger,
+                             NET_PATH_PEER);
+        }
+    } else if (_exception.errnum == ENET_WIRE_FORMAT
+               && group_for_sender(ctx->proc, peer->address) == NULL) {
+        /* Placement is asked only here, on a refusal: walking every held
+         * group (child cohorts included) for each decrypted frame would put a
+         * map walk on the receive path for nothing. errnum is read first;
+         * group_for_sender does not touch it.
+         *
+         * Refused for its format by a peer we cannot place: the admitter's
+         * frame in its cohort's format, before our group says what that is.
+         * Deferred by the caller, not dropped, and not annoy-worthy. */
+        probes_counter("net.wire", "defer", "unplaced_peer");
+        net_wire_msg_free(&wmsg);
+        return false;
+    } else {
+        /* Decrypted successfully but the inner wire is malformed —
+         * still annoy-worthy from a known peer.
+         *
+         * THIS WAS SILENT, and net_message.h's own note on
+         * ENET_WIRE_FORMAT says why that is the worst possible place
+         * for silence: "a cohort misprovisioned into two formats
+         * presents as one peer having gone silent, and only a counter
+         * that says 'foreign format' rather than 'bad message' explains
+         * it." The frame authenticated — it IS this peer — so this is
+         * never ordinary noise. Name the format and the length: a
+         * format disagreement and a truncated payload are different
+         * faults and were previously indistinguishable, both presenting
+         * as a verb that vanishes between two healthy nodes. */
+        log_warn(ctx->logger,
+                 "Network: frame from %s decrypted but did not parse as"
+                 " %s (%zu bytes, errnum %d) — DROPPED\n",
+                 from_addr,
+                 fmt == NET_WIRE_PROTO ? "protobuf" : "JSON",
+                 plain_len, _exception.errnum);
+        pest_track_annoy(from_addr);
+    }
     net_wire_msg_free(&wmsg);
     return true;
 }
@@ -1768,83 +2265,20 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
         int dec = decrypt_message(ctx->myself, peer, inner_buf, inner_len,
                                   &plain, &plain_len);
         if (dec == 0) {
-            net_wire_msg_t wmsg;
-            /* Keyed on the PEER's own address, not from_addr: under a forwarded
-             * envelope from_addr is the gateway, and the format belongs to the
-             * originator's group. */
-            net_wire_format_t fmt =
-                wire_format_for_address(&ctx->proc->protocol.group, peer->address);
-            if (net_message_from_wire_fmt(plain, plain_len, peer, fmt, &wmsg) == 0) {
-                /* A frame that DECRYPTED (so the peer's encryption key is the
-                 * one we hold) but whose signature does not check out against
-                 * the SAME peer entry's signing key. Those two keys arrive
-                 * together in a PEER message, so a mismatch here means one of
-                 * them is stale — and every handler gated on `verified`
-                 * silently does nothing, which is how 107 group-key rotations
-                 * were minted across 25 cohort runs and not one was ever
-                 * adopted. Warned once per frame, naming the verb, because the
-                 * damage is per-verb and invisible at the transport. */
-                if (!wmsg.verified) {
-                    /* Name WHICH of the two failures this is. They need
-                     * different fixes and are indistinguishable from outside:
-                     * an unsigned frame means the sender never signed it, a
-                     * failed check means our peer entry's signing key is not
-                     * the key it signed with, and an all-zero key means the
-                     * entry never carried one at all. */
-                    char sigkey[17] = {0};
-                    sodium_bin2hex(sigkey, sizeof(sigkey),
-                                   peer->signature.public, 8);
-                    bool no_key = sodium_is_zero(peer->signature.public,
-                                                 crypto_sign_PUBLICKEYBYTES);
-                    log_warn(ctx->logger,
-                             "Network: frame '%s' from %s DECRYPTED but is "
-                             "UNVERIFIED (%s; peer signing key %s) — every "
-                             "verified-gated handler will silently ignore it\n",
-                             wmsg.function != NULL ? wmsg.function : "(none)",
-                             peer->address,
-                             !wmsg.has_signature ? "carries no signature"
-                                                 : "signature did not check out",
-                             no_key ? "ABSENT (all zero)" : sigkey);
-                }
-                /* Gateway boundary, invariant B. False on a leaf node and for
-                 * a peer in our own group, so this is a gateway-only gate. */
-                if (identity_verb_is_bootstrap(wmsg.function) &&
-                    address_crosses_gateway(ctx->proc, ctx->myself,
-                                            peer->address)) {
-                    boundary_refuse(ctx->logger, "bootstrap_across_gateway",
-                                    peer->address,
-                                    "admitting across the boundary would make a "
-                                    "group span it");
-                } else {
-                    route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger,
-                                     NET_PATH_PEER);
-                }
-            } else {
-                /* Decrypted successfully but the inner wire is malformed —
-                 * still annoy-worthy from a known peer.
-                 *
-                 * THIS WAS SILENT, and net_message.h's own note on
-                 * ENET_WIRE_FORMAT says why that is the worst possible place
-                 * for silence: "a cohort misprovisioned into two formats
-                 * presents as one peer having gone silent, and only a counter
-                 * that says 'foreign format' rather than 'bad message' explains
-                 * it." The frame authenticated — it IS this peer — so this is
-                 * never ordinary noise. Name the format and the length: a
-                 * format disagreement and a truncated payload are different
-                 * faults and were previously indistinguishable, both presenting
-                 * as a verb that vanishes between two healthy nodes. */
-                log_warn(ctx->logger,
-                         "Network: frame from %s decrypted but did not parse as"
-                         " %s (%zu bytes, errnum %d) — DROPPED\n",
-                         from_addr,
-                         fmt == NET_WIRE_PROTO ? "protobuf" : "JSON",
-                         plain_len, _exception.errnum);
-                pest_track_annoy(from_addr);
+            /* Not routed: a known peer we still cannot place, whose frame is
+             * in a format we cannot read yet (route_decrypted). Deferred whole
+             * (the ciphertext) and replayed once its group arrives. */
+            if (!route_decrypted(ctx, plain, plain_len, peer, from_addr)) {
+                log_info(ctx->logger,
+                         "Network: deferring frame (%zu bytes) from %s -- a "
+                         "peer we cannot place yet, in a format we read only "
+                         "once its group arrives\n", inner_len, from_addr);
+                defer_message(inner_buf, inner_len, from_addr,
+                              meta.has_src_uuid ? meta.src_uuid : NULL, true);
             }
             free(plain);
-            net_wire_msg_free(&wmsg);
         } else if (try_unencrypted_from_known_peer(
-                       ctx, inner_buf, inner_len, from_addr,
+                       ctx, inner_buf, inner_len, from_addr, peer,
                        wire_format_for_address(&ctx->proc->protocol.group,
                                                peer->address))) {
             /* A verb this protocol sends in plaintext by design. Delivered, and
@@ -1871,8 +2305,8 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
                 && strcmp(wmsg.function, "group_key_update") == 0)
                 log_warn(ctx->logger,
                          "Network: group_key_update arrived UNVERIFIED via "
-                         "unknown-sender-plaintext (has_signature=%d) — the rotation will be "
-                         "ignored\n", (int)wmsg.has_signature);
+                         "unknown-sender-plaintext (has_signature=%d) — %s\n",
+                         (int)wmsg.has_signature, NET_UNVERIFIED_UPDATE_NOTE);
             route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger,
                              NET_PATH_STRANGER);
             net_wire_msg_free(&wmsg);
@@ -1893,9 +2327,68 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
                      " no peer known at that address yet\n",
                      inner_len, from_addr);
             defer_message(inner_buf, inner_len, from_addr,
-                          meta.has_src_uuid ? meta.src_uuid : NULL);
+                          meta.has_src_uuid ? meta.src_uuid : NULL, false);
         }
     }
+}
+
+/* The replay pass for entries that wait on a GROUP rather than a peer
+ * (deferred_msg_t.awaits_group). Python's mystery handler polls its whole
+ * queue; C replays the rest on a PEER admission, and that event has already
+ * happened for these, so the main loop asks every pass instead. An entry whose
+ * sender can now be placed is decrypted again and read in its group's format; a
+ * refusal then is the ordinary placed-member drop. One whose sender is still
+ * unplaced (or no longer a peer at all) stays for the age bound. Routes under
+ * deferred_lock, as the PEER pass does. Free when nothing waits. */
+size_t net_replay_placed_deferred(net_thread_ctx_t *ctx)
+{
+    if (ctx == NULL || ctx->proc == NULL)
+        return 0;
+    size_t replayed = 0;
+    pthread_mutex_lock(&deferred_lock);
+    _deferred_sweep_stale_locked(_deferred_now_s());
+    size_t remaining = 0;
+    for (size_t di = 0; di < deferred_count; di++) {
+        deferred_msg_t *dm = deferred_messages[di];
+        const public_identity_t *peer = NULL;
+        if (dm != NULL && dm->awaits_group)
+            peer = dm->has_src_uuid ? net_find_peer_by_uuid(ctx->proc, dm->src_uuid)
+                                    : find_peer_by_address(ctx->proc, dm->from_addr);
+        bool consumed = false;
+        if (peer != NULL && group_for_sender(ctx->proc, peer->address) != NULL) {
+            uint8_t *plain = NULL;
+            size_t plain_len = 0;
+            if (decrypt_message(ctx->myself, peer, dm->data, dm->len,
+                                &plain, &plain_len) == 0) {
+                consumed = route_decrypted(ctx, plain, plain_len, peer,
+                                           dm->from_addr);
+                free(plain);
+            } else {
+                /* It decrypted when deferred, so the key it needs is gone: no
+                 * group will open it. Left to the age bound, and not retried
+                 * every pass. */
+                probes_counter("net.mystery", "decrypt_failed", NULL);
+                dm->awaits_group = false;
+            }
+        }
+        if (consumed) {
+            log_info(ctx->logger, "Network: replayed deferred message from %s "
+                     "in its group's format\n", dm->from_addr);
+            probes_counter("net.mystery", "resolved", NULL);
+            free(dm);
+            deferred_messages[di] = NULL;
+            replayed++;
+        } else {
+            if (remaining != di) {
+                deferred_messages[remaining] = dm;
+                deferred_messages[di] = NULL;
+            }
+            remaining++;
+        }
+    }
+    deferred_count = remaining;
+    pthread_mutex_unlock(&deferred_lock);
+    return replayed;
 }
 
 void handle_inbound_relayed(net_thread_ctx_t *ctx, const uint8_t *buf,
@@ -1905,6 +2398,8 @@ void handle_inbound_relayed(net_thread_ctx_t *ctx, const uint8_t *buf,
     if (ctx == NULL || buf == NULL || from_uuid == NULL
         || uuid_parse(from_uuid, u) != 0)
         return;
+    bool was = _net_ext_inbound;
+    _net_ext_inbound = true;
     const public_identity_t *peer = net_find_peer_by_uuid(ctx->proc, u);
     if (peer != NULL) {
         /* A known peer: the ordinary path, keyed on its own address so the
@@ -1912,7 +2407,7 @@ void handle_inbound_relayed(net_thread_ctx_t *ctx, const uint8_t *buf,
         char addr[ADDR_LEN + 1];
         at_strlcpy(addr, peer->address, sizeof(addr));
         handle_inbound_peer(ctx, (uint8_t *)buf, nbytes, addr);
-        return;
+        goto out;
     }
     /* A sender we do not know yet: only plaintext can be read (the
      * first-contact hello), and its envelope must name the sender the relay
@@ -1921,7 +2416,7 @@ void handle_inbound_relayed(net_thread_ctx_t *ctx, const uint8_t *buf,
     if (net_message_from_wire_fmt(buf, nbytes, NULL, NET_WIRE_JSON, &wmsg) != 0) {
         log_debug(ctx->logger, "Network: unreadable relayed frame from %.8s\n",
                   from_uuid);
-        return;
+        goto out;
     }
     if (uuid_compare(wmsg.from_whom.uuid, u) != 0) {
         char claimed[UUID_STR_LEN + 1];
@@ -1929,11 +2424,53 @@ void handle_inbound_relayed(net_thread_ctx_t *ctx, const uint8_t *buf,
         log_warn(ctx->logger, "Network: relayed frame from %.8s claims to be "
                  "%.8s; dropped\n", from_uuid, claimed);
         net_wire_msg_free(&wmsg);
-        return;
+        goto out;
     }
     route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger,
                      NET_PATH_RELAY_STRANGER);
     net_wire_msg_free(&wmsg);
+out:
+    _net_ext_inbound = was;
+}
+
+void handle_inbound_ext(net_thread_ctx_t *ctx, net_channel_t ch,
+                        const uint8_t *buf, size_t nbytes, const char *from_uuid)
+{
+    uuid_t u;
+    if (ctx == NULL || buf == NULL || nbytes == 0 || from_uuid == NULL
+        || uuid_parse(from_uuid, u) != 0)
+        return;
+    const public_identity_t *peer = net_find_peer_by_uuid(ctx->proc, u);
+    if (peer == NULL) {
+        probes_counter("net.ext", "drop", "unknown_peer");
+        return;
+    }
+    char ustr[UUID_STR_LEN + 1];
+    uuid_unparse_lower(u, ustr);
+    if (reject_message(peer->address) || net_is_excluded(ustr, NULL)) {
+        probes_counter("net.ext", "drop", "excluded");
+        return;
+    }
+    /* The handlers may rewrite the buffer in place; give them a copy. */
+    uint8_t *copy = malloc(nbytes);
+    if (copy == NULL)
+        return;
+    memcpy(copy, buf, nbytes);
+    if (ch == NET_CHAN_PEER) {
+        handle_inbound_relayed(ctx, copy, nbytes, from_uuid);
+        free(copy);
+        return;
+    }
+    char addr[ADDR_LEN + 1];
+    at_strlcpy(addr, peer->address, sizeof(addr));
+    bool was = _net_ext_inbound;
+    _net_ext_inbound = true;
+    if (ch == NET_CHAN_GROUP)
+        handle_inbound_group(ctx, copy, nbytes, addr);
+    else if (ch == NET_CHAN_BROADCAST)
+        handle_inbound_broadcast(ctx, copy, nbytes, addr);
+    _net_ext_inbound = was;
+    free(copy);
 }
 
 static void *peer_receiver_thread(void *arg)
@@ -2003,8 +2540,8 @@ void handle_inbound_broadcast(net_thread_ctx_t *ctx,
             && strcmp(wmsg.function, "group_key_update") == 0)
             log_warn(ctx->logger,
                      "Network: group_key_update arrived UNVERIFIED via "
-                     "broadcast-channel (has_signature=%d) — the rotation "
-                     "will be ignored\n", (int)wmsg.has_signature);
+                     "broadcast-channel (has_signature=%d) — %s\n",
+                     (int)wmsg.has_signature, NET_UNVERIFIED_UPDATE_NOTE);
         route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger,
                          NET_PATH_BROADCAST);
         net_wire_msg_free(&wmsg);
@@ -2113,6 +2650,7 @@ typedef struct {
     int64_t held_at_s;                                /* CLOCK_MONOTONIC */
     int64_t key_epoch;                                /* the key it failed under */
     unsigned char key_public[crypto_box_PUBLICKEYBYTES];
+    bool via_ext;                                     /* an extension injected it */
     uint8_t data[];
 } held_group_frame_t;
 static held_group_frame_t *held_group_frames[NET_HELD_GROUP_FRAMES];
@@ -2140,6 +2678,7 @@ static void _hold_group_frame(net_thread_ctx_t *ctx, const uint8_t *buf,
     h->held_at_s = _deferred_now_s();
     h->key_epoch = grp->key_epoch;
     memcpy(h->key_public, grp->encryptor.public, sizeof(h->key_public));
+    h->via_ext = _net_ext_inbound;
     memcpy(h->data, buf, nbytes);
     pthread_mutex_lock(&held_group_lock);
     if (held_group_count == NET_HELD_GROUP_FRAMES) {
@@ -2187,10 +2726,15 @@ size_t net_retry_held_group_frames(net_thread_ctx_t *ctx)
                  "under the new key %s… epoch %lld\n", n_due, kfp,
                  (long long)grp->key_epoch);
     }
+    bool was = _net_ext_inbound;
     for (size_t i = 0; i < n_due; i++) {
+        /* An injected frame stays injected: no liveness stamp and no
+         * partition signal on its retry either. */
+        _net_ext_inbound = due[i]->via_ext;
         _inbound_group(ctx, due[i]->data, due[i]->len, due[i]->from_addr, true);
         free(due[i]);
     }
+    _net_ext_inbound = was;
     return n_due;
 }
 
@@ -2289,8 +2833,8 @@ static void _inbound_group(net_thread_ctx_t *ctx, uint8_t *buf, size_t nbytes,
                 && strcmp(wmsg.function, "group_key_update") == 0)
                 log_warn(ctx->logger,
                          "Network: group_key_update arrived UNVERIFIED via "
-                         "group-channel (has_signature=%d) — the rotation will be "
-                         "ignored\n", (int)wmsg.has_signature);
+                         "group-channel (has_signature=%d) — %s\n",
+                         (int)wmsg.has_signature, NET_UNVERIFIED_UPDATE_NOTE);
             /* Gateway boundary, invariant B: the pre-admission handshake is
              * never a group message -- announce is broadcast, accept and
              * history are point-to-point to an unplaced identity -- so a
@@ -2334,7 +2878,16 @@ static void _inbound_group(net_thread_ctx_t *ctx, uint8_t *buf, size_t nbytes,
          * `partition_probe` and, on a response, initiate a normal
          * request_access to absorb the foreign group. See
          * doc/architecture/partition-recovery.md §5.1. */
-        _net_signal_partition(ctx, from_addr);
+        if (_net_ext_inbound) {
+            /* Heard some other way (a radio): a foreign cohort's frame on the
+             * air must not start partition recovery. */
+            probes_counter("net.ext", "group_decrypt_fail", NULL);
+        } else {
+            _net_signal_partition(ctx, from_addr);
+            /* The sender is a peer we hold (checked above), so it holds a
+             * key we lack: identity asks it for the group. */
+            _net_signal_key_stale(ctx, from_addr);
+        }
     }
     free(plain);
 }
@@ -2562,6 +3115,344 @@ static void _note_exclusion(const process_t *proc, const char *uuid_str, bool ex
     net_note_exclusion(uuid_str, key, excluded);
 }
 
+/****************************
+ * Outbound: one dequeued message onto the wire
+ ****************************/
+
+/* Per-recipient frames held while an admission of us settles (the block above
+ * note_admission says why), oldest first. Main loop only: held by
+ * net_send_outbound and released by net_release_admission_holds, both on the
+ * network process's own thread, so no lock. Mirrors Python
+ * NetworkProcess._held_for_admission. */
+static generic_msg_t *held_for_admission[NET_HELD_FOR_ADMISSION];
+static size_t held_for_admission_count = 0;
+/* Held frames dropped, oldest first, because the hold was full; read by tests
+ * beside the net.ptp/hold/overflow probe, which has no read side. */
+static unsigned long held_for_admission_overflows = 0;
+
+static bool _held_for_address(const char *addr)
+{
+    for (size_t i = 0; i < held_for_admission_count; i++) {
+        char held[ADDR_LEN + 1];
+        _strip_cidr(held_for_admission[i]->info.net_msg.to_whom.address,
+                   held, sizeof(held));
+        if (strcmp(held, addr) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Hold a non-bootstrap frame to an admitter whose admission of us is still
+ * settling. Sent now it would be JSON, and the admitter, which already counts
+ * us as a member of its cohort, expects that cohort's format. Bootstrap is JSON
+ * by rule and is never held. A frame behind one already held for the same
+ * address is held too, so the two cannot go out of order if the admission
+ * settles between the release pass and this frame. Mirrors Python
+ * NetworkProcess._hold_for_admission. */
+static bool hold_for_admission(const process_t *proc, const generic_msg_t *buf,
+                               const char *address, logger_t *logger)
+{
+    if (identity_verb_is_bootstrap(buf->info.net_msg.function))
+        return false;
+    char addr[ADDR_LEN + 1];
+    _strip_cidr(address, addr, sizeof(addr));
+    if (addr[0] == '\0')
+        return false;
+    bool behind = _held_for_address(addr);
+    if (!behind && admission_settled(proc, addr))
+        return false;
+    generic_msg_t *copy = malloc(sizeof(*copy));
+    if (copy == NULL || at_msg_copy(buf, copy) != 0) {
+        free(copy);
+        if (!behind) {
+            /* Cannot keep it, and nothing earlier waits for that address:
+             * send it now, as the lookup says, which is what happened before
+             * frames were held at all. */
+            return false;
+        }
+        /* Sent now it would overtake the frames already held for that
+         * address, so it is dropped (and the drop counted) instead. */
+        probes_counter("net.ptp", "hold", "copy_failed");
+        log_warn(logger, "Network: dropping %s.%s to %s: could not keep it "
+                 "behind the frames held for that admission\n",
+                 buf->info.net_msg.process,
+                 buf->info.net_msg.function != NULL ? buf->info.net_msg.function : "?",
+                 addr);
+        return true;
+    }
+    if (held_for_admission_count == NET_HELD_FOR_ADMISSION) {
+        probes_counter("net.ptp", "hold", "overflow");
+        held_for_admission_overflows++;
+        log_warn(logger, "Network: dropping the oldest frame held for an "
+                 "admission (%s.%s): %d already held\n",
+                 held_for_admission[0]->info.net_msg.process,
+                 held_for_admission[0]->info.net_msg.function != NULL
+                     ? held_for_admission[0]->info.net_msg.function : "?",
+                 NET_HELD_FOR_ADMISSION);
+        at_msg_copy_release(held_for_admission[0]);
+        free(held_for_admission[0]);
+        memmove(&held_for_admission[0], &held_for_admission[1],
+                (NET_HELD_FOR_ADMISSION - 1) * sizeof(held_for_admission[0]));
+        held_for_admission_count--;
+    }
+    probes_counter("net.ptp", "hold", "admission_pending");
+    log_debug(logger, "Network: holding %s.%s for %s until its admission of us "
+              "settles\n", buf->info.net_msg.process,
+              buf->info.net_msg.function != NULL ? buf->info.net_msg.function : "?",
+              addr);
+    held_for_admission[held_for_admission_count++] = copy;
+    return true;
+}
+
+size_t net_release_admission_holds(const net_outbound_t *out)
+{
+    if (held_for_admission_count == 0)
+        return 0;
+    generic_msg_t *pending[NET_HELD_FOR_ADMISSION];
+    size_t n = held_for_admission_count, sent = 0;
+    memcpy(pending, held_for_admission, n * sizeof(pending[0]));
+    held_for_admission_count = 0;
+    for (size_t i = 0; i < n; i++) {
+        char addr[ADDR_LEN + 1];
+        _strip_cidr(pending[i]->info.net_msg.to_whom.address, addr, sizeof(addr));
+        /* What stays held is back in held_for_admission, so checking there
+         * keeps a frame from going ahead of an earlier one to the same
+         * address. */
+        if (_held_for_address(addr) || !admission_settled(out->proc, addr)) {
+            held_for_admission[held_for_admission_count++] = pending[i];
+            continue;
+        }
+        net_send_outbound(out, pending[i]);
+        at_msg_copy_release(pending[i]);
+        free(pending[i]);
+        sent++;
+    }
+    return sent;
+}
+
+size_t net_proc_test_held_for_admission_count(void)
+{
+    return held_for_admission_count;
+}
+
+unsigned long net_proc_test_held_for_admission_overflows(void)
+{
+    return held_for_admission_overflows;
+}
+
+const char *net_proc_test_held_for_admission_function(size_t idx)
+{
+    if (idx >= held_for_admission_count)
+        return NULL;
+    return held_for_admission[idx]->info.net_msg.function;
+}
+
+/* Forget every held frame (freeing its copy) and every pending admission. On
+ * network_run's exit, so a restart in the same process inherits neither. */
+static void _admissions_reset(void)
+{
+    for (size_t i = 0; i < held_for_admission_count; i++) {
+        at_msg_copy_release(held_for_admission[i]);
+        free(held_for_admission[i]);
+    }
+    held_for_admission_count = 0;
+    pthread_mutex_lock(&admission_lock);
+    admission_pending_count = 0;
+    pthread_mutex_unlock(&admission_lock);
+}
+
+void net_proc_test_reset_admissions(void)
+{
+    _admissions_reset();
+}
+
+/* Everything the outbound path does to a dequeued NET_MESSAGE after the local
+ * intercepts (stats_req, ping_at, roster, exclusion, extension verbs). */
+void net_send_outbound(const net_outbound_t *out, const generic_msg_t *buf)
+{
+    process_t *proc = out->proc;
+    const identity_t *myself = out->myself;
+    const public_identity_t *my_public = out->my_public;
+    const net_transport_t *transport = out->transport;
+    net_transport_ctx_t *tctx = out->tctx;
+    int port_num = out->port_num;
+    const char *bcast_addr = out->bcast_addr;
+    logger_t *logger = out->logger;
+    const net_msg_t *nmsg = &buf->info.net_msg;
+
+    /* Outbound-skip gate (reputation cut-off): never forward a
+     * targeted (unicast) message to an excluded peer. Broadcasts
+     * (empty to_whom) are unaffected — a receiver-side inbound-drop
+     * gate handles those. Mirrors Python netprocess's outbound-skip
+     * in the group-send / pseudo-multicast loops. */
+    if (nmsg->to_whom.address[0] != '\0' &&
+        reject_message(nmsg->to_whom.address)) {
+        log_debug(logger,
+                  "Network: outbound skip to excluded %s (%s.%s)\n",
+                  nmsg->to_whom.address, nmsg->process,
+                  nmsg->function ? nmsg->function : "?");
+        return;
+    }
+
+    net_wire_msg_t wmsg = {0};
+    snprintf(wmsg.process, sizeof(wmsg.process), "%s", nmsg->process);
+    wmsg.function = nmsg->function;
+    wmsg.data     = nmsg->obj;
+    wmsg.data_len = nmsg->len;
+    wmsg.encrypt  = nmsg->encrypt;
+    /* Forward trace_id if the sibling process set one; an empty
+     * string causes net_message_to_wire to mint a fresh id. */
+    memcpy(wmsg.trace_id, nmsg->trace_id, sizeof(wmsg.trace_id));
+
+    /* Stamp from_whom with our identity so unencrypted-to-unknown-peer
+     * messages carry full identity (UUID, name, keys). */
+    if (my_public != NULL)
+        memcpy(&wmsg.from_whom, my_public, sizeof(public_identity_t));
+    else
+        memcpy(&wmsg.from_whom, &nmsg->from_whom, sizeof(public_identity_t));
+    /* Carry our topology rank on the envelope (public_identity_t drops
+     * rank; `myself` is the full identity_t). from_whom is stamped self
+     * above, so the rank is self's — mirrors Python from_whom._rank on
+     * the wire. Fall back to whatever the sibling process set when we
+     * are relaying a non-self from_whom. */
+    wmsg.from_rank = (my_public != NULL && myself != NULL)
+                     ? myself->rank : nmsg->from_rank;
+
+    /* Group multicast (Increment 7): an encrypted send to the whole
+     * cohort on NET_CHAN_GROUP, signalled by the identity process via
+     * nmsg->group_multicast (there is no per-peer to_whom). Checked
+     * BEFORE is_broadcast because a group message also carries an empty
+     * to_whom.address. */
+    bool is_group = nmsg->group_multicast;
+    /* No address is a broadcast -- unless we know WHO and an extension
+     * knows how to reach them: a directory holder's entry carries no
+     * address, only the relays (identity's relay_route, rendezvous).
+     * Python decides broadcast by an absent recipient, never by an
+     * empty address. */
+    bool is_broadcast = (!is_group && nmsg->to_whom.address[0] == '\0'
+                         && !(!uuid_is_null(nmsg->to_whom.uuid)
+                              && net_ext_reachable(nmsg->to_whom.uuid)));
+    if (is_group) {
+        wmsg.to_whom.type = RECIPIENT_GROUP;
+        log_debug(logger, "Network: group-multicasting %s.%s\n",
+                  nmsg->process, nmsg->function);
+    } else if (is_broadcast) {
+        wmsg.to_whom.type = RECIPIENT_BROADCAST;
+        snprintf(wmsg.to_whom.target.peer.address,
+                 sizeof(wmsg.to_whom.target.peer.address),
+                 "%s", bcast_addr);
+        log_debug(logger, "Network: broadcasting %s.%s to %s\n",
+                  nmsg->process, nmsg->function, bcast_addr);
+    } else {
+        wmsg.to_whom.type = RECIPIENT_PEER;
+        memcpy(&wmsg.to_whom.target.peer, &nmsg->to_whom,
+               sizeof(public_identity_t));
+    }
+
+    /* Gateway boundary, invariants B and G. Both are gateway-only
+     * gates -- address_crosses_gateway is false without child groups,
+     * and held_groups_containing can only exceed 1 when we hold more
+     * than one group -- so a leaf node takes exactly the historical
+     * path. A broadcast is exempt from B: discovery is how a node in
+     * OUR domain gets admitted, and it never leaves the segment. */
+    if (!is_broadcast && !is_group) {
+        if (identity_verb_is_bootstrap(nmsg->function) &&
+            address_crosses_gateway(proc, myself,
+                                    nmsg->to_whom.address)) {
+            boundary_refuse(logger, "bootstrap_across_gateway",
+                            nmsg->to_whom.address,
+                            "refusing to send the pre-admission "
+                            "handshake to a cohort we gateway");
+            return;
+        }
+        if (held_groups_containing(proc, myself,
+                                   nmsg->to_whom.address) > 1) {
+            boundary_refuse(logger, "group_spans_gateway",
+                            nmsg->to_whom.address,
+                            "target is a member of more than one group "
+                            "we hold");
+            return;
+        }
+        /* Held while an admission of us settles; released in order by
+         * net_release_admission_holds once we can say which format to use. */
+        if (hold_for_admission(proc, buf, nmsg->to_whom.address, logger))
+            return;
+    }
+
+    /* Broadcast is discovery -> JSON; a peer we can place speaks its
+     * group's format; one we cannot place gets JSON, which is what
+     * makes pre-admission traffic work in a proto cohort (2.3). */
+    /* A group multicast rides the cohort's own wire format (that is what
+     * handle_inbound_group decodes the decrypted plaintext with). */
+    net_wire_format_t send_fmt = is_group
+        ? proc->protocol.group.wire_format
+        : (is_broadcast
+           ? NET_WIRE_JSON
+           : wire_format_for_address(&proc->protocol.group,
+                                     nmsg->to_whom.address));
+    int send_ret = net_encrypt_and_send(myself, &proc->protocol.group,
+                                        &wmsg, transport, tctx,
+                                        port_num, send_fmt, logger);
+    if (send_ret != 0) {
+        log_error(logger, "Network: send failed for %s.%s\n",
+                  nmsg->process, nmsg->function);
+        log_exception(logger);
+    } else {
+        /* What a peer has heard from us lately decides whether we owe
+         * the group a presence frame (net_presence_step). */
+        net_presence_sent((is_group || is_broadcast)
+                              ? NULL : nmsg->to_whom.uuid,
+                          (double)time(NULL));
+        log_info(logger, "Network: sent %s.%s to %s\n",
+                 nmsg->process, nmsg->function,
+                 is_broadcast ? bcast_addr : nmsg->to_whom.address);
+        /* Mirrors Python netprocess.py:495 outbound-routed trace.
+         * The wire-side trace_id is in wmsg (possibly minted by
+         * net_message_to_wire when nmsg's was empty) — read from
+         * there so the trace event reflects what actually went
+         * onto the wire. */
+        probes_trace_msg(wmsg.trace_id, nmsg->process, nmsg->function,
+                         "outbound_routed",
+                         "to_addr",
+                         is_broadcast ? bcast_addr : nmsg->to_whom.address,
+                         NULL);
+    }
+}
+
+/* The checks network_run makes once the filters are in place and before
+ * any receiver starts; -1 refuses the start. */
+static int net_start_checks(const network_config_t *net_cfg, logger_t *logger)
+{
+    /* Refuse a config the filters cannot honour (the envelope with
+     * libat_gateway absent) rather than join a cohort speaking a different
+     * wire format. */
+    if (net_filters_check_config(net_cfg, logger) != 0)
+        return -1;
+    /* The optional half of the plaintext receive policy (identity_run checked
+     * it too, but this is the process that consults it). */
+    net_presence_init();
+    net_liveness_reset(net_liveness_now());
+    if (plaintext_verbs_configure(NULL, logger) != 0)
+        return -1;
+    /* The deployment manifest (RD_13.4 §3.3): a file that exists and breaks a
+     * rule refuses the start, as the plaintext verbs above do. */
+    if (deployment_manifest_configure(NULL, logger) != 0)
+        return -1;
+    /* An extension whose configuration cannot be honoured refuses the start,
+     * as the filters and plaintext verbs above do. */
+    if (net_ext_check_config(logger) != 0) {
+        log_error(logger, "Network: an extension refused its configuration; "
+                  "not starting\n");
+        return -1;
+    }
+    return 0;
+}
+
+int net_proc_test_start_checks(const network_config_t *net_cfg, logger_t *logger)
+{
+    return net_start_checks(net_cfg, logger);
+}
+
 /* Frama-C: skipped —
  * [solver-timeout] network_run: state-cascade through smrt_deref/
  * process_setup/map_get/identity_publish/at_logging (same pattern as
@@ -2661,18 +3552,8 @@ static int network_run(const net_transport_t *transport,
      * still want one here, and must have it before the receivers start. */
     at_extensions_register_handlers(proc, "network");
 
-    /* The filters are in place now; refuse a config they cannot honour (the
-     * envelope with libat_gateway absent) rather than join a cohort speaking
-     * a different wire format. */
-    if (net_filters_check_config(net_cfg, logger) != 0) {
-        transport->close(tctx);
-        if (my_public != NULL) smrt_deref(my_public);
-        return -1;
-    }
-    /* The optional half of the plaintext receive policy (identity_run checked
-     * it too, but this is the process that consults it). */
-    net_presence_init();
-    if (plaintext_verbs_configure(NULL, logger) != 0) {
+    /* The filters are in place now. */
+    if (net_start_checks(net_cfg, logger) != 0) {
         transport->close(tctx);
         if (my_public != NULL) smrt_deref(my_public);
         return -1;
@@ -2692,12 +3573,29 @@ static int network_run(const net_transport_t *transport,
     log_info(logger, "Network: ready (transport=%s, broadcast=%s port=%d)\n",
              transport->name, bcast_addr, port_num);
 
+    net_outbound_t outbound = {
+        .proc       = proc,
+        .myself     = myself,
+        .my_public  = my_public,
+        .transport  = transport,
+        .tctx       = tctx,
+        .port_num   = port_num,
+        .bcast_addr = bcast_addr,
+        .logger     = logger,
+    };
+
     generic_msg_t buf = {0};
     time_t last_kept_drain = 0;
     time_t last_presence = 0;
     while (keep_running(proc, &pctx.sig_q, logger))
     {
         net_ext_periodic(&thread_ctx);
+        /* The moment of admission, both directions: frames from an admitter
+         * we could not place are read once its group arrives (a GROUP message
+         * on this loop), and our frames held for it go out, in order, before
+         * the next outbound message is taken. */
+        (void)net_replay_placed_deferred(&thread_ctx);
+        (void)net_release_admission_holds(&outbound);
         {
             time_t t = time(NULL);
             if (t != last_presence) {
@@ -2861,139 +3759,7 @@ static int network_run(const net_transport_t *transport,
                 }
             }
 
-            /* Outbound-skip gate (reputation cut-off): never forward a
-             * targeted (unicast) message to an excluded peer. Broadcasts
-             * (empty to_whom) are unaffected — a receiver-side inbound-drop
-             * gate handles those. Mirrors Python netprocess's outbound-skip
-             * in the group-send / pseudo-multicast loops. */
-            if (nmsg->to_whom.address[0] != '\0' &&
-                reject_message(nmsg->to_whom.address)) {
-                log_debug(logger,
-                          "Network: outbound skip to excluded %s (%s.%s)\n",
-                          nmsg->to_whom.address, nmsg->process,
-                          nmsg->function ? nmsg->function : "?");
-                continue;
-            }
-
-            net_wire_msg_t wmsg = {0};
-            snprintf(wmsg.process, sizeof(wmsg.process), "%s", nmsg->process);
-            wmsg.function = nmsg->function;
-            wmsg.data     = nmsg->obj;
-            wmsg.data_len = nmsg->len;
-            wmsg.encrypt  = nmsg->encrypt;
-            /* Forward trace_id if the sibling process set one; an empty
-             * string causes net_message_to_wire to mint a fresh id. */
-            memcpy(wmsg.trace_id, nmsg->trace_id, sizeof(wmsg.trace_id));
-
-            /* Stamp from_whom with our identity so unencrypted-to-unknown-peer
-             * messages carry full identity (UUID, name, keys). */
-            if (my_public != NULL)
-                memcpy(&wmsg.from_whom, my_public, sizeof(public_identity_t));
-            else
-                memcpy(&wmsg.from_whom, &nmsg->from_whom, sizeof(public_identity_t));
-            /* Carry our topology rank on the envelope (public_identity_t drops
-             * rank; `myself` is the full identity_t). from_whom is stamped self
-             * above, so the rank is self's — mirrors Python from_whom._rank on
-             * the wire. Fall back to whatever the sibling process set when we
-             * are relaying a non-self from_whom. */
-            wmsg.from_rank = (my_public != NULL && myself != NULL)
-                             ? myself->rank : nmsg->from_rank;
-
-            /* Group multicast (Increment 7): an encrypted send to the whole
-             * cohort on NET_CHAN_GROUP, signalled by the identity process via
-             * nmsg->group_multicast (there is no per-peer to_whom). Checked
-             * BEFORE is_broadcast because a group message also carries an empty
-             * to_whom.address. */
-            bool is_group = nmsg->group_multicast;
-            /* No address is a broadcast -- unless we know WHO and an extension
-             * knows how to reach them: a directory holder's entry carries no
-             * address, only the relays (identity's relay_route, rendezvous).
-             * Python decides broadcast by an absent recipient, never by an
-             * empty address. */
-            bool is_broadcast = (!is_group && nmsg->to_whom.address[0] == '\0'
-                                 && !(!uuid_is_null(nmsg->to_whom.uuid)
-                                      && net_ext_reachable(nmsg->to_whom.uuid)));
-            if (is_group) {
-                wmsg.to_whom.type = RECIPIENT_GROUP;
-                log_debug(logger, "Network: group-multicasting %s.%s\n",
-                          nmsg->process, nmsg->function);
-            } else if (is_broadcast) {
-                wmsg.to_whom.type = RECIPIENT_BROADCAST;
-                snprintf(wmsg.to_whom.target.peer.address,
-                         sizeof(wmsg.to_whom.target.peer.address),
-                         "%s", bcast_addr);
-                log_debug(logger, "Network: broadcasting %s.%s to %s\n",
-                          nmsg->process, nmsg->function, bcast_addr);
-            } else {
-                wmsg.to_whom.type = RECIPIENT_PEER;
-                memcpy(&wmsg.to_whom.target.peer, &nmsg->to_whom,
-                       sizeof(public_identity_t));
-            }
-
-            /* Gateway boundary, invariants B and G. Both are gateway-only
-             * gates -- address_crosses_gateway is false without child groups,
-             * and held_groups_containing can only exceed 1 when we hold more
-             * than one group -- so a leaf node takes exactly the historical
-             * path. A broadcast is exempt from B: discovery is how a node in
-             * OUR domain gets admitted, and it never leaves the segment. */
-            if (!is_broadcast && !is_group) {
-                if (identity_verb_is_bootstrap(nmsg->function) &&
-                    address_crosses_gateway(proc, myself,
-                                            nmsg->to_whom.address)) {
-                    boundary_refuse(logger, "bootstrap_across_gateway",
-                                    nmsg->to_whom.address,
-                                    "refusing to send the pre-admission "
-                                    "handshake to a cohort we gateway");
-                    continue;
-                }
-                if (held_groups_containing(proc, myself,
-                                           nmsg->to_whom.address) > 1) {
-                    boundary_refuse(logger, "group_spans_gateway",
-                                    nmsg->to_whom.address,
-                                    "target is a member of more than one group "
-                                    "we hold");
-                    continue;
-                }
-            }
-
-            /* Broadcast is discovery -> JSON; a peer we can place speaks its
-             * group's format; one we cannot place gets JSON, which is what
-             * makes pre-admission traffic work in a proto cohort (2.3). */
-            /* A group multicast rides the cohort's own wire format (that is what
-             * handle_inbound_group decodes the decrypted plaintext with). */
-            net_wire_format_t send_fmt = is_group
-                ? proc->protocol.group.wire_format
-                : (is_broadcast
-                   ? NET_WIRE_JSON
-                   : wire_format_for_address(&proc->protocol.group,
-                                             nmsg->to_whom.address));
-            int send_ret = net_encrypt_and_send(myself, &proc->protocol.group,
-                                                &wmsg, transport, tctx,
-                                                port_num, send_fmt, logger);
-            if (send_ret != 0) {
-                log_error(logger, "Network: send failed for %s.%s\n",
-                          nmsg->process, nmsg->function);
-                log_exception(logger);
-            } else {
-                /* What a peer has heard from us lately decides whether we owe
-                 * the group a presence frame (net_presence_step). */
-                net_presence_sent((is_group || is_broadcast)
-                                      ? NULL : nmsg->to_whom.uuid,
-                                  (double)time(NULL));
-                log_info(logger, "Network: sent %s.%s to %s\n",
-                         nmsg->process, nmsg->function,
-                         is_broadcast ? bcast_addr : nmsg->to_whom.address);
-                /* Mirrors Python netprocess.py:495 outbound-routed trace.
-                 * The wire-side trace_id is in wmsg (possibly minted by
-                 * net_message_to_wire when nmsg's was empty) — read from
-                 * there so the trace event reflects what actually went
-                 * onto the wire. */
-                probes_trace_msg(wmsg.trace_id, nmsg->process, nmsg->function,
-                                 "outbound_routed",
-                                 "to_addr",
-                                 is_broadcast ? bcast_addr : nmsg->to_whom.address,
-                                 NULL);
-            }
+            net_send_outbound(&outbound, &buf);
         }
         else if (buf.type == PEER) {
             /* A new peer was accepted — add for encrypted messaging */
@@ -3068,28 +3834,34 @@ static int network_run(const net_transport_t *transport,
                         size_t plain_len = 0;
                         if (decrypt_message(myself, new_peer, dm->data, dm->len,
                                             &plain, &plain_len) == 0) {
-                            net_wire_msg_t wmsg;
                             /* The peer is known NOW, so its group answers the
                              * format question that could not be answered when
                              * the frame was deferred
                              * (doc/architecture/network-wire-format.md). A frame
                              * deferred before admission was sent by a peer that
                              * had no group of ours yet, so in practice this
-                             * resolves to JSON unless it was already a member. */
-                            if (net_message_from_wire_fmt(
-                                    plain, plain_len, new_peer,
-                                    wire_format_for_address(&proc->protocol.group,
-                                                            new_peer->address),
-                                    &wmsg) == 0) {
-                                route_to_process(&wmsg, proc, queues, logger,
-                                                 NET_PATH_PEER);
+                             * resolves to JSON unless it was already a member.
+                             * One refused for its format by a peer we still
+                             * cannot place stays, to be read once its group
+                             * arrives (route_decrypted,
+                             * net_replay_placed_deferred). */
+                            bool routed = route_decrypted(&thread_ctx, plain,
+                                                          plain_len, new_peer,
+                                                          dm->from_addr);
+                            free(plain);
+                            if (routed) {
                                 log_info(logger, "Network: replayed deferred message from %s\n",
                                          dm->from_addr);
+                                free(dm);             /* slot consumed */
+                                deferred_messages[di] = NULL;
+                            } else {
+                                dm->awaits_group = true;
+                                if (remaining != di) {
+                                    deferred_messages[remaining] = dm;
+                                    deferred_messages[di] = NULL;
+                                }
+                                remaining++;
                             }
-                            free(plain);
-                            net_wire_msg_free(&wmsg);
-                            free(dm);             /* slot consumed */
-                            deferred_messages[di] = NULL;
                         } else {
                             /* Matched the new peer but still does not decrypt:
                              * unrelated noise from that address, or a frame
@@ -3131,6 +3903,8 @@ static int network_run(const net_transport_t *transport,
     pthread_join(peer_thread,  NULL);
     pthread_join(bcast_thread, NULL);
     pthread_join(grp_thread,   NULL);
+    /* After the receivers stop: they write the pending admissions. */
+    _admissions_reset();
 
     transport->close(tctx);
     if (my_public != NULL) smrt_deref(my_public);

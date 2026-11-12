@@ -31,6 +31,7 @@
 
 #include <pthread.h>
 #include <string.h>
+#include <math.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -58,6 +59,7 @@
 static char GRANT_FN[]    = "place grant";
 static char ACCEPTED_FN[] = "place accepted";
 static char NACK_FN[]     = "place nack";
+static char ASK_FN[]      = "place request";
 
 /* The last payload of each kind this node sent. */
 static json_t *g_request, *g_place, *g_placed, *g_grant;
@@ -150,7 +152,7 @@ static char *_cert(identity_t **signers, int n, const uuid_t scorer,
                    const uuid_t task, double score)
 {
     uint8_t desig[512];
-    size_t dlen = commit_designation(scorer, task, score, NULL, desig, sizeof(desig));
+    size_t dlen = commit_designation(scorer, task, tx_score_to_milli(score), NULL, desig, sizeof(desig));
     json_t *sigs = json_object();
     for (int i = 0; i < n; i++)
     {
@@ -164,7 +166,20 @@ static char *_cert(identity_t **signers, int n, const uuid_t scorer,
     return text;
 }
 
-/* A task between a and b, both halves in our pool, certified by c and d. */
+/* @p scorer's own signature over its half of @p task naming @p other
+ * (R+D.md §14.2), hex into @p out. */
+static void _half_sig(identity_t *scorer, identity_t *other, const uuid_t task,
+                      double score, char *out)
+{
+    uint8_t desig[HALF_DESIG_MAX];
+    size_t dlen = half_designation(task, scorer->uuid, other->uuid, tx_score_to_milli(score), NULL,
+                                   desig, sizeof(desig));
+    ck_assert(dlen > 0);
+    _hex_sig(scorer, desig, dlen, out);
+}
+
+/* A task between a and b, both halves in our pool, certified by c and d and
+ * each signed by its scorer naming the other. */
 static void _ready_task(identity_t *a, identity_t *b, identity_t *c,
                         identity_t *d, uuid_t task)
 {
@@ -172,8 +187,13 @@ static void _ready_task(identity_t *a, identity_t *b, identity_t *c,
     identity_t *signers[2] = {c, d};
     char *ca = _cert(signers, 2, a->uuid, task, 0.9);
     char *cb = _cert(signers, 2, b->uuid, task, 0.6);
-    reputation_record_half(task, a->uuid, 0.9, NULL, ca);
-    ck_assert_int_eq(reputation_record_half(task, b->uuid, 0.6, NULL, cb), TX_HALF_READY);
+    char sa[crypto_sign_BYTES * 2 + 1] = {0}, sb[crypto_sign_BYTES * 2 + 1] = {0};
+    _half_sig(a, b, task, 0.9, sa);
+    _half_sig(b, a, task, 0.6, sb);
+    reputation_record_named_half_on("", task, a->uuid, 900, NULL, ca, b->uuid, sa);
+    ck_assert_int_eq(reputation_record_named_half_on("", task, b->uuid, 600, NULL,
+                                                     cb, a->uuid, sb),
+                     TX_HALF_READY);
     free(ca);
     free(cb);
 }
@@ -202,8 +222,8 @@ static void _digest_of(json_t *place, char out[TX_HASH_HEX_LEN + 1])
         uuid_parse(json_string_value(json_object_get(d, "task")), entries[i].task_uuid);
         uuid_parse(json_string_value(json_object_get(d, "p1")), entries[i].p1_uuid);
         uuid_parse(json_string_value(json_object_get(d, "p2")), entries[i].p2_uuid);
-        entries[i].p1_score = json_number_value(json_object_get(d, "p1_score"));
-        entries[i].p2_score = json_number_value(json_object_get(d, "p2_score"));
+        entries[i].p1_score_milli = (int)json_integer_value(json_object_get(d, "p1_score_milli"));
+        entries[i].p2_score_milli = (int)json_integer_value(json_object_get(d, "p2_score_milli"));
         entries[i].p1_set = entries[i].p2_set = true;
     }
     place_value_digest(entries, n, (int)json_integer_value(json_object_get(place, "k")), out);
@@ -338,11 +358,16 @@ DEFINE_TEST(test_a_reported_value_is_carried_instead_of_ours)
     identity_t *signers[2] = {p[0], me};
     char *ca = _cert(signers, 2, lo->uuid, theirs, lo == p[1] ? 0.9 : 0.6);
     char *cb = _cert(signers, 2, hi->uuid, theirs, hi == p[1] ? 0.9 : 0.6);
-    json_t *entry = json_pack("{s:s, s:s, s:f, s:s, s:f, s:o, s:o}", "task", t,
-                              "p1", a, "p1_score", lo == p[1] ? 0.9 : 0.6,
-                              "p2", b, "p2_score", hi == p[1] ? 0.9 : 0.6,
+    /* Each scorer signs its own half (R+D.md §14.2). */
+    char sl[crypto_sign_BYTES * 2 + 1] = {0}, sh[crypto_sign_BYTES * 2 + 1] = {0};
+    _half_sig(lo, hi, theirs, lo == p[1] ? 0.9 : 0.6, sl);
+    _half_sig(hi, lo, theirs, hi == p[1] ? 0.9 : 0.6, sh);
+    json_t *entry = json_pack("{s:s, s:s, s:i, s:s, s:i, s:o, s:o, s:s, s:s}", "task", t,
+                              "p1", a, "p1_score_milli", lo == p[1] ? 900 : 600,
+                              "p2", b, "p2_score_milli", hi == p[1] ? 900 : 600,
                               "p1_cert", json_loads(ca, 0, NULL),
-                              "p2_cert", json_loads(cb, 0, NULL));
+                              "p2_cert", json_loads(cb, 0, NULL),
+                              "p1_sig", sl, "p2_sig", sh);
     free(ca);
     free(cb);
     json_t *extra = json_pack("{s:{s:{s:i, s:s}, s:[o]}}", "accepted", "ballot",
@@ -358,6 +383,69 @@ DEFINE_TEST(test_a_reported_value_is_carried_instead_of_ours)
     json_t *value = json_object_get(g_place, "value");
     ck_assert_int_eq((int)json_array_size(value), 1);
     ck_assert_str_eq(json_string_value(json_object_get(json_array_get(value, 0), "task")), t);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* Hostile-join run, 2026-11-04: a joiner dropped 14,340 rounds in eight
+ * minutes on this path, and the log never said why. */
+DEFINE_TEST(test_a_value_we_cannot_carry_is_dropped_with_its_reason)
+{
+    process_t *proc = _begin();
+    char log_path[128];
+    snprintf(log_path, sizeof(log_path), "%s/rep.log", g_dir);
+    logger_t lg;
+    ck_assert_int_eq(logger_init(&lg, INFO, log_path), 0);
+    proc->logger = &lg;
+    reputation_place_start(proc);
+    char by[UUID_STRING_LEN + 1], t[UUID_STRING_LEN + 1];
+    char a[UUID_STRING_LEN + 1], b[UUID_STRING_LEN + 1];
+    uuid_t task;
+    uuid_generate(task);
+    uuid_unparse_lower(task, t);
+    uuid_unparse_lower(p[2]->uuid, by);
+    uuid_unparse_lower(p[1]->uuid, a);
+    uuid_unparse_lower(p[2]->uuid, b);
+    /* A value no acceptor should have taken: neither half is certified. */
+    json_t *entry = json_pack("{s:s, s:s, s:i, s:s, s:i}", "task", t,
+                              "p1", strcmp(a, b) < 0 ? a : b, "p1_score_milli", 900,
+                              "p2", strcmp(a, b) < 0 ? b : a, "p2_score_milli", 600);
+    json_t *extra = json_pack("{s:{s:{s:i, s:s}, s:[o]}}", "accepted", "ballot",
+                              "n", 1, "by", by, "value", entry);
+    json_t *g0 = _reply(g_request, extra);
+    json_t *g1 = _reply(g_request, NULL);
+    _send(proc, p[0], GRANT_FN, g0);
+    _send(proc, p[1], GRANT_FN, g1);
+    json_decref(g0);
+    json_decref(g1);
+    json_decref(extra);
+    ck_assert_ptr_null(g_place);
+    /* And it counts as a refused round, so this node backs off. Without it, a
+     * Pi left out of a two-member genesis that both members had accepted
+     * dropped a round every two seconds (Wi-Fi cohort, 2026-11-11), and the
+     * two members that could carry the genesis kept hearing a live round and
+     * left it alone. */
+    int fk = -1, fn = 0;
+    double drawn = 0.0;
+    ck_assert(reputation_place_fails(&fk, &fn, &drawn));
+    ck_assert_int_eq(fk, 0);
+    ck_assert_int_eq(fn, 1);
+    ck_assert(drawn >= 0.5 && drawn <= 2.0);
+
+    proc->logger = NULL;
+    if (lg.file != NULL)
+        fclose(lg.file);
+    FILE *f = fopen(log_path, "r");
+    ck_assert_ptr_nonnull(f);
+    char line[1024];
+    int seen = 0;
+    while (fgets(line, sizeof(line), f) != NULL)
+        if (strstr(line, "value to carry") != NULL
+            && strstr(line, "is not valid here: a half is not certified") != NULL
+            && strstr(line, by) != NULL)
+            seen++;
+    fclose(f);
+    ck_assert_int_eq(seen, 1);
     _end();
 }
 END_TEST_DEFINITION()
@@ -459,8 +547,13 @@ DEFINE_TEST(test_a_child_chain_round_goes_to_that_group_alone)
     identity_t *signers[2] = {me, p[2]};
     char *ca = _cert(signers, 2, p[0]->uuid, task, 0.9);
     char *cb = _cert(signers, 2, p[1]->uuid, task, 0.6);
-    reputation_record_half_on(key, task, p[0]->uuid, 0.9, NULL, ca);
-    ck_assert_int_eq(reputation_record_half_on(key, task, p[1]->uuid, 0.6, NULL, cb),
+    char sa[crypto_sign_BYTES * 2 + 1] = {0}, sb[crypto_sign_BYTES * 2 + 1] = {0};
+    _half_sig(p[0], p[1], task, 0.9, sa);
+    _half_sig(p[1], p[0], task, 0.6, sb);
+    reputation_record_named_half_on(key, task, p[0]->uuid, 900, NULL, ca,
+                                    p[1]->uuid, sa);
+    ck_assert_int_eq(reputation_record_named_half_on(key, task, p[1]->uuid, 600,
+                                                     NULL, cb, p[0]->uuid, sb),
                      TX_HALF_READY);
     free(ca);
     free(cb);
@@ -649,8 +742,8 @@ static void _placed_at_one(process_t *proc, identity_t *from,
     uuid_copy(e.p1_uuid, a->uuid);
     uuid_copy(e.p2_uuid, b->uuid);
     e.p1_set = e.p2_set = true;
-    e.p1_score = 0.9;
-    e.p2_score = 0.6;
+    e.p1_score_milli = 900;
+    e.p2_score_milli = 600;
     char head[TX_HASH_HEX_LEN + 1], digest[TX_HASH_HEX_LEN + 1], task[UUID_STRING_LEN + 1];
     reputation_get_head_hash(head);
     place_value_digest(&e, 1, 1, digest);
@@ -665,8 +758,13 @@ static void _placed_at_one(process_t *proc, identity_t *from,
         json_object_set_new(sigs, u, json_string(sig));
     }
     uuid_unparse_lower(e.task_uuid, task);
-    json_t *value = json_pack("[{s:s, s:s, s:f, s:s, s:f}]", "task", task,
-                              "p1", ua, "p1_score", 0.9, "p2", ub, "p2_score", 0.6);
+    /* Each scorer signs its own half (R+D.md §14.2). */
+    char sa[crypto_sign_BYTES * 2 + 1] = {0}, sb[crypto_sign_BYTES * 2 + 1] = {0};
+    _half_sig(a, b, e.task_uuid, 0.9, sa);
+    _half_sig(b, a, e.task_uuid, 0.6, sb);
+    json_t *value = json_pack("[{s:s, s:s, s:i, s:s, s:i, s:s, s:s}]", "task", task,
+                              "p1", ua, "p1_score_milli", 900, "p2", ub, "p2_score_milli", 600,
+                              "p1_sig", sa, "p2_sig", sb);
     json_t *msg = json_pack("{s:s, s:i, s:o, s:o}", "group", "", "k", 1,
                             "value", value, "sigs", sigs);
     static char PLACED_FN[] = "placed";
@@ -736,7 +834,7 @@ DEFINE_TEST(test_a_placed_attestation_is_logged_as_committed)
     e.p1_set = true;
     uuid_copy(e.p1_uuid, p[0]->uuid);
     uuid_copy(e.subject_uuid, p[2]->uuid);
-    e.p1_score = 0.3;
+    e.p1_score_milli = 300;
     at_strlcpy(e.p1_channel, "probe", sizeof(e.p1_channel));
     memset(e.evidence_digest, 'a', TX_ATTEST_DIGEST_HEX_LEN);
     tx_attest_task_uuid(e.p1_uuid, e.subject_uuid, e.evidence_digest, e.task_uuid);
@@ -760,8 +858,8 @@ DEFINE_TEST(test_a_placed_attestation_is_logged_as_committed)
     uuid_unparse_lower(e.subject_uuid, subj);
     /* The learner takes the attestation's own certificate on the placement's
      * word, so placeholder signatures stand in for it here. */
-    json_t *value = json_pack("[{s:s, s:b, s:s, s:f, s:s, s:s, s:s, s:{s:s, s:s, s:s}}]",
-                              "task", task, "attested", 1, "p1", ver, "p1_score", 0.3,
+    json_t *value = json_pack("[{s:s, s:b, s:s, s:i, s:s, s:s, s:s, s:{s:s, s:s, s:s}}]",
+                              "task", task, "attested", 1, "p1", ver, "p1_score_milli", 300,
                               "p1_channel", "probe", "subject", subj,
                               "evidence_digest", e.evidence_digest, "attest_sigs",
                               "x", "00", "y", "01", "z", "02");
@@ -948,10 +1046,17 @@ static int _catch_up(process_t *proc, identity_t **add_signers, int n_add,
     uuid_copy(t.p1_uuid, a->uuid);
     uuid_copy(t.p2_uuid, b->uuid);
     t.p1_set = t.p2_set = true;
-    t.p1_score = 0.9;
-    t.p2_score = 0.8;
+    t.p1_score_milli = 900;
+    t.p2_score_milli = 800;
     identity_t *two[2] = { p[0], p[1] };
     _src_place(&src, 1, &t, two, 2);
+    /* Each scorer signs its own half (R+D.md §14.2): placement cover does not
+     * excuse a missing one. */
+    char sa[crypto_sign_BYTES * 2 + 1] = {0}, sb[crypto_sign_BYTES * 2 + 1] = {0};
+    _half_sig(a, b, t.task_uuid, 0.9, sa);
+    _half_sig(b, a, t.task_uuid, 0.8, sb);
+    ck_assert_int_eq(tx_history_attach_half_sig(&src, t.task_uuid, a->uuid, sa), 0);
+    ck_assert_int_eq(tx_history_attach_half_sig(&src, t.task_uuid, b->uuid, sb), 0);
     identity_t *grown[5];
     for (int i = 0; i < n_founders; i++)
         grown[i] = founders[i];
@@ -1005,8 +1110,8 @@ DEFINE_TEST(test_a_chain_from_before_rosters_is_reset)
     process_t *proc = _begin_with(0);
     uuid_t t;
     uuid_generate(t);
-    reputation_install_tx_single(t, p[0]->uuid, 0.9);
-    reputation_install_tx_single(t, p[1]->uuid, 0.8);
+    reputation_install_tx_single(t, p[0]->uuid, 900);
+    reputation_install_tx_single(t, p[1]->uuid, 800);
     ck_assert_int_eq(reputation_get_committed_tx_count(), 1);
     ck_assert(reputation_reset_pre_roster(proc));
     ck_assert_int_eq(reputation_get_committed_tx_count(), 0);
@@ -1014,15 +1119,268 @@ DEFINE_TEST(test_a_chain_from_before_rosters_is_reset)
 
     proc = _begin();                          /* a roster in force */
     uuid_generate(t);
-    reputation_install_tx_single(t, p[0]->uuid, 0.9);
-    reputation_install_tx_single(t, p[1]->uuid, 0.8);
+    reputation_install_tx_single(t, p[0]->uuid, 900);
+    reputation_install_tx_single(t, p[1]->uuid, 800);
     ck_assert(!reputation_reset_pre_roster(proc));
     ck_assert_int_eq(reputation_get_committed_tx_count(), 1);
     _end();
 }
 END_TEST_DEFINITION()
 
+/* ---- The declared N_min (RD_13.2 plan section 0.4) ---------------------- */
+
+/* An acceptance of g_place from @p who reporting @p n_min (0 for none). */
+static void _accept_n(process_t *proc, identity_t *who, int n_min)
+{
+    char digest[TX_HASH_HEX_LEN + 1];
+    _digest_of(g_place, digest);
+    uint8_t desig[PLACE_DESIG_MAX];
+    size_t dlen = place_designation(
+        (int)json_integer_value(json_object_get(g_place, "k")),
+        json_string_value(json_object_get(g_place, "head")), digest, desig, sizeof(desig));
+    char sig[crypto_sign_BYTES * 2 + 1] = {0};
+    _hex_sig(who, desig, dlen, sig);
+    json_t *extra = json_pack("{s:s, s:s}", "digest", digest, "sig", sig);
+    if (n_min > 0)
+        json_object_set_new(extra, "n_min", json_integer(n_min));
+    json_t *r = _reply(g_place, extra);
+    _send(proc, who, ACCEPTED_FN, r);
+    json_decref(r);
+    json_decref(extra);
+}
+
+/* Place one task with p0 and p1 accepting, then p2's late acceptance; each
+ * reports reported[i]. Leaves nothing captured. */
+static void _place_reporting(process_t *proc, const int reported[3])
+{
+    uuid_t task;
+    _ready_task(p[0], p[1], p[2], me, task);
+    reputation_place_start(proc);
+    ck_assert_ptr_nonnull(g_request);
+    json_t *grant = _reply(g_request, NULL);
+    _send(proc, p[0], GRANT_FN, grant);
+    _send(proc, p[1], GRANT_FN, grant);
+    json_decref(grant);
+    ck_assert_ptr_nonnull(g_place);
+    _accept_n(proc, p[0], reported[0]);
+    _accept_n(proc, p[1], reported[1]);
+    ck_assert_ptr_nonnull(g_placed);
+    _accept_n(proc, p[2], reported[2]);      /* after the round closed */
+    json_decref(g_request);
+    json_decref(g_place);
+    json_decref(g_placed);
+    g_request = g_place = g_placed = NULL;
+}
+
+static int _value_n_min(json_t *place)
+{
+    return (int)json_integer_value(json_object_get(json_object_get(json_array_get(
+        json_object_get(place, "value"), 0), "roster"), "n_min"));
+}
+
+/* Three of the four report 7 and this node is configured for none: the
+ * leader restates the roster declaring the majority's value, not its own.
+ * Mirrors test_placement_n_min.py
+ * test_a_leader_configured_otherwise_still_declares_the_majoritys. */
+DEFINE_TEST(test_the_leader_restates_the_roster_a_majority_reports)
+{
+    unsetenv("AT_REP_N_MIN");
+    process_t *proc = _begin();
+    const int reported[3] = {7, 7, 7};
+    _place_reporting(proc, reported);
+    reputation_maybe_place(proc);
+    ck_assert_ptr_nonnull(g_place);
+    ck_assert_str_eq(_value_op(g_place), "restate");
+    ck_assert_int_eq(_value_n_min(g_place), 7);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* This node and one other are configured for 7, two of four: no majority,
+ * so the leader proposes no change (a minority leader proposing its own value
+ * could stall the instance; RD_13.2 plan section 0.4, call 9). */
+DEFINE_TEST(test_a_minority_including_the_leader_restates_nothing)
+{
+    setenv("AT_REP_N_MIN", "7", 1);
+    process_t *proc = _begin();
+    const int reported[3] = {7, 0, 0};
+    _place_reporting(proc, reported);
+    reputation_maybe_place(proc);
+    ck_assert_ptr_null(g_place);
+    unsetenv("AT_REP_N_MIN");
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* With this node's own configuration, three of four is a majority. */
+DEFINE_TEST(test_a_majority_counting_the_leader_restates_the_roster)
+{
+    setenv("AT_REP_N_MIN", "7", 1);
+    process_t *proc = _begin();
+    const int reported[3] = {7, 7, 0};
+    _place_reporting(proc, reported);
+    reputation_maybe_place(proc);
+    ck_assert_ptr_nonnull(g_place);
+    ck_assert_str_eq(_value_op(g_place), "restate");
+    ck_assert_int_eq(_value_n_min(g_place), 7);
+    unsetenv("AT_REP_N_MIN");
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* A value stops short of PLACE_VALUE_BYTES_MAX encoded, so its `place` frame
+ * fits a datagram, and holds at least one entry. Bounded only by count, a
+ * backlog at 18 members made frames of 257 KB that no send could carry, and
+ * the 16-colluder hostile-join runs of 2026-11-05 sat on one instance to the
+ * end. Mirrors Python test_a_backlog_is_placed_in_values_that_fit_a_datagram. */
+static int _place_value_len(process_t *proc)
+{
+    uuid_t task;
+    for (int i = 0; i < 3; i++)
+        _ready_task(p[0], p[1], p[2], me, task);
+    reputation_place_start(proc);
+    ck_assert_ptr_nonnull(g_request);
+    json_t *grant = _reply(g_request, NULL);
+    _send(proc, p[0], GRANT_FN, grant);
+    _send(proc, p[1], GRANT_FN, grant);
+    json_decref(grant);
+    ck_assert_ptr_nonnull(g_place);
+    return (int)json_array_size(json_object_get(g_place, "value"));
+}
+
+DEFINE_TEST(test_a_value_holds_the_backlog_that_fits)
+{
+    process_t *proc = _begin();
+    ck_assert_int_eq(_place_value_len(proc), 3);
+    _end();
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_an_entry_too_large_alone_is_still_placed_alone)
+{
+    process_t *proc = _begin();
+    reputation_set_place_value_bytes_max(10);
+    ck_assert_int_eq(_place_value_len(proc), 1);
+    reputation_set_place_value_bytes_max(0);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* A refused proposer backs off further each time: a refusal or a stalled
+ * round at an instance counts one against it, the backoff window doubles with
+ * each to REP_PLACE_BACKOFF_CAP, and the backoff drawn also stretches the wait
+ * after hearing someone else's round. A member that promises a higher ballot
+ * than its own open round steps back from it at once. Mirrors Python
+ * test_the_backoff_window_doubles_to_its_cap and its neighbors. */
+DEFINE_TEST(test_the_backoff_window_doubles_to_its_cap)
+{
+    ck_assert(fabs(reputation_place_backoff_window(1) - 2.0) < 1e-9);
+    ck_assert(fabs(reputation_place_backoff_window(2) - 4.0) < 1e-9);
+    ck_assert(fabs(reputation_place_backoff_window(3) - 8.0) < 1e-9);
+    ck_assert(fabs(reputation_place_backoff_window(40) - 30.0) < 1e-9);
+}
+END_TEST_DEFINITION()
+
+static void _nack_our_round(process_t *proc, json_int_t promised)
+{
+    char by[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(p[2]->uuid, by);
+    json_t *extra = json_pack("{s:i, s:{s:I, s:s}}", "next", 0, "promised",
+                              "n", promised, "by", by);
+    json_t *nack = _reply(g_request, extra);
+    _send(proc, p[0], NACK_FN, nack);
+    json_decref(nack);
+    json_decref(extra);
+}
+
+DEFINE_TEST(test_refusals_at_an_instance_are_counted)
+{
+    process_t *proc = _begin();
+    uuid_t task;
+    _ready_task(p[0], p[1], p[2], me, task);
+    int k = -1, n = 0;
+    double drawn = 0.0;
+    reputation_place_start(proc);
+    json_int_t n1 = json_integer_value(json_object_get(json_object_get(g_request, "ballot"), "n"));
+    _nack_our_round(proc, n1 + 1000000);
+    ck_assert(reputation_place_fails(&k, &n, &drawn));
+    ck_assert_int_eq(k, 0);
+    ck_assert_int_eq(n, 1);
+    ck_assert(drawn >= 0.5 && drawn <= 2.0);
+    reputation_place_start(proc);
+    _nack_our_round(proc, n1 + 2000000);
+    ck_assert(reputation_place_fails(&k, &n, &drawn));
+    ck_assert_int_eq(n, 2);
+    ck_assert(drawn >= 0.5 && drawn <= 4.0);
+    _end();
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_promising_a_higher_ballot_steps_back_from_our_round)
+{
+    process_t *proc = _begin();
+    uuid_t task;
+    _ready_task(p[0], p[1], p[2], me, task);
+    reputation_place_start(proc);
+    json_int_t n1 = json_integer_value(json_object_get(json_object_get(g_request, "ballot"), "n"));
+    char by[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(p[2]->uuid, by);
+    json_t *theirs = json_pack("{s:s, s:I, s:{s:I, s:s}, s:O}",
+                               "group", "", "k", json_integer_value(json_object_get(g_request, "k")),
+                               "ballot", "n", n1 + 1000000, "by", by,
+                               "head", json_object_get(g_request, "head"));
+    _send(proc, p[2], ASK_FN, theirs);
+    json_decref(theirs);
+    int k = -1, n = 0;
+    double drawn = 0.0;
+    ck_assert(reputation_place_fails(&k, &n, &drawn));
+    ck_assert_int_eq(n, 1);
+    /* Grants for our dead round change nothing. */
+    json_t *grant = _reply(g_request, NULL);
+    _send(proc, p[0], GRANT_FN, grant);
+    _send(proc, p[1], GRANT_FN, grant);
+    json_decref(grant);
+    ck_assert_ptr_null(g_place);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* A member behind the round's instance promised nothing and cannot accept
+ * there, so its nack leaves the round open; the members that are not behind
+ * carry it. Ending the round on it let one member stuck at instance 0 stop
+ * the chain for a whole hostile-join run (pass-off-1, 2026-11-05). Mirrors
+ * Python test_a_nack_from_a_member_behind_leaves_the_round_open. */
+DEFINE_TEST(test_a_nack_from_a_member_behind_leaves_the_round_open)
+{
+    process_t *proc = _begin();
+    uuid_t task;
+    _ready_task(p[0], p[1], p[2], me, task);
+    reputation_place_start(proc);
+    json_int_t k = json_integer_value(json_object_get(g_request, "k"));
+    json_t *extra = json_pack("{s:I}", "next", k - 1);
+    json_t *nack = _reply(g_request, extra);
+    _send(proc, p[2], NACK_FN, nack);
+    json_decref(nack);
+    json_decref(extra);
+    int fk = -1, fn = 0;
+    double drawn = 0.0;
+    ck_assert(!reputation_place_fails(&fk, &fn, &drawn));
+    json_t *grant = _reply(g_request, NULL);
+    _send(proc, p[0], GRANT_FN, grant);
+    _send(proc, p[1], GRANT_FN, grant);
+    json_decref(grant);
+    ck_assert_ptr_nonnull(g_place);
+    _end();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(RepPlaceProposer,
+          test_a_nack_from_a_member_behind_leaves_the_round_open,
+          test_the_backoff_window_doubles_to_its_cap,
+          test_refusals_at_an_instance_are_counted,
+          test_promising_a_higher_ballot_steps_back_from_our_round,
+          test_a_value_holds_the_backlog_that_fits,
+          test_an_entry_too_large_alone_is_still_placed_alone,
           test_a_chain_from_before_rosters_is_reset,
           test_a_newcomer_adopts_the_history_its_group_signed,
           test_a_history_only_an_insider_signed_is_refused,
@@ -1040,4 +1398,8 @@ RUN_TESTS(RepPlaceProposer,
           test_a_child_chain_round_goes_to_that_group_alone,
           test_a_round_places_our_ready_items,
           test_a_reported_value_is_carried_instead_of_ours,
-          test_a_nack_ends_the_round_and_the_next_outranks_it)
+          test_a_value_we_cannot_carry_is_dropped_with_its_reason,
+          test_a_nack_ends_the_round_and_the_next_outranks_it,
+          test_the_leader_restates_the_roster_a_majority_reports,
+          test_a_minority_including_the_leader_restates_nothing,
+          test_a_majority_counting_the_leader_restates_the_roster)

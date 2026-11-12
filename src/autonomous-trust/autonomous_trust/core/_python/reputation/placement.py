@@ -39,10 +39,11 @@ from ..config import Configuration, atomic_write, from_json_string, to_json_stri
 from ..network import Message
 from ..system import CfgIds, now
 from .protocol import ReputationProtocol
-from .reputation import (PLACE_BATCH_MAX, ROSTER_OPS, AttestedScore,
+from .reputation import (PLACE_BATCH_MAX, PLACE_VALUE_BYTES_MAX, ROSTER_OPS, AttestedScore,
                          Transaction, TransactionHistory, place_designation,
-                         place_value_digest,
-                         roster_digest, roster_members_norm, roster_task_id)
+                         place_value_digest, roster_digest,
+                         roster_members_norm, roster_n_min_norm, roster_task_id,
+                         milli_to_score, validate_tx_milli)
 
 #: Persisted acceptor state, one file per chain (doc/architecture/reputation.md).
 PLACEMENT_FILE = 'reputation-placement'
@@ -52,6 +53,9 @@ PLACEMENT_FILE = 'reputation-placement'
 POOL_FILE = 'reputation-pool'
 #: Decided placements held ahead of the chain, per chain.
 PLACED_AHEAD_MAX = 16
+#: Equivocation records kept per chain in its evidence document, oldest
+#: dropped first (R+D.md §14.1).
+FORKS_MAX = 32
 
 
 def _hex(value) -> str:
@@ -73,6 +77,14 @@ def parse_ballot(obj):
     return (n, by.lower())
 
 
+def place_backoff_window(fails):
+    """The longest backoff after ``fails`` refusals at one instance: the
+    second end of PlacementMixin.PLACE_BACKOFF, doubled for each refusal
+    after the first, to PLACE_BACKOFF_CAP. Mirrors C _place_backoff_window."""
+    hi, cap = PlacementMixin.PLACE_BACKOFF[1], PlacementMixin.PLACE_BACKOFF_CAP
+    return min(cap, hi * 2 ** max(0, fails - 1))
+
+
 def ballot_obj(ballot):
     return {'n': int(ballot[0]), 'by': str(ballot[1])}
 
@@ -85,10 +97,12 @@ def entry_to_dict(tx: Transaction) -> dict:
                        'uuid': None if tx.roster_uuid is None else str(tx.roster_uuid),
                        'digest': str(tx.roster_digest),
                        'members': [list(m) for m in tx.roster_members or []]}
+        if tx.roster_n_min:
+            d['roster']['n_min'] = int(tx.roster_n_min)
         return d
     if tx.attested:
         d.update({'attested': True, 'p1': str(tx.p1_id),
-                  'p1_score': float(tx.p1_score),
+                  'p1_score_milli': int(tx.p1_score_milli),
                   'p1_channel': tx.p1_channel or '',
                   'subject': str(tx.subject_id),
                   'evidence_digest': str(tx.evidence_digest)})
@@ -97,15 +111,21 @@ def entry_to_dict(tx: Transaction) -> dict:
         if tx.attest_sigs:
             d['attest_sigs'] = {str(k): _hex(v) for k, v in tx.attest_sigs.items()}
         return d
-    for side, uid, score, chan in (('p1', tx.p1_id, tx.p1_score, tx.p1_channel),
-                                   ('p2', tx.p2_id, tx.p2_score, tx.p2_channel)):
+    for side, uid, milli, chan in (('p1', tx.p1_id, tx.p1_score_milli, tx.p1_channel),
+                                   ('p2', tx.p2_id, tx.p2_score_milli, tx.p2_channel)):
         d[side] = str(uid)
-        d[side + '_score'] = float(score)
+        d[side + '_score_milli'] = int(milli)
         if chan:
             d[side + '_channel'] = str(chan)
         cert = tx.certificate_of(uid)
         if cert:
             d[side + '_cert'] = {str(k): _hex(v) for k, v in cert.items()}
+            roster = tx.cert_roster_of(uid)
+            if roster:
+                d[side + '_cert_roster'] = str(roster)
+        sig = tx.half_sig_of(uid)
+        if sig:
+            d[side + '_sig'] = _hex(sig)
     return d
 
 
@@ -117,13 +137,7 @@ def entry_from_dict(d) -> Transaction:
         raise ValueError('entry is not an object')
 
     def _score(key):
-        v = d.get(key)
-        if isinstance(v, bool) or not isinstance(v, (int, float)):
-            raise ValueError('%s is not a number' % key)
-        v = float(v)
-        if not 0.0 <= v <= 1.0:
-            raise ValueError('%s out of range' % key)
-        return v
+        return validate_tx_milli(d.get(key), key)
 
     def _sigs(key):
         v = d.get(key)
@@ -146,25 +160,38 @@ def entry_from_dict(d) -> Transaction:
         who = r.get('uuid')
         return Transaction(task, roster_op=r['op'],
                            roster_uuid=None if who is None else UUID(str(who)),
-                           roster_digest=digest, roster_members=members)
+                           roster_digest=digest, roster_members=members,
+                           roster_n_min=roster_n_min_norm(r.get('n_min')))
     if d.get('attested') is True:
-        return Transaction(task, p1_id=UUID(str(d['p1'])), p1_score=_score('p1_score'),
+        return Transaction(task, p1_id=UUID(str(d['p1'])),
+                           p1_score_milli=_score('p1_score_milli'),
                            p1_channel=d.get('p1_channel') or None, attested=True,
                            subject_id=UUID(str(d['subject'])),
                            evidence_digest=str(d['evidence_digest']),
                            attest_scope=d.get('attest_scope') or None,
                            attest_sigs=_sigs('attest_sigs'))
     p1, p2 = UUID(str(d['p1'])), UUID(str(d['p2']))
-    certs = {}
+    certs, half_sigs, rosters = {}, {}, {}
     for side, uid in (('p1', p1), ('p2', p2)):
         cert = _sigs(side + '_cert')
         if cert:
             certs[str(uid)] = cert
-    return Transaction(task, p1_id=p1, p1_score=_score('p1_score'),
-                       p2_id=p2, p2_score=_score('p2_score'),
+            roster = d.get(side + '_cert_roster')
+            if roster is not None:
+                if not isinstance(roster, str):
+                    raise ValueError('%s_cert_roster is not a string' % side)
+                rosters[str(uid)] = roster
+        sig = d.get(side + '_sig')
+        if sig is not None:
+            if not isinstance(sig, str):
+                raise ValueError('%s_sig is not a string' % side)
+            half_sigs[str(uid)] = sig
+    return Transaction(task, p1_id=p1, p1_score_milli=_score('p1_score_milli'),
+                       p2_id=p2, p2_score_milli=_score('p2_score_milli'),
                        p1_channel=d.get('p1_channel') or None,
                        p2_channel=d.get('p2_channel') or None,
-                       commit_sigs=certs or None)
+                       commit_sigs=certs or None, half_sigs=half_sigs or None,
+                       cert_rosters=rosters or None)
 
 
 def value_from_list(raw):
@@ -255,6 +282,9 @@ class PlacementMixin:
                             'resetting it, its placement state and its pool',
                             key or 'primary', len(chain))
         fresh = TransactionHistory(max_chain_len=chain.max_chain_len)
+        # The chain is abandoned, not this node's own evidence.
+        fresh.keep_party = getattr(chain, 'keep_party', None)
+        fresh.adopt_retained(chain.retained())
         if key:
             self.child_histories[key] = fresh
         else:
@@ -408,6 +438,7 @@ class PlacementMixin:
         st['promised'] = ballot
         if not self._persist_place_state(key, st):
             return True
+        self._place_step_back(key, ballot)
         grant = {'group': payload.get('group') or '', 'k': payload['k'],
                  'ballot': ballot_obj(ballot)}
         held = st['accepted'].get(payload['k'])
@@ -417,13 +448,18 @@ class PlacementMixin:
                          message.from_whom)
         return True
 
-    def _place_value_ok(self, entries, chain, group) -> 'str | None':
+    def _place_value_ok(self, entries, chain, group,
+                        config_check=True) -> 'str | None':
         """Why this value cannot be placed on `chain` now, or None when it
         can. Checked against this node's own prefix and its own view of the
         group, before accepting, so a decided value is valid by construction
-        and its write never needs checking."""
+        and its write never needs checking. A proposer carrying a value
+        another member accepted passes `config_check=False`: whether a
+        declared N_min matches each acceptor's configuration is for the
+        acceptors to say (RD_13.2 plan §0.4, call 9)."""
         if any(tx.is_roster for tx in entries):
-            return self._roster_value_ok(entries, chain, self._chain_key(group))
+            return self._roster_value_ok(entries, chain, self._chain_key(group),
+                                         config_check)
         if not self._founded(chain):
             return 'nothing is placed before the genesis'
         tasks = [str(tx.task_id).lower() for tx in entries]
@@ -445,12 +481,17 @@ class PlacementMixin:
                 return 'entry %s is not bilateral' % str(tx.task_id)[:8]
             if str(tx.p1_id).lower() > str(tx.p2_id).lower():
                 return 'entry %s halves out of order' % str(tx.task_id)[:8]
-            for uid, score, chan in ((tx.p1_id, tx.p1_score, tx.p1_channel),
-                                     (tx.p2_id, tx.p2_score, tx.p2_channel)):
+            for uid, score, chan in ((tx.p1_id, tx.p1_score_milli, tx.p1_channel),
+                                     (tx.p2_id, tx.p2_score_milli, tx.p2_channel)):
                 if not self._commit_cert_ok(uid, tx.task_id, score, chan,
-                                            tx.certificate_of(uid), group):
+                                            tx.certificate_of(uid), group,
+                                            named=tx.cert_roster_of(uid)):
                     return 'half %s of %s is not certified' % (
                         str(uid)[:8], str(tx.task_id)[:8])
+            who = self._entry_halves_signed(tx, chain)
+            if who is not None:
+                return 'half %s of %s is not signed by its scorer' % (
+                    who[:8], str(tx.task_id)[:8])
         return None
 
     def handle_place(self, queues, message):
@@ -488,6 +529,7 @@ class PlacementMixin:
         st['accepted'][k] = (ballot, raw)
         if not self._persist_place_state(key, st):
             return True
+        self._place_step_back(key, ballot)
         digest = place_value_digest(entries, k)
         try:
             sig = self._detached_sig(self.identity, place_designation(
@@ -495,24 +537,28 @@ class PlacementMixin:
         except Exception:
             self.logger.error('handle_place: cannot sign; not accepting')
             return True
-        self._place_send(queues, ReputationProtocol.place_accepted,
-                         {'group': payload.get('group') or '', 'k': k,
-                          'ballot': ballot_obj(ballot),
-                          'digest': _hex(digest), 'sig': sig},
+        accepted = {'group': payload.get('group') or '', 'k': k,
+                    'ballot': ballot_obj(ballot),
+                    'digest': _hex(digest), 'sig': sig}
+        mine = roster_n_min_norm(getattr(self, 'N_MIN', None))
+        if mine is not None:
+            accepted['n_min'] = mine      # our report (see "the declared N_min")
+        self._place_send(queues, ReputationProtocol.place_accepted, accepted,
                          message.from_whom)
         return True
 
     # --- learner --------------------------------------------------------
 
     def _placement_certified(self, chain, k, entries, sigs, group,
-                             roster=...) -> bool:
+                             roster=..., prev=None) -> bool:
         """Does `sigs` certify this value at k, after OUR head? A strict
         majority of the roster in force for k (doc/architecture/reputation.md,
         "Who is in the group"), verified with the keys it records, must have
         signed its :func:`place_designation`; a genesis, every member it
         lists. Before a roster there is nothing else to learn."""
         digest = place_value_digest(entries, k)
-        desig = place_designation(k, chain.head_hash, digest)
+        desig = place_designation(k, chain.head_hash if prev is None else prev,
+                                  digest)
         if roster is ...:
             roster = chain.roster_at(k)
         genesis = self._genesis_of(entries)
@@ -525,11 +571,123 @@ class PlacementMixin:
                 len(roster.roster_members or ()) // 2 + 1
         return False            # nothing but a genesis before the roster
 
+    # --- equivocation (R+D.md §14.1) ----------------------------------------
+    #
+    # Two certificates for different values at one index mean two quorums of
+    # the roster signed both, and the members in both signed twice. We keep
+    # ours either way. The record holds both certificates, so this node can
+    # prove it later; it is never sent and never scored (the user's calls,
+    # 2026-10-21, D3 B and D4 B).
+
+    def _fork_records(self, key) -> list:
+        return list(getattr(self, '_forks', {}).get(key, ()))
+
+    def _load_fork_records(self, key, doc):
+        """Take back the records an evidence document holds for chain `key`."""
+        raw = doc.get('forks') if isinstance(doc, dict) else None
+        if not isinstance(raw, list):
+            return
+        keep = [dict(r) for r in raw if isinstance(r, dict)
+                and isinstance(r.get('index'), int)
+                and isinstance(r.get('ours'), dict)
+                and isinstance(r.get('theirs'), dict)]
+        if not hasattr(self, '_forks'):
+            self._forks = {}
+        self._forks[key] = keep[-FORKS_MAX:]
+
+    def _fork_cert(self, chain, k, entries, sigs, prev) -> dict:
+        """One side of an equivocation: the placement at `k` after the entry
+        whose hash is `prev`, its value digest, its signatures, and who among
+        them verifies against the roster in force for `k` (our live view
+        while the chain holds none)."""
+        digest = place_value_digest(entries, k)
+        desig = place_designation(k, prev or b'', digest)
+        roster = chain.roster_at(k)
+        return {'k': int(k), 'prev': _hex(prev), 'digest': _hex(digest),
+                'sigs': {str(u).lower(): _hex(v) for u, v in sigs.items()},
+                'signers': sorted(self._verified_cosigners(desig, sigs, roster))}
+
+    def _own_fork_cert(self, chain, f):
+        """Our own certificate for the placement holding index `f`, or None
+        when it is not resident in full."""
+        for k, entries, sigs in chain.placement_batches(list(chain._chain)):
+            if entries and k <= f < k + len(entries):
+                return self._fork_cert(chain, k, entries, sigs,
+                                       entries[0].prev_hash)
+        return None
+
+    def _note_equivocation(self, key, f, source, sender, ours, theirs):
+        """Keep one equivocation record for chain `key` and persist it."""
+        if ours is None or theirs is None or ours['digest'] == theirs['digest']:
+            return
+        if not hasattr(self, '_forks'):
+            self._forks = {}
+        held = self._forks.setdefault(key, [])
+        if any(r.get('index') == f and r['ours'].get('digest') == ours['digest']
+               and r['theirs'].get('digest') == theirs['digest'] for r in held):
+            return
+        both = sorted(set(ours['signers']) & set(theirs['signers']))
+        held.append({'index': int(f), 'source': source,
+                     'from': None if sender is None else str(sender).lower(),
+                     'at': int(time.time()), 'ours': ours, 'theirs': theirs,
+                     'both': both})
+        del held[:-FORKS_MAX]
+        self.logger.error(
+            'equivocation recorded on chain %s at index %d (%s): %d member(s) '
+            'signed both values', key or 'primary', f, source, len(both))
+        self._persist_history(key)
+
+    def _record_catchup_equivocation(self, key, chain, seg, f, sender):
+        """Catch-up returned EQUIVOCATION at `f`: record our certificate and
+        the segment's."""
+        theirs = None
+        for k, entries, sigs in chain.placement_batches(seg):
+            if entries and k <= f < k + len(entries):
+                theirs = self._fork_cert(chain, k, entries, sigs,
+                                         entries[0].prev_hash)
+                break
+        self._note_equivocation(key, f, 'catchup', sender,
+                                self._own_fork_cert(chain, f), theirs)
+
+    def _check_placed_equivocation(self, key, chain, k, entries, sigs, sender):
+        """A `placed` for an index we already hold. The same value is a late
+        duplicate. A different value whose certificate verifies after our own
+        entry at k-1 is an equivocation, recorded at the first index where the
+        two differ."""
+        held = {t.index: t for t in chain._chain if t.index is not None}
+        ours = [held.get(i) for i in range(k, k + len(entries))]
+        if any(t is None for t in ours):
+            return
+        if place_value_digest(ours, k) == place_value_digest(entries, k):
+            return
+        before = held.get(k - 1)
+        prev = b'' if k == 0 else (None if before is None else before.entry_hash())
+        if prev is None or not self._placement_certified(
+                chain, k, entries, sigs, None, prev=prev):
+            return
+        f = next((k + i for i in range(len(entries))
+                  if place_value_digest([ours[i]], k + i)
+                  != place_value_digest([entries[i]], k + i)), k)
+        self._note_equivocation(key, f, 'placed', sender,
+                                self._own_fork_cert(chain, f),
+                                self._fork_cert(chain, k, entries, sigs, prev))
+
     def _apply_placement(self, chain, key, k, entries, sigs, group) -> bool:
         if not self._placement_certified(chain, k, entries, sigs, group):
             self.logger.warning('Refusing placement %d: its certificate does '
                                 'not meet our quorum', k)
             return False
+        # A placement certificate is the majority's word, and so is every
+        # commit certificate in it; a scorer's own signature is not
+        # (R+D.md §14.2). An entry missing one is refused whatever signed
+        # the placement.
+        for tx in entries:
+            who = self._entry_halves_signed(tx, chain)
+            if who is not None:
+                self.logger.warning(
+                    'Refusing placement %d: task %s carries no valid signature '
+                    'by %s over its own half', k, str(tx.task_id)[:8], who[:8])
+                return False
         chain.apply_placed(k, entries, sigs)
         me = str(self.identity.uuid)
         for i, tx in enumerate(entries):
@@ -549,7 +707,7 @@ class PlacementMixin:
                     'Attested score committed: verifier=%s subject=%s '
                     'score=%.2f channel=%s signers=%d (index %d)',
                     str(tx.p1_id)[:8], str(tx.subject_id)[:8],
-                    float(tx.p1_score), tx.p1_channel,
+                    milli_to_score(tx.p1_score_milli), tx.p1_channel,
                     len(chain.attest_certs.get(tx.task_id) or {}), k + i)
             self._fold_committed_tx(tx.task_id, chain)
             for uid in (tx.p1_id, tx.p2_id, tx.subject_id if tx.attested else None):
@@ -580,6 +738,9 @@ class PlacementMixin:
             return True
         k = payload['k']
         if k < chain.next_index:
+            self._check_placed_equivocation(
+                key, chain, k, entries, sigs,
+                getattr(message.from_whom, 'uuid', None))
             return True
         st = self._place_state(key)
         if k > chain.next_index:
@@ -623,7 +784,14 @@ class PlacementMixin:
     # instance's ranking, before taking over; hearing anyone else work on the
     # instance resets that wait. A round that stalls for PLACE_ROUND_TIMEOUT
     # is dropped, and a refused one backs off a random interval, so rival
-    # proposers spread out instead of colliding again.
+    # proposers spread out instead of colliding again. Each refusal or stall
+    # at an instance doubles the longest that interval can be, to
+    # PLACE_BACKOFF_CAP, and the interval drawn also lengthens the wait after
+    # hearing a round: a node that heard a round waits PLACE_ROUND_TIMEOUT
+    # after it, so a backoff shorter than that ended inside the wait, and
+    # every node that heard the same round tried again at the same moment.
+    # A member that promises a higher ballot than its own open round steps
+    # back from that round at once (_place_step_back).
     #
     # The leader skips the first phase (Multi-Paxos). A promise is for the
     # whole chain, not one instance, and an acceptor only accepts at its own
@@ -637,6 +805,7 @@ class PlacementMixin:
     PLACE_RANK_STEP = 0.3
     PLACE_ROUND_TIMEOUT = 5.0
     PLACE_BACKOFF = (0.5, 2.0)
+    PLACE_BACKOFF_CAP = 30.0
 
     def _place_vars(self):
         d = self.__dict__
@@ -648,6 +817,7 @@ class PlacementMixin:
             d['_place_backoff'] = {}      # chain key -> do not start before
             d['_place_seen_n'] = 0        # highest ballot n seen anywhere
             d['_place_lead'] = {}         # chain key -> (k, ballot) we may place at unasked
+            d['_place_fails'] = {}        # chain key -> (k, refusals at k, backoff drawn)
         return d
 
     def _place_roster(self, key, k):
@@ -708,25 +878,68 @@ class PlacementMixin:
                                roster_op='genesis', roster_digest=d,
                                roster_members=live)
         have = dict(map(tuple, roster.roster_members or ()))
+        n_min = roster.roster_n_min
         missing = sorted(u for u, _k in live if u not in have)
         if missing:
             who = missing[0]
             members = list(map(list, roster.roster_members)) + [[who, dict(live)[who]]]
             d = roster_digest(members)
-            return Transaction(roster_task_id(roster.task_id, 'add', who, d),
+            return Transaction(roster_task_id(roster.task_id, 'add', who, d, n_min),
                                roster_op='add', roster_uuid=UUID(who),
-                               roster_digest=d, roster_members=members)
-        if roster.index is not None and \
-                chain.next_index - roster.index >= chain.max_chain_len // 2:
-            d = roster.roster_digest
-            return Transaction(roster_task_id(roster.task_id, 'restate', None, d),
-                               roster_op='restate', roster_digest=d,
-                               roster_members=roster.roster_members)
-        return None
+                               roster_digest=d, roster_members=members,
+                               roster_n_min=n_min)
+        target = self._n_min_majority(key, roster)
+        if target is not ... and target != n_min:
+            # A strict majority of the roster reports another N_min: restate
+            # the roster declaring it, whatever our own configuration.
+            n_min = target
+        elif roster.index is None or \
+                chain.next_index - roster.index < chain.max_chain_len // 2:
+            return None
+        d = roster.roster_digest
+        return Transaction(roster_task_id(roster.task_id, 'restate', None, d, n_min),
+                           roster_op='restate', roster_digest=d,
+                           roster_members=roster.roster_members,
+                           roster_n_min=n_min)
 
-    def _roster_value_ok(self, entries, chain, key) -> 'str | None':
+    # --- the declared N_min (RD_13.2 plan §0.4) ---------------------------
+    #
+    # A roster entry may declare the group's N_min, and with it the F the
+    # certificate rounds are sized for. A genesis declares none. Each member
+    # reports its configured value in every place_accepted, and the member
+    # leading a placement restates the roster with value X once a strict
+    # majority of the roster in force has reported X, whatever it is
+    # configured for itself: a leader proposing its own value could have it
+    # accepted by itself alone, and every later proposer at that index would
+    # then have to carry a value most acceptors refuse. An acceptor takes a
+    # value only if it is the one in force or the one it is configured for.
+
+    def _n_min_reports(self, key) -> dict:
+        return self.__dict__.setdefault('_place_n_min_seen', {}).setdefault(key, {})
+
+    def _n_min_majority(self, key, roster):
+        """The N_min a strict majority of `roster`'s members reports (this
+        node's configuration standing for its own report), or ... when no
+        value has one."""
+        me = str(self.identity.uuid).lower()
+        seen = dict(self._n_min_reports(key))
+        seen[me] = roster_n_min_norm(getattr(self, 'N_MIN', None))
+        listed = [u for u, _k in roster.roster_members or ()]
+        counts = {}
+        for u in listed:
+            if u in seen:
+                counts[seen[u]] = counts.get(seen[u], 0) + 1
+        for value, n in counts.items():
+            if n >= len(listed) // 2 + 1:
+                return value
+        return ...
+
+    def _roster_value_ok(self, entries, chain, key,
+                         config_check=True) -> 'str | None':
         """Why a value holding a roster entry cannot be accepted on `chain`
-        now, or None when it can (the acceptor's rules for roster entries)."""
+        now, or None when it can (the acceptor's rules for roster entries).
+        A declared N_min must be the one in force (none before the genesis)
+        or, with `config_check`, the one this node is configured for."""
         if len(entries) != 1:
             return 'a roster entry is placed alone'
         tx = entries[0]
@@ -736,6 +949,12 @@ class PlacementMixin:
             return 'roster members do not match their digest'
         me = str(self.identity.uuid).lower()
         roster = chain.latest_roster()
+        in_force = None if roster is None else roster.roster_n_min
+        mine = roster_n_min_norm(getattr(self, 'N_MIN', None))
+        n_min = tx.roster_n_min
+        if n_min != in_force and config_check and n_min != mine:
+            return 'a declared n_min of %s, ours is %s and %s is in force' % (
+                n_min, mine, in_force)
         if tx.roster_op == 'genesis':
             if roster is not None or chain.next_index != 0:
                 return 'genesis on a chain that has one'
@@ -743,7 +962,7 @@ class PlacementMixin:
                 return 'a genesis that leaves us out'
             if any(live.get(u) != k for u, k in members.items()):
                 return 'a genesis naming a member we do not see'
-            want = roster_task_id(None, 'genesis', None, tx.roster_digest)
+            want = roster_task_id(None, 'genesis', None, tx.roster_digest, n_min)
         elif roster is None:
             return 'a roster change with no roster in force'
         elif tx.roster_op == 'add':
@@ -755,14 +974,18 @@ class PlacementMixin:
                 return 'an add that changes more than one member'
             if live.get(who) != members.get(who):
                 return 'an add of a member we do not see'
-            want = roster_task_id(roster.task_id, 'add', who, tx.roster_digest)
+            if n_min != in_force:
+                return 'an add that changes the declared n_min'
+            want = roster_task_id(roster.task_id, 'add', who, tx.roster_digest, n_min)
         else:
             if tx.roster_digest != roster.roster_digest:
                 return 'a restatement that changes the roster'
-            if roster.index is None or \
-                    chain.next_index - roster.index < chain.max_chain_len // 2:
+            if n_min == in_force and (roster.index is None or
+                                      chain.next_index - roster.index
+                                      < chain.max_chain_len // 2):
                 return 'a restatement too early'
-            want = roster_task_id(roster.task_id, 'restate', None, tx.roster_digest)
+            want = roster_task_id(roster.task_id, 'restate', None,
+                                  tx.roster_digest, n_min)
         if str(tx.task_id) != str(want):
             return 'a roster entry with the wrong task id'
         return None
@@ -807,11 +1030,53 @@ class PlacementMixin:
         return order.index(me)
 
     def _place_target(self, key):
-        """Where a round's broadcast goes: the chain's group."""
+        """Where a round's broadcast goes: the chain's group, or, for the
+        anchored cohort's chain, its other members pairwise, as its halves and
+        commits go (``_send_target``). A cohort member is in the primary group
+        too, and a receiver opens a group frame with the first group that
+        holds the sender, so a frame under the cohort key never opened."""
+        if key and key == self._cohort_key():
+            return self._send_target(key)
         return (self._group_by_uuid(key) if key else None) or self.group
 
     def _note_place_heard(self, key, k):
         self._place_vars()['_place_heard'][key] = (k, time.monotonic())
+
+    def _place_failed(self, key, k):
+        """Our round at instance k of chain `key` was refused or stalled:
+        count it, and back off a random interval within the window that many
+        refusals allow."""
+        v = self._place_vars()
+        was = v['_place_fails'].get(key)
+        n = was[1] + 1 if was is not None and was[0] == k else 1
+        drawn = random.uniform(self.PLACE_BACKOFF[0], place_backoff_window(n))
+        v['_place_fails'][key] = (k, n, drawn)
+        v['_place_backoff'][key] = time.monotonic() + drawn
+
+    def _place_busy(self, key, k) -> bool:
+        """Whether someone else's round at instance k of chain `key` was heard
+        recently enough that we leave it to finish: within
+        PLACE_ROUND_TIMEOUT, plus the backoff drawn after our own refusals
+        there."""
+        v = self._place_vars()
+        heard = v['_place_heard'].get(key)
+        if heard is None or heard[0] != k:
+            return False
+        fails = v['_place_fails'].get(key)
+        drawn = fails[2] if fails is not None and fails[0] == k else 0.0
+        return time.monotonic() - heard[1] < self.PLACE_ROUND_TIMEOUT + drawn
+
+    def _place_step_back(self, key, ballot):
+        """We promised `ballot` on chain `key`: an open round of ours under a
+        lower ballot can no longer win, so drop it now and count it refused,
+        rather than wait for the nacks."""
+        v = self._place_vars()
+        rnd = v['_place_rounds'].get(key)
+        if rnd is None or not rnd['ballot'] < ballot:
+            return
+        v['_place_rounds'].pop(key, None)
+        v['_place_lead'].pop(key, None)
+        self._place_failed(key, rnd['k'])
 
     def _maybe_place(self, queues, present=None):
         """Start a placement round on any chain that has ready items and whose
@@ -830,7 +1095,7 @@ class PlacementMixin:
                 if clock - rnd['started'] > self.PLACE_ROUND_TIMEOUT:
                     v['_place_rounds'].pop(key, None)
                     v['_place_lead'].pop(key, None)
-                    v['_place_backoff'][key] = clock + random.uniform(*self.PLACE_BACKOFF)
+                    self._place_failed(key, rnd['k'])
                 continue
             if clock < v['_place_backoff'].get(key, 0.0):
                 continue
@@ -843,9 +1108,7 @@ class PlacementMixin:
             if since is None or since[0] != k:
                 since = (k, clock)
                 v['_place_ready_since'][key] = since
-            heard = v['_place_heard'].get(key)
-            if heard is not None and heard[0] == k \
-                    and clock - heard[1] < self.PLACE_ROUND_TIMEOUT:
+            if self._place_busy(key, k):
                 continue
             me = str(self.identity.uuid).lower()
             placer = v['_placers'].get(key)
@@ -951,13 +1214,20 @@ class PlacementMixin:
         # accepted at k, or, if none did, our own ready items.
         reported = [g for g in rnd['grants'].values() if g is not None]
         if reported:
-            raw = max(reported, key=lambda g: g[0])[1]
+            ballot, raw = max(reported, key=lambda g: g[0])
             entries = value_from_list(raw)
-            if entries is None or self._place_value_ok(
-                    entries, chain, group if key else None) is not None:
-                self.logger.warning('Placement %d: the value to carry is not '
-                                    'valid here; dropping the round', rnd['k'])
+            why = 'unreadable' if entries is None else self._place_value_ok(
+                entries, chain, group if key else None, config_check=False)
+            if why is not None:
+                self.logger.warning('Placement %d: the value to carry (accepted '
+                                    'under %s) is not valid here: %s; dropping '
+                                    'the round', rnd['k'], ballot, why)
                 self._place_vars()['_place_rounds'].pop(key, None)
+                # A value we cannot carry refuses our round as surely as a
+                # nack. Retrying at once keeps a live round in every member's
+                # ear, and a member that could carry the value leaves it to us
+                # for good.
+                self._place_failed(key, rnd['k'])
                 return True
         else:
             entries = self._own_place_value(chain, key, group if key else None)
@@ -972,17 +1242,23 @@ class PlacementMixin:
         """Our ready items, as a value to place: only items an acceptor will
         take. One it would refuse (a half whose certificate falls short of our
         quorum, say) leaves the pool, or it would sink every round that
-        carries it."""
+        carries it. The value stops short of PLACE_VALUE_BYTES_MAX encoded,
+        so its frame fits a datagram, and holds at least one entry."""
         item = self._roster_item(key, chain)
         if item is not None:
             return [item]
         if not self._founded(chain):
             return []                   # nothing is placed before the genesis
         entries = []
+        size = 2                        # the list's brackets
         for e in chain.ready_items():
             why = self._place_value_ok([e], chain, group)
             if why is None:
+                more = len(to_json_string(entry_to_dict(e))) + 1
+                if entries and size + more > PLACE_VALUE_BYTES_MAX:
+                    break
                 entries.append(e)
+                size += more
             else:
                 chain.pool_drop(e.task_id)
                 self.logger.warning('Placement: dropping %s from the pool: '
@@ -1020,6 +1296,14 @@ class PlacementMixin:
         payload, key, chain, group = got
         rnd = self._place_round_for(payload, key)
         voter = self._place_voter(message, key, payload['k'])
+        if voter is not None:
+            # The member's N_min report, from any acceptance it sends: a round
+            # closes on its majority, and the reports of the rest would go
+            # stale. A hint only; each acceptor holds its own configuration.
+            try:
+                self._n_min_reports(key)[voter] = roster_n_min_norm(payload.get('n_min'))
+            except ValueError:
+                self._n_min_reports(key).pop(voter, None)
         if rnd is None or voter is None or rnd['value'] is None:
             return True
         if str(payload.get('digest') or '') != _hex(rnd['digest']):
@@ -1071,10 +1355,17 @@ class PlacementMixin:
         # -- would otherwise end every round that adds it.
         if rnd is None or self._place_voter(message, key, payload['k']) is None:
             return True
+        # A member behind the round's instance promised nothing and cannot
+        # accept here; the members that are not behind may still carry it.
+        # Ending the round on its nack let one member stuck at instance 0 stop
+        # the chain for the whole hostile-join run of 2026-11-05 (pass-off-1):
+        # nobody else was added, and the joiners refused the chain to the end.
+        nxt = payload.get('next')
+        if isinstance(nxt, int) and nxt < rnd['k']:
+            return True
         v['_place_rounds'].pop(key, None)
         v['_place_lead'].pop(key, None)
-        v['_place_backoff'][key] = time.monotonic() + random.uniform(*self.PLACE_BACKOFF)
-        nxt = payload.get('next')
+        self._place_failed(key, rnd['k'])
         if isinstance(nxt, int) and nxt > chain.next_index:
             try:
                 self._request_update(queues, key=key)

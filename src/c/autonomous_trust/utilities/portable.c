@@ -159,6 +159,11 @@ struct timespec at_file_mtim(const char *path, const struct stat *st)
     }
     struct timespec ts = {.tv_sec = st->st_mtime, .tv_nsec = 0};
     return ts;
+#elif defined(__FRAMAC__)
+    /* Frama-C's libc struct stat has st_mtime but no st_mtim. */
+    (void)path;
+    struct timespec ts = {.tv_sec = st->st_mtime, .tv_nsec = 0};
+    return ts;
 #else
     (void)path;
     return st->st_mtim;

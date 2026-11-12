@@ -83,6 +83,7 @@ module=""
 single_file=""
 timeout=120
 prover="alt-ergo,z3,cvc5"
+par=""
 do_report=0
 verbose=0
 smoke_tests=0
@@ -106,6 +107,8 @@ Options:
   --file <path>       Verify a single .c file (relative to repo root or absolute)
   --timeout <seconds> Per-goal SMT solver timeout (default: $timeout)
   --prover <name>     SMT solver backend (default: $prover)
+  --par <n>           Concurrent prover processes per file (-wp-par;
+                      default: Frama-C's own)
                         Common choices: alt-ergo, z3, cvc4, cvc5
   --report            Write results to frama-c-report.csv in the repo root
   --verbose           Print full Frama-C command and output
@@ -157,6 +160,11 @@ while [[ $# -gt 0 ]]; do
         -p|--prover)
             [[ $# -lt 2 ]] && { echo "ERROR: --prover requires an argument"; usage 1; }
             prover="$2"
+            shift 2
+            ;;
+        --par)
+            [[ $# -lt 2 ]] && { echo "ERROR: --par requires an argument"; usage 1; }
+            par="$2"
             shift 2
             ;;
         --report)
@@ -331,7 +339,7 @@ if [[ -d "$ION_INCLUDE_DIR" ]]; then
 fi
 
 INCLUDE_FLAGS=(
-    -cpp-extra-args="-fms-extensions -DAT_ZTA_ENABLED -include $STUBS_DIR/fc_stdio_spec.h -include $STUBS_DIR/fc_stdlib_spec.h -include $STUBS_DIR/fc_string_spec.h -include $STUBS_DIR/fc_net_spec.h -I $C_SRC -I $EXT_SRC -I $STUBS_DIR -I $PROJ_ROOT/src/c -I $BUILD_DIR -I $PROTO_SRC $PROTO_INCLUDES$OPTIONAL_INCLUDES -I $CONDA_PREFIX/include"
+    -cpp-extra-args="-fms-extensions -DAT_ZTA_ENABLED -include $STUBS_DIR/fc_stdio_spec.h -include $STUBS_DIR/fc_stdlib_spec.h -include $STUBS_DIR/fc_string_spec.h -include $STUBS_DIR/fc_net_spec.h -include $STUBS_DIR/fc_dlfcn_spec.h -I $C_SRC -I $EXT_SRC -I $STUBS_DIR -I $PROJ_ROOT/src/c -I $PROJ_ROOT/src/c/third_party/ryu -I $BUILD_DIR -I $PROTO_SRC $PROTO_INCLUDES$OPTIONAL_INCLUDES -I $CONDA_PREFIX/include"
 )
 
 ####################
@@ -339,6 +347,9 @@ INCLUDE_FLAGS=(
 ####################
 
 WP_FLAGS=(
+    # The sources are built with GCC and use its extensions (__thread);
+    # the default x86_64 machdep rejects them as a fatal parse error.
+    -machdep gcc_x86_64
     -wp
     -wp-prover "$prover"
     -wp-timeout "$timeout"
@@ -373,6 +384,9 @@ WP_FLAGS=(
 
 if [[ $smoke_tests -eq 1 ]]; then
     WP_FLAGS+=(-wp-smoke-tests)
+fi
+if [[ -n "$par" ]]; then
+    WP_FLAGS+=(-wp-par "$par")
 fi
 
 ####################
@@ -819,7 +833,12 @@ for src in "${files[@]}"; do
             # [solver-timeout] reputation/tx_history lifecycle: smrt_ptr/
             # map/array precondition cascades through container operations;
             # serialization via JSON encode/decode
-            skip_fns="reputations_create,reputations_get,tx_history_by_peer,tx_history_by_task,tx_history_create,tx_history_era_from_json,tx_history_era_to_json,tx_history_free,tx_history_update" ;;
+            # [solver-timeout] transaction_canonical_bytes, tx_history_apply_placed,
+            # _reconcile, reputation_evidence_to_json, reputation_evidence_from_json:
+            # each one alone runs past 10 minutes; Qed spends seconds to minutes
+            # simplifying every goal before the provers time out on it, which
+            # kept the whole-file run going for more than 13 hours
+            skip_fns="reputations_create,reputations_get,tx_history_by_peer,tx_history_by_task,tx_history_create,tx_history_era_from_json,tx_history_era_to_json,tx_history_free,tx_history_update,transaction_canonical_bytes,tx_history_apply_placed,_reconcile,reputation_evidence_to_json,reputation_evidence_from_json" ;;
         rep_proc.c)
             # reputation_run: [solver-timeout] state-cascade through paxos_init +
             # 11x process_register_handler prevents discharging valid_rw(proc)
@@ -868,7 +887,9 @@ for src in "${files[@]}"; do
         message.c)
             # [syscall] mq_open, mq_send, mq_receive (POSIX message queues)
             # [string-loop] strncpy separation proof in messaging_init
-            skip_fns="messaging_recv_from,messaging_recv_on,messaging_send,messaging_init" ;;
+            # [syscall] _ensure_sockbuf: the libc getsockopt spec has an
+            # unbounded optval range that aborts WP ("Invalid infinite range")
+            skip_fns="messaging_recv_from,messaging_recv_on,messaging_send,messaging_init,_ensure_sockbuf" ;;
         logger.c)
             # [solver-timeout] all 4 logger_init* variants time out on
             # disjoint_failure_success — the disjoint-behaviors check between the
@@ -914,6 +935,22 @@ for src in "${files[@]}"; do
             # discharge separation/bounds without manual loop invariants
             skip_fns="strremove,makedirs,path_join" ;;
     esac
+    # WP aborts the whole file on a -wp-skip-fct name it cannot find, so keep
+    # only names still present in the file or its directory's headers.
+    if [[ -n "$skip_fns" ]]; then
+        present=()
+        IFS=',' read -ra wanted <<< "$skip_fns"
+        for fn in "${wanted[@]}"; do
+            # A call or definition on a non-comment line; comments that still
+            # name a removed function do not count.
+            if grep -qP -- "^(?!\\s*(\\*|//)).*\\b${fn}\\s*\\(" "$src" "$(dirname "$src")"/*.h 2>/dev/null; then
+                present+=("$fn")
+            else
+                echo "  NOTE: skip-list function '$fn' no longer exists; dropped"
+            fi
+        done
+        skip_fns=$(IFS=','; echo "${present[*]}")
+    fi
     if [[ -n "$skip_fns" ]]; then
         skip_flags=(-wp-skip-fct "$skip_fns")
     fi

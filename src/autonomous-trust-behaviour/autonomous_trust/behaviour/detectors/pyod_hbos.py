@@ -14,16 +14,16 @@
 #   limitations under the License.
 # ******************
 """Per-feature, natively-explainable histogram score via ``pyod.models.hbos``
-(SOW Task 3.2; the AI/ML survey's explainability + determinism layer).
+(the explainable, deterministic half of the detector pair).
 
-PyOD's HBOS is a *batch* estimator, so — exactly as the survey notes ("batch but
-trivially made incremental with streaming histograms") — we make it streaming
+PyOD's HBOS is a *batch* estimator, but one easily made incremental with
+streaming histograms, so we make it streaming
 with a bounded sliding window that is periodically refit. Scoring uses PyOD's
 ``decision_function`` (higher == more anomalous; the ensemble calibrator
 normalizes the scale). The per-feature attribution is read straight off the
 fitted histograms (``hist_`` / ``bin_edges_``): how rare the bin a value falls
-in is, relative to that feature's modal bin — which *is* the HBOS "why" (survey
-axis 6). HBOS has no randomness, so a given window refits to the identical model
+in is, relative to that feature's modal bin — which *is* the HBOS "why".
+HBOS has no randomness, so a given window refits to the identical model
 on every node.
 """
 from __future__ import annotations

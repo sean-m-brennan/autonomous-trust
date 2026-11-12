@@ -38,7 +38,7 @@ from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
-from uuid import UUID, uuid5
+from uuid import UUID, uuid4, uuid5
 
 from autonomous_trust.core.algorithms.impl import AgreementImpl
 from autonomous_trust.core.capabilities import Capabilities, PeerCapabilities
@@ -116,6 +116,20 @@ _TRIGGER_SUBTREE_ROSTER = 'trigger_subtree_roster'
 # advertisement it emits restates the derived value, so nothing wire-shaped is
 # asserted. Mirrors the C adapter's trigger_hierarchy.
 _TRIGGER_HIERARCHY = 'trigger_hierarchy'
+
+# Pseudo-function: end choose_group's wait now and adopt from the histories
+# stashed so far (RD_14.4 plan, Phase 1); the wait itself is a timer. Mirrors
+# the C adapter's trigger_choose_group.
+_TRIGGER_CHOOSE_GROUP = 'trigger_choose_group'
+# Pseudo-function: the participant reaches phase 3. Its payload `admit: [pid]`
+# names the senders it holds as peers by then (the history's roster), and the
+# group updates it held through phase 2 are replayed, as process() offers them
+# again in production. Mirrors the C adapter (identity_replay_held_group_updates).
+_TRIGGER_PHASE3 = 'trigger_phase3'
+# The anchored cohort (RD_14.4 Phase 6): run the forming/coordinating pass now,
+# rather than waiting for a peer-list change or the resync cadence. Mirrors the
+# C adapter's trigger_anchored_cohort.
+_TRIGGER_ANCHORED_COHORT = 'trigger_anchored_cohort'
 
 # Pseudo-function: solicit membership in a cohort this participant is NOT in (runtime
 # cross-group join, doc/architecture/gateway-reputation-tree.md). The step's payload
@@ -221,6 +235,20 @@ def _app_verb(function, body):
 _FIXTURE_GROUP_PUB: dict[str, bytes] = {}
 
 
+def _child_tag(proc, address):
+    """The uuid of the child cohort listing *address* when the primary group
+    does not, else None: NetworkProcess._child_group_of on the receiver."""
+    if not address:
+        return None
+    group = getattr(proc, 'group', None)
+    if group is not None and address in list(group.addresses):
+        return None
+    for key, child in (getattr(proc, 'child_groups', None) or {}).items():
+        if address in list(child.addresses):
+            return str(key)
+    return None
+
+
 @dataclass
 class _Participant:
     """Wraps an IdentityProcess and the captured outbox for a participant."""
@@ -265,6 +293,10 @@ class _Participant:
     # participant id -> uuid string, for every participant in the scenario.
     # Filled by the adapter at setup; see _uuid_for_pid.
     pid_to_uuid: dict = field(default_factory=dict)
+    # group_key_update messages its handler left unhandled before phase 3, in
+    # arrival order: production keeps them in self.messages and offers them
+    # again; the harness keeps them here for trigger_phase3.
+    held: list = field(default_factory=list)
     # participant id -> _Participant, for the few expected_state keys that read
     # ANOTHER participant's state (social_tx_last's same_task_as). Filled with
     # pid_to_uuid.
@@ -580,6 +612,19 @@ class _Participant:
                             f'{self.id}: freshness_refusals[{verb!r}]={actual}, '
                             f'expected {want}'
                         )
+            elif key == 'freshness_mark':
+                # {sender: {verb: N}} -- the high-water mark this participant
+                # holds for a sender's verb: what an ACCEPTED stamped message
+                # moves, and a refused one must not. Mirrors the C adapter's
+                # identity_freshness_mark.
+                for spid, verbs in expected.items():
+                    sender_uuid = str((self.pid_to_uuid or {})[spid])
+                    for verb, want in verbs.items():
+                        actual = self.process.freshness.mark(sender_uuid, verb)
+                        if actual != int(want):
+                            raise AssertionError(
+                                f'{self.id}: freshness_mark[{spid}][{verb!r}]='
+                                f'{actual}, expected {want}')
             elif key == 'caps_query_emitted':
                 # Number of directed `peer_caps_query` messages this participant
                 # emitted -- driven by the periodic caps-resync sweep (triggered
@@ -689,6 +734,20 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: group_uuid={actual}, expected {expected}'
                     )
+            elif key in ('child_group_size', 'child_group_owns_key',
+                         'child_group_key_epoch'):
+                # The one cohort this participant gateways: its membership,
+                # whether it holds the child's private key, and the key's
+                # rotation. Mirrors the C adapter.
+                children = list((getattr(self.process, 'child_groups', {}) or {}).values())
+                if len(children) != 1:
+                    raise AssertionError(f'{self.id}: {key} needs exactly one child group')
+                child = children[0]
+                actual = {'child_group_size': len(list(child.addresses)),
+                          'child_group_owns_key': bool(child.owns_private_key),
+                          'child_group_key_epoch': int(child.key_epoch)}[key]
+                if actual != expected:
+                    raise AssertionError(f'{self.id}: {key}={actual}, expected {expected}')
             elif key == 'child_group_count':
                 # Cohorts this participant gateways. A runtime join lands HERE
                 # and not in the primary group -- that separation is the whole
@@ -710,6 +769,29 @@ class _Participant:
                         f'{self.id}: provisional_peer_count={actual}, '
                         f'expected {int(expected)}'
                     )
+            elif key == 'anchored_cohort_members':
+                # The anchored cohort this participant holds, as sorted
+                # participant ids; [] when it holds none (RD_14.4 Phase 6). C
+                # mirrors via identity_anchored_cohort_held.
+                from autonomous_trust.core._python.identity.anchored_cohort import member_uuids
+                by_uuid = {u.lower(): pid for pid, u in self.pid_to_uuid.items()}
+                held = getattr(self.process, 'anchored_cohort', None)
+                actual = sorted(by_uuid.get(u, u) for u in member_uuids(held))
+                if actual != sorted(expected or []):
+                    raise AssertionError(
+                        f'{self.id}: anchored_cohort_members={actual}, '
+                        f'expected {sorted(expected or [])}')
+            elif key == 'join_provisional_count':
+                # Members this participant marked provisional when it adopted
+                # a history under the join policy: introduced by the cohort,
+                # not anchored, not already held (RD_14.4 plan, D1 (d)). Not
+                # the admission hold above. C mirrors via
+                # identity_provisional_members.
+                actual = len(getattr(self.process, 'provisional_members', set()))
+                if actual != int(expected):
+                    raise AssertionError(
+                        f'{self.id}: join_provisional_count={actual}, '
+                        f'expected {int(expected)}')
             elif key == 'subtree_roster':
                 # The flattened membership roll of this gateway's cohort subtree
                 # (trigger_subtree_roster), as sorted participant ids — each
@@ -721,6 +803,18 @@ class _Participant:
                 if actual != want:
                     raise AssertionError(
                         f'{self.id}: subtree_roster={actual}, expected {want}')
+            elif key == 'anchors':
+                # The join-policy anchor classes this participant counts for
+                # each named participant's PUBLISHED identity, as
+                # {participant_id: [class, ...]}, order-free (RD_14.4 plan,
+                # Phase 2). C mirrors via identity_anchor_classes.
+                for pid, want in (expected or {}).items():
+                    self._uuid_for_pid(pid)
+                    target = self.peers_by_pid[pid].identity.publish()
+                    got = sorted(self.process.anchor_classes(target))
+                    if got != sorted(want or []):
+                        raise AssertionError(
+                            f'{self.id}: anchors[{pid}]={got}, expected {sorted(want or [])}')
             elif key == 'hierarchy_of':
                 # What this participant RECORDED from a peer's hierarchy claim
                 # (protocol step 7), as {participant_id: {rank, children}}.
@@ -923,7 +1017,8 @@ def _uuid_of(ident) -> bytes:
 
 
 def _scenario_operator_binding(corpus_root: Path, ident: Identity,
-                               variant: str) -> tuple[bytes, bytes]:
+                               variant: str, key_of: Identity | None = None
+                               ) -> tuple[bytes, bytes]:
     """Mint an (operator_pubkey, binding) pair for a scenario participant.
 
     The operator key is derived deterministically from the participant's uuid
@@ -946,8 +1041,10 @@ def _scenario_operator_binding(corpus_root: Path, ident: Identity,
     # Deterministic 32-byte "operator key": the uuid, domain-separated. Not a
     # real ed25519 secret — nothing in this path signs with it, and AT only ever
     # verifies the BINDING over it.
+    # ``key_of`` (variant ``valid:<pid>``) derives it from ANOTHER
+    # participant's uuid instead: two nodes under one operator.
     op_pub = hashlib.sha256(b'conformance-operator-key:'
-                            + _uuid_of(ident)).digest()
+                            + _uuid_of(key_of if key_of is not None else ident)).digest()
 
     bind_to = ident
     if variant == 'other-identity':
@@ -1357,6 +1454,8 @@ class IdentityAdapter:
         #   forged          signed by an unrelated key (impostor_leaf.key)
         #   other-identity  correctly signed, but over a pre-image naming a
         #                   DIFFERENT node — the harvested-credential case
+        #   valid:<pid>     as valid, under the operator key <pid> has: two
+        #                   nodes under one operator (RD_14.4 plan, Phase 2)
         #
         # A participant absent from the map advertises nothing, which is the
         # ordinary opted-out node and must stay indistinguishable from one built
@@ -1366,8 +1465,13 @@ class IdentityAdapter:
             if pid not in identities:
                 continue
             ident = identities[pid]
+            variant, _, key_pid = str(variant).partition(':')
+            if key_pid and key_pid not in identities:
+                raise AssertionError(
+                    f'fixtures.operator_bindings[{pid}] names unknown participant {key_pid!r}')
             op_pub, binding = _scenario_operator_binding(
-                self.corpus_root, ident, str(variant))
+                self.corpus_root, ident, variant,
+                key_of=identities[key_pid] if key_pid else None)
             ident.operator_pubkey = op_pub
             ident.operator_key_binding = binding
 
@@ -1421,6 +1525,12 @@ class IdentityAdapter:
             for gi, (pid, spec_g) in enumerate(groups_fix.items()):
                 group_by_pid[pid] = self._build_group_from_fixture(
                     pid, gi, identities[pid], spec_g)
+                # `members`: other participants the group lists, after the
+                # fillers. Lets a scenario hand a node a group that names a
+                # member of a cohort it gateways. Mirrors the C fixture.
+                for m_pid in spec_g.get('members') or []:
+                    group_by_pid[pid].add_address(str(identities[m_pid].uuid),
+                                                  identities[m_pid].address)
 
         # Shared-group sparse-peers mode (identity-resync scenarios): ONE
         # group shared by every participant — each member's address is in
@@ -1439,12 +1549,19 @@ class IdentityAdapter:
                 guuid = UUID(shared_fix['uuid'])
             else:
                 guuid = identities[seed_id].uuid
+            # stale_addresses: {pid: address} puts that address in the map
+            # instead of the member's own, as the cohort seeder does with a
+            # hostname placeholder.
+            stale = (shared_fix.get('stale_addresses') or {}) \
+                if isinstance(shared_fix, dict) else {}
             shared_group_obj = Group(
-                guuid, {identities[seed_id].uuid: identities[seed_id].address},
+                guuid, {identities[seed_id].uuid:
+                        stale.get(seed_id, identities[seed_id].address)},
                 'shared-grp', Encryptor.generate(), False)
             for pid in pids_all[1:]:
-                shared_group_obj.add_address(identities[pid].uuid,
-                                             identities[pid].address)
+                shared_group_obj.add_address(
+                    identities[pid].uuid,
+                    stale.get(pid, identities[pid].address))
 
         # All participants except the newcomer share the same group key in
         # Phase C scenarios. Newcomer is detected as the participant with role
@@ -1522,6 +1639,18 @@ class IdentityAdapter:
             aq_fix: dict[str, int] = fixtures.get('admission_quorum', {}) or {}
             if pid in aq_fix:
                 participant.process._admission_quorum = int(aq_fix[pid])
+            # fixtures.phases {participant_id: int} starts a participant in
+            # another identity phase (a joiner still in phase 2). Mirrors the C
+            # adapter.
+            ph_fix: dict[str, int] = fixtures.get('phases', {}) or {}
+            if pid in ph_fix:
+                participant.process.phase = int(ph_fix[pid])
+            # fixtures.holds {participant_id: [pid, ...]}: the participants it
+            # holds as peers. In distinct-groups mode peers are not
+            # cross-populated, and a group_key_query is answered only for a
+            # member the responder holds. Mirrors the C adapter.
+            for held_pid in (fixtures.get('holds', {}) or {}).get(pid, []) or []:
+                participant.process.peers.add(identities[held_pid].publish(), 0)
             # Install own-capability allowlist from fixtures.capabilities;
             # mirrors the C adapter's `identity_set_own_capabilities`
             # plumbing. handle_caps_query reads
@@ -1576,6 +1705,35 @@ class IdentityAdapter:
         peers_by_pid = {pid: h.impl for pid, h in handles.items()}
         for h in handles.values():
             h.impl.peers_by_pid = peers_by_pid
+        # join_policy fixture: the declaration's own JSON, installed on every
+        # participant (RD_14.4 plan, Phase 2). Mirrors the C adapter, which
+        # holds one per node and so one per scenario.
+        jp_fix = (case.data.get('fixtures') or {}).get('join_policy')
+        if jp_fix is not None:
+            from autonomous_trust.core._python.identity.join_policy import parse_join_policy
+            policy = parse_join_policy(jp_fix)
+            for h in handles.values():
+                h.impl.process.join_policy = policy
+        # self_bootstrapped fixture: [pid, ...] that minted a group of their own
+        # when no history came, so a history arriving now takes the merge path
+        # (_merge_to_mesh) rather than choose_group. Mirrors the C adapter's
+        # identity_set_self_bootstrapped.
+        for pid in (case.data.get('fixtures') or {}).get('self_bootstrapped') or []:
+            h = handles.get(pid)
+            if h is None:
+                raise AssertionError(f'self_bootstrapped names unknown participant {pid!r}')
+            h.impl.process.self_bootstrapped = True
+        # choosing fixture: [pid, ...] whose choose_group wait is running, so
+        # every history delivered is stashed for it and the adoption happens
+        # at trigger_choose_group, as in a real wait that several histories
+        # reach. Without it the harness runs choose_group on the first
+        # delivery and the later ones meet a group already chosen. Mirrors the
+        # C adapter's identity_set_choosing_group.
+        for pid in (case.data.get('fixtures') or {}).get('choosing') or []:
+            h = handles.get(pid)
+            if h is None:
+                raise AssertionError(f'choosing names unknown participant {pid!r}')
+            h.impl.process.choosing = True
         # ranks fixture: {pid: int} — the topology rank each participant HAS,
         # applied both to its own identity and to every other node's view of it.
         # Rank is what the hierarchy derivation reads (protocol step 7), so a
@@ -1722,6 +1880,9 @@ class IdentityAdapter:
         grp = Group(group_uuid, {identity.uuid: identity.address},
                     f'grp-{pid}', enc, public_only,
                     _key_epoch=int(spec.get('key_epoch', 0)),
+                    # `created`: the group's claimed age, which _merge_to_mesh's
+                    # tiebreak reads (RD_14.4 plan, Phase 3). 0 = unknown.
+                    _created=float(spec.get('created', 0.0)),
                     _wire_format=spec.get('wire_format'))
         _FIXTURE_GROUP_PUB[pid] = enc.publish()
         ns = UUID('00000000-0000-0000-0000-000000000aaa')
@@ -1774,11 +1935,19 @@ class IdentityAdapter:
             # A child cohort this node gateways + the recursion target.
             child_members = spec.get('child_group') or []
             if child_members:
-                cg_uuid = str(uuid5(
+                # `child_uuid` pins the child's uuid so a scenario can send an
+                # update for it; `child_public_only` and `child_key_epoch` seed
+                # a gateway holding only the child's public key, at a given
+                # rotation. Mirrors the C adapter.
+                cg_uuid = spec.get('child_uuid') or str(uuid5(
                     UUID('00000000-0000-0000-0000-000000000aaa'),
                     f'at-conformance-cg:{pid}'))
-                cgrp = Group(UUID(cg_uuid), {}, f'cg-{pid}',
-                             Encryptor.generate(), False)
+                public_only = bool(spec.get('child_public_only', False))
+                cg_enc = Encryptor.generate()
+                if public_only:
+                    cg_enc = Encryptor(cg_enc.publish(), public_only=True)
+                cgrp = Group(UUID(cg_uuid), {}, f'cg-{pid}', cg_enc, public_only,
+                             _key_epoch=int(spec.get('child_key_epoch', 0)))
                 for m_pid in child_members:
                     m = _impl(m_pid)
                     cgrp.add_address(m.identity.uuid, m.identity.address)
@@ -1931,6 +2100,16 @@ class IdentityAdapter:
     def _dispatch(self, participant: _Participant, inbound: Any) -> list[CapturedMessage]:
         if not isinstance(inbound, Message):
             raise AssertionError(f'expected a Message, got {type(inbound).__name__}')
+        if (inbound.function == IdentityProtocol.update and inbound.verified
+                and inbound.wire_signature is None
+                and isinstance(inbound.from_whom, Identity)
+                and not getattr(inbound.from_whom, '_public_only', True)):
+            # A captured group_key_update, as its sender's process emitted it.
+            # Over the wire it arrives signed and read as from a peer we hold,
+            # and the rotation gate checks that signature, so it goes the same
+            # way here. C rebuilds a response step through its inbound
+            # builder, which signs a group_key_update the same way.
+            inbound = Message.parse(bytes(inbound), inbound.from_whom.publish())
         trigger = self.TRIGGERS.get(inbound.function)
         if trigger is not None:   # a feature's pseudo-function
             return trigger(self, participant, inbound)
@@ -1955,6 +2134,22 @@ class IdentityAdapter:
             if inbound.obj:
                 target = str(from_json_string(inbound.obj).get('group_uuid', ''))
             participant.process.request_cohort_join(participant.queues, target)
+            return participant.drain_outbox()
+        if inbound.function == _TRIGGER_CHOOSE_GROUP:
+            participant.process._adopt_from_histories(participant.queues)
+            return participant.drain_outbox()
+        if inbound.function == _TRIGGER_PHASE3:
+            spec = from_json_string(inbound.obj) if inbound.obj else {}
+            for pid in spec.get('admit', []) or []:
+                ident = self._roster_by_uuid[participant._uuid_for_pid(pid)].identity
+                participant.process.peers.add(ident.publish(), 0)
+            participant.process.phase = 3
+            held, participant.held = participant.held, []
+            for msg in held:
+                participant.process.protocol.run_message_handlers(participant.queues, msg)
+            return participant.drain_outbox()
+        if inbound.function == _TRIGGER_ANCHORED_COHORT:
+            participant.process._maybe_form_anchored_cohort(participant.queues)
             return participant.drain_outbox()
         if inbound.function == _TRIGGER_HIERARCHY:
             participant.process._refresh_hierarchy(participant.queues)
@@ -2086,9 +2281,17 @@ class IdentityAdapter:
                    for m in members if str(m.get('uuid')) in self._roster_uuid_to_pid]
             participant.subtree_roster = sorted(ids)
             return participant.drain_outbox()
+        # The network process tags a frame from a cohort this node gateways
+        # (NetworkProcess._child_group_of); the harness delivers straight to
+        # identity, so it applies the same tag here. C mirrors in its adapter.
+        inbound.child_group = _child_tag(participant.process,
+                                         getattr(inbound.from_whom, 'address', None))
         # The protocol's handler dispatch is run synchronously. Threads
         # spawned via _spawn() are inlined because synchronous_dispatch is on.
-        participant.process.protocol.run_message_handlers(participant.queues, inbound)
+        handled = participant.process.protocol.run_message_handlers(participant.queues,
+                                                                    inbound)
+        if handled is False and inbound.function == IdentityProtocol.update:
+            participant.held.append(inbound)   # see _Participant.held
         # A propose handler (_process_id) only queues the approval vote in
         # confirmed_block; the actual vote_on_peer message is sent by the
         # separate vote_response phase-3 task. Drive one cycle here so the
@@ -2180,9 +2383,17 @@ class IdentityAdapter:
                     else sender_identity.encryptor,
                     _public_only=False).publish()
         elif function == IdentityProtocol.accept:
+            # The canonical grant, (package_hash, capabilities, seq, grantee):
+            # identity in the envelope, the grantee named (RD_2.6 plan §2.4).
+            # `grantee` names another participant (a misaddressed grant);
+            # the recipient by default. Mirrors the C adapter.
             caps_list = payload.get('capabilities', [])
-            obj = to_json_string((sender_identity.publish(),
-                                  self._package_hash, caps_list))
+            grantee_pid = payload.get('grantee') or to_id
+            grantee = (participants[grantee_pid].impl.identity.uuid
+                       if grantee_pid in participants else None)
+            obj = to_json_string((self._package_hash, caps_list,
+                                  int(payload.get('seq', 1)),
+                                  None if grantee is None else str(grantee)))
         elif function == IdentityProtocol.confirm:
             target_pid = payload.get('peer') or payload.get('candidate')
             target = participants[target_pid].impl.identity
@@ -2225,6 +2436,30 @@ class IdentityAdapter:
                 # sends it. Mirrors the C adapter.
                 canonical.pop('wire_format', None)
             obj = to_json_string(canonical) if canonical is not None else ''
+        elif function == IdentityProtocol.key_query:
+            # {group_uuid, epoch} naming the receiver's group (`other_group:
+            # true` names another), at the sender's epoch. Mirrors the C adapter.
+            receiver = participants[to_id].impl
+            group_uuid = (str(uuid4()) if payload.get('other_group')
+                          else str(receiver.process.group.uuid))
+            epoch = sender.process.group.key_epoch if sender.process.group else 0
+            obj = json.dumps({'group_uuid': group_uuid, 'epoch': int(epoch)})
+        elif function == IdentityProtocol.key_stale:
+            # The network process's local signal: the address of the member
+            # (`address_of: pid`) whose group frame would not open.
+            obj = participants[payload['address_of']].impl.identity.address
+        elif function == IdentityProtocol.cohort_invite:
+            # An anchored cohort minted from the payload (RD_14.4 Phase 6):
+            # {members: [pid, ...], group_uuid, key_epoch}, a fresh key, each
+            # member at its own address. Mirrors the C adapter.
+            from autonomous_trust.core._python.identity.encrypt import Encryptor as _Enc
+            members = {str(participants[m].impl.identity.uuid).lower():
+                       participants[m].impl.identity.address
+                       for m in payload.get('members') or []}
+            cohort = Group(UUID(payload.get('group_uuid')), members, 'anchored',
+                           _Enc.generate(), False,
+                           _key_epoch=int(payload.get('key_epoch', 0)))
+            obj = json.dumps(cohort.to_canonical())
         elif function == IdentityProtocol.hierarchy_req:
             # A late joiner asking the group to state their positions
             # (protocol step 7). The handler answers from its own claim and
@@ -2433,6 +2668,10 @@ class IdentityAdapter:
             grp = sender.process.group
             group_uuid = str(grp.uuid) if grp is not None \
                 else '00000000-0000-0000-0000-000000000000'
+            # A gateway also queries each child cohort; a step names that
+            # group explicitly. C mirrors.
+            if isinstance(payload, dict) and isinstance(payload.get('group_uuid'), str):
+                group_uuid = payload['group_uuid']
             obj = to_json_string({'group_uuid': group_uuid, 'have': have})
         elif function == IdentityProtocol.id_response:
             # Identity-resync response: the responder's published identity +
@@ -2531,7 +2770,8 @@ class IdentityAdapter:
 
         if function in (_TRIGGER_CAPS_RESYNC, _TRIGGER_SUBTREE_ROSTER,
                         _TRIGGER_ATTEST_PULL, _TRIGGER_ATTEST_REPLAY,
-                        _TRIGGER_HIERARCHY):
+                        _TRIGGER_HIERARCHY, _TRIGGER_CHOOSE_GROUP,
+                        _TRIGGER_ANCHORED_COHORT):
             # Pseudo-function: no wire payload; _dispatch invokes the sweep /
             # roster enumeration directly instead of a handler.
             obj = ''
@@ -2540,6 +2780,61 @@ class IdentityAdapter:
                       from_whom=sender_identity,
                       to_whom=Network.broadcast if to_id == 'broadcast' else None,
                       encrypt=(function != IdentityProtocol.announce))
+        if function == IdentityProtocol.id_response and isinstance(payload, dict):
+            # `unsigned: true` arrives unverified; `signed_by: <pid>` carries
+            # another participant's signature over the sender's identity
+            # (RD_2.6 plan §2.5). Mirrors the C adapter.
+            if payload.get('signed_by') in participants:
+                msg = Message(CfgIds.identity, function, obj,
+                              from_whom=participants[payload['signed_by']].impl.identity,
+                              to_whom=msg.to_whom, encrypt=msg.encrypt)
+            if payload.get('unsigned'):
+                msg.verified = False
+        if (function == IdentityProtocol.update and isinstance(payload, dict)
+                and payload.get('unsigned')):
+            # Arrives unverified. Mirrors the C adapter.
+            msg.verified = False
+        if (function == IdentityProtocol.update and isinstance(payload, dict)
+                and not payload.get('unsigned') and not payload.get('held_unverified')):
+            # As the network hands it on: signed (by `signed_by: pid`, else the
+            # sender) and parsed from the wire, so the signature rides along
+            # for the rotation gate to check against the key it holds. Read as
+            # from the sender, a peer the receiver holds; with
+            # `self_attested: true`, as the broadcast channel leaves a
+            # stranger's frame, verified against the key its own envelope
+            # names, whose uuid `claims: <pid>` replaces. Mirrors the C adapter.
+            signer = (participants[payload['signed_by']].impl.identity
+                      if payload.get('signed_by') in participants else sender_identity)
+            raw = bytes(Message(CfgIds.identity, function, obj, from_whom=signer))
+            if payload.get('self_attested'):
+                wire = json.loads(raw.decode('utf-8'))
+                if payload.get('claims') in participants:
+                    wire['from_uuid'] = str(participants[payload['claims']].impl.identity.uuid)
+                msg = Message.parse(json.dumps(wire).encode('utf-8'), None)
+            else:
+                msg = Message.parse(raw, sender_identity.publish() if hasattr(
+                    sender_identity, 'publish') else sender_identity)
+        if (function == IdentityProtocol.update and isinstance(payload, dict)
+                and payload.get('held_unverified')):
+            # Signed (by `signed_by: pid`, else the sender), and arrived before
+            # the receiver held the sender: the signature rides along unchecked,
+            # as Message.parse leaves an unattributed frame. Mirrors the C adapter.
+            signer = (participants[payload['signed_by']].impl.identity
+                      if payload.get('signed_by') in participants else sender.identity)
+            signed = Message(CfgIds.identity, function, obj, from_whom=signer)
+            wire = json.loads(bytes(signed).decode('utf-8'))
+            for key in [k for k in wire if k.startswith('from_')]:
+                del wire[key]
+            msg = Message.parse(json.dumps(wire).encode('utf-8'), None)
+            msg.verified = False
+            msg.from_whom = sender_identity.publish() if hasattr(
+                sender_identity, 'publish') else sender_identity
+        if function == IdentityProtocol.key_stale:
+            # Local IPC names no sender; `from_wire: true` presents it as a
+            # peer's frame, which identity refuses.
+            msg.encrypt = False
+            if not payload.get('from_wire'):
+                msg.from_whom = None
         if function == FirstContactProtocol.reach_record and payload.get('local'):
             # As the network process hands on a relay lookup's answer: no
             # sender on the envelope.

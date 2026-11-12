@@ -217,6 +217,30 @@ def test_seed_cohort_mutual_recognition(tmp_path, scenario_factory):
     assert len(group_uuids) == 1, "every seeded peer must share one group UUID"
 
 
+def test_seed_cohort_group_history_loads_as_a_node_loads_it(tmp_path, scenario_factory):
+    """Each seeded peer's group.cfg.json carries a history that peer can
+    populate, the way IdentityProcess.choose_group reads it. An empty {}
+    raised KeyError 'blacklist' there, and the node fell back to minting a
+    group of its own, so the seeded cohort never formed."""
+    import queue
+    from autonomous_trust.core._python.identity.history.history import IdentityHistory
+    from tools.seed_dod_cohort import seed_cohort
+
+    sc = scenario_factory(squad_size=2, swarm_size=2, sensor_count=2,
+                          hacked_sensors=1, include_command=False)
+    seeded = seed_cohort(tmp_path, sc, force=True)
+
+    for peer in seeded:
+        d = tmp_path / peer / "etc" / "at"
+        with (d / "identity.cfg.json").open() as f:
+            identity = json.load(f, object_hook=config_json_decoder)
+        with (d / "peers.cfg.json").open() as f:
+            peers = json.load(f, object_hook=config_json_decoder)
+        with (d / "group.cfg.json").open() as f:
+            _group, hist_dict = json.load(f, object_hook=config_json_decoder)
+        IdentityHistory(identity, peers, queue.Queue()).populate(hist_dict)
+
+
 def test_seed_cohort_reputation_above_threshold(tmp_path, scenario_factory):
     """Every seeded peer's reputation snapshot has every OTHER seeded
     peer at >0.5 so they would all survive the rep-persist filter."""
@@ -373,6 +397,54 @@ def test_seed_cohort_evidence_signatures_verify(tmp_path, scenario_factory):
     assert verified > len(roster.all) // 2, "short of a reader's quorum"
 
 
+def test_seed_cohort_evidence_is_founded_by_a_roster(tmp_path, scenario_factory):
+    """The seeded window opens with the field group's genesis roster, listing
+    every seeded member and gateway with its signing key, and every placement
+    in it carries a certificate those keys verify. A chain with entries and no
+    roster is reset at boot, whatever its checkpoint says."""
+    from tools.seed_dod_cohort import seed_cohort
+    from nacl.encoding import HexEncoder
+    from nacl.signing import VerifyKey
+    from autonomous_trust.core._python.reputation.reputation import (
+        TransactionHistory, place_designation, place_value_digest,
+        placement_entry,
+    )
+
+    sc = scenario_factory(squad_size=3, swarm_size=2, sensor_count=2,
+                          hacked_sensors=1, include_command=False)
+    seeded = seed_cohort(tmp_path, sc, force=True)
+    peer = sorted(seeded)[0]
+    chain, _signed = _seeded_evidence(tmp_path / peer)
+    genesis = chain[0]
+    assert genesis.index == 0 and genesis.roster_op == 'genesis'
+    assert TransactionHistory(_chain=chain).latest_roster() is not None
+
+    peers_file = tmp_path / peer / "etc" / "at" / "peers.cfg.json"
+    with peers_file.open() as f:
+        others = json.load(f, object_hook=config_json_decoder)
+    with (tmp_path / peer / "etc" / "at" / "identity.cfg.json").open() as f:
+        me = json.load(f, object_hook=config_json_decoder)
+    expected = {str(p.uuid).lower() for p in others.all} | {str(me.uuid).lower()}
+    keys = dict(map(tuple, genesis.roster_members))
+    assert set(keys) == expected
+
+    by_index = {tx.index: tx for tx in chain}
+    certified = 0
+    for tx in chain:
+        if not tx.place_sigs:
+            continue
+        entries = [placement_entry(by_index[i])
+                   for i in range(tx.place_from, tx.index + 1)]
+        desig = place_designation(tx.place_from,
+                                  by_index[tx.place_from].prev_hash,
+                                  place_value_digest(entries, tx.place_from))
+        for voter, sig in tx.place_sigs.items():
+            VerifyKey(keys[voter].encode('ascii'), encoder=HexEncoder).verify(
+                desig, HexEncoder.decode(sig.encode('ascii')))
+        certified += tx.index - tx.place_from + 1
+    assert certified == len(chain), "every entry is in a certified placement"
+
+
 def test_seed_cohort_evidence_supports_the_seeded_tier(tmp_path,
                                                       scenario_factory):
     """The point of the whole exercise: a real ReputationProcess booting on
@@ -429,8 +501,231 @@ def test_seed_cohort_evidence_supports_the_seeded_tier(tmp_path,
     # The evidence verified, so the attested history came up with it.
     assert rp._checkpoint is not None  # noqa: SLF001
     assert len(rp.history) == rp._checkpoint.count  # noqa: SLF001
+    # It came up with its roster, so boot did not reset it as pre-roster.
+    assert rp.history.latest_roster() is not None
     # ...and every seeded peer holds its seeded tier.
     assert rp.reputations.current
     for uuid, score in rp.reputations.current.items():
         assert rp._trust_tier(score) >= SEED_TIER, \
             f"{str(uuid)[:8]} restored at {score:.4f}, below tier {SEED_TIER}"
+
+
+def test_seed_cohort_gateway_restores_field_evidence_as_its_child_chain(
+        tmp_path, scenario_factory):
+    """A gateway holds the field window as the CHILD chain it is, restored
+    once its child group set arrives, with the field roster in force. Its
+    primary chain stays empty for the command cohort it cold-bootstraps: a
+    field-founded primary would give the field roster that cohort's
+    decisions."""
+    import queue
+    from unittest.mock import MagicMock
+    from autonomous_trust.core.processes import ProcessTracker
+    from autonomous_trust.core.system import CfgIds
+    from autonomous_trust.core._python.config import Configuration
+    from autonomous_trust.core._python.reputation.repprocess import (
+        ReputationProcess,
+    )
+    from tools.seed_dod_cohort import GROUP_NICKNAME, is_gateway, seed_cohort
+    from examples.dod_mission.reputation_warmstart import SEED_TIER
+
+    sc = scenario_factory(squad_size=3, swarm_size=2, sensor_count=2,
+                          hacked_sensors=1, include_command=False)
+    seed_cohort(tmp_path, sc, force=True)
+    gws = sorted(n for n in sc.peers if is_gateway(n))
+    assert gws, "the scenario has no gateway to check"
+    root = tmp_path / gws[0]
+    cfg = root / "etc" / "at"
+
+    def load(name):
+        with (cfg / name).open() as f:
+            return json.load(f, object_hook=config_json_decoder)
+
+    field = load("group_child_%s.cfg.json" % GROUP_NICKNAME)
+    procs = []
+    for nm in (CfgIds.network, CfgIds.identity, CfgIds.negotiation,
+               CfgIds.reputation):
+        p = MagicMock()
+        p.name = nm
+        procs.append(p)
+    configs = {
+        'processes': procs,
+        CfgIds.identity: load("identity.cfg.json"),
+        CfgIds.peers: load("peers.cfg.json"),
+        CfgIds.reputation: load("reputation.cfg.json"),
+    }
+    prior = os.environ.get(Configuration.ROOT_VARIABLE_NAME)
+    os.environ[Configuration.ROOT_VARIABLE_NAME] = str(root)
+    try:
+        rp = ReputationProcess(configs, ProcessTracker(), queue.Queue(),
+                               suppress_log=True)
+        assert len(rp.history) == 0
+        rp.protocol.child_groups = {str(field.uuid): field}
+        rp._restore_child_evidence({CfgIds.identity: queue.Queue(),  # noqa: SLF001
+                                    CfgIds.negotiation: queue.Queue(),
+                                    CfgIds.main: queue.Queue(),
+                                    CfgIds.network: queue.Queue()})
+    finally:
+        if prior is None:
+            del os.environ[Configuration.ROOT_VARIABLE_NAME]
+        else:
+            os.environ[Configuration.ROOT_VARIABLE_NAME] = prior
+    child = rp._chain_for_group(str(field.uuid))  # noqa: SLF001
+    assert len(child) == rp._checkpoints[str(field.uuid)].count  # noqa: SLF001
+    assert child.latest_roster() is not None
+    assert len(rp.history) == 0
+    assert rp.reputations.current
+    for uuid, score in rp.reputations.current.items():
+        assert rp._trust_tier(score) >= SEED_TIER, \
+            f"{str(uuid)[:8]} restored at {score:.4f}, below tier {SEED_TIER}"
+
+
+# ------------------------------------------------- seeding the coordinator
+# At 100 peers the coordinator's cold admission reached only one member, so a
+# late joiner such as the MQ-800 never learned it and dropped every data
+# subscribe it sent as undecryptable. --seed-coordinator makes it a seeded
+# member from t=0; its capabilities are left for peers to learn at runtime.
+
+def _small(scenario_factory):
+    return scenario_factory(squad_size=2, swarm_size=2, sensor_count=2,
+                            hacked_sensors=1, include_command=False)
+
+
+def test_coordinator_not_seeded_by_default(tmp_path, scenario_factory):
+    from tools.seed_dod_cohort import seed_cohort
+    seeded = seed_cohort(tmp_path, _small(scenario_factory), force=True)
+    assert "coordinator" not in seeded
+    assert not (tmp_path / "coordinator").exists()
+
+
+def test_seed_coordinator_writes_full_state(tmp_path, scenario_factory):
+    from tools.seed_dod_cohort import seed_cohort
+    seeded = seed_cohort(tmp_path, _small(scenario_factory), force=True,
+                         seed_coordinator=True)
+    assert "coordinator" in seeded
+    d = tmp_path / "coordinator" / "etc" / "at"
+    for fn in ("identity.cfg.json", "group.cfg.json", "peers.cfg.json",
+               "reputation.cfg.json", "reputation-history.cfg.json",
+               "peer-capabilities.cfg.json"):
+        assert (d / fn).exists(), f"coordinator missing {fn}"
+
+
+def test_seeded_peers_recognise_coordinator(tmp_path, scenario_factory):
+    from tools.seed_dod_cohort import seed_cohort
+    seeded = seed_cohort(tmp_path, _small(scenario_factory), force=True,
+                         seed_coordinator=True)
+    for peer in seeded:
+        if peer == "coordinator":
+            continue
+        with (tmp_path / peer / "etc" / "at" / "peers.cfg.json").open() as f:
+            peers = json.load(f, object_hook=config_json_decoder)
+        assert "coordinator" in {p.petname for p in peers.all}, peer
+
+
+def test_coordinator_capabilities_not_seeded(tmp_path, scenario_factory):
+    from tools.seed_dod_cohort import seed_cohort
+    seeded = seed_cohort(tmp_path, _small(scenario_factory), force=True,
+                         seed_coordinator=True)
+    coord_dir = tmp_path / "coordinator" / "etc" / "at"
+    with (coord_dir / "identity.cfg.json").open() as f:
+        coord_uuid = str(json.load(f, object_hook=config_json_decoder).uuid)
+    for peer in seeded:
+        if peer == "coordinator":
+            continue
+        with (tmp_path / peer / "etc" / "at" / "peer-capabilities.cfg.json").open() as f:
+            pc = json.load(f, object_hook=config_json_decoder)
+        listed = {str(u) for caps in pc._listing.values() for u in caps}
+        assert coord_uuid not in listed, peer
+
+
+# ------------------------------------------------- hierarchical seeding
+
+
+def _hier(scenario_factory):
+    return scenario_factory(squad_size=4, swarm_size=35, sensor_count=3,
+                            hacked_sensors=2, include_command=True, rq86_count=3)
+
+
+def _load(path):
+    with path.open() as f:
+        return json.load(f, object_hook=config_json_decoder)
+
+
+def test_hierarchy_anchor_sees_gateway_at_field_address(tmp_path, scenario_factory):
+    """A C microdrone learns the gateway from the anchor's history, so the
+    anchor must hold the gateway at the one address the field can reach."""
+    from tools.seed_dod_cohort import seed_cohort
+    from examples.dod_mission.deploy.hierarchy import plan_layout, field_network
+    sc = _hier(scenario_factory)
+    lay = plan_layout(sc, 32)
+    seed_cohort(tmp_path, sc, force=True, seed_coordinator=True, max_cohort=32)
+    c2 = lay.cohorts[1]
+    peers = _load(tmp_path / c2.anchor / "etc/at/peers.cfg.json")
+    gw = next(p for p in peers.all if p.petname == c2.gateway)
+    assert gw.address == lay.ip(c2.gateway, field_network(2))
+    grp, _ = _load(tmp_path / c2.anchor / "etc/at/group.cfg.json")
+    assert lay.ip(c2.gateway, field_network(2)) in list(grp.addresses)
+
+
+def test_hierarchy_c_microdrones_get_field_identities_only(tmp_path, scenario_factory):
+    from tools.seed_dod_cohort import seed_cohort
+    from examples.dod_mission.deploy.hierarchy import plan_layout, field_network
+    sc = _hier(scenario_factory)
+    lay = plan_layout(sc, 32)
+    seed_cohort(tmp_path, sc, force=True, seed_coordinator=True, max_cohort=32)
+    c = lay.c_microdrones()[0]
+    d = tmp_path / c / "etc/at"
+    ident = json.loads((d / "identity.cfg.json").read_text())
+    assert "hex_seed" in ident["signature"]
+    assert ident["address"] == lay.ip(c, field_network(lay.cohort_of(c).index))
+    assert not (d / "group.cfg.json").exists()
+
+
+def test_hierarchy_command_members_see_gateway_at_command_address(tmp_path, scenario_factory):
+    from tools.seed_dod_cohort import seed_cohort
+    from examples.dod_mission.deploy.hierarchy import plan_layout, COMMAND_NETWORK
+    sc = _hier(scenario_factory)
+    lay = plan_layout(sc, 32)
+    seed_cohort(tmp_path, sc, force=True, seed_coordinator=True, max_cohort=32)
+    peers = _load(tmp_path / "coordinator" / "etc/at/peers.cfg.json")
+    gw = next(p for p in peers.all if p.petname == "rq86-1")
+    assert gw.address == lay.ip("rq86-1", COMMAND_NETWORK)
+    names = {p.petname for p in peers.all}
+    assert not any(n.startswith("microdrone-") for n in names)
+
+
+def test_hierarchy_gateway_holds_command_primary_and_field_child(tmp_path, scenario_factory):
+    from tools.seed_dod_cohort import seed_cohort
+    sc = _hier(scenario_factory)
+    seed_cohort(tmp_path, sc, force=True, seed_coordinator=True, max_cohort=32)
+    d = tmp_path / "rq86-1" / "etc/at"
+    primary, _ = _load(d / "group.cfg.json")
+    child_files = list(d.glob("group_child_*.cfg.json"))
+    assert len(child_files) == 1
+    child = _load(child_files[0])
+    assert primary.uuid != child.uuid
+    hyb = json.loads((d / "hybrid_net.cfg.json").read_text())
+    assert hyb["is_gateway"] is True and len(hyb["inners"]) == 2
+    assert hyb["group_routes"] == [{"group_uuid": str(child.uuid), "leg_index": 1}]
+    from autonomous_trust.core._python.network.hybrid import hybrid_config_from_json
+    assert len(hybrid_config_from_json(hyb).inners) == 2
+    net = _load(d / "network.cfg.json")
+    assert net._ip4_cidr.startswith("172.30.0.")
+
+
+def test_hierarchy_seeds_no_rank(tmp_path, scenario_factory):
+    """Admission is proof-of-authority: the highest-ranked voter decides. A
+    gateway stays out of admission, so ranking it above its field cohort
+    would leave every field proposal without a deciding vote."""
+    from tools.seed_dod_cohort import seed_cohort
+    sc = _hier(scenario_factory)
+    seed_cohort(tmp_path, sc, force=True, seed_coordinator=True, max_cohort=32)
+    assert _load(tmp_path / "rq86-2/etc/at/identity.cfg.json")._rank == 0
+    assert _load(tmp_path / "coordinator/etc/at/identity.cfg.json")._rank == 0
+
+
+def test_flat_seed_unchanged_without_cohort_size(tmp_path, scenario_factory):
+    from tools.seed_dod_cohort import seed_cohort
+    sc = scenario_factory(squad_size=2, swarm_size=2, sensor_count=2,
+                          hacked_sensors=1, include_command=False)
+    seeded = seed_cohort(tmp_path, sc, force=True)
+    assert not any((tmp_path / p / "etc/at/hybrid_net.cfg.json").exists() for p in seeded)

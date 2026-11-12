@@ -157,8 +157,9 @@ static void _dispatch(process_t *proc, identity_t *sender, json_t *payload)
  * from ourselves plants our own half, which handle_committed accepts because
  * it writes only its sender's half; it waits in the pool for its placement. */
 static void _commit_half_by(process_t *proc, identity_t *scorer,
-                            identity_t *signer, const char *task_str,
-                            double score, const char *channel)
+                            identity_t *signer, identity_t *names,
+                            const char *task_str, double score,
+                            const char *channel)
 {
     char who[UUID_STRING_LEN + 1], by[UUID_STRING_LEN + 1];
     uuid_unparse_lower(scorer->uuid, who);
@@ -166,7 +167,7 @@ static void _commit_half_by(process_t *proc, identity_t *scorer,
     uuid_t task;
     ck_assert_int_eq(uuid_parse(task_str, task), 0);
     uint8_t desig[512];
-    size_t dlen = commit_designation(scorer->uuid, task, score, channel, desig,
+    size_t dlen = commit_designation(scorer->uuid, task, tx_score_to_milli(score), channel, desig,
                                      sizeof(desig));
     ck_assert(dlen > 0);
     unsigned char sig[crypto_sign_BYTES];
@@ -177,10 +178,22 @@ static void _commit_half_by(process_t *proc, identity_t *scorer,
     json_t *p = json_object();
     json_object_set_new(p, "task_uuid", json_string(task_str));
     json_object_set_new(p, "peer_uuid", json_string(who));
-    json_object_set_new(p, "score", json_real(score));
+    json_object_set_new(p, "score_milli", json_integer(tx_score_to_milli(score)));
     if (channel != NULL)
         json_object_set_new(p, "channel", json_string(channel));
     json_object_set_new(p, "certificate", json_pack("{s:s}", by, hex));
+    /* Whom the half names, and its scorer's own signature (R+D.md §14.2). */
+    uint8_t hd[HALF_DESIG_MAX];
+    size_t hlen = half_designation(task, scorer->uuid, names->uuid, tx_score_to_milli(score),
+                                   channel, hd, sizeof(hd));
+    ck_assert(hlen > 0);
+    ck_assert(crypto_sign_detached(sig, NULL, hd, hlen,
+                                   scorer->signature.private) == 0);
+    hexlify(sig, crypto_sign_BYTES, (unsigned char *)hex);
+    char named[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(names->uuid, named);
+    json_object_set_new(p, "names", json_string(named));
+    json_object_set_new(p, "half_sig", json_string(hex));
     _dispatch(proc, scorer, p);
     json_decref(p);
 }
@@ -190,12 +203,13 @@ typedef struct { identity_t *me, *alice, *carol; process_t *proc;
 
 static cohort_t *g_c;
 
-/* The same, signed by me for anyone else's half and by alice for mine. */
+/* The same, signed by me for anyone else's half and by alice for mine. My
+ * half names alice and anyone else's names me, so mine and alice's pair. */
 static void _commit_half(process_t *proc, identity_t *scorer,
                          const char *task_str, double score, const char *channel)
 {
     identity_t *signer = scorer == g_c->me ? g_c->alice : g_c->me;
-    _commit_half_by(proc, scorer, signer, task_str, score, channel);
+    _commit_half_by(proc, scorer, signer, signer, task_str, score, channel);
 }
 
 /* Ordinary halves held, in the chain and the pool. */
@@ -272,7 +286,7 @@ DEFINE_TEST(test_a_half_committed_before_a_join_reaches_the_joiner)
         ck_assert_str_eq(json_string_value(json_object_get(p, "task_uuid")), c.t);
         ck_assert_str_eq(json_string_value(json_object_get(p, "peer_uuid")), me);
         ck_assert_str_eq(json_string_value(json_object_get(p, "channel")), "probe");
-        ck_assert(json_real_value(json_object_get(p, "score")) > 0.89);
+        ck_assert_int_eq(json_integer_value(json_object_get(p, "score_milli")), 900);
         ck_assert_ptr_null(json_object_get(p, "group_uuid"));
     }
     _clear_frames();

@@ -1,0 +1,44 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: transport-liveness
+byte_pinning: false
+description: |
+    When a peer was last heard through the node's own transport (C
+    net_liveness, Python TransportLiveness). An extension that carries
+    traffic some other way asks this to learn whether the transport path to
+    a peer works. A peer never heard counts from network start; an older
+    stamp than the one held is ignored; the answer is never negative.
+
+participants:
+  - id: node
+    role: receiver
+
+fixtures:
+  start: 100.0
+  peers:
+    a: "aaaaaaaa-0000-4000-8000-000000000001"
+    b: "bbbbbbbb-0000-4000-8000-000000000002"
+    c: "cccccccc-0000-4000-8000-000000000003"
+  events:
+    - {at: 110.0, heard: a}
+    - {at: 125.0, heard: b}
+    - {at: 120.0, heard: b}
+  checks:
+    - {at: 150.0, peer: a, quiet_for: 40.0}
+    - {at: 150.0, peer: b, quiet_for: 25.0}
+    - {at: 150.0, peer: c, quiet_for: 50.0}
+    - {at: 105.0, peer: b, quiet_for: 0.0}
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: check_transport_liveness
+    description: |
+        The adapter replays the events into the production tracker and asks
+        every check.
+
+expected_state:
+  node:
+    all_checks_match: true

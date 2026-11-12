@@ -41,6 +41,12 @@ endif()
 
 project(autonomous_trust C CXX)
 
+# Where install() puts libraries: lib unless the caller says otherwise. The rpm
+# packages pass lib64, the directory the Fedora/RHEL loader searches.
+if(NOT CMAKE_INSTALL_LIBDIR)
+    set(CMAKE_INSTALL_LIBDIR lib)
+endif()
+
 if(WIN32)
     # Windows (MinGW-w64, UCRT): the POSIX the sources are written against comes
     # from compat/win32 — stand-ins for the POSIX headers MinGW lacks, and
@@ -147,7 +153,13 @@ set(useful_warnings
     -Winit-self
 )
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
-    list(APPEND useful_warnings -Wuse-after-free -Wfree-nonheap-object -Wno-cast-function-type)
+    list(APPEND useful_warnings -Wfree-nonheap-object -Wno-cast-function-type)
+    # GCC 12+; ubuntu:22.04 (the AppImage container) ships GCC 11.
+    include(CheckCCompilerFlag)
+    check_c_compiler_flag(-Wuse-after-free AT_HAVE_WUAF)
+    if(AT_HAVE_WUAF)
+        list(APPEND useful_warnings -Wuse-after-free)
+    endif()
 endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
     list(APPEND useful_warnings -Wno-microsoft-anon-tag -Wno-deprecated-non-prototype -Wno-unused-but-set-variable -Wno-unknown-pragmas -Wno-cast-align)
@@ -176,6 +188,17 @@ add_link_options(-pthread ${sysroot_flag})
 
 # Static linking option for embedded/IoT builds
 option(AT_STATIC "Link at_demo fully statically (no shared library dependencies)" OFF)
+
+# Red-team builds only. With this ON, $AT_REDTEAM_DEFECT_AT (Unix seconds) makes
+# the node answer the handshake and echo probes wrongly from that time on, so
+# that honest peers can be timed detecting and excluding it. Release builds
+# leave it OFF, and in them the variable does nothing.
+option(AT_REDTEAM "Compile in the probe-defection switch for red-team runs" OFF)
+if(AT_REDTEAM)
+    add_compile_definitions(AT_REDTEAM)
+    message(WARNING "AT_REDTEAM is ON: this build answers probes wrongly when "
+                    "AT_REDTEAM_DEFECT_AT is set. Never ship it.")
+endif()
 
 # Zero Trust Architecture integration: builds libat_zta (src/c/extensions/zta,
 # which brings OpenSSL). The core itself needs neither (FEATURE_SPLIT_PLAN Phase 6).
@@ -214,7 +237,8 @@ option(AT_NET_DTN "Build the DTN/Bundle-Protocol transport library (libat_dtn)" 
 # cross-cluster discovery): builds the libat_gateway extension library
 # (extensions/gateway/). ON by default because building it turns nothing on:
 # a node uses it only when its network config sets "envelope": true, and the
-# core refuses such a config when the library is absent.
+# core refuses such a config when the library is absent. The directory may be
+# missing (the gateway is kept in its own repository); the build then skips it.
 option(AT_NET_GATEWAY "Build the gateway relay library (libat_gateway)" ON)
 
 # The verification layers of R+D.md §12, each its own extension library
@@ -229,6 +253,12 @@ option(AT_ORACLE_PREQUENTIAL  "Build the prequential-competence layer (libat_pre
 option(AT_ORACLE_REPLICATION  "Build the replicated-execution layer (libat_replication)" ON)
 if(AT_ORACLE_REPLICATION AND NOT AT_ORACLE_CERTIFICATES)
     message(FATAL_ERROR "AT_ORACLE_REPLICATION=ON requires AT_ORACLE_CERTIFICATES=ON (SplitMix64)")
+endif()
+# Selective assignment (R+D.md §12.7): inert until $AT_SELECTION names a
+# declaration, like the layers above.
+option(AT_ORACLE_SELECTION    "Build the selective-assignment layer (libat_selection)" ON)
+if(AT_ORACLE_SELECTION AND NOT AT_ORACLE_CERTIFICATES)
+    message(FATAL_ERROR "AT_ORACLE_SELECTION=ON requires AT_ORACLE_CERTIFICATES=ON (SplitMix64)")
 endif()
 
 if(AT_STATIC AND APPLE)
@@ -283,14 +313,68 @@ else()
     message(FATAL_ERROR "Required dependency libsodium not found.")
 endif()
 
-# jansson
-find_path(LIBJANSSON_INCLUDE_DIR jansson.h HINTS ${CONDA_ROOT})
-find_library(LIBJANSSON_LIBRARY NAMES jansson HINTS ${CONDA_ROOT})
-include_directories(${LIBJANSSON_INCLUDE_DIR})
-if(LIBJANSSON_LIBRARY)
-    message("-- Found libjansson at ${LIBJANSSON_LIBRARY}")
+# Ryu (shortest-decimal d2s) for JCS number formatting.  Pulled in as a
+# git submodule under third_party/ryu/; the upstream repo's C sources live
+# in its `ryu/` subdir, so source paths read `third_party/ryu/ryu/...`.
+# Includes go via `ryu/ryu.h` — the include-dir at `third_party/ryu/`
+# lets that resolve to `third_party/ryu/ryu/ryu.h`.
+#
+# Build target defined here at top level so both the conformance runner
+# and the jcs_test target can link against it.
+#
+# The library itself also carries Ryu: utilities/numfmt.c formats ("%.17g")
+# and parses doubles with d2fixed.c's d2exp and s2d.c instead of libc, whose
+# results are not correctly rounded on every target (uClibc-ng, on SPARC).
+# The objects are compiled once, position-independent, into at_ryu_obj and
+# linked into both libautonomous_trust builds as well as at_ryu.
+add_library(at_ryu_obj OBJECT
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu/ryu/d2s.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu/ryu/d2fixed.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu/ryu/s2d.c
+)
+set_target_properties(at_ryu_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(at_ryu_obj PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu
+)
+# Ryu emits a few unused-variable warnings on some compilers; suppress
+# rather than patch the submodule.
+target_compile_options(at_ryu_obj PRIVATE -O2 -Wno-error -Wno-unused-function)
+add_library(at_ryu STATIC $<TARGET_OBJECTS:at_ryu_obj>)
+target_include_directories(at_ryu PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu
+)
+
+# numfmt.c is the one library source that includes Ryu's headers
+set_source_files_properties(autonomous_trust/utilities/numfmt.c PROPERTIES
+    INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu)
+
+# jansson: the vendored submodule by default (cmake/vendored-jansson.cmake
+# says why). AT_SYSTEM_JANSSON links the system libjansson instead, whose
+# number conversions are then the libc's: fine on glibc, wrong on uClibc-ng,
+# and the float self-test refuses to start where they are wrong.
+option(AT_SYSTEM_JANSSON "Link the system libjansson instead of the vendored copy" OFF)
+if(AT_SYSTEM_JANSSON)
+    set(AT_PC_JANSSON_REQUIRES " jansson")
+    set(AT_PC_JANSSON_CFLAGS "")
+    set(AT_PC_JANSSON_LIBS_PRIVATE "")
+    find_path(LIBJANSSON_INCLUDE_DIR jansson.h HINTS ${CONDA_ROOT})
+    find_library(LIBJANSSON_LIBRARY NAMES jansson HINTS ${CONDA_ROOT})
+    include_directories(${LIBJANSSON_INCLUDE_DIR})
+    if(LIBJANSSON_LIBRARY)
+        message("-- Found libjansson at ${LIBJANSSON_LIBRARY}")
+    else()
+        message(FATAL_ERROR "Required dependency libjansson not found.")
+    endif()
 else()
-    message(FATAL_ERROR "Required dependency libjansson not found.")
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/vendored-jansson.cmake)
+    set(LIBJANSSON_LIBRARY ${AT_JANSSON_TARGET})
+    # <jansson.h> must find the wrapper first: ahead of any system copy, and
+    # ahead of jansson's own build dir, which holds an unrenamed jansson.h
+    # beside the jansson_config.h the wrapper needs. Each BEFORE prepends,
+    # so the wrapper goes last.
+    include_directories(BEFORE ${AT_JANSSON_CONFIG_DIR})
+    include_directories(BEFORE ${AT_JANSSON_WRAPPER_DIR})
+    message("-- Using vendored jansson from ${AT_JANSSON_SOURCE_DIR}")
 endif()
 
 # protobuf
@@ -397,7 +481,13 @@ endif()
 # check (testing only — optional for non-test builds)
 find_path(LIBCHECK_INCLUDE_DIR check.h HINTS ${CONDA_ROOT})
 find_library(LIBCHECK_LIBRARY NAMES check libcheck.so libcheck.a HINTS ${CONDA_ROOT})
-if(LIBCHECK_LIBRARY)
+# Off for builds that only want the libraries (scripts/package-devel.sh): every
+# test target is gated on LIBCHECK_LIBRARY, which this hides.
+option(AT_TESTS "Build the unit tests (needs libcheck)" ON)
+if(NOT AT_TESTS)
+    set(LIBCHECK_LIBRARY "")
+    message("-- Tests off (AT_TESTS=OFF)")
+elseif(LIBCHECK_LIBRARY)
     include_directories(${LIBCHECK_INCLUDE_DIR})
     message("-- Found libcheck at ${LIBCHECK_LIBRARY}")
 else()
@@ -423,8 +513,9 @@ set(DEPENDENCIES
     ${AT_PLATFORM_LIBS}
     ${LIBUUID_LIBRARY}
     ${LIBSODIUM_LIBRARY}
-    ${Protobuf_LIBRARIES}
-    ${LIBPROTOBUF_LIBRARY}
+    # protobuf-c only. The C++ libprotobuf is a build tool's dependency (protoc
+    # and its google/protobuf/*.proto), not the library's: its soname changes
+    # with every distro release, and linking it tied each package to one.
     ${LIBPROTOBUF_C_LIBRARY}
     ${LIBJANSSON_LIBRARY}
     ${CMAKE_THREAD_LIBS_INIT}
@@ -436,6 +527,16 @@ set(DEPENDENCIES
 get_directory_property(_has_parent PARENT_DIRECTORY)
 if(_has_parent)
     set(DEPENDENCIES "${DEPENDENCIES}" PARENT_SCOPE)
+endif()
+
+# What a SHARED library (the core .so, each extension .so) links. An AT_STATIC
+# build resolves DEPENDENCIES to .a archives, which are not built -fPIC and
+# cannot go into a shared object, so there the shared libraries leave those
+# symbols unresolved; at_demo, the static build's product, links them itself.
+if(AT_STATIC)
+    set(AT_SHARED_DEPENDENCIES)
+else()
+    set(AT_SHARED_DEPENDENCIES ${DEPENDENCIES})
 endif()
 
 set(TEST_DEPENDENCIES ${DEPENDENCIES})
@@ -496,14 +597,18 @@ set(libsrc
     autonomous_trust/config/discover.c
     autonomous_trust/config/names.c
     autonomous_trust/config/trust_ladder.c
+    autonomous_trust/config/deployment_manifest.c
     autonomous_trust/identity/encryptor.c
     autonomous_trust/identity/group.c
+    autonomous_trust/identity/group_file.c
     autonomous_trust/identity/hexlify.c
     autonomous_trust/identity/history.c
     autonomous_trust/identity/identity.c
     autonomous_trust/identity/id_proc.c
     autonomous_trust/utilities/send_retry.c
     autonomous_trust/identity/id_ext.c
+    autonomous_trust/identity/join_policy.c
+    autonomous_trust/identity/anchored_cohort.c
     autonomous_trust/identity/package_hash.c
     autonomous_trust/identity/peers.c
     autonomous_trust/identity/signature.c
@@ -513,6 +618,7 @@ set(libsrc
     autonomous_trust/negotiation/neg_oracle.c
     autonomous_trust/negotiation/neg_ext.c
     autonomous_trust/negotiation/neg_certified.c
+    autonomous_trust/negotiation/neg_replay.c
     autonomous_trust/reputation/reputation.c
     autonomous_trust/reputation/rep_proc.c
     autonomous_trust/reputation/rep_ext.c
@@ -526,6 +632,7 @@ set(libsrc
     autonomous_trust/network/net_transport_registry.c
     autonomous_trust/network/net_filter.c
     autonomous_trust/network/net_presence.c
+    autonomous_trust/network/net_liveness.c
     autonomous_trust/network/net_ext.c
     autonomous_trust/network/network.c
     autonomous_trust/bootstrap/bootstrap_capabilities.c
@@ -547,6 +654,8 @@ set(libsrc
     autonomous_trust/utilities/at_jansson.c
     autonomous_trust/utilities/b64.c
     autonomous_trust/utilities/clock.c
+    autonomous_trust/utilities/float_selftest.c
+    autonomous_trust/utilities/numfmt.c
     autonomous_trust/utilities/err_str.c
     autonomous_trust/utilities/exception.c
     autonomous_trust/utilities/freshness.c
@@ -555,7 +664,6 @@ set(libsrc
     autonomous_trust/utilities/msg_types.c
     autonomous_trust/utilities/msg_registry.c
     autonomous_trust/utilities/probes.c
-    autonomous_trust/utilities/protobuf_shutdown.cpp
     autonomous_trust/utilities/queue_pool.c
     autonomous_trust/utilities/sighandler.c
     autonomous_trust/utilities/socket_helpers.c
@@ -604,6 +712,8 @@ set(libhdr
     autonomous_trust/structures/map.h
     autonomous_trust/structures/merkle.h
     autonomous_trust/utilities/clock.h
+    autonomous_trust/utilities/float_selftest.h
+    autonomous_trust/utilities/numfmt.h
     autonomous_trust/utilities/exception.h
     autonomous_trust/utilities/logger.h
     autonomous_trust/utilities/message.h
@@ -615,6 +725,20 @@ set(libhdr
     autonomous_trust/negotiation/negotiation.h
     autonomous_trust/reputation/reputation.h
     autonomous_trust/config/generate.h
+    # Not app-facing, but the headers above include them: without these an
+    # installed tree cannot compile `#include <autonomous_trust.h>`.
+    autonomous_trust/identity/group.h
+    autonomous_trust/identity/identity_priv.h
+    autonomous_trust/negotiation/task.h
+    autonomous_trust/network/net_wire_format.h
+    autonomous_trust/network/network.h
+    autonomous_trust/processes/process_tracker.h
+    autonomous_trust/processes/process_tracker_priv.h
+    autonomous_trust/processes/processes.h
+    autonomous_trust/reputation/tx_channel.h
+    autonomous_trust/utilities/allocation.h
+    autonomous_trust/utilities/compiler.h
+    autonomous_trust/utilities/util.h
 )
 
 
@@ -710,8 +834,11 @@ function(protoc_c_gen _proto _full_proto _dir)
         OUTPUT ${PROTO_BINARY_DIR}/${_dir}/${_base}.pb-c.h ${_pb_c_src}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${PROTO_BINARY_DIR}
         COMMAND ${Protobuf_PROTOC_EXECUTABLE} --c_out ${PROTO_BINARY_DIR} -I${PROTOBUF_INCLUDE_DIR} -I${PROTO_SOURCE_DIR} ${_full_proto}
+        # unpack casts trip -Wcast-align on 32-bit targets; see the script
+        COMMAND ${CMAKE_COMMAND} -DPB_C_SRC=${_pb_c_src} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/pb-c-unpack-align.cmake
         COMMENT "Building protocol buffer C sources from ${_proto}"
         DEPENDS ${_full_proto} ${LIBPROTOBUF_C_LIBRARY} ${LIBPROTOBUF_LIBRARY} # ${PROTOC_C_EXE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/cmake/pb-c-unpack-align.cmake
         VERBATIM
     )
     set(proto_c_src ${proto_c_src} ${_pb_c_src} PARENT_SCOPE)
@@ -756,47 +883,41 @@ include_directories(${PROTO_BINARY_DIR} ${PROTO_BINARY_DIR}/autonomous_trust/cor
 ## Python will not be built without specifying this target
 add_custom_target(proto_python DEPENDS ${proto_py_src})
 
+## The shared and static core libraries both list the generated C sources and
+## table headers. Under the Makefile generator each target would run the
+## generators itself, and two parallel runs race: pb-c-unpack-align.cmake
+## rewrites a .pb-c.c in place while the other target compiles it. One target
+## owns the generation and both libraries wait for it.
+add_custom_target(at_generated_sources DEPENDS ${proto_c_src} ${table_hdrs})
+
 
 ####################
 # create libraries
 
 
 
-# Ryu (shortest-decimal d2s) for JCS number formatting.  Pulled in as a
-# git submodule under third_party/ryu/; the upstream repo's C sources live
-# in its `ryu/` subdir, so source paths read `third_party/ryu/ryu/...`.
-# Includes go via `ryu/ryu.h` — the include-dir at `third_party/ryu/`
-# lets that resolve to `third_party/ryu/ryu/ryu.h`.
-#
-# Build target defined here at top level so both the conformance runner
-# and the jcs_test target can link against it.
-add_library(at_ryu STATIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu/ryu/d2s.c
-)
-target_include_directories(at_ryu PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu
-)
-# Ryu emits a few unused-variable warnings on some compilers; suppress
-# rather than patch the submodule.
-target_compile_options(at_ryu PRIVATE -O2 -Wno-error -Wno-unused-function)
-
-add_library(autonomous_trust SHARED ${libsrc} ${libhdr} ${proto_c_src} ${table_hdrs})
+add_library(autonomous_trust SHARED ${libsrc} ${libhdr} ${proto_c_src} ${table_hdrs}
+    $<TARGET_OBJECTS:at_ryu_obj>)
 set_target_properties(autonomous_trust PROPERTIES COMPILE_FLAGS "${lib_compile_flags}")
 # The shared library names its own dependencies. It used to leave them to each
 # final executable (a .so may carry unresolved symbols), which Apple's linker
 # refuses for a dylib; on Linux it adds the DT_NEEDED entries the library always
-# had in practice through its consumers.
-target_link_libraries(autonomous_trust PRIVATE ${DEPENDENCIES})
+# had in practice through its consumers. AT_SHARED_DEPENDENCIES is empty in
+# an AT_STATIC build.
+target_link_libraries(autonomous_trust PRIVATE ${AT_SHARED_DEPENDENCIES})
 target_sources(autonomous_trust PUBLIC ${libsrc}
     PUBLIC FILE_SET HEADERS
     BASE_DIRS ${CMAKE_CURRENT_BINARY_DIR} FILES ${genhdr}
     )
 
-add_library(autonomous_trust_static STATIC ${libsrc} ${libhdr} ${proto_c_src} ${table_hdrs})
+add_library(autonomous_trust_static STATIC ${libsrc} ${libhdr} ${proto_c_src} ${table_hdrs}
+    $<TARGET_OBJECTS:at_ryu_obj>)
 set_target_properties(autonomous_trust_static PROPERTIES
     OUTPUT_NAME autonomous_trust
     COMPILE_FLAGS "${lib_compile_flags}"
     )
+add_dependencies(autonomous_trust at_generated_sources)
+add_dependencies(autonomous_trust_static at_generated_sources)
 target_sources(autonomous_trust PUBLIC ${libsrc}
     PUBLIC FILE_SET HEADERS
     BASE_DIRS ${CMAKE_CURRENT_BINARY_DIR} FILES ${genhdr}
@@ -887,6 +1008,9 @@ target_link_libraries(bootstrap_capabilities_test PRIVATE ${AT_TEST_LIBS})
 add_executable(bootstrap_worker_test test/bootstrap_worker_test.c)
 set_source_files_properties(test/bootstrap_worker_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(bootstrap_worker_test PRIVATE ${AT_TEST_LIBS})
+add_executable(bootstrap_burst_test test/bootstrap_burst_test.c)
+set_source_files_properties(test/bootstrap_burst_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(bootstrap_burst_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(net_message_test test/net_message_test.c)
 set_source_files_properties(test/net_message_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -943,6 +1067,12 @@ target_link_libraries(identity_resync_test PRIVATE ${AT_TEST_LIBS})
 add_executable(group_rotation_sibling_test test/group_rotation_sibling_test.c)
 set_source_files_properties(test/group_rotation_sibling_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(group_rotation_sibling_test PRIVATE ${AT_TEST_LIBS})
+add_executable(group_key_query_test test/group_key_query_test.c)
+set_source_files_properties(test/group_key_query_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(group_key_query_test PRIVATE ${AT_TEST_LIBS})
+add_executable(group_rotation_forgery_test test/group_rotation_forgery_test.c)
+set_source_files_properties(test/group_rotation_forgery_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(group_rotation_forgery_test PRIVATE ${AT_TEST_LIBS})
 add_executable(bridged_group_test test/bridged_group_test.c)
 set_source_files_properties(test/bridged_group_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(bridged_group_test PRIVATE ${AT_TEST_LIBS})
@@ -952,6 +1082,12 @@ target_link_libraries(amnesia_recognition_test PRIVATE ${AT_TEST_LIBS})
 add_executable(handoff_retry_test test/handoff_retry_test.c)
 set_source_files_properties(test/handoff_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(handoff_retry_test PRIVATE ${AT_TEST_LIBS})
+add_executable(net_liveness_test test/net_liveness_test.c)
+set_source_files_properties(test/net_liveness_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_liveness_test PRIVATE ${AT_TEST_LIBS})
+add_executable(net_ext_seams_test test/net_ext_seams_test.c)
+set_source_files_properties(test/net_ext_seams_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_ext_seams_test PRIVATE ${AT_TEST_LIBS})
 add_executable(net_presence_test test/net_presence_test.c)
 set_source_files_properties(test/net_presence_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(net_presence_test PRIVATE ${AT_TEST_LIBS})
@@ -963,6 +1099,14 @@ add_executable(net_held_group_test test/net_held_group_test.c)
 set_source_files_properties(test/net_held_group_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(net_held_group_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME net_held_group_test COMMAND $<TARGET_FILE:net_held_group_test>)
+add_executable(net_admission_window_test test/net_admission_window_test.c)
+set_source_files_properties(test/net_admission_window_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_admission_window_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME net_admission_window_test COMMAND $<TARGET_FILE:net_admission_window_test>)
+add_executable(net_reject_dtn_test test/net_reject_dtn_test.c)
+set_source_files_properties(test/net_reject_dtn_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_reject_dtn_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME net_reject_dtn_test COMMAND $<TARGET_FILE:net_reject_dtn_test>)
 add_executable(send_retry_test test/send_retry_test.c)
 set_source_files_properties(test/send_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(send_retry_test PRIVATE ${AT_TEST_LIBS})
@@ -1016,6 +1160,9 @@ target_link_libraries(rep_place_reconcile_test PRIVATE ${AT_TEST_LIBS})
 add_executable(rep_place_pool_persist_test test/rep_place_pool_persist_test.c)
 set_source_files_properties(test/rep_place_pool_persist_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rep_place_pool_persist_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_bilateral_test test/rep_bilateral_test.c)
+set_source_files_properties(test/rep_bilateral_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_bilateral_test PRIVATE ${AT_TEST_LIBS})
 add_executable(rep_place_roster_test test/rep_place_roster_test.c)
 set_source_files_properties(test/rep_place_roster_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rep_place_roster_test PRIVATE ${AT_TEST_LIBS})
@@ -1144,6 +1291,7 @@ add_test(NAME dag_test COMMAND $<TARGET_FILE:dag_test>)
 add_test(NAME agreement_test COMMAND $<TARGET_FILE:agreement_test>)
 add_test(NAME bootstrap_capabilities_test COMMAND $<TARGET_FILE:bootstrap_capabilities_test>)
 add_test(NAME bootstrap_worker_test COMMAND $<TARGET_FILE:bootstrap_worker_test>)
+add_test(NAME bootstrap_burst_test COMMAND $<TARGET_FILE:bootstrap_burst_test>)
 add_test(NAME net_message_test COMMAND $<TARGET_FILE:net_message_test>)
 add_test(NAME socket_helpers_test COMMAND $<TARGET_FILE:socket_helpers_test>)
 add_test(NAME at_jansson_test COMMAND $<TARGET_FILE:at_jansson_test>)
@@ -1158,9 +1306,13 @@ add_test(NAME partition_recovery_test COMMAND $<TARGET_FILE:partition_recovery_t
 add_test(NAME late_joiner_caps_resync_test COMMAND $<TARGET_FILE:late_joiner_caps_resync_test>)
 add_test(NAME identity_resync_test COMMAND $<TARGET_FILE:identity_resync_test>)
 add_test(NAME group_rotation_sibling_test COMMAND $<TARGET_FILE:group_rotation_sibling_test>)
+add_test(NAME group_key_query_test COMMAND $<TARGET_FILE:group_key_query_test>)
+add_test(NAME group_rotation_forgery_test COMMAND $<TARGET_FILE:group_rotation_forgery_test>)
 add_test(NAME bridged_group_test COMMAND $<TARGET_FILE:bridged_group_test>)
 add_test(NAME amnesia_recognition_test COMMAND $<TARGET_FILE:amnesia_recognition_test>)
 add_test(NAME handoff_retry_test COMMAND $<TARGET_FILE:handoff_retry_test>)
+add_test(NAME net_liveness_test COMMAND $<TARGET_FILE:net_liveness_test>)
+add_test(NAME net_ext_seams_test COMMAND $<TARGET_FILE:net_ext_seams_test>)
 add_test(NAME net_presence_test COMMAND $<TARGET_FILE:net_presence_test>)
 add_test(NAME send_retry_test COMMAND $<TARGET_FILE:send_retry_test>)
 add_test(NAME neg_send_keep_test COMMAND $<TARGET_FILE:neg_send_keep_test>)
@@ -1183,6 +1335,7 @@ add_test(NAME rep_place_halves_test COMMAND $<TARGET_FILE:rep_place_halves_test>
 add_test(NAME rep_place_roster_test COMMAND $<TARGET_FILE:rep_place_roster_test>)
 add_test(NAME rep_place_reconcile_test COMMAND $<TARGET_FILE:rep_place_reconcile_test>)
 add_test(NAME rep_place_pool_persist_test COMMAND $<TARGET_FILE:rep_place_pool_persist_test>)
+add_test(NAME rep_bilateral_test COMMAND $<TARGET_FILE:rep_bilateral_test>)
 add_test(NAME rep_resp_shape_test COMMAND $<TARGET_FILE:rep_resp_shape_test>)
 add_test(NAME rep_warmstart_test COMMAND $<TARGET_FILE:rep_warmstart_test>)
 add_test(NAME rep_resolve_test COMMAND $<TARGET_FILE:rep_resolve_test>)
@@ -1232,6 +1385,9 @@ target_link_libraries(unencrypted_verbs_test PRIVATE ${AT_TEST_LIBS})
 add_executable(net_source_bind_test test/net_source_bind_test.c)
 set_source_files_properties(test/net_source_bind_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(net_source_bind_test PRIVATE ${AT_TEST_LIBS})
+add_executable(net_resolve_host_test test/net_resolve_host_test.c)
+set_source_files_properties(test/net_resolve_host_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_resolve_host_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(net_tcp_multiframe_test test/net_tcp_multiframe_test.c)
 set_source_files_properties(test/net_tcp_multiframe_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1255,6 +1411,7 @@ add_test(NAME net_port_test COMMAND $<TARGET_FILE:net_port_test>)
 add_test(NAME cidr_split_test COMMAND $<TARGET_FILE:cidr_split_test>)
 add_test(NAME unencrypted_verbs_test COMMAND $<TARGET_FILE:unencrypted_verbs_test>)
 add_test(NAME net_source_bind_test COMMAND $<TARGET_FILE:net_source_bind_test>)
+add_test(NAME net_resolve_host_test COMMAND $<TARGET_FILE:net_resolve_host_test>)
 add_test(NAME net_tcp_multiframe_test COMMAND $<TARGET_FILE:net_tcp_multiframe_test>)
 add_test(NAME proc_tracker2_test COMMAND $<TARGET_FILE:proc_tracker2_test>)
 add_test(NAME processes_test COMMAND $<TARGET_FILE:processes_test>)
@@ -1305,6 +1462,10 @@ target_link_libraries(trust_ladder_test PRIVATE ${AT_TEST_LIBS})
 target_compile_definitions(trust_ladder_test PRIVATE
     AT_REPO_ROOT_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/../..")
 
+add_executable(deployment_manifest_test test/deployment_manifest_test.c)
+set_source_files_properties(test/deployment_manifest_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(deployment_manifest_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(config2_test test/config2_test.c)
 set_source_files_properties(test/config2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(config2_test PRIVATE ${AT_TEST_LIBS})
@@ -1324,6 +1485,7 @@ add_test(NAME rep_attest_test COMMAND $<TARGET_FILE:rep_attest_test>)
 add_test(NAME trust_ladder_test COMMAND $<TARGET_FILE:trust_ladder_test>)
 set_tests_properties(trust_ladder_test PROPERTIES
     ENVIRONMENT "AT_REPO_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/../..")
+add_test(NAME deployment_manifest_test COMMAND $<TARGET_FILE:deployment_manifest_test>)
 add_test(NAME config2_test COMMAND $<TARGET_FILE:config2_test>)
 add_test(NAME util2_test COMMAND $<TARGET_FILE:util2_test>)
 add_test(NAME msg_types2_test COMMAND $<TARGET_FILE:msg_types2_test>)
@@ -1419,6 +1581,18 @@ add_executable(hybrid_route_test test/hybrid_route_test.c)
 set_source_files_properties(test/hybrid_route_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(hybrid_route_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME hybrid_route_test COMMAND $<TARGET_FILE:hybrid_route_test>)
+add_executable(net_leg_address_test test/net_leg_address_test.c)
+set_source_files_properties(test/net_leg_address_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_leg_address_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME net_leg_address_test COMMAND $<TARGET_FILE:net_leg_address_test>)
+add_executable(gateway_update_scope_test test/gateway_update_scope_test.c)
+set_source_files_properties(test/gateway_update_scope_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(gateway_update_scope_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME gateway_update_scope_test COMMAND $<TARGET_FILE:gateway_update_scope_test>)
+add_executable(join_retry_test test/join_retry_test.c)
+set_source_files_properties(test/join_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(join_retry_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME join_retry_test COMMAND $<TARGET_FILE:join_retry_test>)
 
 # IPv6 CIDR matching — split into its own binary to stay under the
 # RUN_TESTS 9-arg cap in test_setup.h.
@@ -1442,6 +1616,10 @@ set_source_files_properties(test/peer_rtt_update_test.c PROPERTIES COMPILE_FLAGS
 target_link_libraries(peer_rtt_update_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME peer_rtt_update_test COMMAND $<TARGET_FILE:peer_rtt_update_test>)
 
+add_executable(neg_replay_test test/neg_replay_test.c)
+set_source_files_properties(test/neg_replay_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(neg_replay_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME neg_replay_test COMMAND $<TARGET_FILE:neg_replay_test>)
 add_executable(neg_oracle_test test/neg_oracle_test.c)
 set_source_files_properties(test/neg_oracle_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(neg_oracle_test PRIVATE ${AT_TEST_LIBS})
@@ -1504,10 +1682,65 @@ set_source_files_properties(test/rep_tenure_test.c PROPERTIES COMPILE_FLAGS "-Wa
 target_link_libraries(rep_tenure_test PRIVATE ${AT_TEST_LIBS} m)
 add_test(NAME rep_tenure_test COMMAND $<TARGET_FILE:rep_tenure_test>)
 
+add_executable(rep_tier_hysteresis_test test/rep_tier_hysteresis_test.c)
+set_source_files_properties(test/rep_tier_hysteresis_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_tier_hysteresis_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rep_tier_hysteresis_test COMMAND $<TARGET_FILE:rep_tier_hysteresis_test>)
+
 add_executable(group_adopt_test test/group_adopt_test.c)
 set_source_files_properties(test/group_adopt_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(group_adopt_test PRIVATE ${AT_TEST_LIBS} m)
 add_test(NAME group_adopt_test COMMAND $<TARGET_FILE:group_adopt_test>)
+add_executable(join_selection_test test/join_selection_test.c)
+set_source_files_properties(test/join_selection_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(join_selection_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME join_selection_test COMMAND $<TARGET_FILE:join_selection_test>)
+
+add_executable(group_file_test test/group_file_test.c)
+set_source_files_properties(test/group_file_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(group_file_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME group_file_test COMMAND $<TARGET_FILE:group_file_test>)
+
+add_executable(join_policy_test test/join_policy_test.c)
+set_source_files_properties(test/join_policy_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(join_policy_test PRIVATE ${AT_TEST_LIBS})
+# Reads config/cfg/join_policy.example.json, the file the Python suite reads.
+target_compile_definitions(join_policy_test PRIVATE
+    AT_REPO_ROOT_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/../..")
+add_test(NAME join_policy_test COMMAND $<TARGET_FILE:join_policy_test>)
+
+add_executable(anchored_cohort_test test/anchored_cohort_test.c)
+set_source_files_properties(test/anchored_cohort_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(anchored_cohort_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME anchored_cohort_test COMMAND $<TARGET_FILE:anchored_cohort_test>)
+add_executable(rep_cohort_test test/rep_cohort_test.c)
+set_source_files_properties(test/rep_cohort_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_cohort_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rep_cohort_test COMMAND $<TARGET_FILE:rep_cohort_test>)
+add_executable(rep_cert_roster_test test/rep_cert_roster_test.c)
+set_source_files_properties(test/rep_cert_roster_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_cert_roster_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rep_cert_roster_test COMMAND $<TARGET_FILE:rep_cert_roster_test>)
+add_executable(rep_ctft_rule_test test/rep_ctft_rule_test.c)
+set_source_files_properties(test/rep_ctft_rule_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_ctft_rule_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rep_ctft_rule_test COMMAND $<TARGET_FILE:rep_ctft_rule_test>)
+add_executable(rep_coop_entry_test test/rep_coop_entry_test.c)
+set_source_files_properties(test/rep_coop_entry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_coop_entry_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rep_coop_entry_test COMMAND $<TARGET_FILE:rep_coop_entry_test>)
+add_executable(rep_retained_test test/rep_retained_test.c)
+set_source_files_properties(test/rep_retained_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_retained_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rep_retained_test COMMAND $<TARGET_FILE:rep_retained_test>)
+add_executable(rep_brought_test test/rep_brought_test.c)
+set_source_files_properties(test/rep_brought_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_brought_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rep_brought_test COMMAND $<TARGET_FILE:rep_brought_test>)
+add_executable(rep_lone_verdict_test test/rep_lone_verdict_test.c)
+set_source_files_properties(test/rep_lone_verdict_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_lone_verdict_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rep_lone_verdict_test COMMAND $<TARGET_FILE:rep_lone_verdict_test>)
 
 add_executable(rescore_sweep_test test/rescore_sweep_test.c)
 set_source_files_properties(test/rescore_sweep_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1539,10 +1772,18 @@ if(AT_NET_DTN)
     add_subdirectory(extensions/dtn)
 endif()
 if(AT_NET_GATEWAY)
-    add_subdirectory(extensions/gateway)
+    # The gateway is kept in its own repository and checked out here when it is
+    # available. Without it the core builds and runs as before, and refuses any
+    # network config that sets "envelope": true.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extensions/gateway/CMakeLists.txt")
+        add_subdirectory(extensions/gateway)
+    else()
+        message(STATUS "AT_NET_GATEWAY: extensions/gateway is absent; "
+                       "libat_gateway is not built")
+    endif()
 endif()
 # Certificates before replication, which links it.
-foreach(_layer PHYSICS CALIBRATION CERTIFICATES PREQUENTIAL REPLICATION)
+foreach(_layer PHYSICS CALIBRATION CERTIFICATES PREQUENTIAL REPLICATION SELECTION)
     if(AT_ORACLE_${_layer})
         string(TOLOWER ${_layer} _dir)
         add_subdirectory(extensions/${_dir})
@@ -1625,24 +1866,147 @@ if(WIN32 AND LIBCHECK_LIBRARY)
     endforeach()
 endif()
 
-if(EXISTS ${CMAKE_SOURCE_DIR}/../autonomous-trust/conformance)
+option(AT_CONFORMANCE "Build the conformance harness when the corpus is present" ON)
+if(AT_CONFORMANCE AND EXISTS ${CMAKE_SOURCE_DIR}/../autonomous-trust/conformance)
     add_subdirectory(conformance)
 endif()
 
 ####################
 # Packaging
 
+# COMPONENT binds to the artifact kind before it, so each kind names one.
 install(TARGETS autonomous_trust 
-        RUNTIME DESTINATION bin
-        LIBRARY DESTINATION lib
-        PUBLIC_HEADER DESTINATION include
-        FILE_SET HEADERS
+        RUNTIME DESTINATION bin COMPONENT core
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT core
+        PUBLIC_HEADER DESTINATION include COMPONENT core
+        FILE_SET HEADERS COMPONENT core
         )
 install(TARGETS autonomous_trust_static
-        RUNTIME DESTINATION bin
-        LIBRARY DESTINATION lib
-        PUBLIC_HEADER DESTINATION include
-        FILE_SET HEADERS
+        RUNTIME DESTINATION bin COMPONENT core
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT core
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT core
+        PUBLIC_HEADER DESTINATION include COMPONENT core
+        FILE_SET HEADERS COMPONENT core
         )
+
+# The generated message headers, in the build tree's layout: they include each
+# other as autonomous_trust/core/protobuf/..., and identity.h includes
+# identity/identity.pb-c.h relative to core/protobuf.
+install(DIRECTORY ${PROTO_BINARY_DIR}/autonomous_trust
+        DESTINATION include
+        COMPONENT core
+        FILES_MATCHING PATTERN "*.pb-c.h")
+
+# The headers include each other relative to include/autonomous_trust
+# (`utilities/allocation.h`) and include/autonomous_trust/core/protobuf, and
+# embed structs anonymously (-fms-extensions); pkg-config says so.
+if(VERSION)
+    set(AT_PC_VERSION ${VERSION})
+else()
+    set(AT_PC_VERSION ${REVISION})
+endif()
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust.pc.in
+               ${CMAKE_CURRENT_BINARY_DIR}/autonomous_trust.pc @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/autonomous_trust.pc
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
+        COMPONENT core)
+
+# `cpack -G DEB` / `cpack -G RPM` in a build configured with
+# -DCMAKE_INSTALL_PREFIX=/usr makes one package per install COMPONENT:
+#   core         autonomous-trust-devel: libautonomous_trust, its headers, .pc
+#   <extension>  autonomous-trust-<extension>-devel: libat_<extension> and its
+#                at_<extension>.h, for each extension built (AT_ZTA,
+#                AT_NET_DTN, ... decide which), as at_package_component()
+#                registered it
+# .github/workflows/release-packages.yml builds them on the oldest distro of
+# each family (scripts/package-devel.sh says why one package serves the newer
+# ones). Package versions cannot carry '-'. A git-describe snapshot,
+# 0.2.2-125-g53eea3d1, becomes 0.2.2+125.g53eea3d1, which sorts after 0.2.2;
+# a pre-release tag's 0.3.0-rc1 becomes 0.3.0~rc1, which sorts before 0.3.0
+# (both in dpkg and rpm).
+if(NOT AT_PACKAGE_VERSION)
+    string(REGEX REPLACE "-([0-9]+)-g([0-9a-f]+)$" "+\\1.g\\2"
+           AT_PACKAGE_VERSION "${AT_PC_VERSION}")
+    string(REPLACE "-" "~" AT_PACKAGE_VERSION "${AT_PACKAGE_VERSION}")
+endif()
+set(AT_PACKAGE_RELEASE 1)
+set(CPACK_PACKAGE_NAME autonomous-trust-devel)
+set(CPACK_PACKAGE_VERSION ${AT_PACKAGE_VERSION})
+set(CPACK_PACKAGE_CONTACT "Sean M Brennan <sean.brennan@tekfive.com>")
+set(CPACK_PACKAGE_HOMEPAGE_URL https://github.com/sean-m-brennan/autonomous-trust)
+# Container builds copy only src/c, so the repo-root LICENSE is absent there.
+if (EXISTS ${top_src_dir}/LICENSE)
+    set(CPACK_RESOURCE_FILE_LICENSE ${top_src_dir}/LICENSE)
+endif()
+set(CPACK_PACKAGING_INSTALL_PREFIX ${CMAKE_INSTALL_PREFIX})
+set(CPACK_DEB_COMPONENT_INSTALL ON)
+set(CPACK_RPM_COMPONENT_INSTALL ON)
+set(CPACK_DEBIAN_PACKAGE_SECTION libdevel)
+set(CPACK_DEBIAN_PACKAGE_RELEASE ${AT_PACKAGE_RELEASE})
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+set(CPACK_RPM_PACKAGE_LICENSE Apache-2.0)
+set(CPACK_RPM_PACKAGE_RELEASE ${AT_PACKAGE_RELEASE})
+set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
+# Owned by the distro's pkgconf package.
+set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
+    ${CPACK_PACKAGING_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+
+# Core. Its library dependencies come from the binary (dpkg-shlibdeps, rpm's
+# find-requires); these are the -dev packages the installed headers include.
+set(CPACK_COMPONENT_CORE_DESCRIPTION
+    "Autonomous Trust C library: shared and static libraries, headers, pkg-config file")
+set(CPACK_DEBIAN_CORE_PACKAGE_NAME autonomous-trust-devel)
+set(CPACK_DEBIAN_CORE_PACKAGE_SHLIBDEPS ON)
+# jansson only when linked from the system: the vendored copy is inside
+# libautonomous_trust (cmake/vendored-jansson.cmake).
+if(AT_SYSTEM_JANSSON)
+    set(_at_deb_jansson "libjansson-dev, ")
+    set(_at_rpm_jansson "jansson-devel, ")
+else()
+    set(_at_deb_jansson "")
+    set(_at_rpm_jansson "")
+endif()
+set(CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
+    "libsodium-dev, ${_at_deb_jansson}uuid-dev, libprotobuf-c-dev")
+set(CPACK_RPM_CORE_PACKAGE_NAME autonomous-trust-devel)
+set(CPACK_RPM_CORE_PACKAGE_REQUIRES
+    "libsodium-devel, ${_at_rpm_jansson}libuuid-devel, protobuf-c-devel")
+
+# Extensions. Each requires the core package (and the packages of the
+# extensions it depends on) at exactly this version: an extension uses the
+# core's private headers and is ABI-bound to the build it came from. That
+# requirement also carries the core's library dependencies; anything more is
+# the extension's DEB_DEPENDS / RPM_REQUIRES. dpkg-shlibdeps is off for them,
+# because it cannot resolve libautonomous_trust.so from another package's
+# staging tree; rpm still adds soname requirements from the binaries.
+get_property(AT_PACKAGE_COMPONENTS GLOBAL PROPERTY AT_PACKAGE_COMPONENTS)
+set(CPACK_COMPONENTS_ALL core ${AT_PACKAGE_COMPONENTS})
+foreach(_c ${AT_PACKAGE_COMPONENTS})
+    string(TOUPPER ${_c} _C)
+    string(REPLACE "_" "-" _pkg "autonomous-trust-${_c}-devel")
+    set(_deb "autonomous-trust-devel (= ${AT_PACKAGE_VERSION}-${AT_PACKAGE_RELEASE})")
+    set(_rpm "autonomous-trust-devel = ${AT_PACKAGE_VERSION}-${AT_PACKAGE_RELEASE}")
+    get_property(_deps GLOBAL PROPERTY AT_PACKAGE_DEPENDS_${_c})
+    foreach(_d ${_deps})
+        string(REPLACE "_" "-" _dpkg "autonomous-trust-${_d}-devel")
+        string(APPEND _deb ", ${_dpkg} (= ${AT_PACKAGE_VERSION}-${AT_PACKAGE_RELEASE})")
+        string(APPEND _rpm ", ${_dpkg} = ${AT_PACKAGE_VERSION}-${AT_PACKAGE_RELEASE}")
+    endforeach()
+    get_property(_extra GLOBAL PROPERTY AT_PACKAGE_DEB_DEPENDS_${_c})
+    foreach(_x ${_extra})
+        string(APPEND _deb ", ${_x}")
+    endforeach()
+    get_property(_extra GLOBAL PROPERTY AT_PACKAGE_RPM_REQUIRES_${_c})
+    foreach(_x ${_extra})
+        string(APPEND _rpm ", ${_x}")
+    endforeach()
+    set(CPACK_COMPONENT_${_C}_DESCRIPTION
+        "Autonomous Trust ${_c} extension: shared and static libraries, header")
+    set(CPACK_DEBIAN_${_C}_PACKAGE_NAME ${_pkg})
+    set(CPACK_DEBIAN_${_C}_PACKAGE_SHLIBDEPS OFF)
+    set(CPACK_DEBIAN_${_C}_PACKAGE_DEPENDS "${_deb}")
+    set(CPACK_RPM_${_C}_PACKAGE_NAME ${_pkg})
+    set(CPACK_RPM_${_C}_PACKAGE_REQUIRES "${_rpm}")
+endforeach()
 
 include(CPack)

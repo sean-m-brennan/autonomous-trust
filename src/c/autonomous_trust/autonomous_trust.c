@@ -16,6 +16,7 @@
 
 #define _DEFAULT_SOURCE
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdbool.h>
 #include <errno.h>
 #include <unistd.h>
@@ -38,7 +39,6 @@
 #include "processes/process_tracker_priv.h"
 #include "structures/array.h"
 #include "structures/map.h"
-#include "utilities/protobuf_shutdown.h"
 #include "network/network.h"
 #include "negotiation/negotiation.h"
 #include "reputation/reputation.h"
@@ -184,8 +184,11 @@ int at_route_queue_msg(array_t *unhandled, generic_msg_t *msg)
  * a co-sign ask) was lost. Now, while nothing is bound, a state event the
  * roster pull re-emits is counted and dropped, and a one-time event is held,
  * oldest dropped past AT_APP_HELD_MAX, and sent in order once an app binds.
- * One line reports each gap when it ends. */
-static generic_msg_t g_app_held[AT_APP_HELD_MAX];
+ * One line reports each gap when it ends. Each held event is allocated when it
+ * is held: a generic_msg_t is about 8 KB, so a fixed array of AT_APP_HELD_MAX
+ * of them put half a megabyte in static memory that nearly every node leaves
+ * empty. */
+static generic_msg_t *g_app_held[AT_APP_HELD_MAX];
 static size_t g_app_held_n = 0;
 static bool g_app_attached = false;     /* until a send or a probe says so */
 static size_t g_gap_state = 0;          /* state events dropped this gap */
@@ -230,16 +233,20 @@ static void _app_hold(const generic_msg_t *msg, logger_t *logger)
     }
     if (g_app_held_n == AT_APP_HELD_MAX)
     {
-        at_msg_copy_release(&g_app_held[0]);
+        at_msg_copy_release(g_app_held[0]);
+        free(g_app_held[0]);
         memmove(&g_app_held[0], &g_app_held[1],
                 (AT_APP_HELD_MAX - 1) * sizeof(g_app_held[0]));
         g_app_held_n--;
+        g_app_held[AT_APP_HELD_MAX - 1] = NULL;
         g_gap_overflow++;
     }
-    if (at_msg_copy(msg, &g_app_held[g_app_held_n]) == 0)
-        g_app_held_n++;
+    generic_msg_t *slot = calloc(1, sizeof(*slot));
+    if (slot != NULL && at_msg_copy(msg, slot) == 0)
+        g_app_held[g_app_held_n++] = slot;
     else
     {
+        free(slot);
         g_gap_overflow++;
         log_warn(logger, "AutonomousTrust: could not hold an app event of type "
                  "%ld for the app; it is lost\n", msg->type);
@@ -255,14 +262,18 @@ size_t at_app_flush_held(const char *q_out, logger_t *logger)
     {
         /* 0 is sent or kept (a full app queue files it with send_retry, which
          * keeps the order); anything else leaves the rest for the next pass. */
-        if (at_send(NULL, q_out, &g_app_held[sent], "a held app event", q_out,
+        if (at_send(NULL, q_out, g_app_held[sent], "a held app event", q_out,
                     AT_SEND_NOW, NULL, NULL, 0) != 0)
             break;
-        at_msg_copy_release(&g_app_held[sent]);
+        at_msg_copy_release(g_app_held[sent]);
+        free(g_app_held[sent]);
+        g_app_held[sent] = NULL;
         sent++;
     }
     memmove(&g_app_held[0], &g_app_held[sent],
             (g_app_held_n - sent) * sizeof(g_app_held[0]));
+    for (size_t i = g_app_held_n - sent; i < g_app_held_n; i++)
+        g_app_held[i] = NULL;
     g_app_held_n -= sent;
     if (g_app_held_n > 0)
         return sent;    /* still flushing; the gap ends when it is empty */
@@ -287,7 +298,11 @@ size_t at_app_held_count(void)
 void at_app_hold_reset(void)
 {
     for (size_t i = 0; i < g_app_held_n; i++)
-        at_msg_copy_release(&g_app_held[i]);
+    {
+        at_msg_copy_release(g_app_held[i]);
+        free(g_app_held[i]);
+        g_app_held[i] = NULL;
+    }
     g_app_held_n = 0;
     g_app_attached = false;
     g_gap_state = 0;
@@ -480,38 +495,16 @@ int register_queues(tracker_t *tracker, const char *main, directory_t *queues, d
 }
 
 
-int run_autonomous_trust(char *q_in, char *q_out,
-                         capability_t *capabilities, size_t cap_len,
-                         log_level_t log_level, char log_file[])
+/* The node itself, from logger setup to shutdown cleanup. Runs in whichever
+ * process is the node: the forked daemon, or the caller when in-process. */
+static int _run_node(char *q_in, char *q_out, log_level_t log_level,
+                     char log_file[], int fd1, int fd2)
 {
-    (void)capabilities; (void)cap_len;
     int error = 0;
     char cfg_dir[CFG_PATH_LEN + 1] = {0};
     get_cfg_dir(cfg_dir, sizeof(cfg_dir));
     char data_dir[CFG_PATH_LEN + 1] = {0};
     get_data_dir(data_dir, sizeof(data_dir));
-
-    int fd1 = 0;
-    int fd2 = 0;
-    int flags = 0;
-    if (log_file == NULL)
-    {
-        flags |= NO_STDERR_REDIRECT;
-        /* Foreground: keep subsystem children's stderr too, so their logs
-         * (id_proc admission/history handlers, net_proc, etc.) reach the
-         * controlling terminal / container stream instead of /dev/null. */
-        process_child_extra_flags |= NO_STDERR_REDIRECT;
-    }
-    /* In-process the caller's process IS the node (agorad, or a host that
-     * runs the node on a thread): nothing forks, and this returns at shutdown
-     * with 0 instead of returning the daemon's pid at once. */
-    int err = 0;
-    if (!messaging_in_process())
-    {
-        err = daemonize(data_dir, flags, &fd1, &fd2);
-        if (err != 0)
-            return err;
-    }
 
     const char *name = AT_MAIN_QUEUE;
     logger_t logger = {0};
@@ -826,11 +819,48 @@ int run_autonomous_trust(char *q_in, char *q_out,
         close(fd1);
     if (fd2 > 0)
         close(fd2);
-    shutdown_protobuf_library();
 
     /* Clean up PID file */
     if (pid_path[0] != '\0')
         unlink(pid_path);
 
     return error;
+}
+
+
+int run_autonomous_trust(char *q_in, char *q_out,
+                         capability_t *capabilities, size_t cap_len,
+                         log_level_t log_level, char log_file[])
+{
+    (void)capabilities; (void)cap_len;
+    char data_dir[CFG_PATH_LEN + 1] = {0};
+    get_data_dir(data_dir, sizeof(data_dir));
+
+    int fd1 = 0;
+    int fd2 = 0;
+    int flags = 0;
+    if (log_file == NULL)
+    {
+        flags |= NO_STDERR_REDIRECT;
+        /* Foreground: keep subsystem children's stderr too, so their logs
+         * (id_proc admission/history handlers, net_proc, etc.) reach the
+         * controlling terminal / container stream instead of /dev/null. */
+        process_child_extra_flags |= NO_STDERR_REDIRECT;
+    }
+    /* In-process the caller's process IS the node (agorad, or a host that
+     * runs the node on a thread): nothing forks, and this returns at shutdown
+     * with 0 instead of returning the daemon's pid at once. */
+    if (messaging_in_process())
+        return _run_node(q_in, q_out, log_level, log_file, fd1, fd2);
+
+    int pid = daemonize(data_dir, flags, &fd1, &fd2);
+    if (pid != 0)
+        return pid;  /* the caller: the daemon's pid, or a negative error */
+
+    /* The daemon is a fork of the caller, so returning would carry it on into
+     * the caller's code (at_node_start, then the application's main) after
+     * shutdown. It exits here instead, without the caller's atexit handlers. */
+    int error = _run_node(q_in, q_out, log_level, log_file, fd1, fd2);
+    fflush(NULL);
+    _exit(error == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
 }

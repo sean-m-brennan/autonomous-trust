@@ -398,7 +398,7 @@ follow DTN's shape: `at_gateway` links the core `.so` by file, and
 
 ## Oracle layers (`negotiation/neg_oracle.h`, `core/_python/oracles.py`)
 
-The verification layers of R+D.md §12 are five extension libraries
+The verification layers of R+D.md §12 are six extension libraries
 (FEATURE_SPLIT_PLAN Phase 3), `src/c/extensions/<layer>/`, each built by
 `AT_ORACLE_<LAYER>` (all ON by default):
 
@@ -408,10 +408,12 @@ The verification layers of R+D.md §12 are five extension libraries
 | `libat_calibration` | coverage audit (§12.4) | `$AT_CALIBRATION` | arms `calibration.settle` (200, observe) and `calibration.assess` (400, verdict) |
 | `libat_prequential` | prequential competence (§12.5) | `$AT_PREQUENTIAL` | arm `prequential.observe` (210, observe); the competence provider |
 | `libat_certificates` | certificate-carrying interfaces (§12.3) | `$AT_CERTIFICATES` | arm `certificates.check` (300, verdict) |
-| `libat_replication` | replicated execution (§12.6) | — | its declaration only; nothing scores through it yet |
+| `libat_replication` | replicated execution (§12.6) | `$AT_REPLICATION` | live replication through the negotiation result hook (`neg_ext.h`): it holds a sampled result's score, sends a replica, and settles a dispute by the bisection game |
+| `libat_selection` | selective assignment (§12.7) | `$AT_SELECTION` | the negotiation selection hook (`neg_ext.h`): it draws a task's invitees or a probe's target from a committed seed chain, re-draws a decline, checks the draw on an invitation, and answers the `selection audit` verb ([Selective assignment](selection.md)) |
 
-`AT_ORACLE_REPLICATION` requires `AT_ORACLE_CERTIFICATES`, whose SplitMix64 it
-samples with; `libat_replication` links `libat_certificates`.
+`AT_ORACLE_REPLICATION` and `AT_ORACLE_SELECTION` require
+`AT_ORACLE_CERTIFICATES`, whose SplitMix64 they draw with; both libraries link
+`libat_certificates`.
 
 **The registry.** A layer registers from load-time constructors: it
 *declares* itself (`NEG_ORACLE_REGISTER`, carrying its reset), adds its *arms*
@@ -434,8 +436,9 @@ with each score; with no provider it is 1.0, the authored weight verbatim.
 needs: names only, never behavior. A layer that is absent cannot declare
 itself, so the table has to live in the core. `negotiation_run` calls
 `neg_oracles_check_env` and refuses to start, with an ERROR naming the
-library, when `$AT_PHYSICS`, `$AT_CALIBRATION`, `$AT_PREQUENTIAL` or
-`$AT_CERTIFICATES` is set and non-empty and its layer is not loaded. A node
+library, when `$AT_PHYSICS`, `$AT_CALIBRATION`, `$AT_PREQUENTIAL`,
+`$AT_CERTIFICATES`, `$AT_REPLICATION` or `$AT_SELECTION` is set and non-empty and its layer is
+not loaded. A node
 declared to check physics that silently did not would accept results physics
 refutes. Refusing is the only safe answer.
 
@@ -590,6 +593,72 @@ presented with a different key.
 gateway's envelope filters frames, and the gateway is C-only. Rendezvous needs
 the network hooks above, not a filter.
 
+## Seams for a transport extension
+
+A radio, or any carrier that is not the IP transport, needs five more things of
+the core. Each is a generic seam, named alike in both runtimes, and none knows
+what the extension is. With no extension registered, each changes nothing.
+
+| Seam | C | Python |
+|---|---|---|
+| Also-unicast hook | `net_ext_t.also_unicast` | `NetworkHooks.also_unicast` |
+| Fan-out hook | `net_ext_t.fanout` | `NetworkHooks.fanout` |
+| Transport liveness | `net_liveness_quiet_for` (`network/net_liveness.h`) | `NetworkProcess.transport_quiet_for` |
+| Injection by channel | `handle_inbound_ext` | `NetworkProcess.inject_inbound` |
+| Declared network wire verbs | `net_ext_t.wire_verbs`, with `check_config` | `Extension.network_wire_verbs`, with `Extension.check_config` |
+
+**Also-unicast and fan-out.** `also_unicast` sees each unicast the transport
+is about to send, already sealed for the peer, with its process and function. A
+unicast an extension carried itself through `unicast` does not reach it.
+`fanout` sees each GROUP frame (sealed with a group key) and each
+BROADCAST frame (plaintext) after the transport was asked to send it, whether
+or not that succeeded, with the group whose key sealed it. In C that is
+always the node's own group. In Python a gateway's send to a child cohort
+passes the child. A radio that backs up the
+transport needs exactly the frames the transport failed to send. In Python a
+broadcast whose send raises `BrokenPipeError` skips the hook. Neither hook can
+stop or alter a transport send. In Python a hook that raises is logged and
+ignored.
+
+**Transport liveness.** The core records when it last heard each peer through
+the transport, and answers how long a peer has been quiet (seconds since the
+last frame, or since the network process started for a peer never heard). Only
+a frame on a member path counts, the peer and group paths (and C's
+plaintext-from-a-known-peer path, which Python routes as the peer path), where
+the sender is a peer the node holds: a stranger, a relayed stranger or the broadcast channel
+can name any uuid it likes, so those never count. A frame an extension
+injected never counts, and neither does one a rendezvous relayed: neither came
+through the transport. A held group frame keeps that mark when it is retried
+under a new key. (Python's one exception is a
+relayed frame of a plaintext verb from a known peer: it reaches the router as
+point-to-point and stamps. C suppresses every relayed frame.) An extension reads this to decide
+whether the transport still reaches a peer. The conformance scenario
+`network/transport-liveness` pins it in both runtimes.
+
+**Injection by channel.** `handle_inbound_ext(ctx, ch, buf, nbytes, from_uuid)`
+and `inject_inbound(queues, channel, frame, peer_uuid)` hand the core a frame
+the extension received some other way, on the `peer`, `group` or `broadcast`
+channel, attributed to the sending peer's uuid. A peer frame takes the relayed
+path, and group and broadcast frames take the transport's own handlers keyed on
+the peer's address. An unknown uuid is dropped and counted
+(`net.ext/drop/unknown_peer`), and so is a peer reputation has excluded, by
+address or by uuid (`net.ext/drop/excluded`), in both runtimes. C copies the buffer on every channel; the caller keeps it. A group
+frame that fails to open (C), or comes from a sender outside the group
+(Python), is counted as `net.ext/group_decrypt_fail` and never raises
+`partition_signal`: a foreign cohort's frame on the air must not start
+partition recovery.
+
+**Declared network wire verbs.** An extension declares the network-process
+functions it accepts from the wire. They are admitted only on the peer and
+group paths, never from a stranger or the broadcast channel. The local outbound
+form of the same verb reaches the same handler first, with no sender or with
+the node's own identity as sender (a signed one); the handler declines it, so
+that it is sent. In C, `check_config` runs as
+`network_run` starts and a non-zero return refuses to start the process; Python
+runs `Extension.check_config` from `extensions.check_config`. C holds at most
+`NET_EXT_MAX` (8) network extensions. The conformance scenario
+`network/ext-wire-verbs` pins admission in both runtimes.
+
 ## Plaintext verbs (`processes/plaintext_verbs.h`, `plaintext_verbs.py`)
 
 A receiver accepts a frame in the clear from a peer it already knows only for
@@ -660,7 +729,21 @@ phrased so that no extension at all is a node with no such authority:
 
 `admission_gate` answers the most restrictive verdict (`ADMIT`,
 `ADMIT_CAPPED`, `REJECT`); ZTA's publishes its standing to reputation before
-the vote, as the core did. Python's `IdentityHooks` has the same five plus
+the vote, as the core did.
+
+**The anchor hook.** `anchor_classes` (both runtimes, RD_14.4 plan Phase 2)
+says which out-of-band anchor classes a public identity holds here, as
+`AT_ANCHOR_*` bits in C and class names in Python. First contact answers
+`verified_contact` and `unverified_contact` for a recorded contact or a device
+its operator vouched for, and `operator` for a sibling. ZTA answers `zta` for
+a credential that chains to one of our anchors and is bound to the identity,
+and `operator` for a verified operator-key binding naming this node's own
+operator key. Both match on keys, not the uuid alone. The core ORs the answers
+and intersects them with the classes the join policy (`$AT_JOIN_POLICY`,
+`identity/join_policy.{h,c}`, `core/_python/identity/join_policy.py`)
+declares: `identity_anchor_classes` in C, `IdentityProcess.anchor_classes` in
+Python. With no policy, nothing is an anchor. A declared class that no linked
+or installed extension can answer refuses the start. Python's `IdentityHooks` has the same five plus
 `on_tick(proc, queues, tick)`, which carries the background re-verification
 off the identity loop (C has its own `zta_verify` process for that).
 
@@ -1231,6 +1314,11 @@ whether it built.
 
 ## Honest limits
 
+- An injected group frame that does not open is counted and never signals
+  partition recovery in either runtime, but the trigger differs by one line: C
+  counts a decrypt failure, Python a sender outside the group.
+- Rendezvous's relayed plaintext-verb frames from a known peer stamp transport
+  liveness in Python and not in C, as the liveness section says.
 - The core references no feature's anchor any more: with rendezvous and first
   contact out (Phase 7), every feature's consumers own its link.
 - A fleet proposal is verified only against the key its message carries.

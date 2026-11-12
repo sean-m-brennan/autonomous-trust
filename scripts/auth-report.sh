@@ -15,14 +15,14 @@
 #   limitations under the License.
 # ******************
 #
-# Run the authentication-time M&S (SOW Task 2.4, "Auth <=5s") and print the three
+# Run the authentication-time M&S (target: "Auth <=5s") and print the three
 # reported quantities: (1) steady-state re-authentication vs cohort (gated <=5s),
 # (2) one-time enrollment duration (characterized, not gated), (3) degraded-edge
 # first-contact admission (gated <=5s) vs a strict ZTA that blocks on the
 # unreachable revocation source.
 #
-# MODELED (seeded). Per SOW the AT path is to be MEASURED on subscale HW (Task 4)
-# and base-2 (hardware) attestation is modeled (M12). Pure stdlib; deterministic.
+# MODELED (seeded). The AT path is to be MEASURED on subscale HW
+# and base-2 (hardware) attestation is modeled. Pure stdlib; deterministic.
 #
 # Usage:
 #   scripts/auth-report.sh                 # report (default seed 1234)

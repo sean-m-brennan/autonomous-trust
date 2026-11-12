@@ -21,6 +21,7 @@
 #include <uuid/uuid.h>
 
 #include "processes/processes.h"
+#include "identity/join_policy.h"
 
 /*@
   requires \valid(proc);
@@ -97,6 +98,9 @@ size_t _recheck_parked_cosigns(const process_t *proc, double present);
 
 /** Test seam: how many checkpoint proposals are parked for a later co-sign. */
 size_t reputation_parked_cosign_count(void);
+/* The equivocation records chain @p key ("" = primary) holds (R+D.md §14.1),
+ * as a new JSON array. */
+json_t *reputation_fork_records(const char *key);
 
 /** Toggle synchronous-dispatch mode for the conformance harness, as the
  *  Python adapter sets synchronous_dispatch. Production must leave this
@@ -110,6 +114,19 @@ void reputation_set_synchronous_dispatch(bool enabled);
  *  participant's handler runs against its own pre-installed state.
  *  Idempotent. */
 void reputation_reset_state(int num_peers);
+
+/** The join policy reputation marks catch-up under (RD_14.4 plan, D2 (b));
+ *  NULL: inert. Read from $AT_JOIN_POLICY at start; reset by
+ *  reputation_reset_state. Mirrors Python ReputationProcess.join_policy. */
+void reputation_set_join_policy(const at_join_policy_t *policy);
+
+/** Whether chain @p key's ("" or NULL: primary) entry at absolute @p index
+ *  arrived by catch-up under the join policy and names us in neither slot.
+ *  Mirrors Python ReputationProcess.is_told. */
+bool reputation_is_told(const char *key, int index);
+
+/** The catch-up marks, chain key -> indices: a new object the caller decrefs. */
+json_t *reputation_catchup_marks(void);
 
 /** Pre-install the dispatching participant's chain length, as if it had
  *  committed @p len entries. */
@@ -127,16 +144,35 @@ void reputation_set_num_updates(int n);
 void reputation_set_update_page_bytes(size_t bytes);
 
 /** Pre-install OUR round (@p id1, @p id2) as _forward_transaction leaves it
- *  for handle_accepted: its score, and @p task_uuid's evidence @p channel
- *  (NULL or "" for the default). The conformance `proposals` fixture. */
-void reputation_install_proposal(int64_t id1, int64_t id2, double score,
-                                 const uuid_t task_uuid, const char *channel);
+ *  for handle_accepted: its score, @p task_uuid's evidence @p channel (NULL or
+ *  "" for the default), and whom our half names, @p subject (NULL for none,
+ *  R+D.md §14.2). The conformance `proposals` fixture. */
+void reputation_install_proposal(int64_t id1, int64_t id2, int score_milli,
+                                 const uuid_t task_uuid, const char *channel,
+                                 const uuid_t subject);
+/** Bind our staged round (@p id1, @p id2) to @p group_uuid, as
+ *  _forward_transaction does (the anchored cohort's for a half about a
+ *  member, RD_14.4 Phase 6). Unbound, handle_accepted reads it as our
+ *  primary group. The conformance `proposals` fixture's `group`. */
+void reputation_install_round_group(int64_t id1, int64_t id2,
+                                    const char *group_uuid);
 
 /** Keep placement state under @p dir rather than the config directory, or
  *  NULL for the config directory. Test and conformance seam: every
  *  participant shares one process there, and a promise must not survive into
  *  the next case. */
 void reputation_set_placement_dir(const char *dir);
+
+/** Bound a placement value at @p bytes encoded rather than
+ *  PLACE_VALUE_BYTES_MAX, or 0 for PLACE_VALUE_BYTES_MAX. Test seam. */
+void reputation_set_place_value_bytes_max(size_t bytes);
+
+/** The longest placement backoff after @p fails refusals at one instance. */
+double reputation_place_backoff_window(int fails);
+
+/** The primary chain's refusals: the instance, how many, and the backoff last
+ *  drawn. False when none are counted. Test seam. */
+bool reputation_place_fails(int *k, int *n, double *drawn);
 
 /** Stage the primary chain's promised placement ballot (@p n, @p by). */
 void reputation_install_place_promise(int64_t n, const uuid_t by);
@@ -157,13 +193,22 @@ int reputation_install_chain_json(const json_t *arr);
 
 /** Put a committed half in the primary chain's pool, as a commit does under
  *  ordered placement. Returns tx_history_record_half's status. */
-int reputation_record_half(const uuid_t task, const uuid_t scorer, double score,
+int reputation_record_half(const uuid_t task, const uuid_t scorer, int score_milli,
                            const char *channel, const char *cert_json);
+
+/** reputation_record_half_on for a half that names @p counterparty (NULL for
+ *  none) and carries its scorer's signature @p half_sig (may be NULL), R+D.md
+ *  §14.2. Returns tx_history_record_signed_half's status. */
+int reputation_record_named_half_on(const char *chain_key, const uuid_t task,
+                                    const uuid_t scorer, int score_milli,
+                                    const char *channel, const char *cert_json,
+                                    const uuid_t counterparty,
+                                    const char *half_sig);
 
 /** reputation_record_half on chain @p chain_key ("" is the primary, else a
  *  child group's uuid), creating the child chain on first use. */
 int reputation_record_half_on(const char *chain_key, const uuid_t task,
-                              const uuid_t scorer, double score,
+                              const uuid_t scorer, int score_milli,
                               const char *channel, const char *cert_json);
 
 /** Take @p members ([[uuid, signing key hex], ...]) as the roster in force on
@@ -228,6 +273,14 @@ int reputation_get_committed_tx_count(void);
  *  `certified_halves` expected_state assertions (doc/architecture/reputation.md, "Commit certificates").
  *  Mirrors the Python adapter's reading of Transaction.commit_sigs. */
 void reputation_get_commit_cert_counts(int *halves_held, int *certified_halves);
+/** How many of those halves carry their scorer's own signature (R+D.md
+ *  §14.2), for the `signed_halves` expected_state assertion. Mirrors the
+ *  Python adapter's reading of Transaction.half_sigs. */
+int reputation_get_signed_half_count(void);
+/** The ordinary halves the anchored cohort's chain holds, chain and pool (0
+ *  when no cohort is held or nothing has committed to it), for the
+ *  `cohort_halves_held` expected_state assertion (RD_14.4 Phase 6). */
+int reputation_get_cohort_half_count(void);
 
 /** Write the RFC 6962 ordered Merkle root over the resident committed window
  *  (transaction_window_root) into `out` (must hold TX_HASH_HEX_LEN + 1 bytes)
@@ -289,24 +342,31 @@ void reputation_force_checkpoint(const process_t *proc,
 void reputation_install_task_weight(const uuid_t task_uuid, int weight);
 
 /** Pre-install a bilateral Transaction (@p task_uuid) in
- *  rep_state.history: p1_uuid scored at @p p1_score, p2_uuid at
- *  @p p2_score. Drives `tx_history_update` twice under the same task
+ *  rep_state.history: p1_uuid scored at @p p1_score_milli, p2_uuid at
+ *  @p p2_score_milli (thousandths). Drives `tx_history_update` twice under the same task
  *  so both `_peer_mapping` entries get populated, matching how
  *  handle_committed builds bilateral history. Conformance hook only. */
 void reputation_install_tx_pair(const uuid_t task_uuid,
-                                const uuid_t p1_uuid, double p1_score,
-                                const uuid_t p2_uuid, double p2_score);
+                                const uuid_t p1_uuid, int p1_score_milli,
+                                const uuid_t p2_uuid, int p2_score_milli);
 
 /** reputation_install_tx_pair with each half's evidence channel (NULL for the
  *  default). The conformance `tx_history` fixture's p1_channel / p2_channel. */
 void reputation_install_tx_pair_tagged(const uuid_t task_uuid,
-                                       const uuid_t p1_uuid, double p1_score,
+                                       const uuid_t p1_uuid, int p1_score_milli,
                                        const char *p1_channel,
-                                       const uuid_t p2_uuid, double p2_score,
+                                       const uuid_t p2_uuid, int p2_score_milli,
                                        const char *p2_channel);
 
+/** reputation_install_tx_pair on the chain @p group_uuid resolves to (the
+ *  anchored cohort's, RD_14.4 Phase 6; the primary for any other). */
+void reputation_install_tx_pair_in(const char *group_uuid,
+                                   const uuid_t task_uuid,
+                                   const uuid_t p1_uuid, int p1_score_milli,
+                                   const uuid_t p2_uuid, int p2_score_milli);
+
 /** Pre-install ONE SIDE of a Transaction (@p task_uuid): @p peer_uuid scored
- *  at @p score, the counterparty slot left open.
+ *  at @p score_milli, the counterparty slot left open.
  *
  *  Exists so a single-step scenario can drive the arrival that COMPLETES the
  *  entry and then assert on the committed window -- which a two-step scenario
@@ -337,7 +397,7 @@ size_t reputation_attest_cosig_count(void);
 /* Commit a verifier-attested entry directly (test/conformance hook): the
  * chain's half of the rule, without the quorum round. Returns
  * tx_history_append_attested's result. */
-int reputation_install_tx_attested(const uuid_t verifier_uuid, double score,
+int reputation_install_tx_attested(const uuid_t verifier_uuid, int score_milli,
                                    const char *channel,
                                    const uuid_t subject_uuid,
                                    const char *evidence_digest);
@@ -354,7 +414,7 @@ bool reputation_attest_conflicted(const char *a, const char *b);
 /** @ref reputation_install_tx_attested with an attest scope (NULL for none)
  *  and its quorum certificate as JSON text (NULL for none). */
 int reputation_install_tx_attested_scoped(const uuid_t verifier_uuid,
-                                          double score, const char *channel,
+                                          int score_milli, const char *channel,
                                           const uuid_t subject_uuid,
                                           const char *evidence_digest,
                                           const char *scope,
@@ -364,7 +424,7 @@ int reputation_install_tx_attested_scoped(const uuid_t verifier_uuid,
  *  attestation waits to be placed, without the quorum round. Returns
  *  tx_history_pool_attested's result. */
 int reputation_install_pooled_attested(const uuid_t verifier_uuid,
-                                       double score, const char *channel,
+                                       int score_milli, const char *channel,
                                        const uuid_t subject_uuid,
                                        const char *evidence_digest);
 
@@ -382,7 +442,7 @@ void reputation_test_store_checkpoint(const process_t *proc, const char *propose
                                       int first_index, int count,
                                       const char *chain_key, json_t *sigs);
 void reputation_install_tx_single(const uuid_t task_uuid,
-                                  const uuid_t peer_uuid, double score);
+                                  const uuid_t peer_uuid, int score_milli);
 
 /** Pre-install a peer's reputation in rep_state.reputations.
  *  Conformance scenarios use this to set the counterparty's reputation
@@ -402,6 +462,35 @@ int reputation_rescore_sweep(const process_t *proc, double present,
  *  the next rescore sweep), without driving a Paxos round. Test hook. */
 void reputation_note_interaction(const uuid_t peer_uuid);
 
+/** Keep @p self_uuid's own entries aside when they leave the primary window
+ *  and every child chain's (tx_history_set_keep_party). The process does this
+ *  once it resolves itself; the conformance harness calls it up front. */
+void reputation_set_keep_party(const uuid_t self_uuid);
+
+/** How many own entries chain @p chain_key ("" or NULL: primary) holds past
+ *  its window. Test and conformance hook. */
+int reputation_retained_count(const char *chain_key);
+
+/** Lone probe verdicts (the user's call, 2026-11-06): how many are held about
+ *  @p subject (NULL: in all); write and reload the store as the process does
+ *  at checkpoint finalization and startup. */
+int reputation_lone_verdict_count(const uuid_t subject);
+/** Hold a lone verdict of @p score about @p subject from the probe of @p task
+ *  (conformance fixtures). */
+void reputation_install_lone_verdict(const uuid_t task, const uuid_t subject,
+                                     double score);
+void reputation_persist_lone_verdicts(const process_t *proc);
+void reputation_load_lone_verdicts(const process_t *proc);
+/** How many own entries this node holds about @p peer_uuid (Python
+ *  _own_count), and the told contrite tit-for-tat of it. */
+int reputation_own_count(const uuid_t peer_uuid);
+double reputation_told_ctft(const uuid_t self_uuid, const uuid_t peer_uuid);
+/** A TRANSACTION_SCORE from this node's own subsystems, as the process loop
+ *  handles it. */
+void reputation_handle_local_tx_score(const process_t *proc,
+                                      const generic_msg_t *msg,
+                                      const uuid_t self_uuid);
+
 /** Pre-install the coop-mode latch entry for @p peer_uuid. When @p
  *  in_coop is true, the next compute uses COOP_EXIT (0.45) as the
  *  pure-vs-CTFT gate; when false, COOP_ENTER (0.55). Mirrors Python's
@@ -412,6 +501,60 @@ void reputation_install_coop_mode(const uuid_t peer_uuid, bool in_coop);
  *  expected_state assertions. Returns 0 on success (writing to @p out),
  *  -1 if uninitialized or @p peer_uuid is absent. */
 int reputation_get_peer_reputation(const uuid_t peer_uuid, double *out);
+
+/** The brought score (RD_14.4 Phase 4) of @p peer_uuid: 0 and @p out, or -1
+ *  when this node holds none. */
+int reputation_get_brought(const uuid_t peer_uuid, double *out);
+
+/** What a decision about @p peer_uuid reads (bounded): 0 and @p out, or -1
+ *  when no told score is held. */
+int reputation_get_bounded(const uuid_t peer_uuid, double *out);
+
+/** Record identity's anchored cohort (RD_14.4 Phase 6), as an
+ *  ANCHORED_COHORT message does; NULL or not held: none. Reset by
+ *  reputation_reset_state. */
+void reputation_set_anchored_cohort(const anchored_cohort_msg_t *m);
+
+/** Whether @p peer_uuid is a join-burst target (RD_14.4 Phase 5: read under
+ *  the told ceiling), and if so the probe verdicts held about it, into
+ *  @p verdicts. False with the policy off. */
+bool reputation_burst_count(const uuid_t peer_uuid, int *verdicts);
+
+/** Whether @p peer_uuid is a suspect: our latest probe verdict of it failed
+ *  and one more failure would hold it below tier 1 (reputation_probe_hold).
+ *  False with the policy off. */
+bool reputation_is_suspect(const uuid_t peer_uuid);
+
+/** One pass of the join burst's count publisher at @p present: a
+ *  PEER_PROBE_COUNT to negotiation for each peer whose count changed,
+ *  throttled to one pass a second. Run by the process loop. */
+void reputation_publish_probe_counts(const process_t *proc, double present);
+
+/** Publish @p score as @p peer_uuid's tier, as a rescore does: a tier_update
+ *  to identity when the tier held after the demotion margin changes. */
+void reputation_publish_tier(const process_t *proc, const uuid_t peer_uuid,
+                             double score);
+
+/** Where two failed probes in a row hold a peer: the ladder's tier-1 floor
+ *  less 0.01 (REP_PROBE_HOLD at the default floors). */
+double reputation_tier_one_hold(void);
+
+/** Peers scored above this are persisted: AT_REP_PERSIST_THRESHOLD, else the
+ *  ladder's tier-1 floor. */
+double reputation_persist_threshold(void);
+
+/** Record identity's judgement that @p peer_uuid is (or is no longer) an
+ *  anchor, as a PEER_ANCHOR message does. Reset by reputation_reset_state. */
+void reputation_set_anchored(const uuid_t peer_uuid, bool anchored);
+
+/** Replace the primary chain's catch-up marks with @p indices (conformance). */
+void reputation_install_catchup_told(const int64_t *indices, size_t n);
+
+/** Offer one extension seed for @p who, as a provider would (FIRST_CONTACT
+ *  §10.5; under the join policy, RD_14.4 Phase 4). @p label names the
+ *  provider in the log. */
+void reputation_offer_seed(const process_t *proc, const char *label,
+                           const uuid_t who, double seed, const char *what);
 
 /** Deliver one peer standing exactly as the process loop would
  * (doc/architecture/zta-integration.md), so a test or conformance step can exercise the

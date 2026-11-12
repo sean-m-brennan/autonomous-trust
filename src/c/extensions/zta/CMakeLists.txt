@@ -26,6 +26,8 @@ message("-- libat_zta: OpenSSL ${OPENSSL_VERSION} at ${OPENSSL_LIBRARIES}")
 set_target_properties(OpenSSL::SSL OpenSSL::Crypto PROPERTIES IMPORTED_GLOBAL TRUE)
 
 at_extension_library(zta
+    DEB_DEPENDS libssl-dev
+    RPM_REQUIRES openssl-devel
     SOURCES
         zta_verifier.c
         x509_verifier.c

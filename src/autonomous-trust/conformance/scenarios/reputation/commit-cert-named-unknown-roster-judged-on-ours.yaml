@@ -1,0 +1,46 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: commit-cert-named-unknown-roster-judged-on-ours
+byte_pinning: false
+description: |
+    A commit naming a roster bob never held is judged by his own roster in
+    force, as one naming none is. carol's and dave's signatures fall short of
+    the three his roster of six needs, so the half is refused.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+  - id: erin
+    role: member
+  - id: frank
+    role: member
+
+fixtures:
+  roster: {}
+  local_chain:
+    bob:
+      - {roster: genesis, members: [alice, bob, carol, dave]}
+      - {roster: add, member: erin}
+      - {roster: add, member: frank}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: tx committed
+    payload:
+      task_id: t-1
+      score: 0.8
+      cosigners: [carol, dave]
+      cert_roster: abababababababababababababababababababababababababababababababab
+
+expected_state:
+  bob:
+    pool_tasks: []

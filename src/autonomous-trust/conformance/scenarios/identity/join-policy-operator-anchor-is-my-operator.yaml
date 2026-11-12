@@ -1,0 +1,56 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: join-policy-operator-anchor-is-my-operator
+byte_pinning: false
+description: |
+    RD_14.4_HOSTILE_JOIN_PLAN.md Phase 2, the operator class (the user's
+    call, 2026-10-23: same operator as me). bob and carol each present a bound
+    operator-class credential and a valid operator-key binding. bob's names
+    the joiner's own operator key (`valid:joiner`): he is the operator's other
+    node, so he anchors as operator as well as zta. carol's names an operator
+    key of her own, so she anchors as zta only.
+
+participants:
+  - id: joiner
+    role: new_node
+  - id: bob
+    role: border_guard
+  - id: carol
+    role: border_guard
+
+fixtures:
+  zta_policy:
+    enabled: true
+    require_at_admission: true
+    binding_mode: require
+    verifier_type: x509
+    ca_bundle_path: testdata/zta/operator-ca-bundle.pem
+    operator_ca_bundle_path: testdata/zta/operator-ca-bundle.pem
+  credentials:
+    bob: testdata/zta/certs/operator_leaf.der
+    carol: testdata/zta/certs/operator_leaf.der
+  zta_bindings:
+    bob: valid
+    carol: valid
+  operator_bindings:
+    joiner: valid
+    bob: valid:joiner
+    carol: valid
+  join_policy:
+    version: 1
+    enabled: true
+    anchors: [zta, operator]
+
+steps:
+  - id: 1
+    from: joiner
+    to: joiner
+    function: trigger_choose_group
+    description: No history is stashed; a scenario needs a step.
+
+expected_state:
+  joiner:
+    anchors:
+      bob: [operator, zta]
+      carol: [zta]

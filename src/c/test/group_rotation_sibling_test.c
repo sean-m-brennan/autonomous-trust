@@ -155,9 +155,51 @@ static directory_t *_queues(void)
     return queues;
 }
 
-/* Dispatch @p theirs as a VERIFIED group_key_update from @p member, through a
- * queue directory naming both identity and network (so _remember_activity has
- * a sibling to tell). */
+/* Sign @p nmsg's pre-image (`process|function|base64(data)`) with
+ * @p signer's key, as the sender's network process does. */
+static void _sign_update(net_msg_t *nmsg, const identity_t *signer)
+{
+    size_t b64_len = sodium_base64_encoded_len(nmsg->len,
+                                               sodium_base64_VARIANT_ORIGINAL);
+    char *b64 = malloc(b64_len);
+    sodium_bin2base64(b64, b64_len, nmsg->obj, nmsg->len,
+                      sodium_base64_VARIANT_ORIGINAL);
+    size_t pre_len = strlen("identity|group_key_update|") + strlen(b64);
+    char *pre = malloc(pre_len + 1);
+    snprintf(pre, pre_len + 1, "identity|group_key_update|%s", b64);
+    crypto_sign_detached(nmsg->signature, NULL, (unsigned char *)pre,
+                         pre_len, signer->signature.private);
+    free(pre);
+    free(b64);
+    nmsg->has_signature = true;
+}
+
+/* Name @p member in @p proc's group. */
+static void _add_member(process_t *proc, identity_t *member)
+{
+    char ustr[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(member->uuid, ustr);
+    ck_assert_ret_ok(group_add_address(&proc->protocol.group, ustr, member->address));
+}
+
+/* Hold @p member as an admitted peer, as the history's roster does. */
+static void _hold_peer(process_t *proc, identity_t *member)
+{
+    public_identity_t *pub = &proc->protocol.peers[proc->protocol.num_peers++];
+    memcpy(pub, member, sizeof(public_identity_t));
+    memset(pub->signature.private, 0, sizeof(pub->signature.private));
+}
+
+/* A member of @p proc's group that @p proc holds: whose rotations it takes. */
+static void _hold_member(process_t *proc, identity_t *member)
+{
+    _add_member(proc, member);
+    _hold_peer(proc, member);
+}
+
+/* Dispatch @p theirs as a VERIFIED group_key_update signed by @p member,
+ * through a queue directory naming both identity and network (so
+ * _remember_activity has a sibling to tell). */
 static void _dispatch_update(process_t *proc, identity_t *member, group_t *theirs)
 {
     json_t *payload = NULL;
@@ -168,12 +210,12 @@ static void _dispatch_update(process_t *proc, identity_t *member, group_t *their
     strncpy(msg.info.net_msg.process, "identity", PROC_NAME_LEN);
     msg.info.net_msg.function = ID_UPDATE_FN;
     msg.info.net_msg.verified = true;
-    msg.info.net_msg.has_signature = true;
     uuid_copy(msg.info.net_msg.from_whom.uuid, member->uuid);
     at_strlcpy(msg.info.net_msg.from_whom.nickname, member->nickname,
                sizeof(msg.info.net_msg.from_whom.nickname));
     ck_assert_ret_ok(net_msg_pack_json(&msg.info.net_msg, payload));
     json_decref(payload);
+    _sign_update(&msg.info.net_msg, member);
 
     directory_t *queues = _queues();
     run_message_handlers(proc, queues, NET_MESSAGE, &msg);
@@ -189,6 +231,7 @@ DEFINE_TEST(test_an_equal_size_rotation_reaches_the_network_process)
     identity_t *me = _mk_identity("ada", "10.0.0.1");
     identity_t *bob = _mk_identity("bob", "10.0.0.2");
     process_t *proc = _mk_process(me);
+    _hold_member(proc, bob);
 
     group_t theirs;
     _copy_group(proc, &theirs);
@@ -217,6 +260,7 @@ DEFINE_TEST(test_a_declined_rotation_sends_nothing)
     identity_t *me = _mk_identity("ada", "10.0.0.1");
     identity_t *bob = _mk_identity("bob", "10.0.0.2");
     process_t *proc = _mk_process(me);
+    _hold_member(proc, bob);
 
     group_t theirs;
     _copy_group(proc, &theirs);
@@ -246,6 +290,7 @@ DEFINE_TEST(test_an_update_before_phase_3_is_replayed_and_settles_the_tiebreak)
     identity_t *me = _mk_identity("cal", "10.0.0.3");
     identity_t *amy = _mk_identity("amy", "10.0.0.2");
     process_t *proc = _mk_process(me);
+    _hold_member(proc, amy);
 
     /* Two members' simultaneous rotations of one group: the same epoch. */
     group_t a, b;
@@ -306,7 +351,10 @@ DEFINE_TEST(test_an_adopted_groups_key_keeps_its_own_epoch)
     uuid_t huuid;
     uuid_generate(huuid);
     ck_assert_ret_ok(group_create(&huuid, (char *)"10.0.0.1", &theirs));
-    ck_assert_ret_ok(group_add_address(theirs, "uuid-alice", "10.0.0.1"));
+    char alice_uuid[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(alice->uuid, alice_uuid);
+    ck_assert_ret_ok(group_add_address(theirs, alice_uuid, "10.0.0.1"));
+    _hold_peer(proc, alice);
     ck_assert_ret_ok(group_add_address(theirs, "uuid-bob", "10.0.0.2"));
     ck_assert_ret_ok(group_add_address(theirs, "uuid-dee", "10.0.0.4"));
     ck_assert(group_rotate_key(theirs) == 1);
@@ -360,9 +408,110 @@ DEFINE_TEST(test_held_updates_are_bounded)
     _end();
 }
 
+/* Hostile-join run, 2026-11-03: a joiner still in phase 2 held the cohort's
+ * rotations to epochs 10 and 11 from members it did not yet hold, so no
+ * signature had been checked, and after phase 3 the gate refused every one;
+ * the cohort never resent, and the joiner kept a forked key. A held update's
+ * signature is now checked again against the peer this node holds for its
+ * sender. Only a verified update raises the epoch, as before. Mirrors
+ * tests/a_unit/test_group_key_convergence.py TestHeldRotationReverified. */
+
+/* Hold @p theirs at phase 2 as an update signed by @p signer and attributed to
+ * @p claimed, unverified (the network did not hold the sender), then reach
+ * phase 3 and replay it. */
+static void _hold_signed_then_replay(process_t *proc, identity_t *signer,
+                                     identity_t *claimed, group_t *theirs)
+{
+    json_t *payload = NULL;
+    ck_assert_ret_ok(group_to_json(theirs, &payload));
+    generic_msg_t msg = {0};
+    msg.type = NET_MESSAGE;
+    strncpy(msg.info.net_msg.process, "identity", PROC_NAME_LEN);
+    msg.info.net_msg.function = ID_UPDATE_FN;
+    uuid_copy(msg.info.net_msg.from_whom.uuid, claimed->uuid);
+    at_strlcpy(msg.info.net_msg.from_whom.nickname, claimed->nickname,
+               sizeof(msg.info.net_msg.from_whom.nickname));
+    ck_assert_ret_ok(net_msg_pack_json(&msg.info.net_msg, payload));
+    json_decref(payload);
+
+    _sign_update(&msg.info.net_msg, signer);
+    msg.info.net_msg.verified = false;
+
+    proc->protocol.phase = 2;
+    directory_t *queues = _queues();
+    run_message_handlers(proc, queues, NET_MESSAGE, &msg);
+    net_msg_free_obj(&msg.info.net_msg);
+    proc->protocol.phase = 3;
+    ck_assert_int_eq((int)identity_replay_held_group_updates(proc, queues), 1);
+    array_free(queues);
+}
+
+DEFINE_TEST(test_a_held_rotation_signed_by_a_held_member_is_adopted)
+{
+    _begin();
+    identity_t *me = _mk_identity("joiner", "10.0.0.3");
+    identity_t *member = _mk_identity("member", "10.0.0.2");
+    process_t *proc = _mk_process(me);
+    _add_member(proc, member);
+    group_t theirs;
+    _copy_group(proc, &theirs);
+    group_rotate_key(&theirs);
+    ck_assert(group_rotate_key(&theirs) == 2);
+    _hold_peer(proc, member);
+
+    _hold_signed_then_replay(proc, member, member, &theirs);
+
+    ck_assert_int_eq((int)proc->protocol.group.key_epoch, 2);
+    ck_assert_mem_eq(proc->protocol.group.encryptor.public,
+                     theirs.encryptor.public, crypto_box_PUBLICKEYBYTES);
+    _drop_copy(&theirs);
+    _end();
+}
+
+DEFINE_TEST(test_a_held_rotation_signed_by_anyone_else_is_refused)
+{
+    _begin();
+    identity_t *me = _mk_identity("joiner", "10.0.0.3");
+    identity_t *member = _mk_identity("member", "10.0.0.2");
+    identity_t *mallory = _mk_identity("mallory", "10.0.0.9");
+    process_t *proc = _mk_process(me);
+    _add_member(proc, member);
+    group_t theirs;
+    _copy_group(proc, &theirs);
+    ck_assert(group_rotate_key(&theirs) == 1);
+    _hold_peer(proc, member);
+
+    _hold_signed_then_replay(proc, mallory, member, &theirs);
+
+    ck_assert_int_eq((int)proc->protocol.group.key_epoch, 0);
+    _drop_copy(&theirs);
+    _end();
+}
+
+DEFINE_TEST(test_a_held_rotation_from_a_sender_not_yet_held_is_refused)
+{
+    _begin();
+    identity_t *me = _mk_identity("joiner", "10.0.0.3");
+    identity_t *member = _mk_identity("member", "10.0.0.2");
+    process_t *proc = _mk_process(me);
+    _add_member(proc, member);
+    group_t theirs;
+    _copy_group(proc, &theirs);
+    ck_assert(group_rotate_key(&theirs) == 1);
+
+    _hold_signed_then_replay(proc, member, member, &theirs);
+
+    ck_assert_int_eq((int)proc->protocol.group.key_epoch, 0);
+    _drop_copy(&theirs);
+    _end();
+}
+
 RUN_TESTS(GroupRotationSibling,
           test_an_equal_size_rotation_reaches_the_network_process,
           test_a_declined_rotation_sends_nothing,
           test_an_update_before_phase_3_is_replayed_and_settles_the_tiebreak,
           test_held_updates_are_bounded,
-          test_an_adopted_groups_key_keeps_its_own_epoch)
+          test_an_adopted_groups_key_keeps_its_own_epoch,
+          test_a_held_rotation_signed_by_a_held_member_is_adopted,
+          test_a_held_rotation_signed_by_anyone_else_is_refused,
+          test_a_held_rotation_from_a_sender_not_yet_held_is_refused)

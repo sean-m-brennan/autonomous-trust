@@ -17,6 +17,7 @@
 #include "calibration/calibration.h"
 #include "calibration/conformal.h"
 #include "utilities/util.h"   /* at_strlcpy */
+#include "utilities/numfmt.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -28,7 +29,7 @@
 /* ------------------------------------------------------------------------ */
 
 static void _fail(char *err, size_t err_len, const char *fmt, ...)
-    __attribute__((format(printf, 3, 4)));
+    __attribute__((format(AT_PRINTF_FORMAT, 3, 4)));
 
 static void _fail(char *err, size_t err_len, const char *fmt, ...)
 {
@@ -461,7 +462,7 @@ static size_t _result_values(const char *result_str, double *out, size_t cap)
         return 0;
 
     char *end = NULL;
-    double bare = strtod(result_str, &end);
+    double bare = at_strtod(result_str, &end);
     if (end != NULL && end != result_str)
     {
         while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')

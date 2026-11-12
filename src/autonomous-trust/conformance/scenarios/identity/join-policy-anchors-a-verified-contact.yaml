@@ -1,0 +1,45 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: join-policy-anchors-a-verified-contact
+byte_pinning: false
+description: |
+    RD_14.4_HOSTILE_JOIN_PLAN.md Phase 2, D6: the declaration chooses which
+    anchor classes count. With verified_contact declared, bob (a contact whose
+    safety number was compared) is an anchor and carol (recorded, never
+    verified) is not: an unverified contact proves only possession of a
+    ticket, and a forwarded invitation link is enough for one.
+
+participants:
+  - id: joiner
+    role: new_node
+  - id: bob
+    role: border_guard
+  - id: carol
+    role: border_guard
+
+fixtures:
+  first_contact:
+    enabled: true
+  contacts:
+    bob:
+      verified: true
+    carol:
+      verified: false
+  join_policy:
+    version: 1
+    enabled: true
+    anchors: [verified_contact]
+
+steps:
+  - id: 1
+    from: joiner
+    to: joiner
+    function: trigger_choose_group
+    description: No history is stashed; a scenario needs a step.
+
+expected_state:
+  joiner:
+    anchors:
+      bob: [verified_contact]
+      carol: []

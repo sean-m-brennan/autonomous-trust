@@ -24,6 +24,7 @@
 
 #include "physics/physics.h"
 #include "utilities/util.h"   /* at_strlcpy */
+#include "utilities/numfmt.h"
 
 #define AT_PHYSICS_ENV "AT_PHYSICS"
 
@@ -42,7 +43,7 @@
 #define AT_PHYS_MAX_DIAGNOSES 256
 
 static void _err(char *buf, size_t len, const char *fmt, ...)
-    __attribute__((format(printf, 3, 4)));
+    __attribute__((format(AT_PRINTF_FORMAT, 3, 4)));
 
 static void _err(char *buf, size_t len, const char *fmt, ...)
 {
@@ -930,7 +931,7 @@ static bool _parse_claim(const char *result_str, claim_t *out)
         /* Not JSON. A bare decimal is the other shape a `report results`
          * payload carries; whole-string parse only, so "42abc" is not 42. */
         char *end = NULL;
-        double d = strtod(result_str, &end);
+        double d = at_strtod(result_str, &end);
         if (end == NULL || *end != '\0' || end == result_str || !isfinite(d))
             return false;
         out->values[0] = d;
@@ -970,7 +971,7 @@ static bool _parse_claim(const char *result_str, claim_t *out)
 static at_physics_verdict_t _refuted(double *score_out, char *reason_out,
                                      size_t reason_len, const char *reason,
                                      const char *fmt, ...)
-    __attribute__((format(printf, 5, 6)));
+    __attribute__((format(AT_PRINTF_FORMAT, 5, 6)));
 
 static at_physics_verdict_t _refuted(double *score_out, char *reason_out,
                                      size_t reason_len, const char *reason,

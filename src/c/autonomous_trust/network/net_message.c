@@ -106,6 +106,27 @@ static char *wire_data_b64(const uint8_t *data, size_t data_len)
     return b64;
 }
 
+bool net_message_verify_signature(const char *process, const char *function,
+                                  const uint8_t *data, size_t data_len,
+                                  const uint8_t signature[crypto_sign_BYTES],
+                                  const unsigned char public_key[crypto_sign_PUBLICKEYBYTES])
+{
+    if (process == NULL || signature == NULL || public_key == NULL)
+        return false;
+    char *b64 = wire_data_b64(data, data_len);
+    if (b64 == NULL)
+        return false;
+    size_t content_len = 0;
+    char *content = wire_signable_content(process, function, b64, &content_len);
+    free(b64);
+    if (content == NULL)
+        return false;
+    bool ok = crypto_sign_verify_detached(signature, (const unsigned char *)content,
+                                          content_len, public_key) == 0;
+    free(content);
+    return ok;
+}
+
 /* Frama-C: skipped —
  * [serialization] net_message_to_wire: 11x json_object_set_new/json_string + 2x
  * crypto_sign_detached + strlen/snprintf/sodium_bin2base64 cascade.

@@ -24,6 +24,7 @@ learner writes a placement only on a quorum certificate over the placement's
 designation after its own head.
 """
 import os
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
@@ -33,8 +34,8 @@ from autonomous_trust.core.reputation.placement import (
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
 from autonomous_trust.core.reputation.repprocess import ReputationProcess
 from autonomous_trust.core.reputation.reputation import (
-    Transaction, commit_designation, place_designation, place_value_digest,
-    placement_entry)
+    Transaction, commit_designation, half_designation, place_designation,
+    place_value_digest, placement_entry)
 
 from tests.a_unit.test_commit_certificates import (_ident, _node, _sent, _msg,
                                                     _roster)
@@ -81,11 +82,19 @@ def _entry(everyone, a, b, task=None):
     two other members."""
     task = task or uuid4()
     others = [m for m in everyone if m is not a and m is not b]
-    tx = Transaction(task, p1_id=a.uuid, p1_score=0.9, p2_id=b.uuid,
-                     p2_score=0.7,
-                     commit_sigs={str(a.uuid): _cert(a, task, 0.9, others),
-                                  str(b.uuid): _cert(b, task, 0.7, others)})
+    tx = Transaction(task, p1_id=a.uuid, p1_score_milli=900, p2_id=b.uuid,
+                     p2_score_milli=700,
+                     commit_sigs={str(a.uuid): _cert(a, task, 900, others),
+                                  str(b.uuid): _cert(b, task, 700, others)},
+                     half_sigs={str(a.uuid): _half_sig(a, b, task, 900),
+                                str(b.uuid): _half_sig(b, a, task, 700)})
     return placement_entry(tx)
+
+
+def _half_sig(scorer, other, task, score):
+    """`scorer`'s own signature over its half, naming `other`."""
+    return ReputationProcess._detached_sig(
+        scorer, half_designation(task, scorer.uuid, other.uuid, score))
 
 
 def _value(*entries):
@@ -204,7 +213,7 @@ class TestAccept:
         _only(sent, ReputationProtocol.place_nack)
 
     @pytest.mark.parametrize('spoil', ['uncertified', 'order', 'unsorted',
-                                       'held'])
+                                       'held', 'unsigned', 'forged-half'])
     def test_an_invalid_value_is_not_accepted(self, four, spoil):
         prop, acc = four[0], four[1]
         rp, q = _placing(acc, four)
@@ -216,13 +225,28 @@ class TestAccept:
         elif spoil == 'order':
             d = value[0]
             d['p1'], d['p2'] = d['p2'], d['p1']
-            d['p1_score'], d['p2_score'] = d['p2_score'], d['p1_score']
+            d['p1_score_milli'], d['p2_score_milli'] = d['p2_score_milli'], d['p1_score_milli']
             d['p1_cert'], d['p2_cert'] = d['p2_cert'], d['p1_cert']
+            d['p1_sig'], d['p2_sig'] = d['p2_sig'], d['p1_sig']
         elif spoil == 'unsorted':
             value.reverse()
+        elif spoil == 'unsigned':
+            # Certified by the majority, never signed by its scorer
+            # (R+D.md §14.2).
+            value[0].pop('p1_sig')
+        elif spoil == 'forged-half':
+            # The certifiers sign the half in the scorer's name.
+            d, scorer = value[0], next(m for m in four
+                                       if str(m.uuid) == value[0]['p1'])
+            forger = next(m for m in four if str(m.uuid) not in
+                          (d['p1'], d['p2']))
+            other = next(m for m in four if str(m.uuid) == d['p2'])
+            d['p1_sig'] = ReputationProcess._detached_sig(
+                forger, half_designation(e1.task_id if str(e1.task_id) == d['task']
+                                         else e2.task_id, scorer.uuid,
+                                         other.uuid, d['p1_score_milli']))
         elif spoil == 'held':
-            rp.history.record_half(e1.task_id, e1.p1_id, e1.p1_score)
-            rp.history.record_half(e1.task_id, e1.p2_id, e1.p2_score)
+            _pool(rp, e1)
             rp.history.apply_placed(0, rp.history.ready_items())
             value = _value(e1)
         _ask(rp, q, prop, k=rp.history.next_index)
@@ -268,7 +292,7 @@ class TestLearn:
         prop, obs = four[0], four[3]
         rp, q = _placing(obs, four)
         e = _entry(four, obs, four[1])
-        rp.history.record_half(e.task_id, obs.uuid, 0.9)
+        rp.history.record_half(e.task_id, obs.uuid, 900)
         rp.awaiting_commit[str(e.task_id)] = [0.9, 0, 0, None, 0, 0]
         value = _value(e)
         _placed(rp, q, prop, value, _certify(value, 0, b'', four[:3]))
@@ -295,7 +319,7 @@ class TestLearn:
         sigs = {str(m.uuid): ReputationProcess._detached_sig(m, att.designation)
                 for m in (ver, prop, obs)}
         tx = Transaction(attest_task_id(ver.uuid, subj.uuid, digest),
-                         p1_id=ver.uuid, p1_score=0.3, p1_channel='probe',
+                         p1_id=ver.uuid, p1_score_milli=300, p1_channel='probe',
                          attested=True, subject_id=subj.uuid,
                          evidence_digest=digest, attest_sigs=sigs)
         value = _value(placement_entry(tx))
@@ -309,12 +333,19 @@ class TestLearn:
         assert rp._next_checkpoint_at <= __import__('time').time() + \
             rp.ATTEST_CHECKPOINT_SEC + 1
 
-    @pytest.mark.parametrize('spoil', ['sub-quorum', 'forged', 'other-head'])
+    @pytest.mark.parametrize('spoil', ['sub-quorum', 'forged', 'other-head',
+                                       'unsigned-half'])
     def test_an_uncertified_placement_is_refused(self, four, spoil):
         prop, obs = four[0], four[3]
         rp, q = _placing(obs, four)
         value = _value(_entry(four, four[1], four[2]))
-        if spoil == 'sub-quorum':
+        if spoil == 'unsigned-half':
+            # Every member signed the placement and both certificates; the
+            # scorer never signed its half. The majority's word is not its
+            # (R+D.md §14.2).
+            value[0].pop('p2_sig')
+            sigs = _certify(value, 0, b'', four)
+        elif spoil == 'sub-quorum':
             sigs = _certify(value, 0, b'', four[:2])
         elif spoil == 'forged':
             sigs = _certify(value, 0, b'', four[:3])
@@ -381,9 +412,11 @@ def _grant(rp, q, voter, req, accepted=None):
 
 
 def _pool(rp, e):
-    for uid, score in ((e.p1_id, e.p1_score), (e.p2_id, e.p2_score)):
+    for uid, score in ((e.p1_id, e.p1_score_milli), (e.p2_id, e.p2_score_milli)):
         rp.history.record_half(e.task_id, uid, score,
-                               certificate=e.certificate_of(uid))
+                               certificate=e.certificate_of(uid),
+                               counterparty=e.counterparty_of(uid),
+                               half_sig=e.half_sig_of(uid))
 
 
 class TestPropose:
@@ -418,6 +451,29 @@ class TestPropose:
         _grant(rp, q, four[1], req, accepted=reported)
         place = _only(_grant(rp, q, four[2], req), ReputationProtocol.place)
         assert place['value'] == _value(theirs)
+
+    def test_a_value_we_cannot_carry_is_dropped_with_its_reason(self, four):
+        # Hostile-join run, 2026-11-04: a joiner dropped 14,340 rounds in eight
+        # minutes on this path, and the log never said why.
+        me = four[0]
+        rp, q = _placing(me, four)
+        theirs = _entry(four, four[2], four[3])
+        req = _start(rp, q)
+        reported = {'ballot': {'n': 1, 'by': str(four[3].uuid).lower()},
+                    'value': _value(theirs, theirs)}
+        _grant(rp, q, four[1], req, accepted=reported)
+        rp.logger = MagicMock()
+        assert _grant(rp, q, four[2], req) == []
+        [line] = [c.args[0] % c.args[1:] for c in rp.logger.warning.call_args_list
+                  if 'value to carry' in c.args[0]]
+        assert 'not one of each task, by task id' in line
+        assert str(four[3].uuid).lower()[:8] in line
+        # And it counts as a refused round, so this node backs off. Without it,
+        # a Pi left out of a two-member genesis that both members had accepted
+        # dropped a round every two seconds (Wi-Fi cohort, 2026-11-11), and the
+        # two members that could carry the genesis kept hearing a live round
+        # and left it alone.
+        assert rp._place_vars()['_place_fails'][''][:2] == (req['k'], 1)
 
     def test_a_nack_ends_the_round_and_the_next_outranks_it(self, four):
         me = four[0]

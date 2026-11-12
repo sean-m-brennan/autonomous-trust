@@ -1,0 +1,61 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: held-group-update-forged-signature-refused
+byte_pinning: false
+description: |
+    A held rotation whose signature is not the claimed sender's stays refused.
+
+    The re-check after phase 3 uses the key this node holds for the sender the
+    frame names, never a key the frame supplies, so a rotation signed by anyone
+    else fails it. As held-group-update-reverified-after-phase3, except that
+    mallory signed the update member is said to have sent: joiner keeps
+    epoch 0.
+
+participants:
+  - id: joiner
+    role: group_member
+  - id: member
+    role: group_member
+  - id: mallory
+    role: group_member
+
+fixtures:
+  groups:
+    joiner:
+      uuid: "0a000000-0000-4000-8000-000000000ab2"
+      size: 1
+      key_epoch: 0
+      members: [member]
+    member:
+      uuid: "0a000000-0000-4000-8000-000000000ab2"
+      size: 1
+      key_epoch: 2
+      members: [joiner]
+  phases:
+    joiner: 2
+
+steps:
+  - id: 1
+    from: member
+    to: joiner
+    function: group_key_update
+    payload:
+      held_unverified: true
+      signed_by: mallory
+    description: |
+        member's epoch-2 group, signed by mallory, reaches joiner in phase 2.
+
+  - id: 2
+    from: joiner
+    to: joiner
+    function: trigger_phase3
+    payload:
+      admit: [member]
+    description: |
+        joiner reaches phase 3 holding member; the replayed update fails the
+        check against member's key and is refused.
+
+expected_state:
+  joiner:
+    group_key_epoch: 0

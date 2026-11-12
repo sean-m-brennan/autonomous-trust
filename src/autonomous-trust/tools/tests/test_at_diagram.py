@@ -206,9 +206,10 @@ class TestCheck:
         assert not report.is_clean
 
     def test_orphan_enum_entries_excluded(self):
-        # NegotiationProtocol.task ('task info') and ReputationProtocol.rep_resp
-        # ('reputation response') are class attributes with NO
-        # register_handler call in the corresponding *process.py. The
+        # ReputationProtocol.rep_resp ('reputation response') is a class
+        # attribute with NO register_handler call in the corresponding
+        # *process.py ('task info' was NegotiationProtocol's until it was
+        # deleted, 2026-10-21; it stays asserted absent). The
         # orphan-filter inside _registered_functions must exclude them so
         # they don't surface as drift — `_handler_keyed_attrs` parses the
         # production source for `register_handler(<Class>.<attr>, ...)`

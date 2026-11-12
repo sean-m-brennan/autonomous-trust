@@ -94,6 +94,15 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
 void handle_inbound_relayed(net_thread_ctx_t *ctx, const uint8_t *buf,
                             size_t nbytes, const char *from_uuid);
 
+/** @brief Deliver a frame an extension received some other way (a radio) on
+ *  channel @p ch, attributed to the peer @p from_uuid we hold. PEER takes the
+ *  relayed path; GROUP and BROADCAST the transport's handlers, keyed on the
+ *  peer's address. The frame does not stamp transport liveness, and a group
+ *  frame that fails to open is counted (net.ext/group_decrypt_fail), never a
+ *  partition signal. An unknown uuid is dropped. The caller keeps @p buf. */
+void handle_inbound_ext(net_thread_ctx_t *ctx, net_channel_t ch,
+                        const uint8_t *buf, size_t nbytes, const char *from_uuid);
+
 /** @brief Process one inbound BROADCAST-channel frame. See @ref handle_inbound_peer. */
 void handle_inbound_broadcast(net_thread_ctx_t *ctx,
                               uint8_t *buf, size_t nbytes,
@@ -118,6 +127,59 @@ size_t net_retry_held_group_frames(net_thread_ctx_t *ctx);
 /** Test seams: how many group frames are held; forget them all. */
 size_t net_held_group_frame_count(void);
 void net_held_group_frames_reset(void);
+
+/** Replay every deferred point-to-point frame from a known peer that was
+ *  refused for its wire format while we could not place the peer, once the
+ *  peer can be placed in a group we hold: read then in that group's format. A
+ *  frame whose peer is still unplaced stays until the out-of-order age bound
+ *  (net_mystery_max_age_resolve) reclaims it. The main loop calls it every
+ *  pass; returns how many were replayed. */
+size_t net_replay_placed_deferred(net_thread_ctx_t *ctx);
+
+/* ---- The moment of admission, as the joiner ----
+ * An access_granted from a sender we cannot place starts a pending admission,
+ * and per-recipient non-bootstrap frames to that admitter are held until it can
+ * be placed or the out-of-order age bound passes. */
+
+/** How many admitters can be pending at once, and how many outbound frames
+ *  can be held for them (past that the oldest held frame is dropped). */
+#define NET_ADMISSIONS_PENDING 8
+#define NET_HELD_FOR_ADMISSION 64
+
+/** What the main loop's outbound path needs to put one queued message on the
+ *  wire. Exposed so a test can drive that path with a fake transport. */
+typedef struct {
+    process_t               *proc;
+    const identity_t        *myself;
+    const public_identity_t *my_public;   /* stamped as from_whom; may be NULL */
+    const net_transport_t   *transport;
+    net_transport_ctx_t     *tctx;
+    int                      port_num;
+    const char              *bcast_addr;
+    logger_t                *logger;
+} net_outbound_t;
+
+/** Send one NET_MESSAGE the network process dequeued (group multicast,
+ *  broadcast or per-recipient), after the local intercepts. A per-recipient
+ *  frame to an admitter whose admission of us is still settling is held
+ *  instead. Main loop only. */
+void net_send_outbound(const net_outbound_t *out, const generic_msg_t *buf);
+
+/** Send, in order, the held frames whose admission has settled; a frame never
+ *  goes ahead of an earlier still-held frame to the same address. The main loop
+ *  calls it before each dequeue. Main loop only; returns how many were sent. */
+size_t net_release_admission_holds(const net_outbound_t *out);
+
+/** Test seams: held-frame count; whether @p address has a pending admission;
+ *  move every pending deadline @p secs into the past; forget all of it. */
+size_t net_proc_test_held_for_admission_count(void);
+/** Test seams: how many held frames the full hold has dropped since start, and
+ *  the verb of the held frame at @p idx (oldest first; NULL past the end). */
+unsigned long net_proc_test_held_for_admission_overflows(void);
+const char *net_proc_test_held_for_admission_function(size_t idx);
+bool net_proc_test_admission_pending(const char *address);
+void net_proc_test_backdate_admissions(int64_t secs);
+void net_proc_test_reset_admissions(void);
 
 /**
  * @brief The registered peer whose identity uuid is @p uuid, or NULL.
@@ -175,6 +237,12 @@ void net_proc_test_track_annoy(const char *address);
  *         dropped before any further processing). */
 bool net_proc_test_is_rejected(const char *address);
 
+/** @brief Blacklist @p address, as a reputation exclude does. */
+void net_proc_test_blacklist(const char *address);
+
+/** @brief Lift @p address from the blacklist, as a reputation readmit does. */
+void net_proc_test_readmit(const char *address);
+
 /* ---- Test-only: route_to_process capture ----
  * Tests for AT_DISCOVERY_CROSS_CLUSTER observe whether a forwarded
  * broadcast preserved the wire payload's self-reported from_whom.address
@@ -228,6 +296,29 @@ bool net_wire_verb_admitted(const char *process, const char *function,
  *         API. */
 int net_proc_test_route_on_path(const net_wire_msg_t *wmsg, process_t *proc,
                                 logger_t *logger, net_route_path_t path);
+
+/** @brief The child cohort @p address belongs to, when it is on the far side
+ *  of a gateway boundary from our primary group: fills @p out with that
+ *  group's uuid (hyphenated, lowercase) and returns true. Otherwise leaves
+ *  @p out empty and returns false; always false on a leaf node. Mirrors Python
+ *  NetworkProcess._child_group_of. */
+bool net_child_group_of(const process_t *proc, const char *address,
+                        char *out, size_t out_len);
+
+/** @brief net_encrypt_and_send, exposed for tests (the send path's hooks). */
+int net_proc_test_encrypt_and_send(const identity_t *myself, const group_t *grp,
+                                   const net_wire_msg_t *msg,
+                                   const net_transport_t *transport,
+                                   net_transport_ctx_t *ctx, int port,
+                                   net_wire_format_t fmt, logger_t *logger);
+
+/** @brief Mark this thread as routing extension-delivered frames (tests). */
+void net_proc_test_set_ext_inbound(bool on);
+
+/** @brief The checks network_run makes before its receivers start (the
+ *  filters, the plaintext verbs, each extension's check_config), exposed for
+ *  tests. @return 0, or -1 when the start is refused. */
+int net_proc_test_start_checks(const network_config_t *net_cfg, logger_t *logger);
 
 /* ---- ping_at refusal (divergence: C implements no PingAT) ----
  * The outbound drain answers the `ping_at` selector with an explicit refusal

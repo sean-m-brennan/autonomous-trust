@@ -50,6 +50,48 @@ All four thresholds honor environment overrides, read once at startup, and the
 inspector dashboard reads the same cut-off variable, so its displayed line
 tracks a re-adjusted backend rather than a compiled-in assumption.
 
+### Integer scores
+
+A transaction score crosses the wire, is signed and is hashed as an integer
+number of thousandths, 0 to 1000 for 0.0 to 1.0 (`TX_SCORE_SCALE` in both
+runtimes). The arithmetic that turns scores into a reputation still works in
+doubles. Only the bytes two nodes have to agree on are integers.
+
+The reason is the C library on the smallest targets. Those bytes used to be the
+score's `%.17g` text, and producing and reading that text is the libc's job.
+glibc rounds both directions correctly. uClibc-ng, the libc of SPARC V8 / LEON3
+Linux, does not: it misreads about a quarter of three-decimal values, and prints
+0.1 + 0.2 as a string that does not parse back to the same double. A node on
+such a libc builds different canonical bytes for the same entry, so its entry
+hashes, window roots and every signature over a score disagree with the rest of
+the group, and it refuses their valid data. An integer has one spelling on
+every libc. Doubles that remain on the wire, such as a reputation carried as a
+cross-check, are formatted and parsed by correctly rounded code, never the
+libc: Ryu (`utilities/numfmt.h`) and, inside the vendored jansson, David Gay's
+dtoa (the fork parses with it too, and keeps its state per thread). The C core refuses to start if a self-test finds a conversion it
+depends on is not exact (`AT_ALLOW_INEXACT_FLOAT=1` overrides it, loudly).
+
+Floats stop at the producer. An application still hands `TransactionScore` a
+value from 0.0 to 1.0. It is validated as before (an off-scale value is
+refused, not clamped) and rounded once, half away from zero, as C's
+`lround(score * 1000.0)` rounds it. Python's `score_to_milli` reproduces that
+bit for bit. From there on everything holds the integer: the proposal, the
+round's signatures, the `committed` broadcast, the chain entry, the placement
+value, the pool and evidence files, and the slash floor. A score off the
+wire must be a JSON integer from 0 to 1000. A real is refused even when it is
+integral, so a value from a build that predates this (which sent `0.8`) is
+never misread as thousandths.
+
+The field names changed with the type (`score` became `score_milli`,
+`p1_score` became `p1_score_milli`, `floor_score` became `floor_milli`), and
+the persisted documents bumped their schemas: the pool to 2, the evidence
+document and the attested record to "2". This was a hard cutover. A node from
+before it and a node after it do not interoperate, and the older node's stored
+chain and pool are refused on load and rebuilt, the same safe outcome as any
+other unusable evidence. Every pinned window root in the corpus was regenerated
+from Python and reproduced independently by C, natively and big-endian under
+qemu-sparc.
+
 ### Where a score came from
 
 A score says how well a peer did, and it does not, on its own, say how we know.
@@ -288,6 +330,20 @@ evidence starts in cooperation mode rather than parked at its prior until the
 next entry about it, which could otherwise raise it even when that entry was a
 finding (ISSUES §2.64).
 
+Cooperation mode takes one more test, on every rescore: the cooperation score
+itself must be at or above 0.45. Otherwise the peer is scored by tit-for-tat,
+and a peer already in cooperation leaves it in that same rescore. Without the
+test, a peer whose own record and whose reputation in the group disagree flips
+on every rescore. In the hostile-join runs of 2026-11-04 without the join
+policy, tit-for-tat over a joiner's own transactions scored its contact 0.84,
+the weighted average over everyone's entries, the cohort's slander included,
+scored it 0.34, and each sent the next rescore to the other, so the contact's
+tier changed every minute. Testing only on entry still let a peer already in
+cooperation take one score from that average on the way out, and the runs of
+2026-11-05 lost the contact's tier for a minute that way. Now this node's own
+evidence wins. The brought score follows the same rule over this node's own
+entries (`coop_regime_of`, `reputation_coop_regime`).
+
 In *cooperation mode*, the score is pure reputation, being a weighted average of
 every transaction score involving this peer. Each score carries two weights, the
 reputation of the counterparty and the capability weight of the transaction, so
@@ -302,14 +358,29 @@ is what ties this arithmetic directly to the tiered transaction model of the
 next chapter.
 
 In *tit-for-tat mode*, the strategy is contrite tit-for-tat over the bilateral
-history between this node and the queried peer. If the peer defected, meaning
-scored below the pivot, but local standing is itself poor, the response is to
-cooperate. If the peer defected and local standing is fine, the response is to
-defect. Otherwise cooperate. The contrition is the middle case, and it exists so
-that two peers in a mutual downward spiral have a path out rather than a
-ratchet.
+history between this node and the queried peer. The peer's standing is the
+mean of the scores this node gave it, shrunk toward neutral by the same
+pseudo-count the cold-start prior uses, so one good transaction is not a track
+record: one 0.9 reads 0.375, three read 0.55 and ten 0.74.
+
+```
+standing = (Σ given + k · neutral) / (n + k)        k = 3, neutral = 0.2
+```
+
+A defection is a transaction in which the peer scored this node below the
+pivot. The first is forgiven and the score is the standing; two in a row hold
+it at 0.49, below tier 1. The forgiveness is the contrition, and it exists so
+that one bad exchange does not start a ratchet. There is no floor: a peer that
+keeps failing sinks to its record. Until the hostile-join run of 2026-11-04 the
+rule took the plain mean with a floor of 0.51, which carried an honest joiner
+to tier 4 on a few transactions and held five failing colluders at tier 1.
 
 ### Tenure
+
+(A joiner can also bound what a cohort's word alone buys a peer, by tier
+rather than by time: under the join policy a peer read only on told evidence
+holds at most `told_tier` until this node has `own_evidence_min` entries of
+its own. See [Joining a hostile cohort](hostile-join.md#brought-and-told).)
 
 Either strategy rewards a peer that answers well, and AT's own probes are cheap
 to answer well. Stele's red team showed what that costs (`rt-3717776`,
@@ -357,7 +428,7 @@ rather than open.
 |---------|----------|-----------|---------|
 | `transaction` | `transaction` | proposer to group | Propose the half, asking to be certified and naming its group |
 | `tx accepted` | `accepted` | peer to proposer | Accept the half, signing its commit designation |
-| `tx committed` | `committed` | proposer to group | Announce the certified half, certificate included |
+| `tx committed` | `committed` | proposer to group | Announce the certified half, certificate, name and scorer signature included |
 | `update needed` | `outdated` | behind-peer to top peers | Sync: request missing history |
 | `latest update` | `update` | peer to behind-peer | Sync: send a history segment |
 | `request reputation` | `rep_req` | any process to reputation | Query: compute a score |
@@ -414,9 +485,11 @@ carried every round however large the group grew.
 
 *Commit broadcast.* Once the signatures make a certificate, the proposer puts
 its half in its chain's pool and broadcasts `tx committed` carrying the task
-identifier, the proposer identifier, the score, the group, the channel and the
-certificate. Each member checks the certificate against its own roster and
-pools the same half; the proposer skips its own bounce-back. This step looks
+identifier, the proposer identifier, the score, the group, the channel, the
+certificate, whom the half names and the proposer's own signature over it
+([Signed halves](#signed-halves)). Each member checks the certificate against
+its own roster and the signature against the proposer's key, and pools the
+same half; the proposer skips its own bounce-back. This step looks
 redundant and is not. Without it, every peer would hold only its own halves.
 When peers A and B independently score the same task, A would hold only A's
 half and B only B's, and the bilateral check that contrite tit-for-tat performs
@@ -452,7 +525,11 @@ responder's head hash, the same on every page of one window. The receiver
 keeps the pages it has, one set per sender and chain and at most eight sets at
 a time. A page naming another head or page count starts that set over. Once
 every page is in, the receiver handles the joined window exactly as an
-unpaged reply. A window that fits goes unpaged.
+unpaged reply. A window that fits goes unpaged. A window may run to as many
+pages as the chain cap has entries, so it always goes even at one entry per
+page. At 32 colluders an entry ran 8 to 12 KB, and a limit of 64 pages left
+every window past about 130 entries unsent, so a node that fell behind never
+caught up.
 
 Pending proposals and acceptances expire after three hundred seconds, which
 bounds memory growth for rounds that never completed.
@@ -481,7 +558,12 @@ same calls a commit uses, so a task that was placed or tombstoned in the
 meantime stays out.
 
 **Instances.** Instance `k` decides what is written at chain index `k`. Its
-value is a batch of up to 32 ready entries sorted by task id. Within an
+value is a batch of up to 32 ready entries sorted by task id, cut short
+before its JSON passes 40,000 bytes, so that a `place` frame, which carries
+the value base64-encoded, fits one UDP datagram. A value holds at least one
+entry. At 18 members an entry is about 6 KB, and before the size bound a
+backlog of 32 made a 257 KB frame that no send could carry: the 16-colluder
+hostile-join runs of 2026-11-05 sat on one instance to the end. Within an
 ordinary entry the halves are ordered by scorer uuid; an attestation keeps
 its verifier in `p1`. The batch is written verbatim at `k`, `k+1`, and so on,
 so every node builds the same bytes whichever half reached it first. A ballot
@@ -531,13 +613,24 @@ stays on the batch's last entry (`place_from` and `place_sigs`). It travels
 on the catch-up wire and in the evidence document, outside the entry hash.
 
 **Who proposes.** Only members of the roster in force for `k` propose, grant
-or accept there; a refusal from anyone else is ignored. Whoever placed
+or accept there; a refusal from anyone else is ignored. So is a refusal from
+a member whose own next index is below `k`: it promised nothing and cannot
+accept there, and the members that are not behind may still carry the round.
+In the hostile-join run of 2026-11-05 a member added just after the genesis
+could not anchor on the chain, stayed at instance 0, and refused every round;
+ending the round on that refusal stopped the chain for the whole run. Whoever placed
 instance `k-1` leads `k`, and proposes as soon as it holds a ready entry or a
 roster entry is due. Every other member waits until ready entries
 have sat for 3 s with no placement round heard. It then takes over in an
-order every node computes the same way, `blake2b(uuid|k)`, 0.3 s per rank. A
-nack or a round that runs past 5 s backs off for a random 0.5 to 2 s. A
-proposer leaves out any pooled entry its own acceptor check would refuse, and
+order every node computes the same way, `blake2b(uuid|k)`, 0.3 s per rank.
+A member that heard someone else's round leaves it 5 s to finish. A nack or
+a round that runs past 5 s backs off for a random interval from 0.5 s up to
+a window that starts at 2 s and doubles with each refusal at the same
+instance, to 30 s, and the interval drawn lengthens that 5 s wait too.
+Without the second part the backoff ended inside the wait, and every member
+that heard the same round tried again at the same moment. A member that
+promises a higher ballot than its own open round drops that round at once and
+counts it refused. A proposer leaves out any pooled entry its own acceptor check would refuse, and
 drops it from the pool, so one bad entry cannot sink every round.
 
 **The leader skips Phase 1.** A promise covers the whole chain, not one
@@ -554,13 +647,28 @@ placement is saved: `place` and `place accepted` carry it, then `placed`.
 **Catch-up.** Reconcile follows four rules:
 1. Nothing below this node's own placed end is rewritten. A certified entry
    there that differs from ours is equivocation: two certificates for one
-   index. It is logged as an error and refused.
+   index. It is logged as an error, refused, and recorded (below).
 2. Past the placed end, a certified segment wins whatever the lengths. The
    finalized-checkpoint guard still applies.
 3. An uncertified entry is cut off once the segment reaches placed territory.
    A segment carrying a placement certificate that does not verify is refused
    whole.
 4. A certified placement may carry a node that is far behind across a gap.
+
+**Equivocation is recorded.** Two quorums of one roster cannot sign two
+values at one index unless the members in both signed twice. A node meets
+this in two places: in catch-up (rule 1), and in a `placed` for an index it
+already holds whose certificate verifies after its own entry before it, which
+used to be dropped unread. Either way it keeps its own entry and writes a
+record into the chain's evidence document, under `forks`: the fork index,
+where it was seen and from whom, both certificates (start index, predecessor
+hash, value digest, signatures, and who among the signers verifies against the
+roster in force), and the members who signed both. A rival without a verifying
+certificate proves nothing and is not recorded, and neither is the same value
+twice. The same fork is recorded once, and a chain keeps the last 32. The
+records survive a restart, are never sent, and are never scored or used to
+slash anyone: the proof is this node's own (R+D.md §14.1, the user's calls of
+2026-10-21). A node that never saw one writes the document it always did.
 
 Every placement certificate in a segment is judged against the roster in
 force for its instance: the latest roster entry below it, the node's own or
@@ -608,6 +716,8 @@ sequenceDiagram
 | A certified attestation goes to the pool | [`attest-final-placing-pooled.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/attest-final-placing-pooled.yaml) |
 | A certified segment beats a longer uncertified one | [`catchup-placed-beats-longer-uncertified.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-placed-beats-longer-uncertified.yaml) |
 | The placed end is never rewritten; equivocation is refused | [`catchup-placed-end-not-rewritten.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-placed-end-not-rewritten.yaml), [`catchup-placed-equivocation-kept.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-placed-equivocation-kept.yaml) |
+| An equivocation is kept, with both certificates and who signed both | [`catchup-placed-equivocation-kept.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-placed-equivocation-kept.yaml), [`placed-equivocation-recorded.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/placed-equivocation-recorded.yaml) |
+| A rival without a verifying certificate is not recorded | [`placed-equivocation-uncertified-not-recorded.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/placed-equivocation-uncertified-not-recorded.yaml) |
 | A certified placement crosses a gap | [`catchup-placed-crosses-gap.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/catchup-placed-crosses-gap.yaml) |
 
 What conformance cannot reach is covered by unit tests. Its C harness starts
@@ -709,10 +819,11 @@ by one. It exists only in development and cohort directories, so at boot it is
 cleared with its placement state and pool, and the group founds it anew (the
 user's call, 2026-10-14).
 
-**Still on the live view.** Checkpoints and slashes keep sizing their quorum
-from the live roster. Merges are out of scope: absorbed members arrive as adds,
-one per instance. A gateway's child chain has its own roster, of that child
-group's members.
+**Still on the live view.** Checkpoints keep sizing their quorum from the live
+roster. Slashes moved to the roster in force on 2026-10-22 (see "Fault model"
+below). Merges are out of scope: absorbed members arrive as adds, one per
+instance. A gateway's child chain has its own roster, of that child group's
+members.
 
 **A contact is not a member.** The live view is the peers in the address map
 of this node's group, or of a child group it gateways (Python
@@ -732,6 +843,7 @@ reputation table and is never part of a half, a checkpoint or a roster.
 | A placement is judged by the roster logged before it | [`placed-judged-by-logged-roster.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/placed-judged-by-logged-roster.yaml) |
 | A signer outside the roster does not count | [`placed-signer-outside-roster-not-counted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/placed-signer-outside-roster-not-counted.yaml) |
 | A half's certificate is judged by the roster in force | [`place-value-cert-judged-by-roster.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-value-cert-judged-by-roster.yaml) |
+| A placement value carries the roster each certificate names | [`place-value-cert-judged-by-named-roster.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-value-cert-judged-by-named-roster.yaml), [`place-value-cert-unnamed-judged-by-roster-in-force.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-value-cert-unnamed-judged-by-roster-in-force.yaml) |
 | An add of a member the acceptor sees is accepted | [`place-roster-add-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-roster-add-accepted.yaml) |
 | An add of a stranger, under another key, beside other entries, or an early restatement, is refused | [`place-roster-add-unknown-member-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-roster-add-unknown-member-refused.yaml), [`place-roster-key-mismatch-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-roster-key-mismatch-refused.yaml), [`place-roster-not-alone-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-roster-not-alone-refused.yaml), [`place-roster-restate-too-early-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-roster-restate-too-early-refused.yaml) |
 | A genesis within the acceptor's view is accepted; one naming a stranger is not | [`place-genesis-subset-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-genesis-subset-accepted.yaml), [`place-genesis-stranger-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-genesis-stranger-refused.yaml) |
@@ -747,6 +859,107 @@ roster are all run by `tests/a_unit/test_placement_sim.py`. The entry's bytes
 are pinned identically by `tests/a_unit/test_placement_roster.py` and
 `src/c/test/rep_place_roster_test.c`; the C proposer side, the anchor and the
 boot reset by `src/c/test/rep_place_proposer_test.c`.
+
+## Fault model
+
+Every reputation quorum is a strict majority of the group, this node counted.
+That is the crash-fault bound: any two majorities share a member, which is what
+Paxos needs when nobody lies. AT signs everything, and that buys something a
+crash-fault protocol does not have, but it does not make the majorities
+Byzantine-safe (R+D.md §14.0). What the signatures buy is checkability and
+detection, not agreement under a lying majority:
+
+- **Every decision carries a certificate its receivers check.** Slash,
+  checkpoint, attestation, commit and placement certificates are signatures
+  over canonical bytes the receiver re-derives, counted against the receiver's
+  own view of the group. A finalizer cannot choose the bar it has to clear.
+- **A fork is detected and kept, not prevented.** Placement grants are not
+  signed, so a member that hides an accepted value can lead an honest majority
+  to accept a second value at the same index. Two certificates for different
+  values at one index are kept as a fork record holding both (R+D.md §14.1;
+  "Agreeing on an order"), and the members in both signed twice.
+- **The bound is partial synchrony's.** AT runs under DDIL and cannot assume
+  synchrony. With signatures and synchrony, agreement is possible for f < n/2;
+  under partial synchrony signatures do not lift the 3f + 1 bound. The sources
+  are in [Byzantine references](byzantine-references.md).
+
+So the honest description is crash-fault majorities with signed,
+receiver-verified certificates and detectable disagreement. Placement is
+leaderless Multi-Paxos over those majorities. It is not Byzantine Paxos.
+
+**The slash bar** (2026-10-22). A slash finalizes on a strict majority of the
+whole group, the slasher's own signature counted, sized from the roster in
+force and verified with the keys it records, as commit, placement and
+attestation already were. Before a genesis, the live view decides. The old bar
+was more than half the roster without this node, so two members of four
+finalized a slash, and a slash floors its target into sticky exclusion. Python
+`_quorum_met`, C `_quorum_met_for`, at the slasher's tally and at every
+receiver.
+
+**A declared N_min** (2026-10-22, RD_13.2_BYZANTINE_QUORUM_PLAN.md §0.4). A
+roster entry may declare the cohort size N_min the group should be sized for.
+F = (N_min − 1) // 3, and the bars of the four certificate rounds whose votes
+are signed statements rise from a strict majority to (M + F) // 2 + 1 of the M
+members:
+
+| Round | Counted over | Bar at F = 0 | Bar with F |
+|---|---|---|---|
+| Slash | the roster in force, slasher included | M // 2 + 1 | (M + F) // 2 + 1 |
+| Checkpoint | the live group, proposer included | M // 2 + 1 | (M + F) // 2 + 1 |
+| Attestation | members other than the subject and its teammates, verifier included | O // 2 + 1 | (O + F) // 2 + 1 |
+| Commit certificate | the roster in force; the scorer is the remaining vote | M // 2 others | (M + F) // 2 others |
+
+For five members and N_min 4 (F = 1), a slash needs four signatures instead of
+three. The placement certificate stays a strict majority: its grants are
+unsigned, so a higher bar there would add cost and no safety. A round that
+cannot reach the bar is refused, never finalized at a weaker one, and the first
+refusal of each round logs the bar, the declaration and the member count at
+warning level (Python `_bar_met`, C `_bar_met`). F rises only as fast as the
+cohort does: a group smaller than N_min may find the bar out of reach, which is
+the liveness cost the declaration buys its safety with.
+
+*Where the value comes from.* A node is configured with `AT_REP_N_MIN` (unset
+or 0 declares nothing; anything but a non-negative integer stops the
+reputation process at start). A genesis declares nothing and an add carries
+the value in force, so a declaration changes only by a `restate`. Each member
+reports its configured value in every `place accepted`, and the member leading
+a placement restates the roster declaring X once a strict majority of the
+roster in force has reported X, whatever it is configured for itself. An
+acceptor takes a declared value only if it is the one in force or the one it is
+configured for, so a change needs a majority configured alike, and a mismatch
+leaves the value in force. The leader acts on the reports rather than on its
+own configuration because a value an acceptor refuses is dropped silently, and
+Paxos makes every later proposer carry any value already accepted: a minority
+leader proposing its own value would accept it alone and stall that index. A
+proposer carrying a value, or building one from the reports, leaves the
+configuration check to the acceptors. A restatement that changes the value is
+not held to the half-window age a plain one is.
+
+The declaration is in the roster entry's hash only when made, so an undeclaring
+roster entry hashes as it always did, and so is its task id (`|N_min` follows
+the digest). Wire: `roster.n_min` on the placement wire, `roster_n_min` on the
+catch-up wire and in evidence, `n_min` on `place accepted`. Python
+`Transaction.roster_n_min`, C `transaction_t.roster_n_min` (appended, mirrored
+in `_ffi.py`).
+
+| Behavior | Scenario |
+|---|---|
+| Two of four do not finalize a slash; three do | [`slash-final-even-group-half-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/slash-final-even-group-half-refused.yaml), [`slash-final-even-group-majority-applied.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/slash-final-even-group-majority-applied.yaml) |
+| A slash signer outside the roster in force does not count | [`slash-final-signer-outside-roster-not-counted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/slash-final-signer-outside-roster-not-counted.yaml) |
+| A declared N_min raises the slash bar | [`slash-final-declared-n-min-raises-the-bar.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/slash-final-declared-n-min-raises-the-bar.yaml), [`slash-final-declared-n-min-bar-met-applied.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/slash-final-declared-n-min-bar-met-applied.yaml) |
+| ...the checkpoint bar | [`checkpoint-final-declared-n-min-raises-the-bar.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/checkpoint-final-declared-n-min-raises-the-bar.yaml), [`checkpoint-final-declared-n-min-bar-met-stored.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/checkpoint-final-declared-n-min-bar-met-stored.yaml) |
+| ...the attestation bar | [`attest-final-declared-n-min-raises-the-bar.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/attest-final-declared-n-min-raises-the-bar.yaml), [`attest-final-declared-n-min-bar-met-pooled.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/attest-final-declared-n-min-bar-met-pooled.yaml) |
+| ...the commit-certificate bar | [`commit-cert-declared-n-min-raises-the-bar.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-declared-n-min-raises-the-bar.yaml), [`commit-cert-declared-n-min-bar-met-pooled.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-declared-n-min-bar-met-pooled.yaml) |
+| An acceptor takes a change it is configured for, and no other; an add never changes it | [`place-roster-restate-declaring-configured-n-min-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-roster-restate-declaring-configured-n-min-accepted.yaml), [`place-roster-restate-declaring-unconfigured-n-min-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-roster-restate-declaring-unconfigured-n-min-refused.yaml), [`place-roster-add-changing-n-min-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/place-roster-add-changing-n-min-refused.yaml) |
+
+The leader's trigger needs state across rounds, which the corpus resets, so it
+is run by `tests/a_unit/test_placement_n_min.py` (a configured majority
+declares its value, a minority including the leader changes nothing and keeps
+placing, a leader configured otherwise still declares the majority's) and by
+`src/c/test/rep_place_proposer_test.c`. The bytes and task ids are pinned
+identically there and in `src/c/test/rep_place_roster_test.c`; the slasher's
+tally by `tests/a_unit/test_repprocess_slashing.py` and
+`src/c/test/rep_quorum_test.c`.
 
 ## Warm start, and why it is safe
 
@@ -1133,6 +1346,22 @@ ever add to the set. If it removed a former teammate, older certificates
 would be recounted against a larger outside quorum and fall short wherever
 they were re-checked. Stele therefore keeps every node a team has ever listed.
 
+**Own entries outlive the window.** A busy group evicts this node's own
+transactions as fast as anyone's. In the hostile-join runs of 2026-11-04 without
+the join policy, ten nodes' probes and tasks pushed a joiner's 35 transactions
+with its contact down to 2 within minutes, and the cohort's word was all that
+remained. So when the window evicts an entry this node is a party to, and the
+entry is not attested, the node keeps it aside: at most 64 per counterparty and
+800 in all, oldest out first. Contrite tit-for-tat, the cooperation average, the
+prior and the brought score read these entries before the resident ones. They
+are not on the chain and never go on the wire, so the window, its root and
+catch-up are unchanged. Each chain's are written to
+`reputation-retained[-<chain>].cfg.json` beside its evidence when a checkpoint
+finalizes, in the evidence document's shape with no checkpoint, and read back
+after a verified warm start. Only an eviction at the cap keeps an entry. A chain
+replaced by catch-up drops its entries without keeping them, as before. A chain
+reset because it has no roster keeps them.
+
 **What outlives the window.** The resident window holds 200 entries and the
 evidence file is rewritten at every checkpoint, so on a busy group both lose an
 attested entry within minutes, while an application may need to show the
@@ -1224,7 +1453,9 @@ at least `(n + 1) // 2` members of the receiver's own view besides the scorer
 this scorer, on this channel, for this task. It does not prove the score is
 true. An acceptor never sees the task; it signs what the proposer tells it. So
 the lie a certificate leaves open is a scorer's about its own half, which is
-`R+D.md` §14.2's question (bilateral evidence), not this one's. What it buys is
+`R+D.md` §14.2's question (bilateral evidence), not this one's. Nor does it
+prove the scorer wrote the half at all; that is what [Signed
+halves](#signed-halves) adds. What it buys is
 round existence, non-equivocation (every node writes the score a quorum saw),
 an entry that can be checked offline, and a per-entry cost of a quorum's
 participation.
@@ -1239,12 +1470,13 @@ canonical form that carries it still loads, and the key is ignored.
 **What is signed.** One certificate per half, so two per entry, because the two
 halves are committed by two rounds:
 
-    "AT-COMMIT\0" scorer "|" task "|" %.17g score "|" channel
+    "AT-COMMIT\0" scorer "|" task "|" score_milli "|" channel
 
-Lowercase uuids, and the channel normalized, so an absent channel and an
-explicit `task_outcome` are one claim with one signature, as they are one entry
-hash. Byte-identical in both runtimes (`commit_designation`), and pinned by a C
-unit test against Python's bytes.
+The score is its integer thousandths ("Integer scores"), the uuids lowercase,
+and the channel normalized, so an absent channel and an explicit
+`task_outcome` are one claim with one signature, as they are one entry
+hash. Byte-identical in both runtimes (`commit_designation`), and pinned by a
+unit test on each side against the same literal.
 
 The group is not covered. An acceptor is never told which of a gateway's chains
 the round lands in, and a group's uuid changes when a merge absorbs it, which
@@ -1268,12 +1500,36 @@ resolves, so what it leaves is a scorer re-filing its own certified half.
    2026-10-13 this was more than `n // 2`; a node still on that rule refuses a
    certificate the new one issues in a group of four or five.)
 
+**Which roster judges it.** A certificate names the roster it met. While a
+group's roster grows, its members sit at different heights of the chain, and a
+proposer one roster behind its receivers cuts certificates that clear its own
+bar and fall short of theirs. The hostile-join run of 2026-11-04 lost every
+such half while the roster grew from four members to ten ("4 of 4 signature(s)
+verify, 5 needed, roster of 10"). So the proposer names the digest of the
+roster in force when its certificate cleared (Python: element nine of
+`committed`; C: `"roster"`), and a receiver judges the certificate by that
+roster if the roster was in force within the last 32 instances of the
+receiver's chain (`CERT_ROSTER_WINDOW`, C `REP_CERT_ROSTER_WINDOW`). The name
+is not signed, and it does not need to be. The signatures still have to
+verify against the keys that roster records and clear its bar, which is the
+same bar the proposer met. Rosters only grow, so an older roster is a smaller
+one, and the window bounds how small a bar a proposer can claim. A digest
+covers the members only, and a restatement keeps it, so the newest entry with
+that digest decides and its N_min applies. A name the receiver does not hold,
+or one older than the window, is judged by the receiver's roster in force, as
+a commit that names none is. The refusal warning says which decided ("named
+roster of 4" or "roster of 6").
+
 **Where they are kept.** Beside the entry and outside its hash, as a
 checkpoint's co-signatures sit outside its root: `Transaction.commit_sigs` in
 Python, `tx_history_t.commit_certs` in C. They travel on the catch-up wire and
 in the evidence document as `commit_sigs`, `{scorer: {voter: signature}}`,
 omitted when there are none. A fork that drops an entry drops its
-certificates.
+certificates. The roster each one names goes wherever the certificate does: as
+`cert_rosters`, `{scorer: digest}`, on the catch-up wire and in the evidence
+document, as `cert_roster` on a half in the pool file, and as
+`p1_cert_roster` / `p2_cert_roster` in a placement value, where an acceptor
+judges the certificate by it.
 
 **Catch-up.** A segment is refused unless every ordinary half of every entry
 in it that is new to this node, and that no verified placement covers, carries
@@ -1293,11 +1549,98 @@ a certificate meeting this node's quorum. Three kinds of entry are exempt:
 - **Entries already held identically**, at the same index with the same hash.
   Repeating them tells the receiver nothing new.
 
-Certificates are judged against the roster in force for their instance
-rather than the receiver's live view (under "Who is in the group").
+Certificates are judged against the roster in force for their instance, or
+the recent roster they name, rather than the receiver's live view (under "Who
+is in the group").
 
-Pinned by the `commit-cert-*` scenarios below, `tests/a_unit/test_commit_certificates.py`
-and `src/c/test/rep_commit_cert_test.c`.
+Pinned by the `commit-cert-*` and `place-value-cert-*` scenarios below,
+`tests/a_unit/test_commit_certificates.py`, `tests/a_unit/test_cert_roster.py`,
+`src/c/test/rep_commit_cert_test.c` and `src/c/test/rep_cert_roster_test.c`.
+
+## Signed halves
+
+A commit certificate is the acceptors' word that a round ran. It is not the
+scorer's word, and until 2026-10-22 nothing was. The live path binds a half to
+its transport sender, but placement and catch-up take the certificate as proof,
+and the scorer's own signature never counted toward it. So a majority of the
+roster could certify, and then place, a half "by" an honest member that the
+member never wrote. It could also pair that half with one of its own. That is
+the one forgery `R+D.md` §14.2 says a dishonest majority must not have: an
+entry about an honest node that the node never agreed to.
+
+**Every ordinary half is signed by its scorer.** The scorer signs its own half
+and nothing else:
+
+    "AT-HALF\0" task "|" scorer "|" counterparty "|" score_milli "|" channel
+
+Lowercase uuids and the channel normalized, as `commit_designation`. Index and
+link are not covered, for the reason attestation gives: they differ per node
+until chains reconcile. The bytes are identical in both runtimes
+(`half_designation`) and pinned by a unit test on each side against the same
+literal.
+
+**A half names its counterparty, and the name is mandatory.** A producer that
+cannot say whom it scored gets no round: `forward_transaction` (C
+`_forward_transaction`) drops a half that names nobody, or names its own node,
+and logs why. The executor's half of a task names the requestor; the
+requestor's names the executor.
+
+**Two halves pair only when each names the other.** The pool used to fill a
+task's two slots first come, first served, and task ids travel in the clear
+inside `committed`, so a member that saw one half could commit its own for the
+same task first and close the entry as a transaction between the wrong pair.
+Now a half that the held half does not name, or that names somebody else, is
+refused (`record_half` returns `mismatch`). One case gives way instead of
+refusing: when the held half names the newcomer's scorer, and the newcomer's
+signed half names somebody else. The newcomer's signature proves the held half
+can never pair, so it is dropped and the newcomer takes its place. Without that
+rule a squatter that learned a task id early could block the real pair. A half
+with no name at all, held from before names existed, pairs as it always did.
+
+**Where the signature lives.** Outside the entry hash, like the certificates
+(the user's call, 2026-10-22), so a signed entry hashes exactly as an unsigned
+one did and no chain, checkpoint or pinned root moves:
+`Transaction.half_sigs` (`{scorer: signature}`) in Python, and
+`tx_history_t.half_sigs` with `pool_halves` (which also keeps a pooled half's
+name) in C. It travels as `half_sigs` on the catch-up wire and in the evidence
+document, as `p1_sig` / `p2_sig` on a placement entry, and as `names` and
+`sig` on a pooled half in `reputation-pool*.cfg.json`. A `committed` carries
+the name and the signature as elements seven and eight in Python, `"names"`
+and `"half_sig"` in C, beside the certificate.
+
+**Where it is checked.** On every path a half enters a chain:
+
+- **`committed`.** Refused without a name, or without a signature that
+  verifies over a half naming it.
+- **Placement, as acceptor and as learner.** The acceptor refuses a value with
+  an unsigned half. The learner refuses a decided placement with one, whatever
+  signed the placement: a placement certificate is the majority's word, and
+  so is every commit certificate in it.
+- **Catch-up.** A segment is refused if any ordinary entry new to this node
+  lacks either scorer's signature. Unlike certificates, **neither placement
+  cover nor checkpoint cover excuses a missing signature** (the user's call,
+  2026-10-22). The majority that could forge a half also signs the placement
+  and the checkpoint. The only exemption is an entry this node already holds
+  identically.
+
+**Whose key.** The identity this node holds for the scorer (itself, or a roster
+peer) when there is one. Otherwise, the rosters logged in this node's own chain
+that list the scorer, newest first, so a member who has since left is still
+checkable. A roster a segment brings with it is never used: it could list any
+key for any uuid.
+
+**What this does not do.** It does not make a score true; a scorer can still
+lie about its own half, and a certificate never could stop that. It does not
+stop a withheld half: a peer can still refuse to commit, and the other half
+then never pairs (R+D.md §14.2, question 4). It does not reach deep
+resolution: an answer's requestor holds no keys for the answering group's
+scorers, so it still trusts the anchored checkpoint signers. And it costs a
+node with no chain one thing: a window committed before signed halves cannot
+be adopted by catch-up until it slides out of the window (`MAX_CHAIN_LEN`). The
+node can still place new rounds meanwhile.
+
+Pinned by the `half-*` scenarios below, `tests/a_unit/test_bilateral_halves.py`
+and `src/c/test/rep_bilateral_test.c`.
 
 ## Asking others what they think
 
@@ -1614,7 +1957,9 @@ is not lost in the lottery for chain slots: a node follows at most
 is pending it proposes none. New probes are dropped, and overdue ones wait. Otherwise it is
 re-proposed every `AT_REP_PARK_RETRY_SEC` (default 120 s), and given up after
 `AT_REP_PARK_TTL_SEC` (default one day). Parked halves are not persisted. Pinned by `rep_commit_retry_test` and
-`test_repprocess_commit_retry.py`.
+`test_repprocess_commit_retry.py`. Under the join policy a dropped probe half of the
+prober's still leaves its verdict, kept aside as a lone verdict before the cap
+is applied ([Joining a hostile cohort](hostile-join.md#the-join-burst)).
 
 **A member that joins late is handed the halves it missed** (2026-10-08,
 ISSUES §2.62). A join carries only bilateral entries. A half committed before a
@@ -1767,6 +2112,9 @@ stands over is documented rather than papered over.
 | A certified commit is written beside its certificate | [`commit-cert-certified-commit-written.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-certified-commit-written.yaml) |
 | A declaring group refuses an uncertified commit | [`commit-cert-uncertified-commit-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-uncertified-commit-refused.yaml) |
 | A sub-quorum certificate is refused | [`commit-cert-sub-quorum-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-sub-quorum-refused.yaml) |
+| A certificate is judged by the recent roster it names | [`commit-cert-named-previous-roster-pooled.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-named-previous-roster-pooled.yaml), [`commit-cert-unnamed-judged-by-roster-in-force.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-unnamed-judged-by-roster-in-force.yaml) |
+| A named roster the receiver does not hold is judged by its own | [`commit-cert-named-unknown-roster-judged-on-ours.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-named-unknown-roster-judged-on-ours.yaml) |
+| A signer outside the named roster does not count | [`commit-cert-named-roster-signer-outside-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-named-roster-signer-outside-refused.yaml) |
 | The scorer's own signature is not counted | [`commit-cert-proposer-signature-not-counted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-proposer-signature-not-counted.yaml) |
 | A forged certificate is refused | [`commit-cert-forged-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-forged-refused.yaml) |
 | A certificate binds the score | [`commit-cert-other-score-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-other-score-refused.yaml) |
@@ -1774,6 +2122,20 @@ stands over is documented rather than papered over.
 | An unsigned acceptance is not counted | [`commit-cert-unsigned-acceptance-not-counted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-unsigned-acceptance-not-counted.yaml) |
 | Catch-up refuses an uncertified segment | [`commit-cert-catchup-uncertified-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-catchup-uncertified-refused.yaml) |
 | Catch-up accepts a certified segment and keeps its certificates | [`commit-cert-catchup-certified-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-catchup-certified-accepted.yaml) |
+| A signed half naming its counterparty is pooled | [`half-committed-signed-pooled.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-committed-signed-pooled.yaml) |
+| A certified half its scorer never signed is refused | [`half-committed-unsigned-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-committed-unsigned-refused.yaml) |
+| A half that names nobody is refused | [`half-committed-unnamed-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-committed-unnamed-refused.yaml) |
+| A half signed in its scorer's name by another is refused | [`half-committed-forged-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-committed-forged-refused.yaml) |
+| A signature over a half naming somebody else is refused | [`half-committed-signed-for-another-name-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-committed-signed-for-another-name-refused.yaml) |
+| Halves that do not name each other do not pair | [`half-committed-names-somebody-else-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-committed-names-somebody-else-refused.yaml) |
+| A squatted half gives way to the half it names | [`half-committed-squatted-half-gives-way.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-committed-squatted-half-gives-way.yaml) |
+| The proposer signs its own half | [`half-proposer-signs-its-half.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-proposer-signs-its-half.yaml) |
+| Catch-up adopts a signed segment and keeps the signatures | [`half-catchup-signed-chain-adopted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-catchup-signed-chain-adopted.yaml) |
+| Catch-up refuses an unsigned half | [`half-catchup-unsigned-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-catchup-unsigned-refused.yaml) |
+| Catch-up refuses a forged half | [`half-catchup-forged-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-catchup-forged-refused.yaml) |
+| Placement cover does not excuse an unsigned half | [`half-catchup-placed-unsigned-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-catchup-placed-unsigned-refused.yaml) |
+| An acceptor accepts a signed value, and refuses an unsigned one | [`half-place-signed-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-place-signed-accepted.yaml), [`half-place-unsigned-not-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-place-unsigned-not-accepted.yaml) |
+| A learner writes a signed placement, and refuses an unsigned one | [`half-placed-signed-written.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-placed-signed-written.yaml), [`half-placed-unsigned-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/half-placed-unsigned-refused.yaml) |
 | A member short of its tenure is held below tier 3 | [`tenure-young-member-held-below-tier-three.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/tenure-young-member-held-below-tier-three.yaml) |
 | A member past its tenure is scored as before | [`tenure-old-member-not-held.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/tenure-old-member-not-held.yaml) |
 | A replication from a verifier short of its tenure is declined | [`attest-propose-replication-young-verifier-declined.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/attest-propose-replication-young-verifier-declined.yaml) |

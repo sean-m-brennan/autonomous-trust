@@ -26,9 +26,11 @@ at_extension_library(replication
         adjudication.c
         bisection.c
         replication_oracle.c
+        replication_live.c
     DEPENDS certificates
 )
 
 at_extension_tests(replication
     replication_test
+    replication_live_test
 )

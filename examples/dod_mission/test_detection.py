@@ -885,7 +885,7 @@ def test_microdrone_live_motion_wired_on_by_default():
     stub = _pose_stub()
 
     def _pose_at(scenario_secs):
-        # The closure captures _t0_epoch; epoch = now - t lands the replay at t.
+        # The provider captures _t0_epoch; epoch = now - t lands the replay at t.
         stub._t0_epoch = _time.time() - scenario_secs
         prov = DoDMissionParticipant._detection_pose_provider(
             stub, "microdrone", SQUAD_LL)
@@ -918,3 +918,22 @@ def test_pose_provider_scoping_and_optout(monkeypatch):
     monkeypatch.setenv("AT_DETECTION_LIVE_MOTION", "0")
     assert DoDMissionParticipant._detection_pose_provider(
         stub2, "microdrone", SQUAD_LL) is None
+
+
+def test_microdrone_pose_provider_survives_pickling():
+    # The demo runs its workers under the forkserver start method, which pickles
+    # each worker's state, including the DetectionSource's pose provider. A
+    # local closure cannot be pickled, so the provider must be a module-level
+    # callable, and a pickled copy must still replay the same path.
+    import pickle
+    import time as _time
+    sys.path.insert(0, str(_DOD))
+    from participant import DoDMissionParticipant
+
+    stub = _pose_stub()
+    stub._t0_epoch = _time.time() - 210.0
+    prov = DoDMissionParticipant._detection_pose_provider(
+        stub, "microdrone", SQUAD_LL)
+    clone = pickle.loads(pickle.dumps(prov))
+    assert clone() is not None
+    assert _haversine_m(clone(), prov()) < 1.0

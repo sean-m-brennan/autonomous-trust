@@ -21,7 +21,7 @@
  *  @{
  *
  * The arithmetic of replication sampling: one draw, one decision (R+D.md
- * §12.6), the C twin of `autonomous_trust.core._python.replication.sampling`.
+ * §12.6), the C twin of `autonomous_trust.oracle._python.replication.sampling`.
  *
  * Build-order step 6 of doc/verification_oracle.md. Replicating a random
  * fraction p of tasks (rather than all of them) is what makes replication

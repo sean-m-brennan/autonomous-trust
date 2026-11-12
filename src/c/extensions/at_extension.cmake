@@ -32,14 +32,30 @@
 
 set(AT_EXT_DIR ${CMAKE_CURRENT_LIST_DIR})
 
+# at_package_component(<name> [DEPENDS <extension>...] [DEB_DEPENDS <pkg>...]
+#                      [RPM_REQUIRES <pkg>...]): package extension <name>'s
+# install() rules (COMPONENT <name>) as autonomous-trust-<name>-devel, which
+# requires the core package and the packages of the extensions it DEPENDS on,
+# at the same version. DEB_DEPENDS / RPM_REQUIRES name what its header or
+# library needs from the distro beyond the core's. Read by the Packaging
+# section of the top-level CMakeLists.txt.
+function(at_package_component name)
+    cmake_parse_arguments(A "" "" "DEPENDS;DEB_DEPENDS;RPM_REQUIRES" ${ARGN})
+    set_property(GLOBAL APPEND PROPERTY AT_PACKAGE_COMPONENTS ${name})
+    set_property(GLOBAL PROPERTY AT_PACKAGE_DEPENDS_${name} "${A_DEPENDS}")
+    set_property(GLOBAL PROPERTY AT_PACKAGE_DEB_DEPENDS_${name} "${A_DEB_DEPENDS}")
+    set_property(GLOBAL PROPERTY AT_PACKAGE_RPM_REQUIRES_${name} "${A_RPM_REQUIRES}")
+endfunction()
+
 # at_extension_library(<name> SOURCES <src>... [DEPENDS <extension>...])
 function(at_extension_library name)
-    cmake_parse_arguments(A "" "" "SOURCES;DEPENDS" ${ARGN})
+    cmake_parse_arguments(A "" "" "SOURCES;DEPENDS;DEB_DEPENDS;RPM_REQUIRES" ${ARGN})
     add_library(at_${name} SHARED ${A_SOURCES})
     # The core's own dependencies too: an extension calls sodium, jansson and
     # uuid directly, and Apple's linker refuses a dylib with unresolved symbols.
+    # AT_SHARED_DEPENDENCIES is empty in an AT_STATIC build.
     target_link_libraries(at_${name} PRIVATE $<TARGET_LINKER_FILE:autonomous_trust>
-        ${DEPENDENCIES})
+        ${AT_SHARED_DEPENDENCIES})
     add_dependencies(at_${name} autonomous_trust)
 
     add_library(at_${name}_static STATIC ${A_SOURCES})
@@ -61,8 +77,14 @@ function(at_extension_library name)
     set_property(TARGET at_${name}_static PROPERTY AT_EXT_DEPENDS "${A_DEPENDS}")
 
     install(TARGETS at_${name} at_${name}_static
-        LIBRARY DESTINATION lib
-        ARCHIVE DESTINATION lib)
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT ${name}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT ${name})
+    # The public header, when the extension has one.
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/at_${name}.h)
+        install(FILES at_${name}.h DESTINATION include COMPONENT ${name})
+    endif()
+    at_package_component(${name} DEPENDS ${A_DEPENDS}
+        DEB_DEPENDS ${A_DEB_DEPENDS} RPM_REQUIRES ${A_RPM_REQUIRES})
 endfunction()
 
 # at_extension_tests(<name> <test>...): test/<test>.c, linked with the

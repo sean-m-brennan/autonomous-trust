@@ -1,0 +1,50 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: half-catchup-placed-unsigned-refused
+byte_pinning: false
+description: |
+    Signed halves (R+D.md §14.2; doc/architecture/reputation.md, "Signed
+    halves"). A commit certificate is the acceptors' word that a round ran; a
+    half also carries its scorer's own signature over AT-HALF, which names the
+    counterparty, and two halves pair only when each names the other.
+
+    Ordered placement covers what it placed: catch-up does not re-judge those
+    entries' commit certificates against today's roster. It does check every
+    scorer's signature (the user's call, 2026-10-22), because the majority that
+    could forge a half also signs the placement. bob holds placement a; alice's
+    chain adds b and c in a second placement that a majority signed, and c's
+    halves were never signed by their scorers. bob refuses the segment.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: proposer
+  - id: dave
+    role: member
+
+fixtures:
+  # Real scorers, so each half carries its scorer's signature (R+D.md §14.2).
+  chain_parties: [carol, dave]
+  local_chain:
+    bob:
+      - {task: a, p1: 0.7, p2: 0.5, batch: 1, placed_by: [alice, bob, carol]}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: latest update
+    payload:
+      chain:
+        - {task: a, p1: 0.7, p2: 0.5, batch: 1, placed_by: [alice, bob, carol]}
+        - {task: b, p1: 0.9, p2: 0.3, batch: 2, certified_by: [alice, carol, dave]}
+        - {task: c, p1: 0.6, p2: 0.4, batch: 2, placed_by: [alice, bob, carol], certified_by: [alice, carol, dave], unsigned: true}
+
+expected_state:
+  bob:
+    chain_entries: [a]
+    committed_tx_count: 1

@@ -49,6 +49,8 @@
 #include "processes/extension.h"
 #include "utilities/util.h"
 #include "identity/group.h"           /* group_init / group_add_address */
+#include "identity/anchored_cohort.h" /* RD_14.4 Phase 6 */
+#include "identity/package_hash.h"    /* at_package_hash */
 #include "config/configuration.h"     /* config_t (proc->configs["identity"]) */
 #include "structures/data.h"          /* object_ptr_data */
 #ifdef AT_ZTA_ENABLED
@@ -71,6 +73,7 @@
 #include "utilities/allocation.h"
 #include <math.h>
 #include "network/network.h"
+#include "network/net_proc_priv.h"
 /* First contact's half of this adapter is compiled only when its library is
  * built (AT_FIRST_CONTACT_LIB); without it, its scenarios skip. */
 #ifdef AT_FIRST_CONTACT_ENABLED
@@ -462,17 +465,22 @@ static int _ic_run_attest_pull(sce_run_ctx_t *ctx, ic_impl_t *puller,
  *                    harvested credential)
  */
 static int _scenario_operator_binding(const char *root, const char *variant,
-                                      public_identity_t *pub)
+                                      public_identity_t *pub,
+                                      const public_identity_t *key_of)
 {
     if (root == NULL || variant == NULL || pub == NULL)
         return -1;
+    /* key_of (variant "valid:<pid>") derives the key from ANOTHER
+     * participant's uuid: two nodes under one operator. */
+    if (key_of == NULL)
+        key_of = pub;
 
     /* The derived operator key: SHA-256 over a domain tag and the uuid. Keep
      * this tag byte-identical to the Python adapter's. */
     static const char TAG[] = "conformance-operator-key:";
     uint8_t seed[sizeof(TAG) - 1 + UUID_LEN];
     memcpy(seed, TAG, sizeof(TAG) - 1);
-    memcpy(seed + sizeof(TAG) - 1, pub->uuid, UUID_LEN);
+    memcpy(seed + sizeof(TAG) - 1, key_of->uuid, UUID_LEN);
     uint8_t op_pub[crypto_sign_PUBLICKEYBYTES];
     crypto_hash_sha256(op_pub, seed, sizeof(seed));
 
@@ -693,8 +701,27 @@ static void _apply_zta_fixtures(sce_run_ctx_t *ctx, json_t *fixtures) {
             sce_participant_t *p = sce_find_participant(ctx, pid);
             if (p == NULL) continue;
             ic_impl_t *impl = (ic_impl_t *)p->impl;
-            if (_scenario_operator_binding(root, json_string_value(bv),
-                                           impl->pub) != 0) {
+            /* "valid:<pid>": valid, under <pid>'s operator key. */
+            char variant[64];
+            at_strlcpy(variant, json_string_value(bv), sizeof(variant));
+            const public_identity_t *key_of = NULL;
+            char *colon = strchr(variant, ':');
+            if (colon != NULL) {
+                *colon = '\0';
+                sce_participant_t *kp = sce_find_participant(ctx, colon + 1);
+                if (kp == NULL) {
+                    fprintf(stderr, "conformance: %s: operator_bindings names unknown "
+                            "participant %s\n", pid, colon + 1);
+                    exit(2);
+                }
+                key_of = ((ic_impl_t *)kp->impl)->pub;
+            }
+            if (_scenario_operator_binding(root, variant, impl->pub, key_of) == 0)
+                /* The node's own identity carries its key too, as an opted-in
+                 * node's does and Python's fixture leaves it. */
+                memcpy(impl->full->operator_pubkey, impl->pub->operator_pubkey,
+                       sizeof(impl->full->operator_pubkey));
+            else {
                 /* Fatal, not skipped. This applier is void and cannot fail a
                  * scenario, and a skipped mint would leave the participant
                  * advertising nothing — which is precisely the expected
@@ -954,8 +981,31 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
                         group_add_address(&impl->proc->protocol.group,
                                           fuuid, faddr);
                     }
+                    /* members: other participants the group lists, after the
+                     * fillers. Lets a scenario hand a node a group that names a
+                     * member of a cohort it gateways. Mirrors the Python
+                     * fixture. */
+                    json_t *gmem = json_object_get(gspec, "members");
+                    size_t mi;
+                    json_t *mv;
+                    json_array_foreach(gmem, mi, mv) {
+                        sce_participant_t *mp =
+                            sce_find_participant(ctx, json_string_value(mv));
+                        if (mp == NULL) continue;
+                        ic_impl_t *mimpl = (ic_impl_t *)mp->impl;
+                        char mu[UUID_STRING_LEN + 1];
+                        uuid_unparse_lower(mimpl->full->uuid, mu);
+                        group_add_address(&impl->proc->protocol.group, mu,
+                                          mimpl->full->address);
+                    }
                     /* key_epoch: how many rotations this group key has been
                      * through (ISSUES §2.31). Mirrors the Python fixture. */
+                    /* created: the group's claimed age, which _merge_to_mesh's
+                     * tiebreak reads (RD_14.4 plan, Phase 3); 0 = unknown, as
+                     * the Python fixture's default. */
+                    json_t *gcr = json_object_get(gspec, "created");
+                    impl->proc->protocol.group.created =
+                        json_is_number(gcr) ? json_number_value(gcr) : 0.0;
                     json_t *gke = json_object_get(gspec, "key_epoch");
                     if (json_is_integer(gke))
                         impl->proc->protocol.group.key_epoch =
@@ -1005,13 +1055,21 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
                 group_init(&guuid, gaddr, &impl->proc->protocol.group);
             else
                 group_init(NULL, gaddr, &impl->proc->protocol.group);
+            /* stale_addresses: { "<participant>": "<address>" } puts that
+             * address in the map instead of the member's own, as the cohort
+             * seeder does with a hostname placeholder. */
+            json_t *stale = json_object_get(shared, "stale_addresses");
             for (size_t j = 0; j < ctx->participant_count; j++) {
                 ic_impl_t *other = (ic_impl_t *)ctx->participants[j].impl;
                 if (other == NULL || other->pub == NULL) continue;
                 char u[UUID_STRING_LEN + 1];
                 uuid_unparse_lower(other->pub->uuid, u);
+                const char *over = json_is_object(stale)
+                    ? json_string_value(json_object_get(
+                          stale, ctx->participants[j].id))
+                    : NULL;
                 group_add_address(&impl->proc->protocol.group, u,
-                                  other->pub->address);
+                                  over != NULL ? over : other->pub->address);
             }
         }
     }
@@ -1021,6 +1079,35 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
      * its peers[] and NOT in its group, which holds the participant itself
      * (R+D.md §13.5 D2). Mirrors the Python adapter, whose shared group
      * leaves every listed peer out. */
+    /* mutual_peers: every participant holds every other as a peer and as a
+     * member of its primary group, as the Python adapter's participants do
+     * by default (the anchored cohort, RD_14.4 Phase 6, counts the primary
+     * group's members it holds). */
+    if (json_is_true(json_object_get(fixtures, "mutual_peers"))) {
+        for (size_t i = 0; i < ctx->participant_count; i++) {
+            ic_impl_t *impl = (ic_impl_t *)ctx->participants[i].impl;
+            if (impl == NULL || impl->proc == NULL || impl->pub == NULL) continue;
+            process_t *p = impl->proc;
+            if (p->protocol.group.address_map.items == NULL)
+                map_init(&p->protocol.group.address_map);
+            /* One cohort, as Python's shared group is: a pinned uuid when the
+             * participant was given none. */
+            if (uuid_is_null(p->protocol.group.uuid))
+                uuid_parse("c0000000-0000-4000-8000-00000000c0c0",
+                           p->protocol.group.uuid);
+            for (size_t j = 0; j < ctx->participant_count; j++) {
+                ic_impl_t *o = (ic_impl_t *)ctx->participants[j].impl;
+                if (o == NULL || o->pub == NULL) continue;
+                char ou[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(o->pub->uuid, ou);
+                group_add_address(&p->protocol.group, ou, o->pub->address);
+                if (i == j || p->protocol.num_peers >= DEFAULT_MAX_PEERS) continue;
+                memcpy(&p->protocol.peers[p->protocol.num_peers], o->pub,
+                       sizeof(public_identity_t));
+                p->protocol.num_peers++;
+            }
+        }
+    }
     json_t *direct = json_object_get(fixtures, "direct_peers");
     if (json_is_object(direct)) {
         const char *dp_pid;
@@ -1082,6 +1169,47 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
                 slot->uuid[3] = 0x71;
                 snprintf(slot->nickname, sizeof(slot->nickname),
                          "capless-%s-%lld", cl_pid, (long long)i);
+                p->protocol.num_peers++;
+            }
+        }
+    }
+
+    /* phases: { "<participant>": <int> } starts a participant in another
+     * identity phase (a joiner still in phase 2). Mirrors the Python adapter. */
+    json_t *phases = json_object_get(fixtures, "phases");
+    if (json_is_object(phases)) {
+        const char *ph_pid;
+        json_t *ph_val;
+        json_object_foreach(phases, ph_pid, ph_val) {
+            sce_participant_t *part = sce_find_participant(ctx, ph_pid);
+            if (part == NULL || !json_is_integer(ph_val)) continue;
+            ic_impl_t *impl = (ic_impl_t *)part->impl;
+            if (impl != NULL && impl->proc != NULL)
+                impl->proc->protocol.phase = (int)json_integer_value(ph_val);
+        }
+    }
+
+    /* holds: { "<participant>": ["<pid>", ...] } -- the participants it holds
+     * as peers. In distinct-groups mode peers are not cross-populated, and a
+     * group_key_query is answered only for a member the responder holds.
+     * Mirrors the Python adapter. */
+    json_t *holds = json_object_get(fixtures, "holds");
+    if (json_is_object(holds)) {
+        const char *h_pid;
+        json_t *h_list;
+        json_object_foreach(holds, h_pid, h_list) {
+            sce_participant_t *part = sce_find_participant(ctx, h_pid);
+            if (part == NULL) continue;
+            ic_impl_t *impl = (ic_impl_t *)part->impl;
+            if (impl == NULL || impl->proc == NULL) continue;
+            size_t hi;
+            json_t *hv;
+            json_array_foreach(h_list, hi, hv) {
+                sce_participant_t *hp = sce_find_participant(ctx, json_string_value(hv));
+                process_t *p = impl->proc;
+                if (hp == NULL || p->protocol.num_peers >= DEFAULT_MAX_PEERS) continue;
+                memcpy(&p->protocol.peers[p->protocol.num_peers],
+                       ((ic_impl_t *)hp->impl)->pub, sizeof(public_identity_t));
                 p->protocol.num_peers++;
             }
         }
@@ -1208,9 +1336,22 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
             if (json_is_array(cg) && json_array_size(cg) > 0) {
                 group_t *child = calloc(1, sizeof(group_t));
                 if (child == NULL) continue;
+                /* `child_uuid` pins the child's uuid so a scenario can send
+                 * an update for it; `child_public_only` and `child_key_epoch`
+                 * seed a gateway holding only the child's public key, at a
+                 * given rotation. Mirrors the Python adapter. */
                 uuid_t cguuid;
-                uuid_generate(cguuid);
+                const char *cg_named =
+                    json_string_value(json_object_get(cspec, "child_uuid"));
+                if (cg_named == NULL || uuid_parse(cg_named, cguuid) != 0)
+                    uuid_generate(cguuid);
                 group_init(&cguuid, (char *)impl->full->address, child);
+                if (json_is_true(json_object_get(cspec, "child_public_only")))
+                    sodium_memzero(child->encryptor.private,
+                                   crypto_box_SECRETKEYBYTES);
+                json_t *cg_epoch = json_object_get(cspec, "child_key_epoch");
+                if (json_is_integer(cg_epoch))
+                    child->key_epoch = json_integer_value(cg_epoch);
                 size_t i, n = json_array_size(cg);
                 for (i = 0; i < n; i++) {
                     const char *m_pid =
@@ -1342,7 +1483,6 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                           const char *function,
                           json_t *payload,
                           generic_msg_t *out) {
-    (void)to_id;
     sce_participant_t *sender = sce_find_participant(ctx, from_id);
     if (sender == NULL) {
         snprintf(ctx->err, sizeof(ctx->err), "build_inbound: unknown from %s", from_id);
@@ -1359,6 +1499,11 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     out->info.net_msg.function = (char *)function;
     out->info.net_msg.encrypt = false;
     memcpy(&out->info.net_msg.from_whom, sender_impl->pub, sizeof(public_identity_t));
+    /* The Python adapter builds every inbound message signed by its sender,
+     * so it arrives verified; mirror that, as the reputation adapter does.
+     * Handlers that refuse an unverified frame (id_response, RD_2.6 plan §2.5)
+     * would otherwise see every scenario message as forged. */
+    out->info.net_msg.verified = true;
 
     /* A feature's own functions (ic_ext_t.inbound). */
     if (g_ic_ext != NULL && g_ic_ext->inbound != NULL) {
@@ -1368,6 +1513,31 @@ static int _build_inbound(sce_run_ctx_t *ctx,
             return ext_rc;
     }
 
+    /* access_granted -- the canonical grant [package_hash, capabilities, seq,
+     * grantee]: identity in the envelope, the grantee named (RD_2.6 plan
+     * §2.4). `grantee` names another participant (a misaddressed grant); the
+     * recipient by default. Mirrors the Python adapter. */
+    if (strcmp(function, "access_granted") == 0) {
+        const char *gpid = json_string_value(json_object_get(payload, "grantee"));
+        sce_participant_t *gp = sce_find_participant(ctx, gpid != NULL ? gpid : to_id);
+        json_t *jseq = json_object_get(payload, "seq");
+        json_t *body = json_array();
+        json_array_append_new(body, json_string(at_package_hash()));
+        json_array_append_new(body, json_array());
+        json_array_append_new(body, json_integer(json_is_integer(jseq)
+                                                 ? json_integer_value(jseq) : 1));
+        if (gp != NULL) {
+            char gu[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(((ic_impl_t *)gp->impl)->pub->uuid, gu);
+            json_array_append_new(body, json_string(gu));
+        } else {
+            json_array_append_new(body, json_null());
+        }
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+        return 0;
+    }
+
     /* trigger_cohort_join — the only pseudo-function that carries a payload: it names
      * the cohort to solicit (doc/architecture/gateway-reputation-tree.md). Without
      * packing it the adapter would ask to join "" and the request would be refused
@@ -1375,6 +1545,7 @@ static int _build_inbound(sce_run_ctx_t *ctx,
      * which likewise leaves the payload in place for this one pseudo-function while
      * blanking it for the others. */
     if ((strcmp(function, "trigger_cohort_join") == 0
+         || strcmp(function, "trigger_phase3") == 0
          || strcmp(function, "trigger_first_contact_initiate") == 0
          || strcmp(function, "trigger_first_contact_remove") == 0
          || strncmp(function, "trigger_directory_", 18) == 0
@@ -2199,6 +2370,41 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         return 0;
     }
 
+    if (strcmp(function, "anchored_cohort_invite") == 0) {
+        /* An anchored cohort minted from the payload (RD_14.4 Phase 6):
+         * {members: [pid, ...], group_uuid, key_epoch}, a fresh key, each
+         * member at its own address. Mirrors the Python adapter. */
+        group_t g;
+        memset(&g, 0, sizeof(g));
+        uuid_t gu;
+        const char *gs = json_string_value(json_object_get(payload, "group_uuid"));
+        if (gs == NULL || uuid_parse(gs, gu) != 0
+            || group_init(&gu, (char *)sender_impl->pub->address, &g) != 0) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "anchored_cohort_invite: bad payload");
+            return -1;
+        }
+        size_t mi;
+        json_t *mv;
+        json_array_foreach(json_object_get(payload, "members"), mi, mv) {
+            sce_participant_t *m = sce_find_participant(ctx, json_string_value(mv));
+            ic_impl_t *mimpl = m != NULL ? (ic_impl_t *)m->impl : NULL;
+            if (mimpl == NULL || mimpl->pub == NULL)
+                continue;
+            char mu[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(mimpl->pub->uuid, mu);
+            group_add_address(&g, mu, mimpl->pub->address);
+        }
+        g.key_epoch = json_integer_value(json_object_get(payload, "key_epoch"));
+        json_t *gj = NULL;
+        if (group_to_json(&g, &gj) == 0 && gj != NULL) {
+            net_msg_pack_json(&out->info.net_msg, gj);
+            json_decref(gj);
+        }
+        map_free(&g.address_map);
+        return 0;
+    }
+
     if (strcmp(function, "group_key_update") == 0) {
         json_t *gj = NULL;
         if (group_to_json(&sender_impl->proc->protocol.group, &gj) == 0
@@ -2210,6 +2416,97 @@ static int _build_inbound(sce_run_ctx_t *ctx,
             net_msg_pack_json(&out->info.net_msg, gj);
             json_decref(gj);
         }
+        /* `unsigned: true` arrives unverified. Mirrors the Python adapter. */
+        if (json_is_true(json_object_get(payload, "unsigned"))) {
+            out->info.net_msg.verified = false;
+            return 0;
+        }
+        /* Otherwise signed (by `signed_by: <pid>`, else the sender), so the
+         * signature rides along for the rotation gate to check against the key
+         * it holds, and read as net_proc hands it on:
+         *  - by default, as from the sender, a peer the receiver holds:
+         *    verified only when the sender signed it;
+         *  - `self_attested: true`, as the broadcast channel leaves a
+         *    stranger's frame: from the signer, verified against the key its
+         *    own envelope names, whose uuid `claims: <pid>` replaces;
+         *  - `held_unverified: true`, as a frame that arrived before the
+         *    receiver held the sender: the signature unchecked.
+         * Mirrors the Python adapter. */
+        const identity_t *signer = sender_impl->full;
+        const public_identity_t *signer_pub = sender_impl->pub;
+        json_t *sb = json_object_get(payload, "signed_by");
+        if (json_is_string(sb)) {
+            sce_participant_t *sp = sce_find_participant(ctx, json_string_value(sb));
+            if (sp != NULL) {
+                signer = ((ic_impl_t *)sp->impl)->full;
+                signer_pub = ((ic_impl_t *)sp->impl)->pub;
+            }
+        }
+        const net_msg_t *nm = &out->info.net_msg;
+        size_t b64_len = sodium_base64_encoded_len(nm->len,
+                                                   sodium_base64_VARIANT_ORIGINAL);
+        char *b64 = malloc(b64_len);
+        size_t pre_len = strlen(nm->process) + 1 + strlen(nm->function) + 1 + b64_len;
+        char *pre = malloc(pre_len + 1);
+        if (b64 != NULL && pre != NULL) {
+            sodium_bin2base64(b64, b64_len, nm->obj, nm->len,
+                              sodium_base64_VARIANT_ORIGINAL);
+            int n = snprintf(pre, pre_len + 1, "%s|%s|%s", nm->process,
+                             nm->function, b64);
+            crypto_sign_detached(out->info.net_msg.signature, NULL,
+                                 (unsigned char *)pre, (size_t)n,
+                                 signer->signature.private);
+            out->info.net_msg.has_signature = true;
+        }
+        free(b64);
+        free(pre);
+        out->info.net_msg.verified = (signer == sender_impl->full);
+        if (json_is_true(json_object_get(payload, "self_attested"))) {
+            memcpy(&out->info.net_msg.from_whom, signer_pub, sizeof(public_identity_t));
+            sce_participant_t *cp = sce_find_participant(
+                ctx, json_string_value(json_object_get(payload, "claims")));
+            if (cp != NULL)
+                uuid_copy(out->info.net_msg.from_whom.uuid,
+                          ((ic_impl_t *)cp->impl)->pub->uuid);
+            out->info.net_msg.verified = true;
+        }
+        if (json_is_true(json_object_get(payload, "held_unverified")))
+            out->info.net_msg.verified = false;
+        return 0;
+    }
+
+    /* group_key_query: {group_uuid, epoch} naming the receiver's group
+     * (`other_group: true` names another), at the sender's epoch. Mirrors the
+     * Python adapter. */
+    if (strcmp(function, "group_key_query") == 0) {
+        sce_participant_t *recv = sce_find_participant(ctx, to_id);
+        char gu[UUID_STRING_LEN + 1] = {0};
+        uuid_t other;
+        if (json_is_true(json_object_get(payload, "other_group"))) {
+            uuid_generate(other);
+            uuid_unparse_lower(other, gu);
+        } else if (recv != NULL) {
+            uuid_unparse_lower(((ic_impl_t *)recv->impl)->proc->protocol.group.uuid, gu);
+        }
+        json_t *body = json_pack("{s:s, s:I}", "group_uuid", gu, "epoch",
+                                 (json_int_t)sender_impl->proc->protocol.group.key_epoch);
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+        return 0;
+    }
+
+    /* group_key_stale: the network process's local signal, carrying the
+     * address of the member (`address_of: <pid>`) whose group frame would not
+     * open. Local IPC names no sender; `from_wire: true` presents it as a
+     * peer's frame, which identity refuses. Mirrors the Python adapter. */
+    if (strcmp(function, "group_key_stale") == 0) {
+        sce_participant_t *ap = sce_find_participant(
+            ctx, json_string_value(json_object_get(payload, "address_of")));
+        json_t *body = json_string(ap != NULL ? ((ic_impl_t *)ap->impl)->pub->address : "");
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+        if (!json_is_true(json_object_get(payload, "from_wire")))
+            memset(&out->info.net_msg.from_whom, 0, sizeof(public_identity_t));
         return 0;
     }
 
@@ -2220,6 +2517,12 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     if (strcmp(function, "peer_identity_query") == 0) {
         char guuid[UUID_STRING_LEN + 1] = {0};
         uuid_unparse_lower(sender_impl->proc->protocol.group.uuid, guuid);
+        /* A gateway also queries each child cohort; a step names that group
+         * explicitly. Mirrors the Python adapter. */
+        const char *named = json_is_object(payload)
+            ? json_string_value(json_object_get(payload, "group_uuid")) : NULL;
+        if (named != NULL)
+            snprintf(guuid, sizeof(guuid), "%s", named);
         json_t *have = json_array();
         if (json_is_object(payload)) {
             json_t *h = json_object_get(payload, "have");
@@ -2243,9 +2546,8 @@ static int _build_inbound(sce_run_ctx_t *ctx,
 
     /* peer_identity_response — the sender's published identity + address.
      * handle_identity_response gates on from_address being a known group
-     * address, then adds the identity to peers[]. No signature: the
-     * handler does not verify one (the address-in-group gate is the
-     * trust anchor). */
+     * address and on the response being signed by the identity it carries,
+     * then adds the identity to peers[]. */
     if (strcmp(function, "peer_identity_response") == 0) {
         json_t *from_id_json = NULL;
         public_identity_to_json(sender_impl->pub, &from_id_json);
@@ -2256,6 +2558,16 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                             json_string(sender_impl->pub->address));
         net_msg_pack_json(&out->info.net_msg, body);
         json_decref(body);
+        /* `unsigned: true` arrives unverified; `signed_by: <pid>` carries
+         * another participant's signature over the sender's identity (RD_2.6
+         * plan §2.5). Mirrors the Python adapter. */
+        sce_participant_t *by = sce_find_participant(
+            ctx, json_string_value(json_object_get(payload, "signed_by")));
+        if (by != NULL)
+            memcpy(&out->info.net_msg.from_whom, ((ic_impl_t *)by->impl)->pub,
+                   sizeof(public_identity_t));
+        if (json_is_true(json_object_get(payload, "unsigned")))
+            out->info.net_msg.verified = false;
         return 0;
     }
 
@@ -2633,6 +2945,67 @@ static int _dispatch(sce_run_ctx_t *ctx,
         if (privates != NULL) json_decref(privates);
         return 0;
     }
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
+        && strcmp(inbound->info.net_msg.function, "trigger_anchored_cohort") == 0) {
+        /* Pseudo-function: the anchored cohort's forming/coordinating pass,
+         * now (RD_14.4 Phase 6). Mirrors the Python adapter. */
+        identity_anchored_cohort_tick(impl->proc);
+        return 0;
+    }
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
+        && strcmp(inbound->info.net_msg.function, "trigger_choose_group") == 0) {
+        /* Pseudo-function: end choose_group's wait now and adopt from the
+         * histories stashed so far (RD_14.4 plan, Phase 1). The wait itself is
+         * a timer and not observable. Mirrors the Python adapter's
+         * trigger_choose_group handling. */
+        array_t *cq = NULL;
+        array_create(&cq);
+        static const char *const cq_names[] = {"network", "identity",
+                                               "negotiation", "main"};
+        for (size_t i = 0; i < sizeof(cq_names) / sizeof(cq_names[0]); i++) {
+            data_t *qn = string_data((string_t)cq_names[i], strlen(cq_names[i]));
+            if (qn != NULL) array_append(cq, qn);
+        }
+        (void)identity_adopt_group_from_histories(impl->proc, cq);
+        array_free(cq);
+        return 0;
+    }
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
+        && strcmp(inbound->info.net_msg.function, "trigger_phase3") == 0) {
+        /* Pseudo-function: reach phase 3 holding the participants `admit`
+         * names (the history's roster), and replay the group updates held
+         * through phase 2, as identity_run does on entering phase 3. Mirrors
+         * the Python adapter. */
+        json_t *spec = NULL;
+        if (net_msg_unpack_json(&inbound->info.net_msg, &spec) == 0) {
+            size_t ai;
+            json_t *av;
+            json_array_foreach(json_object_get(spec, "admit"), ai, av) {
+                sce_participant_t *ap = sce_find_participant(ctx, json_string_value(av));
+                process_t *p = impl->proc;
+                if (ap == NULL || p->protocol.num_peers >= DEFAULT_MAX_PEERS) continue;
+                memcpy(&p->protocol.peers[p->protocol.num_peers],
+                       ((ic_impl_t *)ap->impl)->pub, sizeof(public_identity_t));
+                p->protocol.num_peers++;
+            }
+        }
+        json_decref(spec);
+        impl->proc->protocol.phase = 3;
+        array_t *rq = NULL;
+        array_create(&rq);
+        static const char *const rq_names[] = {"network", "identity",
+                                               "negotiation", "main"};
+        for (size_t i = 0; i < sizeof(rq_names) / sizeof(rq_names[0]); i++) {
+            data_t *qn = string_data((string_t)rq_names[i], strlen(rq_names[i]));
+            if (qn != NULL) array_append(rq, qn);
+        }
+        (void)identity_replay_held_group_updates(impl->proc, rq);
+        array_free(rq);
+        return 0;
+    }
     /* directory_t is array_t of sibling-process queue names. Populate it
      * with the names handlers expect to find: _announce_identity (the
      * partition-recovery request_access re-broadcast) returns early unless
@@ -2647,6 +3020,13 @@ static int _dispatch(sce_run_ctx_t *ctx,
         data_t *qn = string_data((string_t)qnames[i], strlen(qnames[i]));
         if (qn != NULL) array_append(queues, qn);
     }
+    /* net_proc tags a frame from a cohort this node gateways (route_to_process
+     * -> net_child_group_of); the harness delivers straight to identity, so it
+     * applies the same tag here. Mirrors the Python adapter's _child_tag. */
+    if (inbound->type == NET_MESSAGE)
+        (void)net_child_group_of(impl->proc, inbound->info.net_msg.from_whom.address,
+                                 inbound->info.net_msg.child_group,
+                                 sizeof(inbound->info.net_msg.child_group));
     run_message_handlers(impl->proc, queues, NET_MESSAGE, inbound);
     array_free(queues);
     return 0;
@@ -3366,6 +3746,32 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                         return -1;
                     }
                 }
+            } else if (strcmp(key, "freshness_mark") == 0) {
+                /* {sender: {verb: N}} -- the high-water mark held for a
+                 * sender's verb: what an ACCEPTED stamped message moves, and
+                 * a refused one must not. id_state is process-global, so the
+                 * cases asserting it have one receiving participant. Mirrors
+                 * the Python adapter. */
+                const char *spid = NULL;
+                json_t *verbs = NULL;
+                json_object_foreach(val, spid, verbs) {
+                    sce_participant_t *sp = sce_find_participant(ctx, spid);
+                    if (sp == NULL) continue;
+                    char su[UUID_STRING_LEN + 1];
+                    uuid_unparse_lower(((ic_impl_t *)sp->impl)->pub->uuid, su);
+                    const char *verb = NULL;
+                    json_t *want_val = NULL;
+                    json_object_foreach(verbs, verb, want_val) {
+                        int64_t want = (int64_t)json_integer_value(want_val);
+                        int64_t got = identity_freshness_mark(su, verb);
+                        if (got != want) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: freshness_mark[%s][%s]=%lld, expected %lld",
+                                     pid, spid, verb, (long long)got, (long long)want);
+                            return -1;
+                        }
+                    }
+                }
             } else if (strcmp(key, "caps_query_emitted") == 0) {
                 /* Directed peer_caps_query emissions from the periodic caps-
                  * resync sweep (driven by the trigger_caps_resync pseudo-step).
@@ -3486,6 +3892,36 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                              pid, got, want);
                     return -1;
                 }
+            } else if (strcmp(key, "anchors") == 0) {
+                /* The join-policy anchor classes this participant counts for
+                 * each named participant's PUBLISHED identity, as
+                 * {participant_id: [class, ...]}, order-free (RD_14.4 plan,
+                 * Phase 2). Mirrors Python process.anchor_classes. */
+                const char *tpid;
+                json_t *twant;
+                json_object_foreach(val, tpid, twant) {
+                    sce_participant_t *tp = sce_find_participant(ctx, tpid);
+                    if (tp == NULL || !json_is_array(twant)) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: anchors names unknown participant %s "
+                                 "or wants no list", pid, tpid);
+                        return -1;
+                    }
+                    uint32_t want = 0;
+                    size_t wi;
+                    json_t *wv;
+                    json_array_foreach(twant, wi, wv)
+                        want |= at_join_policy_class(json_string_value(wv));
+                    uint32_t got = identity_anchor_classes(
+                        proc, ((ic_impl_t *)tp->impl)->pub);
+                    if (got != want) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: anchors[%s]=0x%x, expected 0x%x "
+                                 "(verified_contact=1 unverified_contact=2 "
+                                 "zta=4 operator=8)", pid, tpid, got, want);
+                        return -1;
+                    }
+                }
             } else if (strcmp(key, "group_uuid") == 0) {
                 /* This participant's PRIMARY group, pinned by fixtures.groups
                  * so the scenario can state it language-agnostically. The
@@ -3512,6 +3948,45 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: child_group_count=%d, expected %d",
                              pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "child_group_size") == 0
+                       || strcmp(key, "child_group_owns_key") == 0
+                       || strcmp(key, "child_group_key_epoch") == 0) {
+                /* The one cohort this participant gateways: its membership,
+                 * whether it holds the child's private key, and the key's
+                 * rotation. Mirrors the Python adapter. */
+                group_t *child = NULL;
+                if (proc->protocol.child_groups != NULL
+                    && map_size(proc->protocol.child_groups) == 1) {
+                    map_key_t ck;
+                    data_t *cv;
+                    map_entries_for_each(proc->protocol.child_groups, ck, cv)
+                        ptr_t gp = NULL;
+                        if (data_object_ptr(cv, &gp) == 0)
+                            child = (group_t *)gp;
+                    map_end_for_each
+                }
+                if (child == NULL) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: %s needs exactly one child group", pid, key);
+                    return -1;
+                }
+                long long got, want;
+                if (strcmp(key, "child_group_size") == 0) {
+                    got = (long long)map_size(&child->address_map);
+                    want = (long long)json_integer_value(val);
+                } else if (strcmp(key, "child_group_owns_key") == 0) {
+                    got = !sodium_is_zero(child->encryptor.private,
+                                          crypto_box_SECRETKEYBYTES);
+                    want = json_is_true(val);
+                } else {
+                    got = (long long)child->key_epoch;
+                    want = (long long)json_integer_value(val);
+                }
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err), "%s: %s=%lld, expected %lld",
+                             pid, key, got, want);
                     return -1;
                 }
             } else if (strcmp(key, "peer_caps_descriptor") == 0) {
@@ -3575,6 +4050,58 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                 if (got != want) {
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: provisional_peer_count=%d, expected %d",
+                             pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "anchored_cohort_members") == 0) {
+                /* The anchored cohort held, as sorted participant ids; [] when
+                 * none (RD_14.4 Phase 6). Identity state is one per scenario
+                 * here, so the cases asserting it assert one node's view.
+                 * Mirrors the Python adapter. */
+                group_t g;
+                json_t *got = json_array();
+                if (identity_anchored_cohort_held(&g)) {
+                    for (size_t pi = 0; pi < ctx->participant_count; pi++) {
+                        ic_impl_t *pimpl = (ic_impl_t *)ctx->participants[pi].impl;
+                        if (pimpl == NULL || pimpl->pub == NULL)
+                            continue;
+                        char pu[UUID_STRING_LEN + 1];
+                        uuid_unparse_lower(pimpl->pub->uuid, pu);
+                        data_t *d = NULL;
+                        if (map_get(&g.address_map, (map_key_t)pu, &d) == 0)
+                            json_array_append_new(
+                                got, json_string(ctx->participants[pi].id));
+                    }
+                    identity_anchored_cohort_release(&g);
+                }
+                bool same = json_array_size(got) == json_array_size(val);
+                for (size_t gi = 0; same && gi < json_array_size(val); gi++) {
+                    bool found = false;
+                    for (size_t gj = 0; gj < json_array_size(got) && !found; gj++)
+                        found = strcmp(json_string_value(json_array_get(val, gi)),
+                                       json_string_value(json_array_get(got, gj))) == 0;
+                    same = found;
+                }
+                if (!same) {
+                    char *gs = json_dumps(got, JSON_COMPACT);
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: anchored_cohort_members=%s", pid, gs ? gs : "?");
+                    free(gs);
+                    json_decref(got);
+                    return -1;
+                }
+                json_decref(got);
+            } else if (strcmp(key, "join_provisional_count") == 0) {
+                /* Members marked provisional by an adoption under the join
+                 * policy (RD_14.4 plan, D1 (d)); not the admission hold above.
+                 * Mirrors the Python adapter's join_provisional_count. */
+                int want = (int)json_integer_value(val);
+                json_t *prov = identity_provisional_members();
+                int got = (int)json_array_size(prov);
+                json_decref(prov);
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: join_provisional_count=%d, expected %d",
                              pid, got, want);
                     return -1;
                 }
@@ -4089,6 +4616,41 @@ void at_identity_run_ext(const at_case_t *c, at_case_result_t *out,
     /* Wipe singleton id_state so observables (peer_caps_count etc.) are
      * not polluted by prior scenarios. Preserves synchronous_dispatch. */
     identity_reset_state();
+    identity_anchored_cohort_reset();
+
+    /* join_policy fixture: the declaration's own JSON (RD_14.4 plan, Phase
+     * 2). One per node in C, so one per scenario; Python installs it on every
+     * participant. A fixture that does not parse fails the case. */
+    {
+        json_t *fx = json_object_get(c->data, "fixtures");
+        json_t *jp = json_is_object(fx) ? json_object_get(fx, "join_policy") : NULL;
+        if (jp != NULL) {
+            char *text = json_dumps(jp, JSON_COMPACT);
+            at_join_policy_t policy;
+            char perr[256] = {0};
+            bool ok = text != NULL && at_join_policy_parse(text, &policy, perr, sizeof(perr));
+            free(text);
+            if (!ok) {
+                at_case_result_set_fail(out, 0, "JoinPolicyError",
+                                        perr[0] ? perr : "join_policy fixture");
+                return;
+            }
+            identity_set_join_policy(&policy);
+        }
+        /* self_bootstrapped fixture: [pid, ...] that minted a group of their
+         * own, so a history arriving now takes _merge_to_mesh. id_state is one
+         * per node, so any pid listed sets it; a scenario lists the one node
+         * that receives histories. Mirrors the Python fixture. */
+        json_t *sb = json_is_object(fx) ? json_object_get(fx, "self_bootstrapped") : NULL;
+        if (json_is_array(sb) && json_array_size(sb) > 0)
+            identity_set_self_bootstrapped(true);
+        /* choosing fixture: [pid, ...] whose choose_group wait is running, so
+         * histories are stashed for trigger_choose_group. Mirrors the Python
+         * fixture; one id_state per node, as above. */
+        json_t *ch = json_is_object(fx) ? json_object_get(fx, "choosing") : NULL;
+        if (json_is_array(ch) && json_array_size(ch) > 0)
+            identity_set_choosing_group(true);
+    }
 
     /* First contact is OPT-IN, and the opt-in is read when the process
      * registers its handlers -- so it has to be set BEFORE the participants

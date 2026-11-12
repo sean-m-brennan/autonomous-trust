@@ -25,7 +25,9 @@ participants:
   - id: dave
     role: member
 
-fixtures: {}
+fixtures:
+    # Real scorers, so each half carries its scorer's signature (R+D.md §14.2).
+    chain_parties: [carol, dave]
 
 steps:
   - id: 1

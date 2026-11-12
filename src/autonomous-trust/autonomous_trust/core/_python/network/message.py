@@ -120,6 +120,19 @@ class Message(object):
     | size | process | function | data | signature  |
     =================================================
     """
+    # On a gateway, the uuid of the child cohort the sender belongs to (set by
+    # the network process on receipt; never on the wire). None for a frame
+    # from the primary cohort, a stranger, or on any node with no child group.
+    child_group = None
+    # On a received message that carried a signature: the raw 64-byte
+    # signature and the exact pre-image it signs (``_signable_content``), kept
+    # so the signature can be checked again later. A sender the network did
+    # not yet hold leaves ``verified`` False; once the sender is a known peer,
+    # :meth:`reverify` checks it against that peer's stored key. Never on the
+    # wire.
+    wire_signature = None
+    signed_content = None
+
     def __init__(self, process, function, obj, to_whom=None, from_whom=None, encrypt=True, return_to=None,
                  trace_id=None):
         # Deferred import to break circular dependency:
@@ -246,6 +259,43 @@ class Message(object):
                                    % type(to_whom[0]))
             return to_whom
         raise RuntimeError('Invalid to_whom arg. Must be an Identity, but got %s' % type(to_whom))
+
+    def _keep_signature(self, sig_hex, process, function, data_b64):
+        """Keep a received signature and its pre-image (see ``wire_signature``)."""
+        if not sig_hex:
+            return
+        try:
+            self.wire_signature = HexEncoder.decode(sig_hex.encode('ascii'))
+        except Exception:
+            return
+        self.signed_content = Message._signable_content(process, function, data_b64)
+
+    def reverify(self, signer) -> bool:
+        """Check the kept signature against ``signer``'s stored key, and mark
+        the message verified when it holds. ``signer`` must be the peer this
+        node holds for the sender, never the identity the frame names for
+        itself: that is what makes the check mean something. Returns whether
+        the message is verified."""
+        if self.verified:
+            return True
+        if not self.signed_by(signer):
+            return False
+        self.verified = True
+        return True
+
+    def signed_by(self, signer) -> bool:
+        """Whether the kept signature checks against ``signer``'s key, whatever
+        ``verified`` says. ``verified`` may come from the key the envelope
+        names for itself, which a stranger chooses; this checks one key this
+        node already holds. Changes nothing on the message."""
+        if self.wire_signature is None or self.signed_content is None:
+            return False
+        try:
+            signer.signature.public.verify(
+                self.signed_content.encode(Network.encoding), self.wire_signature)
+        except Exception:
+            return False
+        return True
 
     def for_recipient(self, to_whom):
         """This message readdressed to *to_whom*, reusing the signature.
@@ -553,6 +603,9 @@ class Message(object):
         msg = Message(process, function, obj_str, from_whom=sender,
                       encrypt=False)
         msg.verified = False
+        if sig_hex:
+            msg._keep_signature(sig_hex, process, function,
+                                b64encode(obj_str.encode(Network.encoding)).decode('ascii'))
 
         if sig_hex and sender is not None and isinstance(sender, Identity):
             try:
@@ -664,6 +717,7 @@ class Message(object):
         msg = Message(process, function, obj_str, from_whom=eff_sender,
                       encrypt=encrypt, trace_id=trace_id)
         msg.verified = False
+        msg._keep_signature(sig_hex, process, function, data_b64)
 
         # Verify signature if present. Bypass Identity.verify's two-arg path
         # here: it forwards encoder=HexEncoder to PyNaCl, but PyNaCl only

@@ -340,14 +340,29 @@ build_images_once() {
 # given scale point. Mirrors what scripts/run-demo.sh does on `--compose`.
 regenerate_manifests() {
     local squad=$1 swarm=$2 sensor=$3 hacked=$4
-    AT_DEMO_T0_EPOCH=$(date +%s) $AT_PYTHON \
+    # A hierarchical compose file (AT_COHORT_SIZE) needs a hierarchical seed:
+    # under a flat one the gateways start with the hybrid transport and no
+    # hybrid_net.cfg.json, and exit. Seed with tools.seed_dod_cohort under the
+    # same AT_COHORT_SIZE and AT_RQ86_COUNT.
+    if [[ -n "${AT_COHORT_SIZE:-}" && "${AT_COHORT_SIZE}" != "0" ]]; then
+        local gw_cfg="$here/.demo-state/dod-mission/rq86-1/etc/at/hybrid_net.cfg.json"
+        if [[ ! -f "$gw_cfg" ]]; then
+            err "AT_COHORT_SIZE=$AT_COHORT_SIZE but the seed is not hierarchical ($gw_cfg missing); run tools.seed_dod_cohort with the same AT_COHORT_SIZE"
+            return 1
+        fi
+    fi
+    # The scenario clock starts at T0. A large point on slow storage can take
+    # longer to start than the scenario lasts, so AT_DEMO_T0_DELAY_SEC pushes
+    # T0 past start-up; producers emit nothing before T0.
+    AT_DEMO_T0_EPOCH=$(( $(date +%s) + ${AT_DEMO_T0_DELAY_SEC:-0} )) $AT_PYTHON \
         -m examples.dod_mission.deploy.generate_compose \
         "$COMPOSE_FILE" \
         --image "$DEMO_IMAGE_REF" \
         --squad-size "$squad" \
         --swarm-size "$swarm" \
         --sensor-count "$sensor" \
-        --hacked-sensors "$hacked" >/dev/null
+        --hacked-sensors "$hacked" \
+        --rq86-count "${AT_RQ86_COUNT:-2}" >/dev/null
     # Simulator scenario regeneration is best-effort: it transitively
     # imports geopy + a few other deps that aren't strictly required
     # for `docker compose up` (the previous scenario.yaml stays bind-
@@ -356,7 +371,8 @@ regenerate_manifests() {
             --squad-size "$squad" \
             --swarm-size "$swarm" \
             --sensor-count "$sensor" \
-            --hacked-sensors "$hacked" >/dev/null 2>&1; then
+            --hacked-sensors "$hacked" \
+            --rq86-count "${AT_RQ86_COUNT:-2}" >/dev/null 2>&1; then
         warn "  simulator scenario regeneration failed (non-fatal)"
     fi
 }
@@ -404,11 +420,14 @@ import sys, re, datetime as dt
 line = sys.stdin.read().strip()
 if not line:
     sys.exit(1)
-m = re.search(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)', line)
+# Logs use either ',' or '.' before the milliseconds, and containers log in
+# UTC, so parse as UTC to compare against the host's epoch t_start.
+m = re.search(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[,.]\d+)', line)
 if not m:
     sys.exit(1)
 t = dt.datetime.strptime(m.group(1).replace(',', '.'),
-                         '%Y-%m-%d %H:%M:%S.%f').timestamp()
+                         '%Y-%m-%d %H:%M:%S.%f').replace(
+                             tzinfo=dt.timezone.utc).timestamp()
 print(round(t - $t_start, 2))
 " 2>/dev/null
 }
@@ -422,7 +441,7 @@ run_scale_point() {
 
     log "[$label] squad=$squad swarm=$swarm sensor=$sensor hacked=$hacked"
 
-    regenerate_manifests "$squad" "$swarm" "$sensor" "$hacked"
+    regenerate_manifests "$squad" "$swarm" "$sensor" "$hacked" || exit 1
     cp "$COMPOSE_FILE" "$run_dir/docker-compose.yml"
     [[ -f "$SIM_SCENARIO_YAML" ]] && \
         cp "$SIM_SCENARIO_YAML" "$run_dir/scenario.yaml"
@@ -641,14 +660,15 @@ print('%s %s %s %s %s' % (
     local t_start
     t_start=$($AT_PYTHON -c "
 import re, datetime as dt
-ts_re = re.compile(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)')
+ts_re = re.compile(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[,.]\d+)')
 with open('$coord_log') as f:
     for line in f:
         m = ts_re.search(line)
         if m:
             t = dt.datetime.strptime(
                 m.group(1).replace(',', '.'),
-                '%Y-%m-%d %H:%M:%S.%f').timestamp()
+                '%Y-%m-%d %H:%M:%S.%f').replace(
+                    tzinfo=dt.timezone.utc).timestamp()
             print(t)
             break
 " 2>/dev/null)

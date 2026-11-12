@@ -73,6 +73,17 @@ COPY src/autonomous-trust-evaluation/autonomous_trust  /opt/at-evaluation/autono
 COPY src/autonomous-trust-services/autonomous_trust    /opt/at-services/autonomous_trust
 COPY src/autonomous-trust-simulator/autonomous_trust   /opt/at-simulator/autonomous_trust
 
+# reactjs/build.sh leaves dash_components/async_update as a symlink into
+# reactjs/, which COPY carries over as a link that dangles here, and core.py
+# then fails on "from .async_update import bin_data_pb2". Replace the link with
+# the package build.sh built on the host (bin_data_pb2.py and the JS bundle are
+# generated, not committed, so run build.sh before building this image).
+ARG AT_DASH_COMPONENTS=/opt/at-inspector/autonomous_trust/inspector/dash_components
+RUN rm -rf "${AT_DASH_COMPONENTS}/async_update" && \
+    mkdir -p "${AT_DASH_COMPONENTS}/assets"
+COPY src/autonomous-trust-inspector/reactjs/async_update \
+     ${AT_DASH_COMPONENTS}/async_update
+
 # Multi-agency demo lives under examples/, not in the inspector package;
 # put it on PYTHONPATH so `python -m examples.multi_agency` resolves.
 COPY examples/multi_agency  /opt/examples/multi_agency

@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import time
 import traceback
 from queue import Empty, Full
 from datetime import timedelta
@@ -21,14 +22,20 @@ from uuid import UUID
 
 from ..bootstrap_capabilities import BOOTSTRAP_CAPABILITY_NAMES
 from ..capabilities import Capability
-from ..config import from_json_string
+from ..config import from_json_string, to_json_string
 from ..freshness import Freshness
 from ..identity.protocol import IdentityProtocol
 from ..network import Message
 from ..processes import Process, ProcMeta
-from ..extensions import capped_tier, load_extensions, run_post_fork
+from ..extensions import (capped_tier, load_extensions, negotiation_on_decline,
+                          negotiation_on_invitation, negotiation_on_result,
+                          negotiation_on_score, negotiation_select,
+                          negotiation_periodic, run_post_fork)
 from .protocol import NegotiationProtocol
-from .negotiation import Job, JobQueue, Task, TaskStatus, TaskTracker, TaskCounter, TaskResult, Status
+from .negotiation import (Job, JobQueue, Task, TaskParameters, TaskStatus,
+                          TaskTracker, TaskCounter, TaskResult, ScoreEcho,
+                          Status)
+from .replay import trace_chain
 from ..system import CfgIds, max_concurrency, now, proc_idle_floor
 from .. import _probes
 
@@ -42,11 +49,24 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
     # Status-request rounds the deadline sweep sends, without a live answer,
     # before it gives a task up. C twin: NEG_STATUS_ASKS.
     STATUS_ASKS = 3
+    #: How long a given-up task's tracker is kept, and how many at most, so a
+    #: result that arrives after give-up is still scored against the
+    #: challenge we issued (hostile-join run, 2026-11-04: a colluder's backlog
+    #: held a joiner's probes past their deadline, and the answers that came
+    #: minutes later were dropped). Mirrors C NEG_LATE_RESULT_SEC / _MAX.
+    LATE_RESULT_SEC = 600.0
+    LATE_RESULT_MAX = 64
 
     def __init__(self, configurations, subsystems, log_q, max_cores=max_concurrency, **kwargs):
         super().__init__(configurations, subsystems, log_q,
                          dependencies=[CfgIds.network, CfgIds.identity], **kwargs)
         self.task_stack = JobQueue()
+        # Tasks handed to main for execution whose result has not gone out:
+        # they answer a status request "running" (handle_stat_req).
+        self._dispatched: set[str] = set()
+        # Given-up tasks' trackers, by task id, with when each is let go: a
+        # late result is scored against them (status_sweep, handle_results).
+        self._given_up: dict = {}
         self.proposed_tasks = {}  # TaskCounters for local tasks remotely requested
         # Persistent per-task flood counter. Kept separate from
         # `proposed_tasks` because `_add_task` clears the latter on every
@@ -68,15 +88,25 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
         # core/freshness.py and doc/architecture/security-hardening.md,
         # "Replay resistance, per verb".
         self.freshness = Freshness(self.name, self.logger)
+        # Our own identity, to sign what a receiver must verify: a nack is
+        # honored only when signed (handle_refuse). C's network layer signs
+        # every frame with its own key; ours signs only given from_whom.
+        self.identity = self.configs.get(CfgIds.identity)
         self.max_concurrency = max_cores
         self.protocol = NegotiationProtocol(self.name, self.logger, configurations)
         self.protocol.register_handler(NegotiationProtocol.start, self.start_task)
         self.protocol.register_handler(NegotiationProtocol.announce, self.handle_invite)
         self.protocol.register_handler(NegotiationProtocol.response, self.handle_haggle)
         self.protocol.register_handler(NegotiationProtocol.acceptance, self.handle_accept)
+        self.protocol.register_handler(NegotiationProtocol.refusal, self.handle_refuse)
         self.protocol.register_handler(NegotiationProtocol.status_req, self.handle_stat_req)
         self.protocol.register_handler(NegotiationProtocol.status_resp, self.handle_stat_resp)
         self.protocol.register_handler(NegotiationProtocol.result, self.handle_results)
+        # The executor's half of live replication (RD_12.6 plan §3.7).
+        self.protocol.register_handler(NegotiationProtocol.replay_challenge,
+                                       self.handle_replay_request)
+        self.protocol.register_handler(NegotiationProtocol.replay_reveal,
+                                       self.handle_replay_request)
         # Trust-tier demotion → cancel in-flight tasks the peer is no
         # longer authorised for. Local IPC from ReputationProcess; see
         # doc/architecture/trust-tiers.md §7.2.
@@ -154,6 +184,20 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                     del self.my_tasks[task.uuid]
                     return True
                 participants = present
+            # Selective assignment (RD_12.7 plan §3.1): a selection layer may
+            # draw the invitees from the capable, present peers -- k of them
+            # for a capability it selects on, or the target of a directed
+            # probe -- and stamp the invitation with the draw. With no layer,
+            # or none that selects this task, nothing below changes.
+            chosen = None
+            if participants:
+                wanted = getattr(message, 'to_whom', None)
+                if isinstance(wanted, (list, tuple)):
+                    wanted = wanted[0] if len(wanted) == 1 else None
+                chosen = negotiation_select(self, task, participants, wanted)
+                if chosen is not None:
+                    participants = list(chosen)
+                    tracker.draw = task.draw
             # Optional single-peer addressing (R+D.md §12.7). `to_whom` unset
             # keeps the historical fan-out to every capable peer; set, it
             # narrows the announcement to that one peer.
@@ -175,7 +219,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
             if isinstance(target, (list, tuple)):
                 target = target[0] if len(target) == 1 else None
             target_uuid = getattr(target, 'uuid', None)
-            if target_uuid is not None:
+            if target_uuid is not None and chosen is None:
                 addressed = [p for p in participants
                              if getattr(p, 'uuid', None) == target_uuid]
                 if not addressed:
@@ -250,6 +294,9 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                     getattr(task, 'seq', 0),
                     self.freshness.mark(sender, NegotiationProtocol.announce))
                 return True
+            # A selection layer checks the requestor's coin (RD_12.7 plan
+            # §0.2): it logs and counts a bad draw, and changes nothing here.
+            negotiation_on_invitation(self, queues, task, message.from_whom)
             if task.uuid not in self.proposed_tasks:
                 self.proposed_tasks[task.uuid] = TaskCounter(task)
             self.proposed_tasks[task.uuid].count += 1
@@ -263,14 +310,16 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                     'Negotiation: flood detected for task %s (count=%d), refusing', task.uuid, self.flood_counts[task.uuid])
                 try:
                     msg = Message(self.name, NegotiationProtocol.refusal,
-                                  task.to_json_string(), message.from_whom)
+                                  task.to_json_string(), message.from_whom,
+                                  from_whom=self.identity)
                     queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                 except Full:
                     self.logger.error('handle_invite: Network queue full (flood-refuse)')
                 return True
             try:
                 if task.capability not in self.capabilities:
-                    msg = Message(self.name, NegotiationProtocol.refusal, task.to_json_string(), message.from_whom)
+                    msg = Message(self.name, NegotiationProtocol.refusal, task.to_json_string(),
+                                  message.from_whom, from_whom=self.identity)
                     queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                     self.logger.debug('Remote task refused: not capable')
                 else:
@@ -302,7 +351,8 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                     required_tier = getattr(local_cap, 'required_tier', 0)
                     if sender_tier < required_tier:
                         msg = Message(self.name, NegotiationProtocol.refusal,
-                                      task.to_json_string(), message.from_whom)
+                                      task.to_json_string(), message.from_whom,
+                                      from_whom=self.identity)
                         queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                         self.logger.debug(
                             'Remote task refused: sender tier %d < required %d',
@@ -332,9 +382,13 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
 
     def _cancel_participant(self, queues, message):
         task = message.obj
-        result = self.my_tasks[task.uuid].results
-        if result[message.from_whom.uuid] is None:
-            del result[message.from_whom.uuid]
+        tracker = self.my_tasks.get(task.uuid)
+        if tracker is None:
+            return              # not a task of ours, as C's lookup decides
+        result = tracker.results
+        uid = message.from_whom.uuid
+        if uid in result and result[uid] is None:
+            del result[uid]
         # Drop the confirmation too, mirroring the C twin's removal of its
         # per-(task, peer) marker: a peer we have cancelled out of a task must
         # not still read as confirmed in handle_stat_resp, or it can go on
@@ -399,27 +453,78 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
         return False
 
     def handle_refuse(self, queues, message):
+        """A participant declined our task: drop it, as C does. Only a signed
+        nack counts, or anyone could cancel a participant by naming the task
+        (RD_2.6 plan §2.8, the user's call 2026-10-21)."""
         if message.function == NegotiationProtocol.refusal:
+            if not getattr(message, 'verified', False):
+                self.logger.warning(
+                    'Ignoring unverified nack from %s',
+                    getattr(message.from_whom, 'nickname', message.from_whom))
+                return True
             try:
                 self._cancel_participant(queues, message)
                 self.logger.debug('My task refused')
+                self._replace_declined(queues, message)
             except Full:
                 self.logger.error('handle_refuse: Main queue full')
             return True
         return False
 
+    def _capable_present(self, cap_name: str) -> list:
+        """Every known peer advertising ``cap_name`` that the network process
+        has not reported absent: the set ``start_task`` invites from."""
+        absent = getattr(self.protocol, 'absent_peers', set()) or set()
+        out = []
+        for peer_id in self.peer_capabilities.get(cap_name, []):
+            peer = self.peers.find_by_uuid(peer_id)
+            if peer is not None and str(peer.uuid) not in absent:
+                out.append(peer)
+        return out
+
+    def _replace_declined(self, queues, message):
+        """Invite a selection layer's replacement for a peer that declined
+        (RD_12.7 plan §3.5, D5(a)). With no layer, nobody replaces it."""
+        tracker = self.my_tasks.get(message.obj.uuid)
+        if tracker is None or getattr(tracker, 'draw', None) is None:
+            return      # only a drawn invitee has a replacement to draw
+        cap = tracker.capability
+        chosen = negotiation_on_decline(
+            self, tracker, message.from_whom.uuid,
+            self._capable_present(getattr(cap, 'name', cap)))
+        if not chosen:
+            return
+        task = Task(**tracker.to_dict())
+        task.seq = self.freshness.stamp()
+        for peer in chosen:
+            tracker.results[peer.uuid] = None
+            queues[CfgIds.network].put(
+                Message(self.name, NegotiationProtocol.announce,
+                        task.to_json_string(), peer),
+                block=True, timeout=self.q_cadence)
+            self.logger.debug('Declined task %s re-drawn to %s', task.uuid,
+                              getattr(peer, 'nickname', peer))
+
     def handle_stat_req(self, queues, message):
+        """Answer a requestor's status request from what negotiation holds:
+        pending while the task waits in the stack, running once it has been
+        handed to execution and until its result has gone out, unknown
+        otherwise. The answer used to come from main, through main's queue:
+        on a node whose queue was backed up (a colluder held 162 tasks in the
+        hostile-join run of 2026-11-04) it waited behind the work it reported
+        on, and main answered unknown for a task it had not started, so the
+        requestor gave the task up. Mirrors C handle_stat_req."""
         if message.function == NegotiationProtocol.status_req:
             task_status = TaskStatus(message.obj, message.from_whom)
             if task_status.uuid in self.task_stack:
                 task_status.status = Status.pending
-                self.forward_status(queues, task_status)
+            elif str(task_status.uuid) in self._dispatched:
+                task_status.status = Status.running
             else:
-                try:
-                    queues[CfgIds.main].put(task_status, block=True, timeout=self.q_cadence)
-                    self.logger.debug('Remote status requested')
-                except Full:
-                    self.logger.error('handle_stat_req: Main queue full')
+                task_status.status = Status.unknown
+            self.logger.debug('Remote status requested: %s',
+                              task_status.status.value)
+            self.forward_status(queues, task_status)
             return True
         return False
 
@@ -506,6 +611,8 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
 
     def forward_result(self, queues, message):
         if isinstance(message, TaskResult):
+            self._dispatched.discard(str(message.uuid))
+            self._retain_trace(message)
             try:
                 msg = Message(self.name, NegotiationProtocol.result, message.to_json_string(), message.requestor)
                 queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
@@ -514,6 +621,110 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                 self.logger.error('forward_result: Network queue full')
             return True
         return False
+
+    # --- live replication (RD_12.6_LIVE_REPLICATION_PLAN.md §3.7) ---------
+
+    #: How long an executor keeps a trace to answer a verifier: twice the
+    #: requestor's hold on its halves. Mirrors C NEG_TRACE_RETAIN_SEC.
+    TRACE_RETAIN_SEC = 60.0
+    #: How many traces are kept at once; the oldest goes first.
+    TRACE_RETAIN_MAX = 16
+
+    def _retain_trace(self, result) -> None:
+        """Keep a replayable capability's states, by task uuid, to answer the
+        requestor's questions about them."""
+        states = getattr(result, 'trace_states', None)
+        requestor = getattr(getattr(result, 'requestor', None), 'uuid', None)
+        if not states or requestor is None:
+            return
+        traces = self.__dict__.setdefault('_traces', {})
+        self._expire_traces()
+        while len(traces) >= self.TRACE_RETAIN_MAX:
+            del traces[min(traces, key=lambda k: traces[k][2])]
+        traces[str(result.uuid)] = (list(states), str(requestor),
+                                    time.monotonic() + self.TRACE_RETAIN_SEC)
+
+    def _expire_traces(self) -> None:
+        traces = self.__dict__.get('_traces')
+        if traces:
+            clock = time.monotonic()
+            for key in [k for k, v in traces.items() if v[2] <= clock]:
+                del traces[key]
+
+    def handle_replay_request(self, queues, message):
+        """Answer a verifier about a trace we committed to: a chain digest
+        (`replay challenge`) or the reveal at the divergent step (`replay
+        reveal`). Only the task's requestor is answered, and only while the
+        trace is kept."""
+        if message.function not in (NegotiationProtocol.replay_challenge,
+                                     NegotiationProtocol.replay_reveal):
+            return False
+        if not message.verified:
+            return True
+        payload = message.obj
+        if isinstance(payload, (str, bytes)):
+            try:
+                payload = from_json_string(payload)
+            except ValueError:
+                return True
+        if not isinstance(payload, dict):
+            return True
+        task, rnd, index = payload.get('task'), payload.get('round'), payload.get('index')
+        if not isinstance(task, str) or isinstance(index, bool) \
+                or not isinstance(index, int) or isinstance(rnd, bool) \
+                or not isinstance(rnd, int):
+            return True
+        self._expire_traces()
+        kept = self.__dict__.get('_traces', {}).get(task)
+        sender = getattr(message.from_whom, 'uuid', None)
+        if kept is None or sender is None or str(sender) != kept[1]:
+            self.logger.debug('replay request for %s from %s not answered',
+                              task[:8], str(sender)[:8])
+            return True
+        states = kept[0]
+        answer = {'task': task, 'round': rnd, 'index': index}
+        if message.function == NegotiationProtocol.replay_challenge:
+            if not 0 <= index < len(states):
+                return True
+            answer['digest'] = trace_chain(states[:index + 1])[-1]
+        else:
+            if not 0 <= index <= len(states):
+                return True
+            chain = trace_chain(states[:index]) if index else []
+            answer['reveal'] = {
+                'prev': chain[index - 2] if index >= 2 else None,
+                'pre': states[index - 1] if index >= 1 else None,
+                'state': states[index] if index < len(states) else None}
+        try:
+            queues[CfgIds.network].put(Message(
+                self.name, NegotiationProtocol.replay_response,
+                to_json_string(answer), message.from_whom,
+                from_whom=self.identity), block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('handle_replay_request: network queue full')
+        return True
+
+    def release_result(self, queues, task, score=None) -> None:
+        """Release a result whose score live replication held: scored with
+        ``score`` (``(score, channel)``, the verdict) or, with None, by the
+        ordinary arms. Never forwarded to the application again."""
+        task.score_hold = False
+        task.score_only = True
+        task.replication_score = score
+        try:
+            queues[CfgIds.main].put(task, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('release_result: main queue full')
+
+    def start_directed(self, queues, capability_name, args, kwargs, peer):
+        """Ask ``peer`` alone to run ``capability_name`` (a replica,
+        RD_12.6 plan D4). Returns the task, or None when it could not be
+        started."""
+        task = Task(TaskParameters(Capability(capability_name), args=list(args or ()),
+                                   kwargs=dict(kwargs or {})), self.identity)
+        self.start_task(queues, Message(self.name, NegotiationProtocol.start,
+                                        task, peer))
+        return task if task.uuid in self.my_tasks else None
 
     def handle_results(self, queues, message):
         """Every invitee's result is scored, as it arrives, under its own pair
@@ -526,9 +737,14 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
         answered (or the task is cancelled). Mirrors C handle_results."""
         if message.function == NegotiationProtocol.result:
             task = message.obj
-            if task.uuid in self.my_tasks:
+            # A task we gave up is still scored if its result comes before
+            # we let its tracker go: scored, never forwarded to the
+            # application, which already had the give-up.
+            late = task.uuid not in self.my_tasks and task.uuid in self._given_up
+            if task.uuid in self.my_tasks or late:
                 try:
-                    tracker = self.my_tasks[task.uuid]
+                    tracker = (self._given_up[task.uuid][0] if late
+                               else self.my_tasks[task.uuid])
                     results = tracker.results
                     who = message.from_whom.uuid
                     invited = set(results)
@@ -572,9 +788,24 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                             'handle_results: no parameters retained for '
                             'task %s; result forwarded unstamped', task.uuid)
                     # Local-only: never serialized, read by automate.py.
-                    task.score_only = len(scored) > 1
-                    queues[CfgIds.main].put(task, block=True, timeout=self.q_cadence)
-                    self.logger.debug('Task results forwarded')
+                    task.score_only = len(scored) > 1 or late
+                    if late:
+                        self.logger.info(
+                            'late result for given-up task %s from %s scored',
+                            task.uuid, str(who)[:8])
+                        queues[CfgIds.main].put(task, block=True,
+                                                timeout=self.q_cadence)
+                        if len(scored) >= max(1, len(invited)):
+                            del self._given_up[task.uuid]
+                        return True
+                    # Live replication may hold this result's score, or take
+                    # a replica's result entirely (RD_12.6 plan §3.7).
+                    held = negotiation_on_result(self, queues, task, tracker)
+                    if held == 'hold':
+                        task.score_hold = True
+                    if held != 'consume':
+                        queues[CfgIds.main].put(task, block=True, timeout=self.q_cadence)
+                        self.logger.debug('Task results forwarded')
                     if len(scored) >= max(1, len(invited)):
                         del self.my_tasks[task.uuid]  # every invitee answered
                 except Full:
@@ -710,6 +941,17 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                 peer_uuid_str, new_tier, cancelled_jobs)
         return True
 
+    def _dispatch_jobs(self, queues) -> None:
+        """Hand every due job in the stack to main for execution, and note it
+        as dispatched until its result goes out (handle_stat_req)."""
+        for job in self._get_jobs():  # local jobs
+            try:
+                queues[CfgIds.main].put(job.task, block=True, timeout=self.q_cadence)
+                self._dispatched.add(str(job.task.uuid))
+                self.logger.debug('Send for execution')
+            except Full:
+                self.logger.error('process: Main queue full')
+
     def _forget_task(self, task_id):
         """Everything this node keeps about one of its own tasks: the tracker,
         the confirmations and any outstanding status token."""
@@ -727,9 +969,14 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
         Silence, or an answer that does not extend, is asked again once an
         extension's worth of time has passed, and after ``STATUS_ASKS`` rounds
         the task is given up: logged and forgotten, with no result to main and
-        no score, since a lost frame looks the same as a refusal. Returns the
-        number given up. C twin: ``negotiation_status_sweep``."""
+        no score, since a lost frame looks the same as a refusal. Its tracker
+        is kept LATE_RESULT_SEC so a result that comes after all is scored
+        (handle_results). Returns the number given up. C twin:
+        ``negotiation_status_sweep``."""
         given_up = 0
+        for task_id in [t for t, (_tr, until) in self._given_up.items()
+                        if until <= present]:
+            del self._given_up[task_id]
         for task_id, tracker in list(self.my_tasks.items()):
             params = tracker.parameters
             if present <= params.when + params.duration + params.timeout:
@@ -758,6 +1005,11 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                 self.logger.warning(
                     'Task %s past its deadline with no live answer after %d '
                     'status request round(s); giving it up', task_id, asks)
+                # Kept a while: a late result is still scored against it.
+                self._given_up[task_id] = (
+                    tracker, present + timedelta(seconds=self.LATE_RESULT_SEC))
+                while len(self._given_up) > self.LATE_RESULT_MAX:
+                    del self._given_up[next(iter(self._given_up))]
                 self._forget_task(task_id)
                 given_up += 1
                 continue
@@ -800,6 +1052,8 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                                 if isinstance(message, tuple) and len(message) > 1 and \
                                         isinstance(message[1], Capability):
                                     self.peer_capabilities[message[0]] = message[1]
+                                elif isinstance(message, ScoreEcho):
+                                    negotiation_on_score(self, message)
                                 else:
                                     if isinstance(message, Message):
                                         _probes.counter('proc.negotiation', 'unhandled', message.function)
@@ -810,14 +1064,11 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                                         self.logger.error('Unhandled message of type %s', message.__class__.__name__)  # noqa
                 _probes.counter('proc.negotiation', 'iter_drained', str(drained))
 
-                for job in self._get_jobs():  # local jobs
-                    try:
-                        queues[CfgIds.main].put(job.task, block=True, timeout=self.q_cadence)
-                        self.logger.debug('Send for execution')
-                    except Full:
-                        self.logger.error('process: Main queue full')
+                self._dispatch_jobs(queues)
 
                 self.status_sweep(queues, now())
+                self._expire_traces()
+                negotiation_periodic(self, queues)
             except Exception as err:
                 self.logger.error(err)
                 self.logger.error(traceback.format_exc())

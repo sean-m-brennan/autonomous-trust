@@ -1,0 +1,81 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: selected-peer-declines-redraw
+byte_pinning: false
+description: |
+    A drawn peer that declines is replaced by a second draw over the peers
+    not yet asked (RD_12.7 plan section 3.5, D5(a)). The decline costs carol
+    nothing.
+
+    As in spawn-task-selects-k, link 1 of alice's chain draws carol. carol
+    declines in a signed nack. alice records the decline and draws again,
+    over dave and bob only, seeded by link 2. That draw falls on dave, whose
+    invitation carries draw index 2. It is the first draw dave has seen, so it
+    checks against the head and dave finds nothing. bob is not invited at
+    either point.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+  - id: carol
+    role: worker
+  - id: dave
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_fetch]
+    carol: [data_fetch]
+    dave: [data_fetch]
+  selection:
+    holder: alice
+    root: 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+    declaration:
+      version: 1
+      capabilities:
+        data_fetch: {k: 1, floor: 0.05}
+
+steps:
+  - id: 1
+    from: alice
+    to: alice
+    function: spawn task
+    payload:
+      capability: data_fetch
+      task_id: t-redraw
+  - id: 2
+    from: alice
+    to: carol
+    function: invitation
+    in_response_to: 1
+    no_propagate: true
+    description: carol is drawn and invited.
+  - id: 3
+    from: carol
+    to: alice
+    function: nack
+    payload:
+      task_id: t-redraw
+    description: carol declines, in a signed nack.
+  - id: 4
+    from: alice
+    to: dave
+    function: invitation
+    in_response_to: 3
+    description: the re-draw falls on dave, who checks draw 2.
+  - id: 5
+    from: alice
+    to: bob
+    function: invitation
+    in_response_to: 3
+    expect_none: true
+    description: bob is still not invited.
+
+expected_state:
+  alice:
+    has_my_task: {slug: t-redraw, present: true}
+  dave:
+    selection_findings: {}

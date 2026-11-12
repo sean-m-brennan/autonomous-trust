@@ -31,12 +31,15 @@
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
 #include "network/network.h"
+#include "network/net_ext.h"
+#include "network/net_liveness.h"
 #include "network/net_message.h"
 #include "network/net_proc_priv.h"
 #ifdef AT_RENDEZVOUS_ENABLED   /* libat_rendezvous is built */
 #include "rendezvous/net_relay_rosters.h"
 #endif
 #include "processes/plaintext_verbs.h"
+#include "config/deployment_manifest.h"
 
 #include "../negative_runner.h"
 #include "../jcs.h"
@@ -2741,6 +2744,89 @@ static int run_wire_verb_policy(const at_case_t *c, char *err, size_t err_len) {
     return expect_flag(c, "node", "all_cases_match", all, err, err_len) != 0 ? -1 : 0;
 }
 
+/* Extension-declared network verbs (scenario `ext-wire-verbs`). The registry
+ * is filled once and never emptied, so the test extension's list is a
+ * static array this case fills, then clears. Mirrors Python
+ * _run_ext_wire_verbs. */
+static const char *_conf_wire_verbs[9];
+static const net_ext_t _conf_wire_ext = {
+    .name = "conformance.wire_verbs",
+    .wire_verbs = _conf_wire_verbs,
+};
+
+static int run_ext_wire_verbs(const at_case_t *c, char *err, size_t err_len) {
+    static bool registered;
+    if (!registered) {
+        if (net_ext_register(&_conf_wire_ext) != 0) {
+            snprintf(err, err_len, "could not register the test extension");
+            return -1;
+        }
+        registered = true;
+    }
+    json_t *fx = json_object_get(c->data, "fixtures");
+    json_t *declared = json_object_get(fx, "declared");
+    size_t i;
+    json_t *one;
+    memset(_conf_wire_verbs, 0, sizeof(_conf_wire_verbs));
+    if (json_array_size(declared) > 8) {
+        snprintf(err, err_len, "scenario: more than 8 declared verbs");
+        return -1;
+    }
+    json_array_foreach(declared, i, one)
+        _conf_wire_verbs[i] = json_string_value(one);
+    int rc = run_wire_verb_policy(c, err, err_len);
+    memset(_conf_wire_verbs, 0, sizeof(_conf_wire_verbs));
+    return rc;
+}
+
+/* Transport liveness (scenario `transport-liveness`): replay the events into
+ * net_liveness and ask every check. Mirrors Python _run_transport_liveness. */
+static int _liveness_peer(json_t *peers, const char *name, uuid_t out)
+{
+    const char *s = json_string_value(json_object_get(peers, name ? name : ""));
+    return (s != NULL && uuid_parse(s, out) == 0) ? 0 : -1;
+}
+
+static int run_transport_liveness(const at_case_t *c, char *err, size_t err_len)
+{
+    json_t *fx = json_object_get(c->data, "fixtures");
+    json_t *peers = json_object_get(fx, "peers");
+    json_t *events = json_object_get(fx, "events");
+    json_t *checks = json_object_get(fx, "checks");
+    if (!json_is_number(json_object_get(fx, "start")) || !json_is_object(peers)
+        || !json_is_array(checks) || json_array_size(checks) == 0) {
+        snprintf(err, err_len, "scenario: fixtures.start, peers or checks missing");
+        return -1;
+    }
+    net_liveness_reset(json_number_value(json_object_get(fx, "start")));
+    size_t i;
+    json_t *one;
+    json_array_foreach(events, i, one) {
+        uuid_t u;
+        if (_liveness_peer(peers, json_string_value(json_object_get(one, "heard")), u) != 0) {
+            snprintf(err, err_len, "scenario: event %zu names an unknown peer", i);
+            return -1;
+        }
+        net_liveness_heard(u, json_number_value(json_object_get(one, "at")));
+    }
+    bool all = true;
+    json_array_foreach(checks, i, one) {
+        uuid_t u;
+        if (_liveness_peer(peers, json_string_value(json_object_get(one, "peer")), u) != 0) {
+            snprintf(err, err_len, "scenario: check %zu names an unknown peer", i);
+            return -1;
+        }
+        double got = net_liveness_quiet_for(u, json_number_value(json_object_get(one, "at")));
+        double want = json_number_value(json_object_get(one, "quiet_for"));
+        if (got - want > 1e-9 || want - got > 1e-9) {
+            fprintf(stderr, "transport-liveness mismatch: check %zu got %f want %f\n",
+                    i, got, want);
+            all = false;
+        }
+    }
+    return expect_flag(c, "node", "all_checks_match", all, err, err_len) != 0 ? -1 : 0;
+}
+
 /* The plaintext allowlist (scenario `unencrypted-verbs`).
  *
  * Pins the membership AND the size of the set a receiver accepts unencrypted
@@ -2961,6 +3047,118 @@ static int run_plaintext_verbs_file(const at_case_t *c, char *err, size_t err_le
                     err, err_len) != 0 ||
         expect_flag(c, "node", "group_key_update_never_plaintext", gku_never,
                     err, err_len) != 0)
+        return -1;
+    return 0;
+}
+
+/* The rules of the deployment manifest (scenario `deployment-manifest`,
+ * RD_13.4 §3.3): each row is applied over the baseline through the production
+ * loader. An accepted row's gateway-pair counts must match; a refused row must
+ * leave the baseline in force. Mirrors Python _run_deployment_manifest. */
+static int _dm_write(const char *path, const json_t *row)
+{
+    json_t *text = json_object_get(row, "text");
+    if (json_is_string(text)) {
+        FILE *fh = fopen(path, "w");
+        if (fh == NULL)
+            return -1;
+        fputs(json_string_value(text), fh);
+        return fclose(fh);
+    }
+    return json_dump_file(json_object_get(row, "manifest"), path, 0);
+}
+
+static int run_deployment_manifest(const at_case_t *c, char *err, size_t err_len) {
+    json_t *fx = json_object_get(c->data, "fixtures");
+    json_t *rows = fx ? json_object_get(fx, "rows") : NULL;
+    const char *base_node = fx ? json_string_value(json_object_get(fx, "baseline_node")) : NULL;
+    if (!json_is_array(rows) || json_array_size(rows) == 0 || base_node == NULL) {
+        snprintf(err, err_len, "scenario: fixtures.rows or baseline_node missing");
+        return -1;
+    }
+    const char *tmp = getenv("TMPDIR");
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/at_dm_XXXXXX", tmp != NULL && tmp[0] ? tmp : "/tmp");
+    if (mkdtemp(dir) == NULL) {
+        snprintf(err, err_len, "adapter: cannot make a scratch dir");
+        return -1;
+    }
+    char base_path[600], row_path[600], absent[600];
+    snprintf(base_path, sizeof(base_path), "%s/baseline.json", dir);
+    snprintf(row_path, sizeof(row_path), "%s/row.json", dir);
+    snprintf(absent, sizeof(absent), "%s/absent.json", dir);
+    char *saved = getenv(DEPLOYMENT_MANIFEST_ENV) != NULL
+                      ? strdup(getenv(DEPLOYMENT_MANIFEST_ENV)) : NULL;
+    unsetenv(DEPLOYMENT_MANIFEST_ENV);
+
+    int rc = 0;
+    bool all_match = true, keeps_previous = true;
+    if (json_dump_file(json_object_get(fx, "baseline"), base_path, 0) != 0) {
+        snprintf(err, err_len, "adapter: cannot write the baseline");
+        rc = -1;
+    }
+    size_t i;
+    json_t *row;
+    json_array_foreach(rows, i, row) {
+        if (rc != 0)
+            break;
+        deployment_manifest_reset();
+        if (deployment_manifest_configure(base_path, NULL) != 0) {
+            snprintf(err, err_len, "adapter: the baseline did not load");
+            rc = -1;
+            break;
+        }
+        const char *source = json_string_value(json_object_get(row, "source"));
+        const char *path = NULL;
+        if (source != NULL && strcmp(source, "unset") == 0) {
+            unsetenv(DEPLOYMENT_MANIFEST_ENV);
+        } else if (source != NULL && strcmp(source, "missing") == 0) {
+            setenv(DEPLOYMENT_MANIFEST_ENV, absent, 1);
+        } else {
+            if (_dm_write(row_path, row) != 0) {
+                snprintf(err, err_len, "adapter: cannot write a row");
+                rc = -1;
+                break;
+            }
+            path = row_path;
+        }
+        bool refused = deployment_manifest_configure(path, NULL) != 0;
+        unsetenv(DEPLOYMENT_MANIFEST_ENV);
+        const deployment_manifest_t *active = deployment_manifest_active();
+        if (refused && deployment_manifest_gateway_pairs(active, base_node) != 1)
+            keeps_previous = false;
+        bool pairs_ok = true;
+        json_t *want = json_object_get(row, "expect_pairs");
+        const char *node;
+        json_t *n;
+        json_object_foreach(want, node, n) {
+            if (deployment_manifest_gateway_pairs(active, node)
+                != (size_t)json_integer_value(n))
+                pairs_ok = false;
+        }
+        bool want_refused = json_is_true(json_object_get(row, "expect_refused"));
+        if (refused != want_refused || (!refused && !pairs_ok)) {
+            all_match = false;
+            const char *id = json_string_value(json_object_get(row, "id"));
+            snprintf(err, err_len, "%s: refused=%s pairs_ok=%s, want refused=%s",
+                     id != NULL ? id : "?", refused ? "true" : "false",
+                     pairs_ok ? "true" : "false", want_refused ? "true" : "false");
+            rc = -1;
+        }
+    }
+    deployment_manifest_reset();
+    unlink(base_path);
+    unlink(row_path);
+    rmdir(dir);
+    if (saved != NULL) {
+        setenv(DEPLOYMENT_MANIFEST_ENV, saved, 1);
+        free(saved);
+    }
+    if (rc != 0)
+        return rc;
+    if (expect_flag(c, "node", "all_rows_match", all_match, err, err_len) != 0 ||
+        expect_flag(c, "node", "a_refusal_keeps_the_previous_manifest",
+                    keeps_previous, err, err_len) != 0)
         return -1;
     return 0;
 }
@@ -3312,11 +3510,18 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
     if (strcmp(c->name, "wire-verb-policy") == 0) {
         return run_wire_verb_policy(c, err, err_len);
     }
+    if (strcmp(c->name, "ext-wire-verbs") == 0)
+        return run_ext_wire_verbs(c, err, err_len);
+    if (strcmp(c->name, "transport-liveness") == 0)
+        return run_transport_liveness(c, err, err_len);
     if (strcmp(c->name, "unencrypted-verbs") == 0) {
         return run_unencrypted_verbs(c, err, err_len);
     }
     if (strcmp(c->name, "plaintext-verbs-file") == 0) {
         return run_plaintext_verbs_file(c, err, err_len);
+    }
+    if (strcmp(c->name, "deployment-manifest") == 0) {
+        return run_deployment_manifest(c, err, err_len);
     }
     if (strcmp(c->name, "transport-binds-the-recipient") == 0) {
         return run_transport_binds_the_recipient(c, err, err_len);
