@@ -1329,8 +1329,10 @@ double reputation_contrite_tft_told_lone(const tx_history_t *hist,
 double reputation_ctft_score(double given_sum, int n, double got_last,
                              double got_prev);
 
-/** Where two failed probes in a row hold a peer's brought score: below tier
- *  1, as contrite tit-for-tat holds a repeat defector. */
+/** Where two failed probes in a row hold a peer's brought score, just below
+ *  tier 1, at the default floors. The hold in force follows the trust ladder's
+ *  tier-1 floor (reputation_tier_one_hold); contrite tit-for-tat's 0.49
+ *  belongs to the 0.5 cooperation boundary and does not move. */
 #define REP_PROBE_HOLD 0.49
 
 /** The probe score that is neither a pass nor a failure: an out-of-tolerance

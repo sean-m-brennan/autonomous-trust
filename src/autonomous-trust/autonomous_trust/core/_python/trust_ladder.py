@@ -23,6 +23,7 @@ absent (§8: "everything tier 0, weight 1, bootstrap on")::
       at.handshake:      { required_tier: 0, transaction_weight: 1 }
       dod.sensor-report: { required_tier: 2, transaction_weight: 4 }
     tier_demotion_epsilon: 0.02
+    tier_floors: [0.50, 0.65, 0.80, 0.90]   # tiers 1-4
 
 Set ``AT_TRUST_LADDER`` to a ladder path to drive registration from config; with
 nothing set, :func:`load_trust_ladder` returns the all-defaults ladder so the
@@ -64,6 +65,12 @@ DEFAULT_TRANSACTION_WEIGHT = 1
 DEFAULT_BOOTSTRAP_DURATION_SEC = 30
 DEFAULT_BOOTSTRAP_PAIRS = 20
 DEFAULT_TIER_DEMOTION_EPSILON = 0.02
+#: The score floors of tiers 1 to 4. Mirrors C TRUST_LADDER_DEFAULT_TIER_FLOORS.
+DEFAULT_TIER_FLOORS = (0.50, 0.65, 0.80, 0.90)
+#: Tier 1's floor must exceed this. Reputation holds a peer failing probes
+#: 0.01 below tier 1's floor, and that hold must stay above the 0.1
+#: communication cut-off, or a hold would become an exclusion.
+MIN_TIER_ONE_FLOOR = 0.11
 
 # Env escape hatch: point at a trust_ladder.yaml to drive registration.
 TRUST_LADDER_ENV = 'AT_TRUST_LADDER'
@@ -93,6 +100,7 @@ class TrustLadder:
     capabilities: dict[str, CapMeta] = field(default_factory=dict)
     bootstrap: BootstrapParams = field(default_factory=BootstrapParams)
     tier_demotion_epsilon: float = DEFAULT_TIER_DEMOTION_EPSILON
+    tier_floors: tuple = DEFAULT_TIER_FLOORS
 
     # Mapping-ish conveniences so callers can treat a ladder like the
     # capability dict it mostly is.
@@ -176,7 +184,28 @@ def load_trust_ladder(path: Optional[PathLike] = None) -> TrustLadder:
         capabilities=_coerce_caps(data.get('capabilities')),
         bootstrap=bootstrap,
         tier_demotion_epsilon=epsilon,
+        tier_floors=_coerce_floors(data.get('tier_floors'), path),
     )
+
+
+def _coerce_floors(raw, path) -> tuple:
+    """The ladder's tier floors: four scores, strictly increasing, tier 1's
+    above MIN_TIER_ONE_FLOOR and tier 4's at most 1.0. Mirrors C _parse_floors."""
+    if raw is None:
+        return DEFAULT_TIER_FLOORS
+    try:
+        floors = tuple(float(f) for f in raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'trust_ladder: malformed tier_floors in {path}: {exc}') from exc
+    if isinstance(raw, (str, bytes)) or len(floors) != len(DEFAULT_TIER_FLOORS):
+        raise ValueError(f'trust_ladder: tier_floors in {path} must list '
+                         f'{len(DEFAULT_TIER_FLOORS)} floors')
+    if any(a >= b for a, b in zip(floors, floors[1:])):
+        raise ValueError(f'trust_ladder: tier_floors in {path} must increase')
+    if floors[0] <= MIN_TIER_ONE_FLOOR or floors[-1] > 1.0:
+        raise ValueError(f'trust_ladder: tier_floors in {path} must lie in '
+                         f'({MIN_TIER_ONE_FLOOR}, 1.0]')
+    return floors
 
 
 def register_trust_ladder(

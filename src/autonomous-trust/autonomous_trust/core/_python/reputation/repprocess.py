@@ -113,7 +113,8 @@ def _env_n_min(name):
 # Reputation save gate: only peers strictly above this threshold survive a process
 # restart. Self is always persisted regardless. See
 # doc/architecture/persistent-cohort.md for the rationale. Override:
-# AT_REP_PERSIST_THRESHOLD.
+# AT_REP_PERSIST_THRESHOLD. This is the value at the default floors: a running
+# process uses its ladder's tier-1 floor (ReputationProcess.persist_threshold).
 REPUTATION_PERSIST_THRESHOLD = _env_float('AT_REP_PERSIST_THRESHOLD', 0.5)
 
 # Upper bound on how many subjects one `consensus_rep_batch_req` may name. The
@@ -243,7 +244,8 @@ def contrite_tft_of(peer_scores, my_scores, neutral, k):
     one transaction's score: one cooperative 0.9 reads 0.375 at the defaults,
     ten read 0.74. A defection is a transaction in which the peer scored this
     node below 0.5. The first is forgiven; when the latest two are both
-    defections the score is held below tier 1 (0.49). There is no floor: a
+    defections the score is held below the 0.5 cooperation boundary (0.49),
+    whatever the ladder's tier floors. There is no floor: a
     peer that keeps failing sinks to its record (hostile-join run,
     2026-11-04, where a 0.51 floor kept five colluders at tier 1). Mirrors C
     reputation_ctft_score."""
@@ -253,9 +255,20 @@ def contrite_tft_of(peer_scores, my_scores, neutral, k):
     return shrunk
 
 
-#: Where two failed probes in a row hold a peer's brought score: below tier 1,
-#: as contrite tit-for-tat holds a repeat defector.
+#: Where two failed probes in a row hold a peer's brought score: just below
+#: tier 1. The value at the default floors; the hold in force follows the
+#: ladder's tier 1 (tier_one_hold). Unlike contrite tit-for-tat's 0.49, which
+#: belongs to the 0.5 cooperation boundary, this one is about access.
 PROBE_HOLD = 0.49
+#: How far below tier 1's floor the probe hold sits.
+TIER_ONE_HOLD_GAP = 0.01
+_tier_one_hold = PROBE_HOLD
+
+
+def tier_one_hold() -> float:
+    """Where a peer failing probes is held: tier 1's floor less
+    TIER_ONE_HOLD_GAP. Mirrors C reputation_tier_one_hold."""
+    return _tier_one_hold
 #: The probe score that is neither a pass nor a failure: an out-of-tolerance
 #: time attestation. Mirrors C REP_PROBE_NEUTRAL.
 PROBE_NEUTRAL = 0.5
@@ -290,16 +303,27 @@ def bilateral_scores(tx, peer_uuid, me):
 
 
 
-def _ladder_demotion_epsilon(logger) -> float:
-    """The trust ladder's tier_demotion_epsilon, or its default when the
-    ladder cannot be read. A broken ladder must not stop reputation."""
-    from ..trust_ladder import DEFAULT_TIER_DEMOTION_EPSILON, load_trust_ladder
+def _load_ladder(logger):
+    """The trust ladder, or the defaults when it cannot be read. A broken
+    ladder must not stop reputation."""
+    from ..trust_ladder import default_ladder, load_trust_ladder
     try:
-        return float(load_trust_ladder().tier_demotion_epsilon)
+        return load_trust_ladder()
     except Exception as err:  # noqa: BLE001 -- any parse failure degrades
-        logger.warning('trust ladder unreadable (%s); tier demotion margin '
-                       '%.2f', err, DEFAULT_TIER_DEMOTION_EPSILON)
-        return DEFAULT_TIER_DEMOTION_EPSILON
+        logger.warning('trust ladder unreadable (%s); default tier floors '
+                       'and demotion margin', err)
+        return default_ladder()
+
+
+def apply_ladder_tiers(ladder) -> None:
+    """Make @p ladder's tier floors the ones this process scores against,
+    with the probe hold just below tier 1. Process-wide, as in C, where one
+    reputation process runs per node; every ReputationProcess applies its
+    ladder when it starts."""
+    global _tier_one_hold
+    ReputationProcess.TIER_FLOORS = tuple(
+        (float(f), t) for t, f in enumerate(ladder.tier_floors, start=1))
+    _tier_one_hold = round(ladder.tier_floors[0] - TIER_ONE_HOLD_GAP, 6)
 
 class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                         proc_name=CfgIds.reputation, description='Reputation tracking', cfg_name=CfgIds.reputation):
@@ -817,10 +841,16 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         # Last published trust tier per peer uuid-string. Suppresses
         # redundant tier_update IPC when the tier hasn't changed.
         self.peer_tiers: dict[str, int] = {}
-        # How far below a tier's floor a peer that holds the tier may fall
-        # before it loses it; promotion still happens at the floor. Read
-        # from the trust ladder (AT_TRUST_LADDER), 0.02 by default.
-        self.tier_demotion_epsilon = _ladder_demotion_epsilon(self.logger)
+        # The trust ladder (AT_TRUST_LADDER) sets the tier floors, which are
+        # process-wide, and the demotion margin: how far below a tier's floor
+        # a peer that holds the tier may fall before it loses it (promotion
+        # still happens at the floor).
+        ladder = _load_ladder(self.logger)
+        apply_ladder_tiers(ladder)
+        self.tier_demotion_epsilon = ladder.tier_demotion_epsilon
+        # Peers above it are persisted: tier 1's floor unless overridden.
+        self.persist_threshold = _env_float('AT_REP_PERSIST_THRESHOLD',
+                                            ladder.tier_floors[0])
         # Per-task transaction_weight cache (task_id_str -> int). Populated
         # when a TransactionScore enters the system (locally submitted via
         # _start_paxos, or arriving via handle_transaction). Read by
@@ -5396,8 +5426,8 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         # Two failed probes in a row hold it in either regime: a long record
         # and honest transactions do not outweigh wrong known answers.
         if probe_hold_of(self._probe_recent.get(key, ())) \
-                and score > PROBE_HOLD:
-            score = PROBE_HOLD
+                and score > _tier_one_hold:
+            score = _tier_one_hold
         ceiling = self._standing_ceiling(peer_uuid)
         if ceiling is not None and score > ceiling:
             score = ceiling
@@ -5839,7 +5869,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         """Write the reputation snapshot to disk, filtered two-sided.
 
         Persisted cohorts: (1) self, always; (2) the TRUSTED cohort --
-        peers with score strictly above REPUTATION_PERSIST_THRESHOLD (the
+        peers with score strictly above self.persist_threshold (the
         authoritative warm-start snapshot used by IdentityProcess.
         choose_group() and the dod-mission seed generator at
         tools/seed_dod_cohort.py); and (3) the EXCLUDED cohort -- peers
@@ -5855,11 +5885,11 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
         for u, score in self.reputations.current.items():
             if score is None:
                 continue
-            if score > REPUTATION_PERSIST_THRESHOLD or self._is_excluded(score):
+            if score > self.persist_threshold or self._is_excluded(score):
                 keep_uuids.add(u)
         # The brought map under the same filter (RD_14.4 Phase 4).
         keep_brought = {u for u, score in _brought_of(self).items()
-                        if score > REPUTATION_PERSIST_THRESHOLD
+                        if score > self.persist_threshold
                         or self._is_excluded(score)}
         snapshot = (self.reputations.filtered_for_persist(keep_uuids, keep_brought)
                     if keep_brought else

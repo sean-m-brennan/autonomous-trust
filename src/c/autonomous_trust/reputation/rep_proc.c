@@ -72,7 +72,9 @@ DEFINE_ERROR(EREP_PAXOS, "Paxos consensus error");
  ****************************/
 
 typedef struct { double floor; int tier; } tier_floor_t;
-static const tier_floor_t TIER_FLOORS[] = {
+/* The defaults; the trust ladder ($AT_TRUST_LADDER) replaces the floors at
+ * init and on reset (_load_ladder_tiers). */
+static tier_floor_t TIER_FLOORS[] = {
     {0.50, 1},
     {0.65, 2},
     {0.80, 3},
@@ -95,20 +97,29 @@ static int _trust_tier(double score)
  * ReputationProcess.tier_demotion_epsilon. */
 static double _tier_demotion_epsilon = TRUST_LADDER_DEFAULT_TIER_DEMOTION_EPSILON;
 
-static void _load_demotion_epsilon(void)
+/* Where two failed probes in a row hold a peer: tier 1's floor less
+ * REP_TIER_ONE_HOLD_GAP (REP_PROBE_HOLD at the default floors). Mirrors Python
+ * tier_one_hold. */
+#define REP_TIER_ONE_HOLD_GAP 0.01
+static double _tier_one_hold = REP_PROBE_HOLD;
+
+/* Load the tier floors and the demotion margin from the trust ladder, with
+ * the probe hold just below tier 1. A malformed ladder leaves the defaults in
+ * place, so scoring degrades to the documented floors rather than stopping.
+ * Mirrors Python apply_ladder_tiers. */
+static void _load_ladder_tiers(void)
 {
     /* A ladder holds TRUST_LADDER_MAX_CAPABILITIES entries: too large for
      * the stack of every caller. */
     trust_ladder_t *ladder = calloc(1, sizeof(*ladder));
-    double eps = TRUST_LADDER_DEFAULT_TIER_DEMOTION_EPSILON;
-    /* A malformed ladder leaves the defaults in place, so the margin
-     * degrades to 0.02 rather than stopping reputation. */
-    if (ladder != NULL) {
-        (void)trust_ladder_load_env(ladder);
-        eps = ladder->tier_demotion_epsilon;
-        free(ladder);
-    }
-    _tier_demotion_epsilon = eps;
+    if (ladder == NULL)
+        return;
+    (void)trust_ladder_load_env(ladder);
+    for (size_t i = 0; i < NUM_TIER_FLOORS && i < TRUST_LADDER_NUM_TIERS; i++)
+        TIER_FLOORS[i].floor = ladder->tier_floors[i];
+    _tier_demotion_epsilon = ladder->tier_demotion_epsilon;
+    _tier_one_hold = round((TIER_FLOORS[0].floor - REP_TIER_ONE_HOLD_GAP) * 1e6) / 1e6;
+    free(ladder);
 }
 
 /* The highest score that still maps to @p tier — the next tier's floor,
@@ -1058,7 +1069,7 @@ static void _ensure_init(void)
         map_init(&rep_state.updates);
         array_init(&rep_state.requested_reps);
         map_init(&rep_state.peer_tiers);
-        _load_demotion_epsilon();
+        _load_ladder_tiers();
         map_init(&rep_state.committed_paxos_rounds);
         rep_state.committed_paxos_ring_head = 0;
         rep_state.committed_paxos_ring_len = 0;
@@ -4896,8 +4907,8 @@ static void _score_brought_locked(const uuid_t peer_uuid)
      * honest transactions do not outweigh wrong known answers. */
     double last = -1.0, prev = -1.0;
     _probe_recent_locked(peer_uuid, &last, &prev);
-    if (reputation_probe_hold(last, prev) && score > REP_PROBE_HOLD)
-        score = REP_PROBE_HOLD;
+    if (reputation_probe_hold(last, prev) && score > _tier_one_hold)
+        score = _tier_one_hold;
     double ceiling = _standing_ceiling_of(peer_uuid);
     if (ceiling >= 0.0 && score > ceiling)
         score = ceiling;
@@ -9941,10 +9952,10 @@ static bool handle_checkpoint_final(const process_t *proc, directory_t *queues, 
  * Only peers strictly above the persist threshold survive a restart, mirroring
  * Python's two-sided filter (see doc/architecture/persistent-cohort.md). Self
  * is always kept. */
-#define REP_PERSIST_THRESHOLD_DEFAULT 0.5
+/* Tier 1's floor unless overridden. Mirrors Python
+ * ReputationProcess.persist_threshold. */
 #define REP_PERSIST_THRESHOLD \
-    (reputation_env_double("AT_REP_PERSIST_THRESHOLD", \
-                           REP_PERSIST_THRESHOLD_DEFAULT))
+    (reputation_env_double("AT_REP_PERSIST_THRESHOLD", TIER_FLOORS[0].floor))
 #define REP_SNAPSHOT_TYPE \
     "autonomous_trust.core._python.reputation.reputation.Reputations"
 
@@ -16175,7 +16186,7 @@ void reputation_reset_state(int num_peers)
     map_init(&rep_state.round_group);
     map_free(&rep_state.peer_tiers);
     map_init(&rep_state.peer_tiers);
-    _load_demotion_epsilon();
+    _load_ladder_tiers();
     map_free(&rep_state.committed_paxos_rounds);
     map_init(&rep_state.committed_paxos_rounds);
     /* doc/architecture/zta-integration.md. Must reset with the rest: the conformance harness resets rep_state
@@ -17091,6 +17102,18 @@ void reputation_publish_tier(const process_t *proc, const uuid_t peer_uuid,
 {
     _ensure_init();
     _publish_tier_change(proc, peer_uuid, score);
+}
+
+double reputation_tier_one_hold(void)
+{
+    _ensure_init();
+    return _tier_one_hold;
+}
+
+double reputation_persist_threshold(void)
+{
+    _ensure_init();
+    return REP_PERSIST_THRESHOLD;
 }
 
 void reputation_set_anchored(const uuid_t peer_uuid, bool anchored)

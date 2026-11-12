@@ -443,11 +443,23 @@ capabilities:
   dod.fusion-validate:  { required_tier: 3, transaction_weight: 8 }
   dod.command-issue:    { required_tier: 4, transaction_weight: 8 }
 tier_demotion_epsilon: 0.02
+tier_floors: [0.50, 0.65, 0.80, 0.90]   # tiers 1 to 4
 ```
 
 Capability tier and weight come from this file at registration time, and domain
 code never hard-codes either. A new deployment adds its own ladder and the rest
 of the mechanism applies automatically.
+
+The tier floors come from the same file, and reputation reads them when it
+starts. They must be four scores, strictly increasing, with tier 4's at most
+1.0 and tier 1's above 0.11. That lower bound exists because a peer failing two
+probes in a row is held 0.01 below tier 1's floor, and the hold has to stay
+above the 0.1 communication cut-off or it would become an exclusion. A ladder
+that breaks any of these is rejected and the default floors apply. The
+persistence threshold is tier 1's floor unless `AT_REP_PERSIST_THRESHOLD` says
+otherwise. Contrite tit-for-tat's cap on a repeat defector does not move: its
+0.49 belongs to the 0.5 boundary between cooperation and defection, which the
+formulas need, and the access tiers are independent of it.
 
 Both runtimes load the ladder from one JSON file. The C side parses it with a
 JSON library and the Python side needs no change, since YAML is a superset of

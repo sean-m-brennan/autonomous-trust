@@ -41,6 +41,35 @@ void trust_ladder_defaults(trust_ladder_t *out)
     out->bootstrap.duration_sec = TRUST_LADDER_DEFAULT_BOOTSTRAP_DURATION_SEC;
     out->bootstrap.pairs = TRUST_LADDER_DEFAULT_BOOTSTRAP_PAIRS;
     out->tier_demotion_epsilon = TRUST_LADDER_DEFAULT_TIER_DEMOTION_EPSILON;
+    static const double floors[TRUST_LADDER_NUM_TIERS] =
+        TRUST_LADDER_DEFAULT_TIER_FLOORS;
+    memcpy(out->tier_floors, floors, sizeof(floors));
+}
+
+/** The optional `tier_floors` array into @p floors: absent leaves them be;
+ *  otherwise four numbers, strictly increasing, tier 1's above
+ *  TRUST_LADDER_MIN_TIER_ONE_FLOOR and tier 4's at most 1.0. Mirrors Python
+ *  _coerce_floors. @return false when present but malformed. */
+static bool _parse_floors(const json_t *arr, double floors[TRUST_LADDER_NUM_TIERS])
+{
+    if (arr == NULL || json_is_null(arr))
+        return true;
+    if (!json_is_array(arr) || json_array_size(arr) != TRUST_LADDER_NUM_TIERS)
+        return false;
+    double parsed[TRUST_LADDER_NUM_TIERS];
+    for (size_t i = 0; i < TRUST_LADDER_NUM_TIERS; i++) {
+        const json_t *v = json_array_get(arr, i);
+        if (!json_is_number(v))
+            return false;
+        parsed[i] = json_number_value(v);
+        if (i > 0 && parsed[i] <= parsed[i - 1])
+            return false;
+    }
+    if (parsed[0] <= TRUST_LADDER_MIN_TIER_ONE_FLOOR ||
+        parsed[TRUST_LADDER_NUM_TIERS - 1] > 1.0)
+        return false;
+    memcpy(floors, parsed, sizeof(parsed));
+    return true;
 }
 
 /** An optional integer field: absent → @p dflt, present-but-not-an-integer →
@@ -182,9 +211,12 @@ int trust_ladder_load(const char *path, trust_ladder_t *out)
     out->tier_demotion_epsilon =
         _opt_double(root, "tier_demotion_epsilon",
                     TRUST_LADDER_DEFAULT_TIER_DEMOTION_EPSILON, &bad);
+    if (!_parse_floors(json_object_get(root, "tier_floors"), out->tier_floors))
+        bad = true;
     if (bad)
     {
-        log_error(NULL, "trust_ladder: %s: malformed bootstrap/epsilon\n", path);
+        log_error(NULL, "trust_ladder: %s: malformed bootstrap, epsilon or "
+                  "tier_floors\n", path);
         json_decref(root);
         trust_ladder_defaults(out);
         return EXCEPTION(EINVAL);

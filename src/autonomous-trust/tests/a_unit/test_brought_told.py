@@ -30,6 +30,7 @@ import pytest
 
 from autonomous_trust.core.reputation.reputation import score_to_milli
 from autonomous_trust.core.config import Configuration
+from autonomous_trust.core.system import CfgIds
 from autonomous_trust.core._python.identity.join_policy import (
     AnchoredSet, JoinPolicy)
 from autonomous_trust.core._python.protocol import Protocol
@@ -134,6 +135,22 @@ def test_an_anchored_peer_reads_told():
     told = _score(rp, peer, told=0.95, coop=True)
     rp.protocol.anchored = frozenset({str(peer)})
     assert rp._bounded(peer, told) == pytest.approx(0.95)
+
+
+def test_a_withdrawn_anchor_is_capped_whatever_the_demotion_margin():
+    """Withdrawn, an anchor is capped just under tier 2's floor, inside the
+    0.02 demotion margin: the cap, not the margin, decides its tier. Twin of
+    the withdrawal in test_an_anchored_peer_reads_told in rep_brought_test.c."""
+    rp, peer = _rp(), uuid4()
+    _told(rp, peer, 3, 0.95)
+    told = _score(rp, peer, told=0.95, coop=True)
+    queues = {CfgIds.identity: queue.Queue()}
+    rp.protocol.anchored = frozenset({str(peer)})
+    rp._publish_tier_change(queues, peer, told)
+    assert rp.peer_tiers[str(peer)] == 4
+    rp.protocol.anchored = frozenset()
+    rp._publish_tier_change(queues, peer, told)
+    assert rp.peer_tiers[str(peer)] == 1
 
 
 def test_an_anchored_peer_with_own_evidence_reads_brought():
