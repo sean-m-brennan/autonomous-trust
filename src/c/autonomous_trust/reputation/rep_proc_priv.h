@@ -535,6 +535,14 @@ void reputation_publish_probe_counts(const process_t *proc, double present);
 void reputation_publish_tier(const process_t *proc, const uuid_t peer_uuid,
                              double score);
 
+/** Where two failed probes in a row hold a peer: the ladder's tier-1 floor
+ *  less 0.01 (REP_PROBE_HOLD at the default floors). */
+double reputation_tier_one_hold(void);
+
+/** Peers scored above this are persisted: AT_REP_PERSIST_THRESHOLD, else the
+ *  ladder's tier-1 floor. */
+double reputation_persist_threshold(void);
+
 /** Record identity's judgement that @p peer_uuid is (or is no longer) an
  *  anchor, as a PEER_ANCHOR message does. Reset by reputation_reset_state. */
 void reputation_set_anchored(const uuid_t peer_uuid, bool anchored);

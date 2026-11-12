@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "enabled": true,
+  "anchors": [],
+  "note": "The join policy the live red team runs: each node earns a peer's tier on its own evidence, and two failed probes in a row hold a peer at tier 0. Override with AT_JOIN_POLICY in /opt/autonomous-trust/etc/at/environment."
+}

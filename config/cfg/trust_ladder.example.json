@@ -13,5 +13,6 @@
     "demo.fusion": { "required_tier": 3 },
     "demo.command": {}
   },
-  "tier_demotion_epsilon": 0.05
+  "tier_demotion_epsilon": 0.05,
+  "tier_floors": [0.45, 0.6, 0.75, 0.85]
 }

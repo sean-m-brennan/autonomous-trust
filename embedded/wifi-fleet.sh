@@ -39,6 +39,7 @@
 # Usage:
 #   sudo ./wifi-fleet.sh up [--nodes N] [--iface IF] [--first-ip ADDR] [--tarball PATH]
 #                           [--bad-node N --bad-bin PATH [--defect-after SECONDS]]
+#                           [--no-join-policy]
 #   ./wifi-fleet.sh status [--pi USER@HOST | --pi-addr ADDR]
 #   ./wifi-fleet.sh latency [--pi USER@HOST]
 #   sudo ./wifi-fleet.sh logs N
@@ -68,6 +69,9 @@ BAD_BIN=""
 DEFECT_AFTER=180
 DEFECT_AT=""          # set by up, read back from fleet.env
 PURGE=false
+# The join policy the image ships (rootfs-overlay), so that host nodes and the
+# Pi decide alike; --no-join-policy runs the host nodes without it.
+JOIN_POLICY="$SCRIPT_DIR/buildroot/rootfs-overlay/etc/autonomous-trust/join_policy.json"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -197,6 +201,11 @@ cmd_up() {
         bad_bin="$STATE_DIR/redteam/at_demo"
         defect_at=$(( $(date +%s) + DEFECT_AFTER ))
     fi
+    local policy_env=()
+    if [ -n "$JOIN_POLICY" ]; then
+        cp "$JOIN_POLICY" "$STATE_DIR/join_policy.json"
+        policy_env=(-E "AT_JOIN_POLICY=$STATE_DIR/join_policy.json")
+    fi
     # The units drop to the invoking user, who must be able to reach the binary
     # and the node directories.
     chown -R "$owner_uid:$owner_gid" "$STATE_DIR"
@@ -208,6 +217,7 @@ cmd_up() {
         echo "IPS=\"${ips[*]}\""
         echo "BAD_NODE=$BAD_NODE"
         echo "DEFECT_AT=$defect_at"
+        echo "POLICY=${JOIN_POLICY:+on}"
     } > "$FLEET_ENV"
     chown "$owner_uid:$owner_gid" "$FLEET_ENV"
 
@@ -236,7 +246,7 @@ cmd_up() {
         # the desktop session that started it.
         systemd-run --quiet --unit="${UNIT_PREFIX}${i}" --collect \
             -p Restart=on-failure -p RestartSec=5 -p UMask=0077 \
-            -E AUTONOMOUS_TRUST_ROOT="$LINK_DIR/$i" "${node_env[@]}" \
+            -E AUTONOMOUS_TRUST_ROOT="$LINK_DIR/$i" "${policy_env[@]}" "${node_env[@]}" \
             ip netns exec "$ns" \
             setpriv --reuid="$owner_uid" --regid="$owner_gid" --init-groups -- \
             "$node_bin" --generate-config --log-level info
@@ -436,6 +446,7 @@ while [[ $# -gt 0 ]]; do
         --bad-bin)   BAD_BIN="$(realpath "$2")"; shift 2 ;;
         --defect-after) DEFECT_AFTER="$2"; shift 2 ;;
         --purge)     PURGE=true; shift ;;
+        --no-join-policy) JOIN_POLICY=""; shift ;;
         -h|--help)   usage 0 ;;
         [0-9]*)      LOGS_NODE="$1"; shift ;;
         *)           error "Unknown option: $1"; usage 1 ;;

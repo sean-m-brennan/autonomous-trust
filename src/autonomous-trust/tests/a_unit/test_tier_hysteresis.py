@@ -32,6 +32,8 @@ from types import SimpleNamespace
 import pytest
 
 from autonomous_trust.core.system import CfgIds
+from autonomous_trust.core._python.reputation import repprocess
+from autonomous_trust.core._python.trust_ladder import default_ladder
 from .test_peer_standing import _identity, _make_rep_process
 
 
@@ -41,7 +43,10 @@ def root(tmp_path, monkeypatch):
     monkeypatch.setenv('AUTONOMOUS_TRUST_ROOT', str(tmp_path))
     monkeypatch.delenv('AT_REP_MIN_TENURE_SEC', raising=False)
     monkeypatch.delenv('AT_TRUST_LADDER', raising=False)
-    return tmp_path
+    monkeypatch.delenv('AT_REP_PERSIST_THRESHOLD', raising=False)
+    yield tmp_path
+    # The floors are process-wide, as in C: put the defaults back.
+    repprocess.apply_ladder_tiers(default_ladder())
 
 
 def _node():
@@ -106,3 +111,42 @@ def test_the_ladder_sets_the_margin(root, monkeypatch, tmp_path):
     rp, them = _node()
     assert _publish(rp, them, 0.70) == 2
     assert _publish(rp, them, 0.649) == 1
+
+
+def _laddered(monkeypatch, tmp_path, **keys):
+    ladder = tmp_path / 'ladder.json'
+    ladder.write_text(json.dumps(keys))
+    monkeypatch.setenv('AT_TRUST_LADDER', str(ladder))
+    return _node()
+
+
+def test_the_ladder_sets_the_floors(root, monkeypatch, tmp_path):
+    rp, them = _laddered(monkeypatch, tmp_path, tier_floors=[0.45, 0.6, 0.75, 0.85],
+                         tier_demotion_epsilon=0.0)
+    assert [_publish(rp, them, s) for s in (0.44, 0.46, 0.61, 0.76, 0.86)] == \
+        [0, 1, 2, 3, 4]
+    assert rp._tier_ceiling(1) < 0.6 <= rp._tier_ceiling(2)
+
+
+def test_the_probe_hold_follows_tier_one(root, monkeypatch, tmp_path):
+    """A peer failing probes is held at tier 1's floor less 0.01, wherever
+    the ladder puts that floor. Contrite tit-for-tat's repeat-defection cap
+    belongs to the 0.5 cooperation boundary and stays at 0.49."""
+    _laddered(monkeypatch, tmp_path, tier_floors=[0.45, 0.6, 0.75, 0.85])
+    assert repprocess.tier_one_hold() == pytest.approx(0.44)
+    held = repprocess.contrite_tft_of([0.9] * 6, [0.2, 0.2], 0.5, 3)
+    assert held == pytest.approx(0.49)
+
+
+def test_the_persist_threshold_follows_tier_one(root, monkeypatch, tmp_path):
+    rp, _ = _laddered(monkeypatch, tmp_path, tier_floors=[0.45, 0.6, 0.75, 0.85])
+    assert rp.persist_threshold == pytest.approx(0.45)
+    monkeypatch.setenv('AT_REP_PERSIST_THRESHOLD', '0.7')
+    rp, _ = _node()
+    assert rp.persist_threshold == pytest.approx(0.7)
+
+
+def test_a_malformed_ladder_leaves_the_default_floors(root, monkeypatch, tmp_path):
+    rp, them = _laddered(monkeypatch, tmp_path, tier_floors=[0.5, 0.8, 0.65, 0.9])
+    assert rp.TIER_FLOORS == ((0.50, 1), (0.65, 2), (0.80, 3), (0.90, 4))
+    assert repprocess.tier_one_hold() == pytest.approx(0.49)

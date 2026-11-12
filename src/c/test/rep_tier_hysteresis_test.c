@@ -226,10 +226,51 @@ DEFINE_TEST(test_the_ladder_sets_the_margin)
 }
 END_TEST_DEFINITION()
 
+DEFINE_TEST(test_the_ladder_sets_the_floors)
+{
+    process_t *proc = _begin("{\"tier_floors\": [0.45, 0.6, 0.75, 0.85], "
+                             "\"tier_demotion_epsilon\": 0.0}");
+    static const double scores[] = {0.44, 0.46, 0.61, 0.76, 0.86};
+    for (size_t i = 0; i < sizeof(scores) / sizeof(scores[0]); i++)
+        ck_assert_int_eq(_publish(proc, scores[i]), (int)i);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* A peer failing probes is held at tier 1's floor less 0.01, wherever the
+ * ladder puts that floor. Contrite tit-for-tat's repeat-defection cap belongs
+ * to the 0.5 cooperation boundary and stays at 0.49. */
+DEFINE_TEST(test_the_probe_hold_follows_tier_one)
+{
+    process_t *proc = _begin("{\"tier_floors\": [0.45, 0.6, 0.75, 0.85]}");
+    (void)proc;
+    ck_assert_double_eq_tol(reputation_tier_one_hold(), 0.44, 1e-9);
+    ck_assert_double_eq_tol(reputation_persist_threshold(), 0.45, 1e-9);
+    /* Six cooperative 0.9s and two defections in a row. */
+    ck_assert_double_eq_tol(reputation_ctft_score(5.4, 6, 0.2, 0.2), 0.49, 1e-9);
+    _end();
+    ck_assert_double_eq_tol(reputation_tier_one_hold(), 0.49, 1e-9);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_a_malformed_ladder_leaves_the_default_floors)
+{
+    process_t *proc = _begin("{\"tier_floors\": [0.5, 0.8, 0.65, 0.9], "
+                             "\"tier_demotion_epsilon\": 0.0}");
+    ck_assert_int_eq(_publish(proc, 0.64), 1);
+    ck_assert_int_eq(_publish(proc, 0.66), 2);
+    ck_assert_double_eq_tol(reputation_tier_one_hold(), 0.49, 1e-9);
+    _end();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(RepTierHysteresis,
           test_promotion_happens_at_the_floor,
           test_demotion_waits_for_the_floor_less_the_margin,
           test_a_score_hovering_on_a_floor_does_not_flap,
           test_the_margin_spans_several_tiers_only_as_far_as_the_score,
           test_a_tenure_hold_is_not_softened_by_the_margin,
-          test_the_ladder_sets_the_margin)
+          test_the_ladder_sets_the_margin,
+          test_the_ladder_sets_the_floors,
+          test_the_probe_hold_follows_tier_one,
+          test_a_malformed_ladder_leaves_the_default_floors)

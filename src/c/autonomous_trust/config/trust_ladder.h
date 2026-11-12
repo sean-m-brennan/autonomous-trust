@@ -40,7 +40,8 @@
  *     "at.handshake":      { "required_tier": 0, "transaction_weight": 1 },
  *     "dod.sensor-report": { "required_tier": 2, "transaction_weight": 4 }
  *   },
- *   "tier_demotion_epsilon": 0.02
+ *   "tier_demotion_epsilon": 0.02,
+ *   "tier_floors": [0.50, 0.65, 0.80, 0.90]
  * }
  * ```
  */
@@ -66,6 +67,15 @@
 #define TRUST_LADDER_DEFAULT_BOOTSTRAP_DURATION_SEC 30
 #define TRUST_LADDER_DEFAULT_BOOTSTRAP_PAIRS 20
 #define TRUST_LADDER_DEFAULT_TIER_DEMOTION_EPSILON 0.02
+/** Trust tiers above tier 0, each with a score floor. */
+#define TRUST_LADDER_NUM_TIERS 4
+/** The score floors of tiers 1 to 4. Mirrors Python DEFAULT_TIER_FLOORS. */
+#define TRUST_LADDER_DEFAULT_TIER_FLOORS {0.50, 0.65, 0.80, 0.90}
+/** Tier 1's floor must exceed this. Reputation holds a peer failing probes
+ *  0.01 below tier 1's floor, and that hold must stay above the 0.1
+ *  communication cut-off, or a hold would become an exclusion. Mirrors Python
+ *  MIN_TIER_ONE_FLOOR. */
+#define TRUST_LADDER_MIN_TIER_ONE_FLOOR 0.11
 
 /** One capability's tier/weight metadata. Mirrors Python `CapMeta`. */
 typedef struct {
@@ -87,6 +97,7 @@ typedef struct {
     size_t num_capabilities;
     ladder_bootstrap_t bootstrap;
     double tier_demotion_epsilon;
+    double tier_floors[TRUST_LADDER_NUM_TIERS];
 } trust_ladder_t;
 
 /**

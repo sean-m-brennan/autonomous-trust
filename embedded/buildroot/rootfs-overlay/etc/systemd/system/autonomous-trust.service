@@ -28,6 +28,10 @@ Type=simple
 Environment=AUTONOMOUS_TRUST_ROOT=/opt/autonomous-trust
 Environment=LOG_LEVEL=info
 Environment=STARTUP_DELAY=0
+# Under the join policy a node trusts a peer on its own evidence and holds
+# a peer that fails two probes in a row at tier 0. The environment file
+# below overrides it; an empty AT_JOIN_POLICY= turns the policy off.
+Environment=AT_JOIN_POLICY=/etc/autonomous-trust/join_policy.json
 EnvironmentFile=-/opt/autonomous-trust/etc/at/environment
 
 ExecStartPre=/bin/mkdir -p /opt/autonomous-trust/etc/at /opt/autonomous-trust/var/at
