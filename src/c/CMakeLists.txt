@@ -237,8 +237,8 @@ option(AT_NET_DTN "Build the DTN/Bundle-Protocol transport library (libat_dtn)" 
 # cross-cluster discovery): builds the libat_gateway extension library
 # (extensions/gateway/). ON by default because building it turns nothing on:
 # a node uses it only when its network config sets "envelope": true, and the
-# core refuses such a config when the library is absent. The directory may be
-# missing (the gateway is kept in its own repository); the build then skips it.
+# core refuses such a config when the library is absent. A checkout without
+# extensions/gateway/ still builds; the library is then skipped.
 option(AT_NET_GATEWAY "Build the gateway relay library (libat_gateway)" ON)
 
 # The verification layers of R+D.md §12, each its own extension library
@@ -1772,9 +1772,8 @@ if(AT_NET_DTN)
     add_subdirectory(extensions/dtn)
 endif()
 if(AT_NET_GATEWAY)
-    # The gateway is kept in its own repository and checked out here when it is
-    # available. Without it the core builds and runs as before, and refuses any
-    # network config that sets "envelope": true.
+    # A checkout without extensions/gateway/ still builds: the core runs as
+    # before and refuses any network config that sets "envelope": true.
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extensions/gateway/CMakeLists.txt")
         add_subdirectory(extensions/gateway)
     else()
