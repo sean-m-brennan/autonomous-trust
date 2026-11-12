@@ -25,6 +25,9 @@
 #include "processes/capabilities.h"   /* DECLARE_CAPABILITY */
 #include "utilities/util.h"           /* at_strlcpy */
 #include "utilities/numfmt.h"
+#ifdef AT_REDTEAM
+#include "utilities/logger.h"
+#endif
 
 const char *const BOOTSTRAP_CAPABILITY_NAMES[BOOTSTRAP_CAPABILITY_COUNT] = {
     "at.handshake",
@@ -36,8 +39,37 @@ const char *const BOOTSTRAP_CAPABILITY_NAMES[BOOTSTRAP_CAPABILITY_COUNT] = {
  * Server-side capability functions.
  * --------------------------------------------------------------- */
 
+#ifdef AT_REDTEAM
+/* Red-team builds only (cmake -DAT_REDTEAM=ON). From the Unix time in
+ * $AT_REDTEAM_DEFECT_AT on, the node answers the handshake and echo probes
+ * wrongly, which its peers score 0.1 each, as the Python red team's
+ * AT_REDTEAM_DEFECT_AT does for a Python node. The first wrong answer is
+ * logged, so that a harness can time detection and exclusion from it. */
+static bool _redteam_defecting(void)
+{
+    const char *raw = getenv("AT_REDTEAM_DEFECT_AT");
+    if (raw == NULL || raw[0] == '\0')
+        return false;
+    double defect_at = at_strtod(raw, NULL);
+    if (!(defect_at > 0.0) || (double)time(NULL) < defect_at)
+        return false;
+    static bool announced = false;
+    if (!announced)
+    {
+        announced = true;
+        log_warn(NULL, "Red team: answering probes wrongly from %s "
+                       "(AT_REDTEAM_DEFECT_AT)\n", raw);
+    }
+    return true;
+}
+#endif
+
 long at_handshake(long nonce)
 {
+#ifdef AT_REDTEAM
+    if (_redteam_defecting())
+        return nonce + 2;
+#endif
     return nonce + 1;
 }
 
@@ -53,10 +85,17 @@ char *at_echo_challenge(const char *payload)
 {
     const char *src = (payload != NULL) ? payload : "";
     size_t n = strlen(src);
-    char *out = malloc(n + 1);
+    char *out = malloc(n + 2);
     if (out == NULL)
         return NULL;
     memcpy(out, src, n + 1);
+#ifdef AT_REDTEAM
+    if (_redteam_defecting())
+    {
+        out[n] = '!';
+        out[n + 1] = '\0';
+    }
+#endif
     return out;
 }
 

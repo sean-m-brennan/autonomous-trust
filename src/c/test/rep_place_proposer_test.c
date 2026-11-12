@@ -420,6 +420,17 @@ DEFINE_TEST(test_a_value_we_cannot_carry_is_dropped_with_its_reason)
     json_decref(g1);
     json_decref(extra);
     ck_assert_ptr_null(g_place);
+    /* And it counts as a refused round, so this node backs off. Without it, a
+     * Pi left out of a two-member genesis that both members had accepted
+     * dropped a round every two seconds (Wi-Fi cohort, 2026-11-11), and the
+     * two members that could carry the genesis kept hearing a live round and
+     * left it alone. */
+    int fk = -1, fn = 0;
+    double drawn = 0.0;
+    ck_assert(reputation_place_fails(&fk, &fn, &drawn));
+    ck_assert_int_eq(fk, 0);
+    ck_assert_int_eq(fn, 1);
+    ck_assert(drawn >= 0.5 && drawn <= 2.0);
 
     proc->logger = NULL;
     if (lg.file != NULL)

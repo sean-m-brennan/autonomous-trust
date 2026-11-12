@@ -375,6 +375,50 @@ DEFINE_TEST(test_a_malformed_known_config_is_still_fatal)
 }
 END_TEST_DEFINITION()
 
+/* group.cfg.json shares its name with the registry's "group" section, but
+ * once a node has joined a group the identity process writes it itself, in
+ * Python's ConfigJSONEncoder form: [group, {"step_dag", "blacklist"}], and
+ * reads it back with group_file_read. The loader used to hand that array to
+ * the section's parser, call it malformed and stop the daemon, so every node
+ * that had joined a group refused to start again; found on a Pi 4 cohort on
+ * 2026-11-11. The array is the identity process's file, left to it like the
+ * reputation snapshot above. */
+DEFINE_TEST(test_the_identity_processs_group_file_is_skipped_not_fatal)
+{
+    char root[] = "/tmp/at_cfg_group_XXXXXX";
+    ck_assert_ptr_nonnull(mkdtemp(root));
+    char cfg_dir[256];
+    snprintf(cfg_dir, sizeof(cfg_dir), "%s/etc/at", root);
+    ck_assert_int_eq(makedirs(cfg_dir, 0700), 0);
+    setenv("AUTONOMOUS_TRUST_ROOT", root, 1);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/identity.cfg.json", cfg_dir);
+    ck_assert_int_eq(_write_file(path,
+        "{\"typename\": \"identity\", \"uuid\": "
+        "\"11111111-1111-1111-1111-111111111111\", "
+        "\"address\": \"10.0.0.1\", \"fullname\": \"n\", "
+        "\"nickname\": \"n\"}"), 0);
+    snprintf(path, sizeof(path), "%s/group.cfg.json", cfg_dir);
+    ck_assert_int_eq(_write_file(path,
+        "[{\"__type__\": \"autonomous_trust.core._python.identity.group.Group\", "
+        "\"_uuid\": \"17fb8bc9-06b5-4e90-a8c8-bcf1ae3a4b47\", "
+        "\"_address_map\": {\"11111111-1111-1111-1111-111111111111\": \"10.0.0.1\"}, "
+        "\"_nickname\": \"\", \"_public_only\": false, \"_created\": 0.0, "
+        "\"_key_epoch\": 1, \"_wire_format\": \"json\"}, "
+        "{\"step_dag\": [], \"blacklist\": []}]"), 0);
+
+    map_t *configs = NULL;
+    ck_assert_ret_ok(map_create(&configs));
+    ck_assert(load_all_configs(cfg_dir, configs, &_m2_test_logger) >= 0);
+    _test_count++;
+    data_t *found = NULL;
+    ck_assert_ret_ok(map_get(configs, (map_key_t)"identity", &found));
+
+    unsetenv("AUTONOMOUS_TRUST_ROOT");
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(Config, test_get_cfg_dir, test_get_data_dir,
           test_get_dirs_empty_root, test_find_configuration_missing,
           test_find_configuration_exists, test_config_absolute_path,
@@ -384,4 +428,5 @@ RUN_TESTS(Config, test_get_cfg_dir, test_get_data_dir,
           test_get_dirs_refuse_a_root_too_long_for_the_buffer,
           test_tracker_config_respects_its_destlen,
           test_an_unregistered_config_section_is_skipped_not_fatal,
-          test_a_malformed_known_config_is_still_fatal)
+          test_a_malformed_known_config_is_still_fatal,
+          test_the_identity_processs_group_file_is_skipped_not_fatal)

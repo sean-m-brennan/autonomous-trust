@@ -47,6 +47,10 @@
 
 **/etc
 **/var
+# The image overlays' etc/ is the Pi's own /etc (units, network config), not
+# a node's generated config
+!/embedded/buildroot/rootfs-overlay/etc/
+!/embedded/buildroot/rootfs-overlay-devel/etc/
 dist
 deploy
 /lib

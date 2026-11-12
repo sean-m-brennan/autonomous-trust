@@ -211,6 +211,47 @@ What the runs say about AT:
 - **The replay is refused.** Replayed point-to-point frames from `honest-1`
   moved none of `honest-2`'s counts beyond the control peers.
 
+### Results, 2026-11-11: gaming against the probe hold
+
+A failed known-answer probe is now held against the peer that failed it.
+Under the join policy, two of our probe verdicts in a row below 0.5 hold its
+brought score at 0.49, under tier 1, whatever its transactions say
+(`probe_hold_of`, `reputation_probe_hold`). A single failure, or a 0.5 (an
+out-of-tolerance time attestation, which a wrong clock and plain drift both
+give), makes the peer a suspect that the bootstrap worker probes again at
+once, up to three times, rather than waiting its turn in the steady probing.
+A 0.5 neither joins a run of failures nor breaks one. Without that, a re-probe
+that happened to ask the gamer for the time ended the suspicion, which is how
+the first rerun lost most of its nodes.
+
+Both gaming arms, same deployment as above, three repeats each, run twice on
+the same code (`.scale-results/redteam-gaming-tenure{0,1}-probehold-v3/1..3/`,
+then `-probehold-v4/1..3/`, which also logs the peer each probe went to):
+
+| Arm | Run | Result | Honest nodes that dropped the gamer below tier 1 | `t_fall`, s after the defection |
+|---|---|---|---|---|
+| gaming-tenure0 | first | 3 PASS | 18 / 18 | 62..364 (median 184) |
+| gaming-tenure1 | first | 2 PASS, 1 FAIL | 16 / 18 | 58..425 (median 186) |
+| gaming-tenure0 | second | 2 PASS, 1 FAIL | 16 / 18 | 59..545 (median 181) |
+| gaming-tenure1 | second | 1 PASS, 2 FAIL | 14 / 18 | 123..664 (median 216) |
+| gaming-tenure0 | staleness bound | 3 PASS | 18 / 18 | 61..362 (median 241) |
+| gaming-tenure1 | staleness bound | 3 PASS | 18 / 18 | 59..363 (median 212) |
+
+Every honest node that probed the gamer after it defected dropped it to
+tier 0 and kept it there, and every one that did not drop it never probed it:
+in the second run that is 30 and 6 of 36, read from the probe log. Each of the
+six sent twelve probes in the twelve minutes after the defection, all to
+honest peers. Steady probing picks the peer probed least over the node's whole
+life, deterministically, and the gamer had been probed more than any honest
+peer while it behaved, so it waited at the back of the line until the run
+ended. A staleness bound closed it: a peer left unprobed longer than one round
+and one interval (seven minutes for six peers at 60 s) now goes to the front of
+the line. Rerun on it (`.scale-results/redteam-gaming-tenure{0,1}/1..3/`), every
+honest node probed the gamer after it defected, the latest 319 s after, and
+every one dropped it. A gamer that alternates right and wrong answers
+would also break every run of two; scoring the probe channel apart from the
+rest would close that, and is not built.
+
 ## Harness orchestration
 
 The harness accepts a list of `AttackScenario` instances and a base Appalachian

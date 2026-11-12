@@ -174,8 +174,10 @@ def score_task_result(task, logger=None, name: str = '',
             sent_at=getattr(task, 'requested_at', None))
     if probe_score is not None:
         if logger is not None:
-            logger.info('%s: probe %s scored %.2f for task %s',
-                        name, cap_name, probe_score, task.uuid)
+            # The peer probed ends the line, after the fields readers parse.
+            logger.info('%s: probe %s scored %.2f for task %s of %s',
+                        name, cap_name, probe_score, task.uuid,
+                        getattr(task, 'executor_uuid', None))
         return probe_score, TX_CHANNEL_PROBE
 
     # The verification layers (R+D.md §12.2-12.5), as the arms they registered

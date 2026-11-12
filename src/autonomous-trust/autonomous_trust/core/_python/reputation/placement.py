@@ -1223,6 +1223,11 @@ class PlacementMixin:
                                     'under %s) is not valid here: %s; dropping '
                                     'the round', rnd['k'], ballot, why)
                 self._place_vars()['_place_rounds'].pop(key, None)
+                # A value we cannot carry refuses our round as surely as a
+                # nack. Retrying at once keeps a live round in every member's
+                # ear, and a member that could carry the value leaves it to us
+                # for good.
+                self._place_failed(key, rnd['k'])
                 return True
         else:
             entries = self._own_place_value(chain, key, group if key else None)

@@ -302,6 +302,23 @@ class TestRequestorSideScoring:
             self._reply('at.handshake', 42, nonce=41))
         assert (score, channel) == (0.9, TX_CHANNEL_PROBE)
 
+    def test_the_probe_log_names_the_peer_probed(self, caplog):
+        """Which peer a verdict is about is read off this line: the gaming
+        reruns of 2026-11-11 could only infer, from scores alone, that two
+        honest nodes never probed the gamer. C's negotiation line already
+        names it."""
+        import logging
+        from uuid import uuid4
+        from autonomous_trust.core._python.automate import score_task_result
+        reply = self._reply('at.handshake', 42, nonce=41)
+        peer = uuid4()
+        reply.executor_uuid = peer
+        logger = logging.getLogger('probe-log-test')
+        with caplog.at_level(logging.INFO, logger='probe-log-test'):
+            score_task_result(reply, logger=logger, name='node')
+        assert 'scored 0.90' in caplog.text
+        assert 'of %s' % peer in caplog.text
+
     def test_the_same_answer_against_a_different_challenge_is_a_defection(self):
         """The integrity property, stated as a test: a peer that computed the
         wrong answer would report the challenge its answer satisfies, so the

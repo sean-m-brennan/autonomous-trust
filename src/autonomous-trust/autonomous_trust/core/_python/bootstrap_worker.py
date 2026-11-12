@@ -200,6 +200,8 @@ class BootstrapWorker(Process, metaclass=ProcMeta,
         }
         self._probes_issued = 0
         self._last_probe_at = None
+        # uuid str -> when we last issued any probe to that peer.
+        self._last_probed_at: dict = {}
         # cap_name -> issuance count. Lets the conformance pin assert
         # that each of the three bootstrap caps fired at least once.
         self._counts_by_cap: dict[str, int] = {
@@ -294,7 +296,34 @@ class BootstrapWorker(Process, metaclass=ProcMeta,
         parity with Python — see the conformance scenario's note). With all
         counts equal, the tie-break makes this a round-robin, which is the
         right cold behavior: nothing is known, so spread.
+
+        A peer left unprobed longer than one round and one interval,
+        ``(len(peers) + 1) * probe_interval_sec``, goes first whatever its
+        count, the stalest of several first. While any peer has never been
+        probed the bound waits and UCB, which chooses that peer, decides. The
+        counts are lifetime, so without the bound a peer probed often while it
+        behaved waited until every other peer caught up, however long it
+        misbehaved meanwhile: a gamer that defected after eight minutes went
+        unprobed for the next twelve on 6 of 36 honest nodes (red-team repeat,
+        2026-11-11). A healthy round-robin probes every peer within a round,
+        so the bound does not fire there.
         """
+        current = now()
+        bound = (len(peers) + 1) * self.probe_interval_sec
+        overdue = []
+        for peer in peers:
+            uuid_str = str(getattr(peer, 'uuid', ''))
+            if not uuid_str:
+                continue
+            last = self._last_probed_at.get(uuid_str)
+            if last is None:
+                overdue = []
+                break
+            age = (current - last).total_seconds()
+            if age > bound:
+                overdue.append(((-age, uuid_str), peer))
+        if overdue:
+            return min(overdue, key=lambda item: item[0])[1]
         candidates = []
         for peer in peers:
             uuid_str = str(getattr(peer, 'uuid', ''))
@@ -409,6 +438,7 @@ class BootstrapWorker(Process, metaclass=ProcMeta,
             return False
         uuid_str = str(getattr(target, 'uuid', ''))
         self._probes_by_peer[uuid_str] = self._probes_by_peer.get(uuid_str, 0) + 1
+        self._last_probed_at[uuid_str] = now()
         self._probes_by_cap[cap_name] = self._probes_by_cap.get(cap_name, 0) + 1
         self._probes_issued += 1
         self._counts_by_cap[cap_name] = self._counts_by_cap.get(cap_name, 0) + 1

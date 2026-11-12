@@ -202,7 +202,7 @@ double bootstrap_ucb_bonus(int count, int total)
 }
 
 size_t bootstrap_worker_select_target(const bootstrap_worker_t *w,
-                                     size_t peer_count)
+                                     size_t peer_count, double now_sec)
 {
     if (w == NULL || peer_count == 0)
         return 0;
@@ -219,6 +219,27 @@ size_t bootstrap_worker_select_target(const bootstrap_worker_t *w,
         }
         return peer_count;
     }
+    /* The staleness bound first: the stalest peer past one round and one
+     * interval, unless some peer has never been probed. */
+    double bound = ((double)peer_count + 1.0) * w->probe_interval_sec;
+    size_t stalest = peer_count;
+    double stalest_age = bound;
+    for (size_t i = 0; i < peer_count; i++) {
+        if (w->skip_peer != NULL && w->skip_peer[i])
+            continue;
+        if (w->probes_by_peer[i] <= 0) {
+            stalest = peer_count;
+            break;
+        }
+        double age = now_sec - w->last_probed_sec[i];
+        if (age > stalest_age) {         /* strict: ties keep the lowest index */
+            stalest_age = age;
+            stalest = i;
+        }
+    }
+    if (stalest < peer_count)
+        return stalest;
+
     size_t best = peer_count;
     double best_bonus = -1.0;
     for (size_t i = 0; i < peer_count; i++) {
@@ -266,8 +287,8 @@ const char *bootstrap_worker_select_capability(const bootstrap_worker_t *w)
 /* Issue one directed probe to @p target, or to UCB's choice when @p target
  * is @p peer_count. */
 static bool _issue_probe_to(bootstrap_worker_t *w, size_t target,
-                            size_t peer_count, bootstrap_probe_emit_fn emit,
-                            void *ctx)
+                            size_t peer_count, double now_sec,
+                            bootstrap_probe_emit_fn emit, void *ctx)
 {
     if (w == NULL || peer_count == 0)
         return false;
@@ -278,7 +299,7 @@ static bool _issue_probe_to(bootstrap_worker_t *w, size_t target,
     if (idx < 0)
         return false;
     if (target >= peer_count)
-        target = bootstrap_worker_select_target(w, peer_count);
+        target = bootstrap_worker_select_target(w, peer_count, now_sec);
     if (target >= peer_count)
         return false;                     /* every peer is skipped */
 
@@ -299,8 +320,10 @@ static bool _issue_probe_to(bootstrap_worker_t *w, size_t target,
     if (emit != NULL && !emit(ctx, cap_name, target, nonce, payload_arg))
         return false;                     /* queue full → retry next tick */
 
-    if (target < AT_PROBE_MAX_TRACKED_PEERS)
+    if (target < AT_PROBE_MAX_TRACKED_PEERS) {
         w->probes_by_peer[target] += 1;
+        w->last_probed_sec[target] = now_sec;
+    }
     w->probes_by_cap[idx] += 1;
     w->probes_issued += 1;
     w->counts_by_cap[idx] += 1;
@@ -308,9 +331,10 @@ static bool _issue_probe_to(bootstrap_worker_t *w, size_t target,
 }
 
 bool bootstrap_worker_try_issue_probe(bootstrap_worker_t *w, size_t peer_count,
+                                     double now_sec,
                                      bootstrap_probe_emit_fn emit, void *ctx)
 {
-    return _issue_probe_to(w, peer_count, peer_count, emit, ctx);
+    return _issue_probe_to(w, peer_count, peer_count, now_sec, emit, ctx);
 }
 
 /* ----------------------------------------------------------------------------
@@ -413,7 +437,7 @@ static bool _burst_tick(bootstrap_worker_t *w, size_t peer_count,
     /* Stamped before issuing, as the continuous rate limit is. */
     w->burst_ever = true;
     w->last_burst_sec = now_sec;
-    if (!_issue_probe_to(w, best_index, peer_count, emit, ctx))
+    if (!_issue_probe_to(w, best_index, peer_count, now_sec, emit, ctx))
         return true;
     best->issued += 1;
     w->burst_spent += 1;
@@ -493,7 +517,7 @@ static bool _suspect_tick(bootstrap_worker_t *w, size_t peer_count,
         return false;
     w->suspect_ever = true;
     w->last_suspect_sec = now_sec;
-    if (!_issue_probe_to(w, best_index, peer_count, emit, ctx))
+    if (!_issue_probe_to(w, best_index, peer_count, now_sec, emit, ctx))
         return true;
     best->issued += 1;
     return true;
@@ -543,7 +567,7 @@ void bootstrap_worker_tick_all(bootstrap_worker_t *w, size_t peer_count,
         return;
     w->probed_ever = true;
     w->last_probe_sec = now_sec;
-    bootstrap_worker_try_issue_probe(w, peer_count, probe_emit, ctx);
+    bootstrap_worker_try_issue_probe(w, peer_count, now_sec, probe_emit, ctx);
 }
 
 int bootstrap_worker_count_for(const bootstrap_worker_t *w, const char *cap_name)
