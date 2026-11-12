@@ -530,6 +530,11 @@ bool reputation_is_suspect(const uuid_t peer_uuid);
  *  throttled to one pass a second. Run by the process loop. */
 void reputation_publish_probe_counts(const process_t *proc, double present);
 
+/** Publish @p score as @p peer_uuid's tier, as a rescore does: a tier_update
+ *  to identity when the tier held after the demotion margin changes. */
+void reputation_publish_tier(const process_t *proc, const uuid_t peer_uuid,
+                             double score);
+
 /** Record identity's judgement that @p peer_uuid is (or is no longer) an
  *  anchor, as a PEER_ANCHOR message does. Reset by reputation_reset_state. */
 void reputation_set_anchored(const uuid_t peer_uuid, bool anchored);
