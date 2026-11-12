@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Resilience/threat modeling-and-simulation red-team suite (SOW Task 3.4).
+"""Resilience/threat modeling-and-simulation red-team suite.
 
 Pure, deterministic, library-level M&S for the behavioural-anomaly layer: a
 synthetic peer population across the threat archetypes is driven through the

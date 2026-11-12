@@ -14,7 +14,7 @@
 #   limitations under the License.
 # ******************
 """Administrative-overhead M&S — operator actions/day, with vs without AT
-(SOW Task 2.4, "Admin overhead -25% net").
+(target: "Admin overhead -25% net").
 
 This is an **analytic** operator-action accounting (NOT Monte-Carlo): for a
 modeled operational day it counts operator actions under a conventional ZTA/
@@ -23,23 +23,23 @@ manual-policy baseline vs AT, and reports the **net** reduction = actions AT
 
 AT eliminates the recurring per-asset / per-mission **policy-authoring** load
 (its core "no human policy authoring at decision time" claim — trust is evaluated
-autonomously, and the MissionValor score→tier-floor mapping auto-derives object
+autonomously, and the mission-impact score→tier-floor mapping auto-derives object
 policy) and most manual incident response (autonomous slashing). AT **adds** real
 operator burdens that must be counted honestly: per-session **PIV+MFA operator
-activation** (M10), mandatory **human-on-the-loop review** of safety-critical
+activation**, mandatory **human-on-the-loop review** of safety-critical
 slash recommendations, **false-exclusion adjudication**, and ongoing
 **trust-model oversight**.
 
-Honesty discipline: this is the **softest** Task 2 metric (SOW risk register:
+Honesty discipline: this is the **softest** of these metrics (
 modeled/analytic, baseline could be seen as self-serving). It is therefore
 **tempo-conditional** — the :func:`sweep` shows the saving grows with operational
 tempo and can fall below the -25% target (even negative) at low tempo, where AT's
-~fixed added burden dominates. The baseline action rates are **TPOC-pre-
-registration dependent** (SOW Task 2.2) and exposed on :class:`AdminConfig`.
+~fixed added burden dominates. The baseline action rates are **to be
+pre-registered** and exposed on :class:`AdminConfig`.
 
-The MissionValor interface is **stubbed** here (:class:`MissionValorMock`),
-standing in for the Sentar Task 1.5 deliverable (Mission Impact Prediction Score
-→ required_tier floor / safety-critical flag).
+The mission-impact interface is **stubbed** here (:class:`MissionImpactMock`),
+standing in for an external scorer that maps a mission-impact score to a
+required_tier floor and a safety-critical flag.
 """
 from __future__ import annotations
 
@@ -48,9 +48,9 @@ from typing import List, Optional, Tuple
 
 
 @dataclass(frozen=True)
-class MissionValorMock:
-    """STUB for the Sentar Task 1.5 MissionValor→AT interface: maps a Mission
-    Impact Prediction Score in [0,1] to a (required_tier floor, safety_critical)
+class MissionImpactMock:
+    """STUB for an external mission-impact interface: maps a mission-impact
+    score in [0,1] to a (required_tier floor, safety_critical)
     pair. Used here only to count the per-object policy-authoring actions AT
     **auto-derives** (and therefore eliminates from the operator's load)."""
     crit_floors: Tuple[Tuple[float, int], ...] = (
@@ -69,7 +69,7 @@ class MissionValorMock:
 @dataclass(frozen=True)
 class AdminConfig:
     """Modeled operational-day tempo + per-action-class rates. All MODELED /
-    TPOC-pre-registration dependent; exposed for re-anchoring."""
+    to be pre-registered; exposed for re-anchoring."""
     # Operational-day tempo (the "activity" drivers scale with tempo_multiplier)
     n_assets: int = 40             # data objects/peers needing access policy
     n_retasks: int = 6             # mission re-taskings/day (policy churn)
@@ -137,13 +137,13 @@ class AdminResult:
 
     def as_report(self) -> dict:
         return {
-            'target': 'SOW Task 2.4 — Admin overhead -25% net (operator actions/day)',
+            'target': 'Admin overhead -25% net (operator actions/day)',
             'modeled': True,
             'analytic': True,
-            'note': ('Analytic operator-action accounting (softest Task 2 metric). '
+            'note': ('Analytic operator-action accounting (softest of these metrics). '
                      'AT-added burdens counted explicitly. Tempo-conditional — see '
-                     'sweep. Baseline rates TPOC-pre-registration dependent; '
-                     'MissionValor interface STUBBED (Sentar Task 1.5).'),
+                     'sweep. Baseline rates to be pre-registered; '
+                     'mission-impact interface STUBBED.'),
             'tempo_multiplier': self.config.tempo_multiplier,
             'operator_actions_per_day': {'without_AT': round(self.baseline_total, 1),
                                          'with_AT': round(self.at_total, 1)},
@@ -169,7 +169,7 @@ def run(config: Optional[AdminConfig] = None) -> AdminResult:
             'policy_authoring', 'Access-policy authoring & maintenance',
             baseline=retasks * c.b_reauthor_per_retask
                      + c.n_assets * c.b_asset_daily_review_frac,
-            # MissionValor mock auto-derives per-object floors -> oversight only
+            # mission-impact mock auto-derives per-object floors -> oversight only
             at=retasks * c.at_oversight_per_retask + c.at_standing_trust_policy),
         ActionClass(
             'incident_response', 'Incident investigation & response',
@@ -239,14 +239,14 @@ def main(argv=None):
     result = run(AdminConfig(tempo_multiplier=args.tempo))
 
     print('# Administrative-overhead M&S — operator actions/day, with vs without '
-          'AT (SOW Task 2.4)')
+          'AT')
     print()
     print(f'Modeled operational day · tempo ×{result.config.tempo_multiplier:g} · '
           'analytic accounting (not Monte-Carlo).')
     print()
-    print('_MODELED / analytic — the SOFTEST Task 2 metric. AT-added burdens '
-          'counted explicitly. Baseline rates TPOC-pre-registration dependent; '
-          'MissionValor interface STUBBED (Sentar Task 1.5)._')
+    print('_MODELED / analytic — the SOFTEST of these metrics. AT-added burdens '
+          'counted explicitly. Baseline rates to be pre-registered; '
+          'mission-impact interface STUBBED._')
     print()
     print('| Operator action class | w/o AT | w/ AT | Δ (saved) | note |')
     print('|---|---|---|---|---|')

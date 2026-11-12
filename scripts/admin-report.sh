@@ -15,13 +15,13 @@
 #   limitations under the License.
 # ******************
 #
-# Run the administrative-overhead M&S (SOW Task 2.4, "-25% net") and print the
+# Run the administrative-overhead M&S (target: "-25% net") and print the
 # per-operator-action-class accounting (with vs without AT), the -25% net verdict,
 # and a mission-tempo sensitivity sweep.
 #
-# MODELED / analytic (the softest Task 2 metric). AT-added burdens are counted
-# explicitly; baseline rates are TPOC-pre-registration dependent (Task 2.2); the
-# MissionValor interface is STUBBED (stands in for Sentar Task 1.5). Pure stdlib.
+# MODELED / analytic (the softest of these metrics). AT-added burdens are counted
+# explicitly; baseline rates are to be pre-registered; the
+# mission-impact interface is STUBBED (a fixed score-to-tier-floor map). Pure stdlib.
 #
 # Usage:
 #   scripts/admin-report.sh                 # representative tempo (x1)

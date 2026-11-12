@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Access-stream feature extraction (SOW Task 3.1).
+"""Access-stream feature extraction.
 
 A behavioral *envelope* is learned per **peer×role** from the access stream. An
 :class:`AccessEvent` is one observed interaction (a capability request, its
@@ -26,7 +26,7 @@ We do not decide here that "high rate == bad" — the per-entity detector learns
 what is normal for this peer×role and flags deviation in any direction. That
 keeps the feature layer faithful and the detectors honest (a bot-like, too-
 regular cadence is as much a deviation from a human operator's normal as an
-erratic one). The survey's axis-4 feature menu maps to:
+erratic one). The feature menu maps to:
 
   * ``rate``          — exponentially-weighted request rate (vs a configured max)
   * ``burst``         — fast/slow rate ratio (burstiness)
@@ -39,7 +39,7 @@ erratic one). The survey's axis-4 feature menu maps to:
 
 Everything is deterministic (no RNG) and bounded-memory (a fixed-capacity recent
 window + capped "known-transition" set + scalar EW accumulators), so it ports to
-fixed-point C with the detectors (Task 3.5).
+fixed-point C with the detectors.
 """
 from __future__ import annotations
 

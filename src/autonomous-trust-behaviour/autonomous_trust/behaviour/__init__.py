@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""AutonomousTrust behavioral-anomaly layer (SOW Task 3 / objective O3).
+"""AutonomousTrust behavioral-anomaly layer.
 
 An in-built, on-node streaming anomaly scorer that feeds the existing
 deterministic reputation/slashing/tier-gating engine as *governed evidence* --
@@ -27,14 +27,14 @@ deterministic reputation/slashing/tier-gating engine as *governed evidence* --
     what makes it admissible rather than a black box); and
   * **explainable** -- per-feature attribution of *why* something is anomalous.
 
-The Phase-I prototype builds the detectors **via River/PyOD** — the mature,
-permissively-licensed reference runtimes named in the SOW (Task 3.2) and the
-AI/ML survey (``doc/NV059/work/AIML_software_survey.md`` §2): the multivariate
+The prototype builds the detectors **via River/PyOD** — the mature,
+permissively-licensed reference runtimes for streaming anomaly detection: the
+multivariate
 isolation score from ``river.anomaly.HalfSpaceTrees`` and the per-feature,
 explainable histogram score from ``pyod.models.hbos.HBOS`` (made streaming via a
 sliding-window refit). Both are deterministic under a fixed seed. The deferred
 formally-verified C core is the "owned" reimplementation, pinned to this
-prototype by the cross-language conformance corpus (Task 3.5).
+prototype by the cross-language conformance corpus.
 """
 # The pure, node-agnostic library (the future standalone .so): detectors,
 # features, the per-peer×role engine, and its neutral SlashProposal output. No

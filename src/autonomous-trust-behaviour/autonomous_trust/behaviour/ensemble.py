@@ -13,13 +13,13 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Detector ensemble + sustained-anomaly state machine (SOW Task 3.1/3.3 logic).
+"""Detector ensemble + sustained-anomaly state machine.
 
 One :class:`PeerRoleDetector` per peer×role couples the feature extractor, the
 two detectors (Half-Space Trees + HBOS) and their calibrators, and a
 *sustained-anomaly* state machine. The state machine is the crux of "ML proposes,
 deterministic consensus disposes": a single anomalous spike must NOT trip an
-exclusion (the base-rate-fallacy risk the survey calls out). Only a *sustained*
+exclusion (the base-rate-fallacy risk). Only a *sustained*
 deviation — exceedance held over a dwell window, tolerant of brief dips — raises
 an alarm that the governed path (B4) turns into a slashing attestation.
 
@@ -82,7 +82,7 @@ class SlashProposal:
     edge of a sustained anomaly. It carries *what the detector found* -- no node,
     queue, identity, or wire type. The host-side adapter is what turns this into
     a signed ``SlashAttestation`` and submits it. This is the cross-language
-    output the Task 3.5 conformance corpus pins (same stream -> same proposals)."""
+    output the conformance corpus pins (same stream -> same proposals)."""
     peer_id: str
     role: str
     reason: str                  # REASON_SUSTAINED_ANOMALY
@@ -129,7 +129,7 @@ class PeerRoleDetector:
         self.min_obs = int(min_obs)
         self.hst_weight = float(hst_weight)
 
-        # Detectors via River/PyOD (SOW Task 3.2).
+        # Detectors via River/PyOD.
         self.hst = RiverHalfSpaceTrees(FEATURE_NAMES, n_trees=hst_trees,
                                        height=hst_height, window_size=hst_window,
                                        seed=seed)

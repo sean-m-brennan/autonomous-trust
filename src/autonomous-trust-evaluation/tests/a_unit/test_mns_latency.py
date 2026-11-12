@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Unit tests for the AT-vs-ZTA access-decision latency M&S (SOW Task 2.4).
+"""Unit tests for the AT-vs-ZTA access-decision latency M&S.
 
 The model is pure stdlib + deterministic; these tests pin determinism, the
 structural AT<ZTA ordering, the -50% target across link profiles, and the

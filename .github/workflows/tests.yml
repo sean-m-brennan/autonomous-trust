@@ -2,7 +2,8 @@ name: Tests
 
 # Unit/package test gate for merges. Complements the other workflows:
 #   * conformance.yml — dual-language conformance corpus (already gating)
-#   * arm64-build.yml — aarch64 cross-build (already gating)
+#   * the aarch64 cross-build lives with the embedded image, in its own
+#     repository (embedded/.github/workflows/arm64-build.yml)
 # This workflow runs the project's Python package suites and the C unit
 # tests, the CI-runnable core of `scripts/test.sh`. The remaining members
 # of that chain are deliberately NOT run here because they need privileged

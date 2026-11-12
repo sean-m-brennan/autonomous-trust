@@ -45,6 +45,10 @@ attic/
 # dir, and two of them already `rm -rf` the stale examples/build they inherit.
 src/c/build/
 src/c/build-*/
+# A host cmake run with no REVISION writes this (gitignored). CMake keeps an
+# existing version.h over -DREVISION, so a stale copy riding along in
+# `COPY src/c` stamped every image with the host's old version.
+src/c/autonomous_trust/version.h
 # Copied by Dockerfile-native/-devel as part of `COPY src/autonomous-trust/rust`,
 # then rebuilt: the image installs its own rustup, so host artifacts never hit.
 **/rust/target/

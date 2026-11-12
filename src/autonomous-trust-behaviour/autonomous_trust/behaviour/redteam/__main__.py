@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Generate the resilience/threat M&S results artifact (SOW Task 3.4).
+"""Generate the resilience/threat M&S results artifact.
 
     python -m autonomous_trust.behaviour.redteam            # markdown to stdout
     python -m autonomous_trust.behaviour.redteam --json out.json --seed 1234

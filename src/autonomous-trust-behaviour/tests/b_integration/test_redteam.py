@@ -13,8 +13,8 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Resilience/threat M&S suite results (SOW Task 3.4), driving the behaviour
-layer end-to-end over the threat-archetype population. Pins the M5 exit criteria:
+"""Resilience/threat M&S suite results, driving the behaviour
+layer end-to-end over the threat-archetype population. Pins the exit criteria:
 
   * a compromised-but-credentialed asset is detected and (governably) excluded
     under simulated attack;
@@ -47,7 +47,7 @@ class TestDeterminism:
 
 class TestM5ExitCriteria:
     def test_compromised_credential_detected_and_excluded(self, result):
-        # M5: the compromised-but-credentialed asset is detected + excluded.
+        # Exit: the compromised-but-credentialed asset is detected + excluded.
         ml = result.ml
         assert ml.archetype_detection_rate(COMPROMISED_CREDENTIAL) == 1.0
         assert ml.tp >= 1                       # at least one true exclusion
@@ -103,7 +103,7 @@ class TestReportShape:
         assert 'False-exclusion rate' in md and 'base-rate' in md
 
     def test_report_artifact_generator(self, tmp_path, capsys):
-        # the SOW deliverable: a results artifact (markdown + JSON).
+        # the deliverable: a results artifact (markdown + JSON).
         import json
         from autonomous_trust.behaviour.redteam.__main__ import main
         out = tmp_path / 'redteam.json'

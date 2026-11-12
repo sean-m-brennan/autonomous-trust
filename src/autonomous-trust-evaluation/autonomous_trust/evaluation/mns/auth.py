@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Authentication-time M&S — the three Auth (<=5 s) quantities (SOW Task 2.4).
+"""Authentication-time M&S — the three Auth (<=5 s) quantities.
 
 Reports, over a modeled tactical link (seeded Monte-Carlo, reusing
 :class:`~autonomous_trust.evaluation.mns.latency.LinkModel`):
@@ -32,17 +32,16 @@ Reports, over a modeled tactical link (seeded Monte-Carlo, reusing
    (reputation-capped admit now; delegated-verification quorum lifts the cap
    later, off the admission path — see `doc/architecture/zta-integration.md`).
 
-**Trust "bases".** The SOW phrases (3) as "bases 1, 3-4 (base-2 attestation
+**Trust "bases".** Quantity (3) is phrased as "bases 1, 3-4 (base-2 attestation
 modeled)". Only **base 2 = hardware root-of-trust / attestation** is enumerated in
 the available docs (it is unbuilt -> **modeled** here as an added attestation
-step, mechanism M12 / Option O.2). The other first-contact bases exercised are the
+step). The other first-contact bases exercised are the
 *implemented* admission mechanisms — cryptographic identity (Ed25519 + X.509 ZTA
 chain), quorum vouching (welcoming committee), and DDIL delegated verification.
-**The precise 1/3/4 numbering should be reconciled with the Technical Volume**
-(not machine-readable here); the mechanisms modeled are the substantive content.
+The mechanisms modeled are the substantive content, not the base numbering.
 
-Honesty discipline (as across `mns`): all figures MODELED; per SOW, the AT path is
-to be **measured on subscale HW (Task 4)** and the basic ICAM/PIV path built
+Honesty discipline (as across `mns`): all figures MODELED; the AT path is
+to be **measured on subscale HW** and the basic ICAM/PIV path built
 there, with base-2 attestation modeled. Parameters are exposed for re-anchoring.
 """
 from __future__ import annotations
@@ -73,7 +72,7 @@ class AuthConfig:
     # Enrollment / degraded admission quorum
     n_border_guards: int = 7
     quorum_q: int = 4                     # q-of-N vouches needed
-    base2_attestation_ms: float = 150.0   # MODELED hardware attestation step (M12)
+    base2_attestation_ms: float = 150.0   # MODELED hardware attestation step
 
     # A strict ZTA at the degraded edge blocks on the unreachable OCSP/PDP for
     # this long before timing out — busts the 5 s gate.
@@ -152,7 +151,7 @@ def degraded_admission(cfg: AuthConfig, with_base2: bool = True) -> Dist:
                             cfg.quorum_q, rng)                          # reachable vouch
         t += cfg.local_verify_ms
         if with_base2:
-            t += cfg.base2_attestation_ms                              # MODELED M12
+            t += cfg.base2_attestation_ms                              # MODELED
         xs.append(t)
     return Dist.of(xs)
 
@@ -184,12 +183,11 @@ class AuthResult:
 
     def as_report(self) -> dict:
         return {
-            'target': 'SOW Task 2.4 — Auth <=5s (3 quantities)',
+            'target': 'Auth <=5s (3 quantities)',
             'modeled': True,
             'gate_ms': self.config.gate_ms,
-            'note': ('MODELED; AT path to be MEASURED on subscale HW (Task 4), '
-                     'base-2 attestation modeled (M12). base-numbering to be '
-                     'reconciled with the Technical Volume.'),
+            'note': ('MODELED; AT path to be MEASURED on subscale HW, '
+                     'base-2 attestation modeled.'),
             'seed': self.config.seed,
             'reauth_steady_state': {
                 'gated': True,
@@ -233,11 +231,11 @@ def main(argv=None):
     r = run(AuthConfig(seed=args.seed))
     gate = r.config.gate_ms
 
-    print('# Authentication-time M&S — Auth <=5 s (SOW Task 2.4)')
+    print('# Authentication-time M&S — Auth <=5 s')
     print()
     print(f'Seed {r.config.seed} (deterministic) · gate {_s(gate)} · modeled '
-          'tactical link. MODELED — AT path to be MEASURED on subscale HW (Task 4); '
-          'base-2 attestation modeled (M12).')
+          'tactical link. MODELED — AT path to be MEASURED on subscale HW; '
+          'base-2 attestation modeled.')
     print()
 
     print('## (1) Steady-state re-authentication — gated ≤ 5 s')
@@ -259,7 +257,7 @@ def main(argv=None):
     print(f"Consensus admission (announce + {r.config.quorum_q}-of-"
           f"{r.config.n_border_guards} quorum vouch + welcome): mean "
           f"{_s(r.enroll.mean_ms)}, p95 {_s(r.enroll.p95_ms)}. Reported as a "
-          f"characterization per SOW (one-time, not gated).")
+          f"characterization (one-time, not gated).")
     print()
 
     print('## (3) Degraded-edge first-contact admission — gated ≤ 5 s')

@@ -14,7 +14,7 @@
 #   limitations under the License.
 # ******************
 """Behavioural adversary/benign archetypes for the resilience/threat M&S
-red-team suite (SOW Task 3.4).
+red-team suite.
 
 Each archetype is a *behavioural footprint*: a deterministic, seeded generator of
 the per-peer ``AccessEvent`` stream the behaviour layer would observe. These are
@@ -28,7 +28,7 @@ metrics report honestly what the behaviour layer does and does not catch.
 The crucial benign-but-abnormal archetype is **DDIL** (disrupted/intermittent
 comms): a *legitimate* peer whose timing/refusal features shift under a degraded
 link though its capabilities and transaction quality stay normal. It is the
-false-exclusion trap the SOW's base-rate analysis is about — the layer must not
+false-exclusion trap the base-rate problem is about — the layer must not
 exclude it. Ground-truth labels (`adversary`) drive the confusion matrix.
 """
 from __future__ import annotations
@@ -46,7 +46,7 @@ NORMAL_PEERS = ('peer-A', 'peer-B', 'peer-C', 'peer-D')
 
 #: Archetype names (also the threat taxonomy rows of the M&S report).
 BENIGN = 'benign'
-COMPROMISED_CREDENTIAL = 'compromised_credential'  # the M5 exit target
+COMPROMISED_CREDENTIAL = 'compromised_credential'  # the exit target
 BYZANTINE = 'byzantine'
 SYBIL = 'sybil'
 DDIL = 'ddil'                                       # benign-but-disrupted

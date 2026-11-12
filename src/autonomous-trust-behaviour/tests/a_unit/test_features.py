@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Unit tests for access-stream feature extraction (SOW Task 3.1)."""
+"""Unit tests for access-stream feature extraction."""
 from autonomous_trust.behaviour import AccessEvent, BehaviorFeatures, FEATURE_NAMES
 
 

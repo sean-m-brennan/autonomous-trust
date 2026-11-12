@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Unit tests for the auth-time M&S (SOW Task 2.4, Auth <=5s)."""
+"""Unit tests for the auth-time M&S (target: Auth <=5s)."""
 from autonomous_trust.evaluation.mns.auth import AuthConfig, run
 
 

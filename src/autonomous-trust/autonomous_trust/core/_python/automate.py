@@ -1359,8 +1359,8 @@ class AutonomousTrust(Protocol):
                     # capability's configured transaction_weight. The executor
                     # holds the original Task (active_tasks), so the name comes
                     # "for free" off the negotiation-driven path — this is the
-                    # principled producer the DoD coordinator stop-gap hand-tags
-                    # by hand (see doc/NV059/work/deferred.md §1.2). A None name
+                    # principled producer the DoD coordinator stop-gap tags
+                    # by hand. A None name
                     # falls back to weight 1, the prior behavior.
                     cap_name = getattr(
                         getattr(orig_task, 'capability', None), 'name', None)

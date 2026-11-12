@@ -4,14 +4,23 @@
 
 ## Current state
 
-As of 2026-04-17 the full Frama-C/WP suite runs at **100 % proof coverage on the
-goals it attempts** (4 262 / 4 262) but only **53.6 % function coverage** (351 /
-655 functions verified, 304 skipped). All skips are deliberate and each one
-carries an in-script comment naming the blocker category and a `/* Frama-C:
-skipped, [category] reason */` comment at the definition. The skips are
-deliberate, categorized, and commented.
+In the run of 2026-11-08 (`frama-c-report.csv`), with Alt-Ergo, Z3 and CVC5
+each given 30 seconds per goal, WP proved **17 912 of the core's 21 629 goals
+(82.8 %)** and attempted **1 764 of its 2 050 functions (86.0 %)**, leaving 286
+skipped. Every one of the 3 717 unproved core goals is a solver timeout at that
+limit, not a refuted goal. The extension libraries split out of the core since
+September (Zero Trust, DTN, gateway, rendezvous, first contact, fleet and data
+source) went through the same run: 7 776 of 9 459 goals proved (82.2 %), 922 of
+1 053 functions attempted, and all but one of the 1 683 unproved goals timeouts.
 
-The remaining 304 skipped functions are not uniformly hard. They cluster into a
+The trade has moved since 2026-04-17, when the suite proved every goal it
+attempted (4 262 / 4 262) but covered only 53.6 % of the functions (351 / 655).
+Since then the coverage has grown, and the open work is now mostly timeouts
+rather than skips. All skips are deliberate and each one carries
+an in-script comment naming the blocker category and a `/* Frama-C: skipped,
+[category] reason */` comment at the definition.
+
+The remaining 286 skipped functions are not uniformly hard. They cluster into a
 small number of categorical blockers. This document records *why* pushing
 coverage further is expensive, so that future work can target the right
 choke-point instead of relitigating dead ends.

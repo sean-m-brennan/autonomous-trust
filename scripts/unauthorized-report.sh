@@ -15,13 +15,13 @@
 #   limitations under the License.
 # ******************
 #
-# Run the unauthorized-access reduction M&S (SOW Task 2.4, "-90%") and print the
+# Run the unauthorized-access reduction M&S (target: "-90%") and print the
 # with-vs-without-AT comparison over the ATT&CK-mapped attempt taxonomy, the -90%
 # target verdict, and the reduction projected once the tracked gaps close.
 #
 # MODELED (seeded). Behavioural block-rates anchored to the red-team's MEASURED
-# detection; the rest are modeled gates. The attempt mix is TPOC-pre-registration
-# dependent (Task 2.2). Pure stdlib (no deps); deterministic under a fixed seed.
+# detection; the rest are modeled gates. The attempt mix is to be
+# pre-registered. Pure stdlib (no deps); deterministic under a fixed seed.
 #
 # Usage:
 #   scripts/unauthorized-report.sh                 # report (default seed 1234)

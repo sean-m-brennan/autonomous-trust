@@ -13,11 +13,11 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Modeling & simulation harnesses for SOW Task 2 performance-feasibility targets.
+"""Modeling & simulation harnesses for the performance-feasibility targets.
 
 Pure, deterministic, dependency-free (stdlib only) so the figures reproduce
 byte-for-byte under a fixed seed and run anywhere. See :mod:`.latency` for the
-Latency-(-50%) target (SOW Task 2.4).
+Latency-(-50%) target.
 """
 from .latency import (LatencyConfig, LinkModel, LatencyResult,  # noqa: F401
                       PROFILES, run, sweep)

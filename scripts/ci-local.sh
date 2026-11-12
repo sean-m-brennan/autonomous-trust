@@ -26,20 +26,16 @@
 #       the Python package suites (test-packages.sh --quick) + the C unit tests
 #       (test-c-exe.sh). --quick skips the macvlan two-node Docker integration
 #       test (unavailable off a real cluster).
-#   arm64-build   (arm64-build.yml job 1)   BLOCKING
-#       Registers QEMU binfmt (the CI's setup-qemu-action), then
-#       `embedded/build-arm.sh` (dynamic) + `--static`. Needs docker + buildx.
-#   qemu-smoke    (arm64-build.yml job 2)   NON-BLOCKING (continue-on-error)
-#       `embedded/test-qemu.sh --nodes 2`. Heavy (QEMU VMs); opt-in. A failure
-#       here is reported but does NOT fail the overall run, matching CI.
+#
+# The aarch64 cross-build and the QEMU smoke test belong to the embedded image,
+# which is its own repository checked out at embedded/. Its workflow and its
+# local runner are there: embedded/ci-local.sh --arm64 | --qemu | --all.
 #
 # Usage:
-#   scripts/ci-local.sh                 # default: conformance + tests + arm64
-#   scripts/ci-local.sh --all           # + qemu-smoke (heavy, non-blocking)
+#   scripts/ci-local.sh                 # default: conformance + tests
+#   scripts/ci-local.sh --all           # the same, every job
 #   scripts/ci-local.sh --conformance   # just one job (repeatable flags)
 #   scripts/ci-local.sh --tests
-#   scripts/ci-local.sh --arm64
-#   scripts/ci-local.sh --qemu
 #   scripts/ci-local.sh --conformance --recreate-env   # match CI's fresh env
 #   scripts/ci-local.sh --conformance --update-env      # layer yml changes in
 #   scripts/ci-local.sh --list          # show jobs and exit
@@ -47,8 +43,9 @@
 # Exit codes: 0 all selected blocking jobs passed; 1 a blocking job FAILED;
 #             2 a blocking job was SKIPPED for missing prereqs (inconclusive).
 #
-# NOTE: arm64-build and qemu-smoke drive Docker. Run this on your host, never
-# inside the Claude sandbox (Docker there crashes the agent -- see CLAUDE.md).
+# NOTE: the conformance and tests jobs run in a Docker container by default.
+# Run this on your host, never inside the Claude sandbox (Docker there crashes
+# the agent -- see CLAUDE.md).
 
 set -uo pipefail   # intentionally NOT -e: we capture each job's status and continue
 
@@ -84,21 +81,21 @@ declare -a SELECTED=()
 while [[ $# -gt 0 ]]; do case "$1" in
   --conformance) SELECTED+=(conformance); shift;;
   --tests)       SELECTED+=(tests);       shift;;
-  --arm64)       SELECTED+=(arm64);       shift;;
-  --qemu)        SELECTED+=(qemu);        shift;;
-  --all)         SELECTED=(conformance tests arm64 qemu); shift;;
+  --arm64|--qemu)
+    err "$1 moved with the embedded image: run embedded/ci-local.sh $1"; exit 1;;
+  --all)         SELECTED=(conformance tests); shift;;
   --recreate-env) RECREATE_ENV=true; shift;;
   --update-env)   UPDATE_ENV=true;   shift;;
   --host-conda)   USE_HOST_CONDA=true; shift;;
   --conda-image)  CONDA_IMAGE="$2"; shift 2;;
   --conda-image=*) CONDA_IMAGE="${1#*=}"; shift;;
-  --list) echo "jobs: conformance (blocking), tests (blocking), arm64 (blocking), qemu (non-blocking)"; exit 0;;
+  --list) echo "jobs: conformance (blocking), tests (blocking)"; exit 0;;
   -h|--help) awk 'NR>=2 && /^#/{sub(/^# ?/,"");print;next} NR>=2{exit}' "$0"; exit 0;;
   *) err "unknown option: $1"; exit 1;;
 esac; done
 
-# Default selection mirrors the blocking CI jobs (qemu is opt-in / non-blocking).
-if [[ ${#SELECTED[@]} -eq 0 ]]; then SELECTED=(conformance tests arm64); fi
+# Default selection mirrors the blocking CI jobs.
+if [[ ${#SELECTED[@]} -eq 0 ]]; then SELECTED=(conformance tests); fi
 
 # ---------------------------------------------------------------------------
 # Shared Miniforge env provisioning (conformance + tests)
@@ -319,47 +316,6 @@ bash scripts/test-c-exe.sh
 }
 
 # ---------------------------------------------------------------------------
-# Job: arm64-build  (arm64-build.yml job 1)
-# ---------------------------------------------------------------------------
-job_arm64() {
-  command -v docker >/dev/null 2>&1 || { err "docker not found"; return 3; }
-  docker buildx version >/dev/null 2>&1 || { err "docker buildx not available"; return 3; }
-
-  # The CI registers QEMU emulation via docker/setup-qemu-action; do the same
-  # so the amd64 host can run aarch64 build steps. Idempotent.
-  info "Registering QEMU binfmt handlers (arm64) ..."
-  docker run --privileged --rm tonistiigi/binfmt --install arm64 >/dev/null 2>&1 \
-    || warn "binfmt registration returned nonzero (may already be installed)."
-
-  cd "$REPO/embedded" || return 1
-  info "Cross-building at_demo arm64 (dynamic) -> autonomous-trust-arm64.tar.gz ..."
-  ./build-arm.sh          || { err "build-arm.sh (dynamic) failed"; cd "$REPO" || true; return 1; }
-  info "Cross-building at_demo arm64 (static) -> autonomous-trust-arm64-static.tar.gz ..."
-  ./build-arm.sh --static || { err "build-arm.sh --static failed"; cd "$REPO" || true; return 1; }
-  cd "$REPO" || return 1
-
-  info "Artifacts:"
-  ls -lh embedded/dist/*arm64* 2>/dev/null || warn "no arm64 artifacts found in embedded/dist/"
-}
-
-# ---------------------------------------------------------------------------
-# Job: qemu-smoke  (arm64-build.yml job 2; continue-on-error -> non-blocking)
-# ---------------------------------------------------------------------------
-job_qemu() {
-  command -v docker >/dev/null 2>&1 || { err "docker not found"; return 3; }
-  local miss=0
-  for t in qemu-system-x86_64 qemu-img cloud-localds; do
-    command -v "$t" >/dev/null 2>&1 || { warn "missing $t"; miss=1; }
-  done
-  [[ $miss -eq 1 ]] && warn "Install: sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils openssh-client wget"
-
-  cd "$REPO/embedded" || return 1
-  info "Two-node QEMU discovery smoke test (heavy) ..."
-  ./test-qemu.sh --nodes 2 || { err "test-qemu.sh failed"; cd "$REPO" || true; return 1; }
-  cd "$REPO" || return 1
-}
-
-# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 declare -A RESULT DURATION BLOCKING
@@ -387,8 +343,6 @@ info "Selected jobs: ${SELECTED[*]}"
 for j in "${SELECTED[@]}"; do case "$j" in
   conformance) run_job conformance job_conformance yes;;
   tests)       run_job tests       job_tests       yes;;
-  arm64)       run_job arm64       job_arm64       yes;;
-  qemu)        run_job qemu        job_qemu        no;;
 esac; done
 
 hr; echo; echo "================== CI-LOCAL SUMMARY =================="

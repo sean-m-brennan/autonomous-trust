@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Pure unit tests for the M&S metrics + archetypes (SOW Task 3.4). Fast: no
+"""Pure unit tests for the M&S metrics + archetypes. Fast: no
 detector run. Pins the confusion-matrix math and the base-rate (Axelsson)
 projection that the resilience claim rests on."""
 import random
@@ -32,7 +32,7 @@ class TestDetectorMetrics:
         m = DetectorMetrics(tp=9, fp=10, fn=1, tn=90)
         assert m.tpr == pytest.approx(0.9)            # 9/10
         assert m.fpr == pytest.approx(0.1)            # 10/100
-        assert m.false_exclusion_rate == m.fpr        # SOW wording alias
+        assert m.false_exclusion_rate == m.fpr        # conventional-name alias
         assert m.ppv == pytest.approx(9 / 19)
         assert m.fdr == pytest.approx(10 / 19)
 

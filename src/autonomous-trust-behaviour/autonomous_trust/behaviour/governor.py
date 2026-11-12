@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Host-side adapter (SOW Task 3 / O3 governed path).
+"""Host-side adapter (the governed path).
 
 :class:`PeerBehaviourGovernor` is the **pluggable component each node embeds** to
 monitor *its own* peers. It composes a (portable, node-agnostic)
