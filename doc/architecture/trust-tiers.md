@@ -407,7 +407,11 @@ and tier transitions need the same protection or a peer hovering near a boundary
 will oscillate. A fixed epsilon of 0.02 applies to each floor on the way down,
 so promotion happens at the floor and demotion at the floor less 0.02. This
 keeps the published floor stable for documentation while adding a quiet buffer
-in the implementation.
+in the implementation. The margin is the ladder's `tier_demotion_epsilon` and
+applies only to the published tier, the one identity's gates read. It never
+softens a bound that exists to deny a tier: a tenure hold or a standing ceiling
+below a tier's floor takes the tier away at once, although the capped score sits
+inside the margin. The attest co-sign gate reads the bare floors.
 
 *Below the ladder.* One threshold sits below tier 0 and is not a tier. The
 communication cut-off at 0.1 excludes a peer at the network layer rather than

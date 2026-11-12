@@ -5475,21 +5475,23 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 return tier
         return 0
 
-    def _held_tier(self, peer_uuid, score: float, prior) -> int:
+    def _held_tier(self, peer_uuid, score: float, prior, bound=None) -> int:
         """The tier to publish for a peer last published at ``prior``.
 
         Promotion happens at the floor. A peer that holds a tier keeps it
         until its score falls below that floor less
         ``tier_demotion_epsilon``, so a score hovering on a floor does not
         flap across it. The margin never outranks a bound that exists to
-        deny a tier: a tenure hold or a standing ceiling below a tier's
-        floor takes the tier away at once, though the capped score sits
-        inside the margin.
+        deny a tier: a tenure hold, a standing ceiling, or a join-policy
+        ``bound`` that bit, below a tier's floor, takes the tier away at
+        once, though the capped score sits inside the margin.
         """
         tier = self._trust_tier(score)
         if prior is None or prior <= tier:
             return tier
         cap = self._tenure_bound(peer_uuid, 1.0)
+        if bound is not None:
+            cap = min(cap, bound)
         ceiling = self._standing_ceiling(peer_uuid)
         if ceiling is not None:
             cap = min(cap, ceiling)
@@ -5954,9 +5956,13 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
             # network process is notified only on an actual crossing.
             # Under the join policy exclusion reads brought + slash and the
             # tier reads bounded (RD_14.4 Phase 4); `score` is the told one.
+            bound = None
             if _policy_on(self):
+                told = score
                 excl, score = (self._exclusion_score(peer_uuid, score),
                                self._bounded(peer_uuid, score))
+                if score < told:
+                    bound = score
             else:
                 excl = score
             now_excluded = self._is_excluded(excl)
@@ -5968,7 +5974,7 @@ class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                 self._excluded.discard(key)
                 self._publish_exclusion(queues, peer_uuid, False)
             old_tier = self.peer_tiers.get(key)
-            new_tier = self._held_tier(peer_uuid, score, old_tier)
+            new_tier = self._held_tier(peer_uuid, score, old_tier, bound)
             if old_tier == new_tier:
                 return
             # Capture demotion before storing the new tier so

@@ -1681,6 +1681,11 @@ set_source_files_properties(test/rep_tenure_test.c PROPERTIES COMPILE_FLAGS "-Wa
 target_link_libraries(rep_tenure_test PRIVATE ${AT_TEST_LIBS} m)
 add_test(NAME rep_tenure_test COMMAND $<TARGET_FILE:rep_tenure_test>)
 
+add_executable(rep_tier_hysteresis_test test/rep_tier_hysteresis_test.c)
+set_source_files_properties(test/rep_tier_hysteresis_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_tier_hysteresis_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rep_tier_hysteresis_test COMMAND $<TARGET_FILE:rep_tier_hysteresis_test>)
+
 add_executable(group_adopt_test test/group_adopt_test.c)
 set_source_files_properties(test/group_adopt_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(group_adopt_test PRIVATE ${AT_TEST_LIBS} m)

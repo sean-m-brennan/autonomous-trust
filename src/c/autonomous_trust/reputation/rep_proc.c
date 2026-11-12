@@ -46,6 +46,7 @@
 #include "identity/id_proc_priv.h"   /* identity_self_identity */
 #include "config/configuration.h"   /* get_cfg_dir, CFG_PATH_LEN */
 #include "config/discover.h"        /* CFG_FILE_EXT */
+#include "config/trust_ladder.h"    /* tier_demotion_epsilon */
 #include "reputation/rep_ext.h"   /* extensions' trust seeds */
 #include "reputation/rep_proc_priv.h"
 #include "identity/join_policy.h"
@@ -86,6 +87,28 @@ static int _trust_tier(double score)
             return TIER_FLOORS[i].tier;
     }
     return 0;
+}
+
+/* How far below a tier's floor a peer that holds the tier may fall before it
+ * loses it; promotion still happens at the floor. Read from the trust ladder
+ * ($AT_TRUST_LADDER) at init and on reset, 0.02 by default. Mirrors Python
+ * ReputationProcess.tier_demotion_epsilon. */
+static double _tier_demotion_epsilon = TRUST_LADDER_DEFAULT_TIER_DEMOTION_EPSILON;
+
+static void _load_demotion_epsilon(void)
+{
+    /* A ladder holds TRUST_LADDER_MAX_CAPABILITIES entries: too large for
+     * the stack of every caller. */
+    trust_ladder_t *ladder = calloc(1, sizeof(*ladder));
+    double eps = TRUST_LADDER_DEFAULT_TIER_DEMOTION_EPSILON;
+    /* A malformed ladder leaves the defaults in place, so the margin
+     * degrades to 0.02 rather than stopping reputation. */
+    if (ladder != NULL) {
+        (void)trust_ladder_load_env(ladder);
+        eps = ladder->tier_demotion_epsilon;
+        free(ladder);
+    }
+    _tier_demotion_epsilon = eps;
 }
 
 /* The highest score that still maps to @p tier — the next tier's floor,
@@ -1035,6 +1058,7 @@ static void _ensure_init(void)
         map_init(&rep_state.updates);
         array_init(&rep_state.requested_reps);
         map_init(&rep_state.peer_tiers);
+        _load_demotion_epsilon();
         map_init(&rep_state.committed_paxos_rounds);
         rep_state.committed_paxos_ring_head = 0;
         rep_state.committed_paxos_ring_len = 0;
@@ -1804,6 +1828,44 @@ static const char *_task_channel_locked(const char *task_uuid_str)
     return (const char *)val;
 }
 
+static double _standing_ceiling_of(const uuid_t peer_uuid);
+static double _tenure_bound_locked(const uuid_t peer_uuid, double score);
+
+/* The tier to publish for a peer last published at @p prior (-1: never).
+ *
+ * Promotion happens at the floor. A peer that holds a tier keeps it until its
+ * score falls below that floor less _tier_demotion_epsilon, so a score
+ * hovering on a floor does not flap across it. The margin never outranks a
+ * bound that exists to deny a tier: a tenure hold, a standing ceiling, or a
+ * join-policy bound that bit (@p bound, negative when it did not) below a
+ * tier's floor takes the tier away at once, though the capped score sits
+ * inside the margin. Caller must hold rep_state.lock. Mirrors Python
+ * _held_tier. */
+static int _held_tier_locked(const uuid_t peer_uuid, double score, int prior,
+                             double bound)
+{
+    int tier = _trust_tier(score);
+    if (prior <= tier)
+        return tier;
+    double cap = _tenure_bound_locked(peer_uuid, 1.0);
+    if (bound >= 0.0 && bound < cap)
+        cap = bound;
+    double ceiling = _standing_ceiling_of(peer_uuid);
+    if (ceiling >= 0.0 && ceiling < cap)
+        cap = ceiling;
+    int allowed = _trust_tier(cap);
+    for (int i = (int)NUM_TIER_FLOORS - 1; i >= 0; i--) {
+        int held = TIER_FLOORS[i].tier;
+        if (held <= tier)
+            break;
+        if (held > prior || held > allowed)
+            continue;
+        if (score >= TIER_FLOORS[i].floor - _tier_demotion_epsilon)
+            return held;
+    }
+    return tier;
+}
+
 static void _publish_tier_change(const process_t *proc,
                                  const uuid_t peer_uuid, double score)
 {
@@ -1815,8 +1877,9 @@ static void _publish_tier_change(const process_t *proc,
      * bounded (RD_14.4 Phase 4); @p score is the told one. */
     double excl = score;
     bool have_excl = _exclusion_score_locked(peer_uuid, score, &excl);
+    double told = score;
     score = _bounded_locked(peer_uuid, score);
-    int new_tier = _trust_tier(score);
+    double bound = score < told ? score : -1.0;
 
     /* Communication cut-off crossing. Checked BEFORE the tier dedup
      * early-return because COMM_CUTOFF (0.1) lies WITHIN tier 0 ([0,0.5)):
@@ -1847,6 +1910,7 @@ static void _publish_tier_change(const process_t *proc,
         prior_dat != NULL) {
         data_integer(prior_dat, &prior);
     }
+    int new_tier = _held_tier_locked(peer_uuid, score, prior, bound);
     if (prior == new_tier) {
         pthread_mutex_unlock(&rep_state.lock);
         /* Still enforce the cut-off crossing even when the tier is
@@ -16111,6 +16175,7 @@ void reputation_reset_state(int num_peers)
     map_init(&rep_state.round_group);
     map_free(&rep_state.peer_tiers);
     map_init(&rep_state.peer_tiers);
+    _load_demotion_epsilon();
     map_free(&rep_state.committed_paxos_rounds);
     map_init(&rep_state.committed_paxos_rounds);
     /* doc/architecture/zta-integration.md. Must reset with the rest: the conformance harness resets rep_state
@@ -17019,6 +17084,13 @@ void reputation_publish_probe_counts(const process_t *proc, double present)
 {
     _ensure_init();
     _publish_probe_counts(proc, present);
+}
+
+void reputation_publish_tier(const process_t *proc, const uuid_t peer_uuid,
+                             double score)
+{
+    _ensure_init();
+    _publish_tier_change(proc, peer_uuid, score);
 }
 
 void reputation_set_anchored(const uuid_t peer_uuid, bool anchored)
